@@ -22,6 +22,7 @@
 
 #include "Common.h"
 #include "RamCloud.h"
+#include "MultiRead.h"
 
 namespace RAMCloud {
 
@@ -63,6 +64,21 @@ class Transaction {
         ObjectBuffer buf;               /// Scratch buffer for read rpc.
         Tub<ReadKeysAndValueRpc> rpc;   /// Read rpc use if no value is cached.
         DISALLOW_COPY_AND_ASSIGN(ReadOp);
+    };
+
+    class MultiReadOp {
+      public:
+        MultiReadOp(Transaction* transaction,
+                    MultiReadObject* const requests[],
+                    uint32_t numRequests);
+        void wait();
+
+      PRIVATE:
+        Transaction* transaction;       /// Pointer to associated transaction.
+        MultiReadObject* const* requests;
+        uint32_t numRequests;
+        MultiRead multiReadRpc;
+        DISALLOW_COPY_AND_ASSIGN(MultiReadOp);
     };
 
   PRIVATE:

@@ -290,4 +290,49 @@ Transaction::ReadOp::wait()
     value->appendCopy(data, dataLength);
 }
 
+Transaction::MultiReadOp::MultiReadOp(Transaction* transaction, MultiReadObject* const requests[], uint32_t numRequests)
+    : transaction(transaction)
+    , requests(requests)
+    , numRequests(numRequests)
+    , multiReadRpc(transaction->ramcloud, requests, numRequests)
+{}
+
+void
+Transaction::MultiReadOp::wait()
+{
+    multiReadRpc.wait();
+    if (expect_false(transaction->commitStarted)) {
+        throw TxOpAfterCommit(HERE);
+    }
+
+    ClientTransactionTask* task = transaction->taskPtr.get();
+
+    for (uint32_t i = 0; i < numRequests; i++) {
+        if (!requests[i]->value)
+            continue;
+
+        Key keyObj(requests[i]->tableId,
+                   requests[i]->key,
+                   requests[i]->keyLength);
+        ClientTransactionTask::CacheEntry* entry = task->findCacheEntry(keyObj);
+
+        if (entry == NULL) {
+            // If no entry exists in cache an rpc must have been issued.
+            assert(rpc);
+
+            uint64_t version = requests[i]->version;
+
+            entry = task->insertCacheEntry(requests[i]->tableId,
+                                           requests[i]->key,
+                                           requests[i]->keyLength,
+                                           NULL, 0);
+            entry->type = ClientTransactionTask::CacheEntry::READ;
+            entry->rejectRules.givenVersion = version;
+            entry->rejectRules.versionNeGiven = true;
+        } else if (entry->type == ClientTransactionTask::CacheEntry::REMOVE) {
+            throw ObjectDoesntExistException(HERE);
+        }
+    }
+}
+
 } // namespace RAMCloud
