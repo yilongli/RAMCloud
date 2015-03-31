@@ -36,8 +36,10 @@
 #include "SideLog.h"
 #include "SpinLock.h"
 #include "TabletManager.h"
+#include "TxRecoveryManager.h"
 #include "IndexletManager.h"
 #include "WireFormat.h"
+#include "UnackedRpcResults.h"
 
 namespace RAMCloud {
 
@@ -103,9 +105,49 @@ class MasterService : public Service {
     TabletManager tabletManager;
 
     /**
+     * The TxRecoveryManager keeps track of the ongoing transaction recoveries
+     * that have been assigned to this server.
+     */
+    TxRecoveryManager txRecoveryManager;
+
+    /**
      * The IndexletManger class that is responsible for index storage.
      */
     IndexletManager indexletManager;
+
+    /**
+     * The UnackedRpcResults keeps track of those linearizable rpcs that have
+     * not yet been acknowledged by the client.
+     */
+    UnackedRpcResults unackedRpcResults;
+
+    /**
+     * The PreparedWrites keep track all prepared objects staged during
+     * transactions.
+     */
+    PreparedWrites preparedWrites;
+
+    /**
+     * Largest cluster time that this master service either directly or
+     * indirectly received from the coordinator.
+     */
+    Atomic<uint64_t> clusterTime;
+
+    /**
+     * Protecting concurrent updates on clusterTime.
+     */
+    std::mutex mutex_updateClusterTime;
+
+    /**
+     * Advances clusterTime if provided value is larger than current.
+     * \param newVal
+     *      A observed value of clusterTime.
+     */
+    void updateClusterTime(uint64_t newVal) {
+        std::lock_guard<std::mutex> lock(mutex_updateClusterTime);
+        if (clusterTime < newVal)
+            clusterTime = newVal;
+    }
 
 #ifdef TESTING
     /// Used to pause the read-increment-write cycle in incrementObject
@@ -242,9 +284,63 @@ class MasterService : public Service {
                 const WireFormat::TakeIndexletOwnership::Request* reqHdr,
                 WireFormat::TakeIndexletOwnership::Response* respHdr,
                 Rpc* rpc);
+    void txDecision(
+                const WireFormat::TxDecision::Request* reqHdr,
+                WireFormat::TxDecision::Response* respHdr,
+                Rpc* rpc);
+    void txHintFailed(
+                const WireFormat::TxHintFailed::Request* reqHdr,
+                WireFormat::TxHintFailed::Response* respHdr,
+                Rpc* rpc);
+    void txPrepare(
+                const WireFormat::TxPrepare::Request* reqHdr,
+                WireFormat::TxPrepare::Response* respHdr,
+                Rpc* rpc);
     void write(const WireFormat::Write::Request* reqHdr,
                 WireFormat::Write::Response* respHdr,
                 Rpc* rpc);
+
+    /**
+     * Helper function for handling linearizable RPCs. Parse the log location
+     * for RpcResult log entry into actually saved RPC response.
+     *
+     * \param result
+     *      Location of RPC result entry in log. Typically obtained from
+     *      UnackedRpcResults::checkDuplicate.
+     *
+     * \return
+     *      Saved response from original RPC. Rpc handled should respond with
+     *      this response without executing rpc.
+     */
+    template <typename LinearizableRpcType>
+    typename LinearizableRpcType::Response parseRpcResult(void* result) {
+        if (!result) {
+            throw RetryException(HERE, 50, 50,
+                    "Duplicate RPC is in progress.");
+        }
+
+        //Obtain saved RPC response from log.
+        Buffer resultBuffer;
+        Log::Reference resultRef((uint64_t)result);
+        objectManager.getLog()->getEntry(resultRef, resultBuffer);
+        RpcRecord savedRec(resultBuffer);
+        return *((typename LinearizableRpcType::Response*) savedRec.getResp());
+    }
+
+    WireFormat::TxPrepare::Vote
+    parsePrepRpcResult(void* result) {
+        if (!result) {
+            throw RetryException(HERE, 50, 50,
+                    "Duplicate RPC is in progress.");
+        }
+
+        //Obtain saved RPC response from log.
+        Buffer resultBuffer;
+        Log::Reference resultRef((uint64_t)result);
+        objectManager.getLog()->getEntry(resultRef, resultBuffer);
+        RpcRecord savedRec(resultBuffer);
+        return *((WireFormat::TxPrepare::Vote*) savedRec.getResp());
+    }
 
     /**
      * Counts the number of times disable has been called, minus the number

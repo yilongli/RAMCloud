@@ -128,6 +128,40 @@ def print_cdf_from_log(
     print("%8.2f    %9.4f" % (numbers[int(len(numbers)*9999/10000)], .9999))
     print("%8.2f    %8.3f" % (numbers[-1], 1.0))
 
+def print_rcdf_from_log(
+        index = 1                 # Client index (1 for first client,
+                                  # which is usually the one that's wanted)
+        ):
+    """
+    Given the index of a client, print in gnuplot format a reverse cumulative
+    distribution of the data in the client's log file (where "data" consists
+    of comma-separated numbers stored in all of the lines of the log file
+    that are not RAMCloud log messages). Each line in the printed output
+    will contain a fraction and a number, such that the given fraction of all
+    numbers in the log file have values less than or equal to the given number.
+    """
+
+    # Read the log file into an array of numbers.
+    numbers = []
+    globResult = glob.glob('%s/latest/client%d*.log' %
+            (options.log_dir, index))
+    if len(globResult) == 0:
+        raise Exception("couldn't find log file for client %d" % (index))
+    result = "";
+    for line in open(globResult[0], 'r'):
+        if not re.match('([0-9]+\.[0-9]+) ', line):
+            for value in line.split(","):
+                numbers.append(float(value))
+
+    # Generate a RCDF from the array.
+    numbers.sort()
+    result = []
+    print("%8.2f    %11.6f" % (numbers[0], 1.0))
+    for i in range(1, len(numbers)-1):
+        if (numbers[i] != numbers[i-1] or numbers[i] != numbers[i+1]):
+            print("%8.2f    %11.6f" % (numbers[i], 1-(i/len(numbers))))
+    print("%8.2f    %11.6f" % (numbers[-1], 1/len(numbers)))
+
 def run_test(
         test,                     # Test object describing the test to run.
         options                   # Command-line options.
@@ -167,6 +201,10 @@ def run_test(
         client_args['--count'] = options.count
     if options.size != None:
         client_args['--size'] = options.size
+    if options.numObjects != None:
+        client_args['--numObjects'] = options.numObjects
+    if options.numTables != None:
+        client_args['--numTables'] = options.numTables
     if options.warmup != None:
         client_args['--warmup'] = options.warmup
     if options.numIndexlet != None:
@@ -233,8 +271,16 @@ def indexBasic(name, options, cluster_args, client_args):
 def indexRange(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
-    if cluster_args['timeout'] < 200:
-        cluster_args['timeout'] = 200
+    if cluster_args['timeout'] < 360:
+        cluster_args['timeout'] = 360
+
+    if '--numObjects' not in client_args:
+        client_args['--numObjects'] = 1000
+    if '--warmup' not in client_args:
+        client_args['--warmup'] = 10
+    if '--count' not in client_args:
+        client_args['--count'] = 90
+
     # Ensure at least 5 hosts for optimal performance
     if options.num_servers == None:
         cluster_args['num_servers'] = len(hosts)
@@ -245,8 +291,8 @@ def indexRange(name, options, cluster_args, client_args):
 def indexMultiple(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '--masterServiceThreads 1'
-    if cluster_args['timeout'] < 2100:
-        cluster_args['timeout'] = 200
+    if cluster_args['timeout'] < 360:
+        cluster_args['timeout'] = 360
     # Ensure atleast 15 hosts for optimal performance
     if options.num_servers == None:
         cluster_args['num_servers'] = len(hosts)
@@ -272,10 +318,17 @@ def indexMultiple(name, options, cluster_args, client_args):
 def indexScalability(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '--masterServiceThreads 2'
-    if cluster_args['timeout'] < 100:
-        cluster_args['timeout'] = 100
+    if cluster_args['timeout'] < 360:
+        cluster_args['timeout'] = 360
     cluster_args['backups_per_server'] = 0
     cluster_args['replicas'] = 0
+    # Number of concurrent rpcs to do per indexlet
+    if '--count' not in client_args:
+        client_args['--count'] = 20
+    # Number of objects per read request
+    if '--numObjects' not in client_args:
+        client_args['--numObjects'] = 1
+
     # Ensure at least 15 hosts for optimal performance
     if options.num_servers == None:
         cluster_args['num_servers'] = len(hosts)
@@ -284,6 +337,112 @@ def indexScalability(name, options, cluster_args, client_args):
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name), **cluster_args)
     print(get_client_log(), end='')
+
+def indexWriteDist(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
+    if cluster_args['timeout'] < 200:
+        cluster_args['timeout'] = 200
+
+    if options.num_servers == None:
+        cluster_args['num_servers'] = len(hosts)
+
+    if '--count' not in client_args:
+        client_args['--count'] = 10000
+
+    if '--numObjects' not in client_args:
+        client_args['--numObjects'] = 1000000
+
+    cluster.run(client='%s/ClusterPerf %s %s' %
+            (obj_path, flatten_args(client_args), name), **cluster_args)
+
+    print("# Cumulative distribution of time for a single client to write\n"
+          "# %d %d-byte objects to a table with one index and %d\n"
+          "# initial objects. Each object has two 30-byte keys and a 100\n"
+          "# byte value. Each line indicates that a given fraction of all\n"
+          "# reads took at most a given time to complete.\n"
+          "#\n"
+          "# Generated by 'clusterperf.py readDist'\n#\n"
+          "# Time (usec)  Cum. Fraction\n"
+          "#---------------------------"
+          % (client_args['--count'], options.size, client_args['--numObjects'] ))
+    print_cdf_from_log()
+
+
+def indexReadDist(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '--masterServiceThreads 1 --totalMasterMemory 1500'
+    if cluster_args['timeout'] < 200:
+        cluster_args['timeout'] = 200
+
+    if options.num_servers == None:
+        cluster_args['num_servers'] = len(hosts)
+
+    if '--count' not in client_args:
+        client_args['--count'] = 10000
+
+    if '--numObjects' not in client_args:
+        client_args['--numObjects'] = 1000000
+
+    if '--warmup' not in client_args:
+        client_args['--warmup'] = 100
+
+    cluster.run(client='%s/ClusterPerf %s %s' %
+            (obj_path, flatten_args(client_args), name), **cluster_args)
+
+    print("# Cumulative distribution of time for a single client to read\n"
+          "# %d %d-byte objects to a table with one index and %d\n"
+          "# initial objects. Each object has two 30-byte keys and a 100\n"
+          "# byte value. Each line indicates that a given fraction of all\n"
+          "# reads took at most a given time to complete.\n"
+          "#\n"
+          "# Generated by 'clusterperf.py readDist'\n#\n"
+          "# Time (usec)  Cum. Fraction\n"
+          "#---------------------------"
+          % (client_args['--count'], options.size, client_args['--numObjects'] ))
+    print_cdf_from_log()
+
+def transactionDist(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '-t 2000'
+    cluster_args['disjunct'] = True
+    if options.numTables == None:
+        client_args['--numTables'] = 1
+    cluster.run(client='%s/ClusterPerf %s %s' %
+            (obj_path,  flatten_args(client_args), name),
+            **cluster_args)
+    print("# Cumulative distribution of time for a single client to commit a\n"
+          "# transactional read-write on a single %d-byte object from a\n"
+          "# single server.  Each line indicates that a given fraction of all\n"
+          "# commits took at most a given time to complete.\n"
+          "# Generated by 'clusterperf.py %s'\n#\n"
+          "# Time (usec)  Cum. Fraction\n"
+          "#---------------------------"
+          % (options.size, name))
+    if (options.rcdf):
+        print_rcdf_from_log()
+    else:
+        print_cdf_from_log()
+
+def transactionThroughput(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '-t 2000'
+    if cluster_args['timeout'] < 250:
+        cluster_args['timeout'] = 250
+    if 'num_clients' not in cluster_args:
+        cluster_args['num_clients'] = len(hosts) - cluster_args['num_servers']
+    if cluster_args['num_clients'] < 2:
+        print("Not enough machines in the cluster to run the '%s' benchmark"
+                % name)
+        print("Need at least %d machines in this configuration" %
+                (cluster_args['num_servers'] + 2))
+        return
+    if options.numTables == None:
+        client_args['--numTables'] = 1
+    cluster.run(client='%s/ClusterPerf %s %s' %
+            (obj_path, flatten_args(client_args), name), **cluster_args)
+    for i in range(1, cluster_args['num_clients'] + 1):
+        print(get_client_log(i), end='')
 
 def multiOp(name, options, cluster_args, client_args):
     if cluster_args['timeout'] < 100:
@@ -370,7 +529,8 @@ def readRandom(name, options, cluster_args, client_args):
             (obj_path, flatten_args(client_args), name), **cluster_args)
     print(get_client_log(), end='')
 
-# This method is also used for multiReadThroughput
+# This method is also used for multiReadThroughput and
+# linearizableWriteThroughput
 def readThroughput(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '-t 2000'
@@ -384,6 +544,18 @@ def readThroughput(name, options, cluster_args, client_args):
         print("Need at least %d machines in this configuration" %
                 (cluster_args['num_servers'] + 2))
         return
+    cluster.run(client='%s/ClusterPerf %s %s' %
+            (obj_path, flatten_args(client_args), name), **cluster_args)
+    print(get_client_log(), end='')
+
+def txCollision(name, options, cluster_args, client_args):
+    if cluster_args['timeout'] < 100:
+        cluster_args['timeout'] = 100
+    if options.num_servers == None:
+        cluster_args['num_servers'] = len(hosts)
+    #client_args['--numTables'] = cluster_args['num_servers'];
+    if 'num_clients' not in cluster_args:
+        cluster_args['num_clients'] = 5
     cluster.run(client='%s/ClusterPerf %s %s' %
             (obj_path, flatten_args(client_args), name), **cluster_args)
     print(get_client_log(), end='')
@@ -403,7 +575,11 @@ def writeDist(name, options, cluster_args, client_args):
           "# Time (usec)  Cum. Fraction\n"
           "#---------------------------"
           % (options.size, name))
-    print_cdf_from_log()
+    if (options.rcdf):
+        print_rcdf_from_log()
+    else:
+        print_cdf_from_log()
+
 #-------------------------------------------------------------------
 #  End of driver functions.
 #-------------------------------------------------------------------
@@ -420,7 +596,8 @@ simple_tests = [
     Test("broadcast", broadcast),
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),
-    Test("readNotFound", default)
+    Test("readNotFound", default),
+    Test("linearizableRpc", basic)
 ]
 
 graph_tests = [
@@ -428,22 +605,33 @@ graph_tests = [
     Test("indexRange", indexRange),
     Test("indexMultiple", indexMultiple),
     Test("indexScalability", indexScalability),
+    Test("indexReadDist", indexReadDist),
+    Test("indexWriteDist", indexWriteDist),
     Test("multiRead_general", multiOp),
     Test("multiRead_generalRandom", multiOp),
     Test("multiRead_oneMaster", multiOp),
     Test("multiRead_oneObjectPerMaster", multiOp),
     Test("multiReadThroughput", readThroughput),
     Test("multiWrite_oneMaster", multiOp),
+    Test("transaction_oneMaster", multiOp),
+    Test("transactionDistRandom", transactionDist),
+    Test("transactionThroughput", transactionThroughput),
+    Test("transactionContention", transactionThroughput),
     Test("readDist", readDist),
     Test("readDistRandom", readDistRandom),
     Test("readLoaded", readLoaded),
     Test("readRandom", readRandom),
     Test("readThroughput", readThroughput),
     Test("readVaryingKeyLength", default),
+    Test("transaction_oneMaster", multiOp),
+    Test("transaction_collision", txCollision),
     Test("writeAsyncSync", default),
     Test("writeVaryingKeyLength", default),
     Test("writeDist", writeDist),
     Test("writeDistRandom", writeDist),
+    Test("writeThroughput", readThroughput),
+    Test("linearizableWriteDistRandom", writeDist),
+    Test("linearizableWriteThroughput", readThroughput),
 ]
 
 if __name__ == '__main__':
@@ -487,6 +675,10 @@ if __name__ == '__main__':
             help='Number of hosts on which to run servers')
     parser.add_option('-s', '--size', type=int, default=100,
             help='Object size in bytes')
+    parser.add_option('--numObjects', type=int,
+            help='Number of objects per operation.')
+    parser.add_option('--numTables', type=int,
+            help='Number of tables involved.')
     parser.add_option('-t', '--timeout', type=int, default=30,
             metavar='SECS',
             help="Abort if the client application doesn't finish within "
@@ -506,6 +698,9 @@ if __name__ == '__main__':
             help='Number of indexlets for measuring index scalability ')
     parser.add_option('-k', '--numIndexes', type=int,
             help='Number of secondary keys/object to measure index operations')
+    parser.add_option('--rcdf', action='store_true', default=False,
+            dest='rcdf',
+            help='Output reverse CDF data instead.')
     (options, args) = parser.parse_args()
 
     # Invoke the requested tests (run all of them if no tests were specified)
@@ -548,4 +743,4 @@ if __name__ == '__main__':
                 ["starting new cluster from scratch",
                  "Ping timeout to server"])
         if len(logInfo) > 0:
-            print(logInfo)
+            print(logInfo, file=sys.stderr)

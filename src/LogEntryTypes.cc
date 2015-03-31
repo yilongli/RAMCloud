@@ -40,6 +40,14 @@ toString(LogEntryType type)
         return "Object Safe Version";
     case LOG_ENTRY_TYPE_TABLESTATS:
         return "Table Stats Digest";
+    case LOG_ENTRY_TYPE_RPCRECORD:
+        return "Linearizable Rpc Record";
+    case LOG_ENTRY_TYPE_PREP:
+        return "Transaction Prepare Record";
+    case LOG_ENTRY_TYPE_PREPTOMB:
+        return "Transaction Prepare Tombstone";
+    case LOG_ENTRY_TYPE_TXDECISION:
+        return "Transaction Decision Record";
     default:
         return "<<Unknown>>";
     }

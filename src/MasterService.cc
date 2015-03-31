@@ -79,9 +79,17 @@ MasterService::MasterService(Context* context, const ServerConfig* config)
                     &serverId,
                     config,
                     &tabletManager,
-                    &masterTableMetadata)
+                    &masterTableMetadata,
+                    &unackedRpcResults,
+                    &preparedWrites,
+                    &txRecoveryManager)
     , tabletManager()
+    , txRecoveryManager(context)
     , indexletManager(context, &objectManager)
+    , unackedRpcResults(context)
+    , preparedWrites(context)
+    , clusterTime(0)
+    , mutex_updateClusterTime()
     , disableCount(0)
     , initCalled(false)
     , logEverSynced(false)
@@ -213,6 +221,18 @@ MasterService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
         case WireFormat::TakeIndexletOwnership::opcode:
             callHandler<WireFormat::TakeIndexletOwnership, MasterService,
                         &MasterService::takeIndexletOwnership>(rpc);
+            break;
+        case WireFormat::TxDecision::opcode:
+            callHandler<WireFormat::TxDecision, MasterService,
+                        &MasterService::txDecision>(rpc);
+            break;
+        case WireFormat::TxHintFailed::opcode:
+            callHandler<WireFormat::TxHintFailed, MasterService,
+                        &MasterService::txHintFailed>(rpc);
+            break;
+        case WireFormat::TxPrepare::opcode:
+            callHandler<WireFormat::TxPrepare, MasterService,
+                        &MasterService::txPrepare>(rpc);
             break;
         case WireFormat::Write::opcode:
             callHandler<WireFormat::Write, MasterService,
@@ -696,6 +716,8 @@ MasterService::initOnceEnlisted()
     LOG(NOTICE, "My server ID is %s", serverId.toString().c_str());
     metrics->serverId = serverId.getId();
     objectManager.initOnceEnlisted();
+
+    unackedRpcResults.startCleaner();
 
     initCalled = true;
 }
@@ -2195,6 +2217,339 @@ MasterService::takeIndexletOwnership(
 }
 
 /**
+ * Top-level server method to handle the TX_DECISION request.
+ *
+ * \param reqHdr
+ *      Header from the incoming RPC request. Lists the number of writes
+ *      contained in this request.
+ * \param[out] respHdr
+ *      Header for the response that will be returned to the client.
+ *      The caller has pre-allocated the right amount of space in the
+ *      response buffer for this type of request, and has zeroed out
+ *      its contents (so, for example, status is already zero).
+ * \param[out] rpc
+ *      Complete information about the remote procedure call.
+ */
+void
+MasterService::txDecision(const WireFormat::TxDecision::Request* reqHdr,
+        WireFormat::TxDecision::Response* respHdr,
+        Rpc* rpc)
+{
+    uint32_t reqOffset = sizeof32(*reqHdr);
+
+    // 1. Process participant list.
+    uint32_t participantCount = reqHdr->participantCount;
+    WireFormat::TxParticipant *participants =
+        (WireFormat::TxParticipant*)rpc->requestPayload->getRange(reqOffset,
+                sizeof32(WireFormat::TxParticipant) * participantCount);
+
+    if (reqHdr->decision == WireFormat::TxDecision::COMMIT) {
+        for (uint32_t i = 0; i < participantCount; ++i) {
+            TabletManager::Tablet tablet;
+            if (!tabletManager.getTablet(participants[i].tableId,
+                                         participants[i].keyHash,
+                                         &tablet)
+                 || tablet.state != TabletManager::NORMAL) {
+                respHdr->common.status = STATUS_UNKNOWN_TABLET;
+                rpc->sendReply();
+                return;
+            }
+
+            uint64_t opPtr = preparedWrites.peekOp(reqHdr->leaseId,
+                                                   participants[i].rpcId);
+
+            // Skip if object is not prepared since it is already committed.
+            if (!opPtr) {
+                continue;
+            }
+
+            Buffer opBuffer;
+            Log::Reference opRef(opPtr);
+            objectManager.getLog()->getEntry(opRef, opBuffer);
+            PreparedOp op(opBuffer, 0, opBuffer.size());
+
+            if (op.header.type == WireFormat::TxPrepare::READ) {
+                objectManager.commitRead(op, opRef);
+            } else if (op.header.type == WireFormat::TxPrepare::REMOVE) {
+                objectManager.commitRemove(op, opRef);
+            } else if (op.header.type == WireFormat::TxPrepare::WRITE) {
+                objectManager.commitWrite(op, opRef);
+            }
+
+            preparedWrites.popOp(reqHdr->leaseId,
+                                 participants[i].rpcId);
+        }
+    } else if (reqHdr->decision == WireFormat::TxDecision::ABORT) {
+        for (uint32_t i = 0; i < participantCount; ++i) {
+            TabletManager::Tablet tablet;
+            if (!tabletManager.getTablet(participants[i].tableId,
+                                         participants[i].keyHash,
+                                         &tablet)
+                 || tablet.state != TabletManager::NORMAL) {
+                respHdr->common.status = STATUS_UNKNOWN_TABLET;
+                rpc->sendReply();
+                return;
+            }
+
+            uint64_t opPtr = preparedWrites.peekOp(reqHdr->leaseId,
+                                                   participants[i].rpcId);
+
+            // Skip if object is not prepared since it is already committed
+            // or never prepared (abort-vote in prepare stage).
+            if (!opPtr) {
+                continue;
+            }
+
+            Buffer opBuffer;
+            Log::Reference opRef(opPtr);
+            objectManager.getLog()->getEntry(opRef, opBuffer);
+            PreparedOp op(opBuffer, 0, opBuffer.size());
+
+            objectManager.commitRead(op, opRef);
+
+            preparedWrites.popOp(reqHdr->leaseId,
+                                 participants[i].rpcId);
+        }
+    } else {
+        respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+        rpc->sendReply();
+    }
+
+    objectManager.syncChanges();
+
+    respHdr->common.status = STATUS_OK;
+
+    // Respond to the client RPC now. Removing old index entries can be
+    // done asynchronously while maintaining strong consistency.
+    rpc->sendReply();
+}
+
+
+/**
+ * Top-level server method to handle the TX_HINT_FAILED request.
+ *
+ * This RPC is issued by another master when it thinks that the client running
+ * a particular transaction may have failed.  If this master is the recovery
+ * manager for this transaction, this master should take steps to ensure the
+ * transaction is run to completion.
+ *
+ * \copydetails Service::ping
+ */
+void
+MasterService::txHintFailed(
+        const WireFormat::TxHintFailed::Request* reqHdr,
+        WireFormat::TxHintFailed::Response* respHdr,
+        Rpc* rpc)
+{
+    txRecoveryManager.handleTxHintFailed(rpc->requestPayload);
+}
+
+/**
+ * Top-level server method to handle the TX_PREPARE request.
+ *
+ * \param reqHdr
+ *      Header from the incoming RPC request. Lists the number of writes
+ *      contained in this request.
+ * \param[out] respHdr
+ *      Header for the response that will be returned to the client.
+ *      The caller has pre-allocated the right amount of space in the
+ *      response buffer for this type of request, and has zeroed out
+ *      its contents (so, for example, status is already zero).
+ * \param[out] rpc
+ *      Complete information about the remote procedure call.
+ *      TODO(seojin): add more doc.
+ */
+void
+MasterService::txPrepare(const WireFormat::TxPrepare::Request* reqHdr,
+        WireFormat::TxPrepare::Response* respHdr,
+        Rpc* rpc)
+{
+    uint32_t reqOffset = sizeof32(*reqHdr);
+
+    // 1. Process participant list.
+    uint32_t participantCount = reqHdr->participantCount;
+    WireFormat::TxParticipant *participants =
+        (WireFormat::TxParticipant*)rpc->requestPayload->getRange(reqOffset,
+                sizeof32(WireFormat::TxParticipant) * participantCount);
+
+    reqOffset += sizeof32(WireFormat::TxParticipant) * participantCount;
+
+    // 2. Process operations.
+    uint32_t numRequests = reqHdr->opCount;
+
+    updateClusterTime(reqHdr->lease.timestamp);
+
+    // Temporary storage for completed RPCs; recordCompletion()
+    // is called after log is synched with backup.
+    std::vector<std::pair<uint64_t, uint64_t>> completedRpcs;
+    completedRpcs.reserve(numRequests);
+
+    // Each iteration extracts one request from the rpc, writes the object
+    // if possible, and appends a status and version to the response buffer.
+    for (uint32_t i = 0; i < numRequests; i++) {
+        Tub<PreparedOp> op;
+        uint64_t tableId, rpcId;
+        RejectRules rejectRules;
+
+        respHdr->common.status = STATUS_OK;
+        respHdr->vote = WireFormat::TxPrepare::COMMIT;
+
+        Buffer buffer;
+        const WireFormat::TxPrepare::OpType *type =
+                rpc->requestPayload->getOffset<
+                WireFormat::TxPrepare::OpType>(reqOffset);
+        if (*type == WireFormat::TxPrepare::READ) {
+            const WireFormat::TxPrepare::Request::ReadOp *currentReq =
+                    rpc->requestPayload->getOffset<
+                    WireFormat::TxPrepare::Request::ReadOp>(reqOffset);
+
+            reqOffset += sizeof32(WireFormat::TxPrepare::Request::ReadOp);
+
+            if (currentReq == NULL || rpc->requestPayload->size() <
+                                      reqOffset + currentReq->keyLength) {
+                respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+                respHdr->vote = WireFormat::TxPrepare::ABORT;
+                break;
+            }
+            tableId = currentReq->tableId;
+            rpcId = currentReq->rpcId;
+            rejectRules = currentReq->rejectRules;
+
+            buffer.emplaceAppend<KeyCount>((unsigned char) 1);
+            buffer.emplaceAppend<CumulativeKeyLength>(currentReq->keyLength);
+            buffer.appendExternal(rpc->requestPayload, reqOffset,
+                                  currentReq->keyLength);
+
+            op.construct(*type, reqHdr->lease.leaseId, rpcId,
+                         participantCount, participants,
+                         tableId, 0, 0,
+                         buffer);
+
+            reqOffset += currentReq->keyLength;
+        } else if (*type == WireFormat::TxPrepare::REMOVE) {
+            const WireFormat::TxPrepare::Request::RemoveOp *currentReq =
+                    rpc->requestPayload->getOffset<
+                    WireFormat::TxPrepare::Request::RemoveOp>(reqOffset);
+
+            reqOffset += sizeof32(WireFormat::TxPrepare::Request::RemoveOp);
+
+            if (currentReq == NULL || rpc->requestPayload->size() <
+                                      reqOffset + currentReq->keyLength) {
+                respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+                respHdr->vote = WireFormat::TxPrepare::ABORT;
+                break;
+            }
+            tableId = currentReq->tableId;
+            rpcId = currentReq->rpcId;
+            //TODO(seojin): apply default rejectRules?
+            //              or is it provided by client?
+            rejectRules = currentReq->rejectRules;
+
+            buffer.emplaceAppend<KeyCount>((unsigned char) 1);
+            buffer.emplaceAppend<CumulativeKeyLength>(currentReq->keyLength);
+            buffer.appendExternal(rpc->requestPayload, reqOffset,
+                                  currentReq->keyLength);
+
+            op.construct(*type, reqHdr->lease.leaseId, rpcId,
+                         participantCount, participants,
+                         tableId, 0, 0,
+                         buffer);
+
+            reqOffset += currentReq->keyLength;
+        } else if (*type == WireFormat::TxPrepare::WRITE) {
+            const WireFormat::TxPrepare::Request::WriteOp *currentReq =
+                    rpc->requestPayload->getOffset<
+                    WireFormat::TxPrepare::Request::WriteOp>(reqOffset);
+
+            reqOffset += sizeof32(WireFormat::TxPrepare::Request::WriteOp);
+
+            if (currentReq == NULL || rpc->requestPayload->size() <
+                                      reqOffset + currentReq->length) {
+                respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+                respHdr->vote = WireFormat::TxPrepare::ABORT;
+                break;
+            }
+            tableId = currentReq->tableId;
+            rpcId = currentReq->rpcId;
+            rejectRules = currentReq->rejectRules;
+            op.construct(*type, reqHdr->lease.leaseId, rpcId,
+                         participantCount, participants,
+                         tableId, 0, 0,
+                         *(rpc->requestPayload), reqOffset,
+                         currentReq->length);
+
+            reqOffset += currentReq->length;
+        } else {
+            respHdr->common.status = STATUS_REQUEST_FORMAT_ERROR;
+            break;
+        }
+
+        void* result;
+        if (unackedRpcResults.checkDuplicate(reqHdr->lease.leaseId,
+                                             rpcId,
+                                             reqHdr->ackId,
+                                             reqHdr->lease.leaseTerm,
+                                             &result)) {
+            respHdr->vote = parsePrepRpcResult(result);
+            if (respHdr->vote == WireFormat::TxPrepare::COMMIT) {
+                continue;
+            } else if (respHdr->vote == WireFormat::TxPrepare::ABORT) {
+                break;
+            } else {
+                assert(false);
+            }
+        }
+
+        uint64_t rpcRecordPtr;
+        KeyLength pKeyLen;
+        const void* pKey = op->object.getKey(0, &pKeyLen);
+        respHdr->common.status = STATUS_OK;
+        WireFormat::TxPrepare::Vote vote = WireFormat::TxPrepare::COMMIT;
+        RpcRecord rpcRecord(
+                tableId,
+                Key::getHash(tableId, pKey, pKeyLen),
+                reqHdr->lease.leaseId, rpcId, reqHdr->ackId,
+                &vote, sizeof(vote));
+
+        uint64_t newOpPtr;
+        bool isCommitVote;
+        respHdr->common.status = objectManager.prepareOp(
+                *op, &rejectRules, &newOpPtr, &isCommitVote,
+                &rpcRecord, &rpcRecordPtr);
+
+        if (!isCommitVote || respHdr->common.status != STATUS_OK) {
+            respHdr->vote = WireFormat::TxPrepare::ABORT;
+            completedRpcs.emplace_back(rpcId, rpcRecordPtr);
+            break;
+        }
+
+        preparedWrites.bufferWrite(reqHdr->lease.leaseId, rpcId, newOpPtr);
+
+        // Defer this operation after sync with backup.
+        completedRpcs.emplace_back(rpcId, rpcRecordPtr);
+    }
+
+    // By design, our response will be shorter than the request. This ensures
+    // that the response can go back in a single RPC.
+    assert(rpc->replyPayload->size() <= Transport::MAX_RPC_LEN);
+
+    // All of the individual writes were done asynchronously. Sync the objects
+    // now to propagate them in bulk to backups.
+    objectManager.syncChanges();
+
+    for (auto it = completedRpcs.begin();
+            it != completedRpcs.end(); ++it) {
+        unackedRpcResults.recordCompletion(reqHdr->lease.leaseId,
+                            it->first,
+                            reinterpret_cast<void*>(it->second));
+    }
+
+    // Respond to the client RPC now. Removing old index entries can be
+    // done asynchronously while maintaining strong consistency.
+    rpc->sendReply();
+}
+
+/**
  * Top-level server method to handle the WRITE request.
  *
  * \copydetails MasterService::read
@@ -2204,6 +2559,22 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
         WireFormat::Write::Response* respHdr,
         Rpc* rpc)
 {
+    const bool linearizable = reqHdr->rpcId > 0;
+    if (linearizable) {
+        updateClusterTime(reqHdr->lease.timestamp);
+
+        void* result;
+        if (unackedRpcResults.checkDuplicate(reqHdr->lease.leaseId,
+                                             reqHdr->rpcId,
+                                             reqHdr->ackId,
+                                             reqHdr->lease.leaseTerm,
+                                             &result)) {
+            *respHdr = parseRpcResult<WireFormat::Write>(result);
+            rpc->sendReply();
+            return;
+        }
+    }
+
     // This is a temporary object that has an invalid version and timestamp.
     // An object is created here to make sure the object format does not leak
     // outside the object class. ObjectManager will update the version,
@@ -2222,11 +2593,33 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
     // Write the object.
     RejectRules rejectRules = reqHdr->rejectRules;
 
-    respHdr->common.status = objectManager.writeObject(
-            object, &rejectRules, &respHdr->version, &oldObjectBuffer);
+    uint64_t rpcRecordPtr;
+    if (linearizable) {
+        KeyLength pKeyLen;
+        const void* pKey = object.getKey(0, &pKeyLen);
+        respHdr->common.status = STATUS_OK;
+        RpcRecord rpcRecord(
+                reqHdr->tableId, Key::getHash(reqHdr->tableId, pKey, pKeyLen),
+                reqHdr->lease.leaseId, reqHdr->rpcId, reqHdr->ackId,
+                respHdr, sizeof(*respHdr));
+
+        respHdr->common.status = objectManager.writeObject(
+                object, &rejectRules, &respHdr->version, &oldObjectBuffer,
+                &rpcRecord, &rpcRecordPtr);
+    } else {
+        respHdr->common.status = objectManager.writeObject(
+                object, &rejectRules, &respHdr->version, &oldObjectBuffer);
+    }
 
     if (respHdr->common.status == STATUS_OK)
         objectManager.syncChanges();
+
+    if (linearizable) {
+        unackedRpcResults.recordCompletion(reqHdr->lease.leaseId,
+                                    reqHdr->rpcId,
+                                    reinterpret_cast<void*>(rpcRecordPtr));
+    }
+
     // Respond to the client RPC now. Removing old index entries can be
     // done asynchronously while maintaining strong consistency.
     rpc->sendReply();
@@ -2740,6 +3133,11 @@ MasterService::recover(const WireFormat::Recover::Request* reqHdr,
 
     // reqHdr, respHdr, and rpc are off-limits now
 
+    // Start asking the coordinator for the current cluster time.
+    // We should do some other work while we wait of this rpc to return but not
+    // so much that we are needlessly using up the rpc resources.
+    GetLeaseInfoRpc getLeaseInfoRpc(context, 0);
+
     // Install tablets we are recovering and mark them as such (we don't
     // own them yet).
     foreach (const ProtoBuf::Tablets::Tablet& newTablet,
@@ -2755,6 +3153,15 @@ MasterService::recover(const WireFormat::Recover::Request* reqHdr,
                     newTablet.start_key_hash(), newTablet.end_key_hash(),
                     tabletManager.toString().c_str()));
         }
+    }
+
+    // Update the cluster time.  To guarantee the safety of linearizable rpcs,
+    // this update must occur before requests for recovered data are serviced.
+    WireFormat::ClientLease clientLease = getLeaseInfoRpc.wait();
+    uint64_t currentClusterTime = clusterTime;
+    while (currentClusterTime < clientLease.timestamp) {
+        currentClusterTime = clusterTime.compareExchange(currentClusterTime,
+                                                         clientLease.timestamp);
     }
 
     // Record the log position before recovery started.
@@ -2828,9 +3235,11 @@ MasterService::recover(const WireFormat::Recover::Request* reqHdr,
     bool cancelRecovery = CoordinatorClient::recoveryMasterFinished(
             context, recoveryId, serverId, &recoveryPartition, successful);
     if (!cancelRecovery) {
-        // Ok - we're expected to be serving now. Mark recovered tablets and
-        // indexlets as normal so we can handle clients.
+        // Re-grab all transaction locks.
+        preparedWrites.regrabLocksAfterRecovery(&objectManager);
 
+        // Ok - we're expected to be serving now. Mark recovered tablets
+        // as normal so we can handle clients.
         foreach (const ProtoBuf::Tablets::Tablet& tablet,
                 recoveryPartition.tablet()) {
             bool changed = tabletManager.changeState(
@@ -2868,6 +3277,9 @@ MasterService::recover(const WireFormat::Recover::Request* reqHdr,
     } else {
         LOG(WARNING, "Failed to recover partition for recovery %lu; "
             "aborting recovery on this recovery master", recoveryId);
+        // TODO(seojin): remove unackedRpcResults entries? Maybe it is okay.
+        // TODO(seojin): remove preparedWrites entries? It won't be GCed.
+
         // If recovery failed then clean up all objects written by
         // recovery before starting to serve requests again.
         foreach (const ProtoBuf::Tablets::Tablet& tablet,

@@ -33,6 +33,7 @@ class Logger;
 class MasterRecoveryManager;
 class MasterService;
 class MockContextMember;
+class RpcTracker;
 class ServiceManager;
 class SessionAlarmTimer;
 class PortAlarmTimer;

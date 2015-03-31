@@ -110,22 +110,28 @@ enum Opcode {
     GET_LOG_METRICS             = 56,
     VERIFY_MEMBERSHIP           = 57,
     GET_RUNTIME_OPTION          = 58,
-    SERVER_CONTROL              = 59,
-    SERVER_CONTROL_ALL          = 60,
-    GET_SERVER_ID               = 61,
-    READ_KEYS_AND_VALUE         = 62,
-    LOOKUP_INDEX_KEYS           = 63,
-    READ_HASHES                 = 64,
-    INSERT_INDEX_ENTRY          = 65,
-    REMOVE_INDEX_ENTRY          = 66,
-    CREATE_INDEX                = 67,
-    DROP_INDEX                  = 68,
-    DROP_INDEXLET_OWNERSHIP     = 69,
-    TAKE_INDEXLET_OWNERSHIP     = 70,
-    PREP_FOR_INDEXLET_MIGRATION = 71,
-    SPLIT_AND_MIGRATE_INDEXLET  = 72,
-    COORD_SPLIT_AND_MIGRATE_INDEXLET = 73,
-    ILLEGAL_RPC_TYPE            = 74, // 1 + the highest legitimate Opcode
+    GET_LEASE_INFO              = 59,
+    RENEW_LEASE                 = 60,
+    SERVER_CONTROL              = 61,
+    SERVER_CONTROL_ALL          = 62,
+    GET_SERVER_ID               = 63,
+    READ_KEYS_AND_VALUE         = 64,
+    LOOKUP_INDEX_KEYS           = 65,
+    READ_HASHES                 = 66,
+    INSERT_INDEX_ENTRY          = 67,
+    REMOVE_INDEX_ENTRY          = 68,
+    CREATE_INDEX                = 69,
+    DROP_INDEX                  = 70,
+    DROP_INDEXLET_OWNERSHIP     = 71,
+    TAKE_INDEXLET_OWNERSHIP     = 72,
+    PREP_FOR_INDEXLET_MIGRATION = 73,
+    SPLIT_AND_MIGRATE_INDEXLET  = 74,
+    COORD_SPLIT_AND_MIGRATE_INDEXLET = 75,
+    TX_DECISION                 = 76,
+    TX_PREPARE                  = 77,
+    TX_REQUEST_ABORT            = 78,
+    TX_HINT_FAILED              = 79,
+    ILLEGAL_RPC_TYPE            = 80, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -145,6 +151,17 @@ enum ControlOp {
     START_PERF_COUNTERS         = 1008,
     STOP_PERF_COUNTERS          = 1009,
     LOG_MESSAGE                 = 1010,
+};
+
+/**
+ * Used in linearizable RPCs to check whether or not the RPC can be processed.
+ */
+struct ClientLease {
+    uint64_t leaseId;           /// A cluster unique id for a specific lease.
+    uint64_t leaseTerm;         /// Cluster time after which the lease may have
+                                /// become invalid.
+    uint64_t timestamp;         /// Cluster time when this lease information was
+                                /// provided by the coordinator.
 };
 
 /**
@@ -656,6 +673,19 @@ struct GetHeadOfLog {
         ResponseCommon common;
         uint64_t headSegmentId;     // ID of head segment in the log.
         uint32_t headSegmentOffset; // Byte offset of head within the segment.
+    } __attribute__((packed));
+};
+
+struct GetLeaseInfo {
+    static const Opcode opcode = GET_LEASE_INFO;
+    static const ServiceType service = COORDINATOR_SERVICE;
+    struct Request {
+        RequestCommon common;
+        uint64_t leaseId;
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+        ClientLease lease;
     } __attribute__((packed));
 };
 
@@ -1402,6 +1432,19 @@ struct RemoveIndexEntry {
     } __attribute__((packed));
 };
 
+struct RenewLease {
+    static const Opcode opcode = RENEW_LEASE;
+    static const ServiceType service = COORDINATOR_SERVICE;
+    struct Request {
+        RequestCommon common;
+        uint64_t leaseId;
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+        ClientLease lease;
+    } __attribute__((packed));
+};
+
 struct ServerControl {
     static const Opcode opcode = Opcode::SERVER_CONTROL;
     static const ServiceType service = PING_SERVICE;
@@ -1605,6 +1648,182 @@ struct TakeIndexletOwnership {
     } __attribute__((packed));
 };
 
+struct TxParticipant {
+    uint64_t tableId;           // Table Id of the participant object.
+    uint64_t keyHash;           // Key Hash of the participant object.
+    uint64_t rpcId;             // Unique (per transaction) participant id.
+
+    TxParticipant()
+        : tableId()
+        , keyHash()
+        , rpcId()
+    {}
+
+    TxParticipant(uint64_t tableId, uint64_t keyHash, uint64_t rpcId)
+        : tableId(tableId)
+        , keyHash(keyHash)
+        , rpcId(rpcId)
+    {
+    }
+
+    bool operator==(const TxParticipant &other) const {
+        return tableId == other.tableId &&
+               keyHash == other.keyHash &&
+               rpcId == other.rpcId;
+    }
+} __attribute__((packed));
+
+struct TxDecision {
+    static const Opcode opcode = Opcode::TX_DECISION;
+    static const ServiceType service = MASTER_SERVICE;
+
+    enum Decision { COMMIT, ABORT, INVALID };
+
+    struct Request {
+        RequestCommon common;
+        Decision decision;          // Result of a transaction commit attempt.
+        uint64_t leaseId;           // Id of the client lease associated with
+                                    // this transaction.
+        uint32_t participantCount;  // Number of local objects participating TX
+                                    // for this server.
+        // List of local Participants
+    } __attribute__((packed));
+
+    struct Response {
+        ResponseCommon common;
+    } __attribute__((packed));
+};
+
+struct TxPrepare {
+    static const Opcode opcode = Opcode::TX_PREPARE;
+    static const ServiceType service = MASTER_SERVICE;
+
+    /// Type of Tx Operation
+    /// Note: Make sure INVALID is always last.
+    enum OpType { READ, REMOVE, WRITE, INVALID };
+
+    enum Vote { COMMIT, ABORT };
+
+    struct Request {
+        RequestCommon common;
+        ClientLease lease;          // Lease information for the requested
+                                    // transaction.  To ensure prepare requests
+                                    // are linearizable.
+        uint64_t ackId;             // Id of the largest RPC id whose metadata
+                                    // can be garbage-collected.  Used for
+                                    // linearizability.
+        uint32_t participantCount;  // Number of all objects participating TX
+                                    // in whole cluster.
+        uint32_t opCount;
+        // List of all Participants of TX.
+        // List of Ops
+
+        struct ReadOp {
+            OpType type;
+            uint64_t tableId;
+            uint64_t rpcId;
+            uint16_t keyLength;
+            RejectRules rejectRules;
+
+            // In buffer: The actual key for this part
+            // follows immediately after this.
+            ReadOp(uint64_t tableId, uint64_t rpcId, uint16_t keyLength,
+                    RejectRules rejectRules)
+                : type(OpType::READ)
+                , tableId(tableId)
+                , rpcId(rpcId)
+                , keyLength(keyLength)
+                , rejectRules(rejectRules)
+            {
+            }
+        } __attribute__((packed));
+
+        struct RemoveOp {
+            OpType type;
+            uint64_t tableId;
+            uint64_t rpcId;
+            uint16_t keyLength;
+            RejectRules rejectRules;
+
+            // In buffer: The actual key for this part
+            // follows immediately after this.
+            RemoveOp(uint64_t tableId, uint64_t rpcId, uint16_t keyLength,
+                       RejectRules rejectRules)
+                : type(OpType::REMOVE)
+                , tableId(tableId)
+                , rpcId(rpcId)
+                , keyLength(keyLength)
+                , rejectRules(rejectRules)
+            {
+            }
+        } __attribute__((packed));
+
+        struct WriteOp {
+            OpType type;
+            uint64_t tableId;
+            uint64_t rpcId;
+            uint32_t length;        // length of keysAndValue
+            RejectRules rejectRules;
+
+            // In buffer: KeysAndValue follow immediately after this
+            WriteOp(uint64_t tableId, uint64_t rpcId, uint32_t length,
+                        RejectRules rejectRules)
+                : type(OpType::WRITE)
+                , tableId(tableId)
+                , rpcId(rpcId)
+                , length(length)
+                , rejectRules(rejectRules)
+            {
+            }
+        } __attribute__((packed));
+    } __attribute__((packed));
+
+    struct Response {
+        ResponseCommon common;
+        Vote vote;
+    } __attribute__((packed));
+};
+
+struct TxRequestAbort {
+    static const Opcode opcode = Opcode::TX_REQUEST_ABORT;
+    static const ServiceType service = MASTER_SERVICE;
+
+    enum Vote { COMMIT, ABORT, INVALID };
+
+    struct Request {
+        RequestCommon common;
+        uint64_t leaseId; //Recovery coordinator may not know about leaseTerm.
+                          //DM can set arbitrary leaseTerm anyway.
+        uint32_t participantCount; // Number of local objects participating TX
+                                   // for this server.
+        // List of local participants.
+
+    } __attribute__((packed));
+
+    struct Response {
+        ResponseCommon common;
+        Vote vote;
+    } __attribute__((packed));
+};
+
+struct TxHintFailed {
+    static const Opcode opcode = Opcode::TX_HINT_FAILED;
+    static const ServiceType service = MASTER_SERVICE;
+
+    struct Request {
+        RequestCommon common;
+        uint64_t leaseId;           // Id of the client lease associated with
+                                    // this transaction.
+        uint32_t participantCount;  // Number of local objects participating TX
+                                    // for this server.
+        // List of local Participants
+    } __attribute__((packed));
+
+    struct Response {
+        ResponseCommon common;
+    } __attribute__((packed));
+};
+
 struct UpdateServerList {
     static const Opcode opcode = UPDATE_SERVER_LIST;
     static const ServiceType service = MEMBERSHIP_SERVICE;
@@ -1647,6 +1866,9 @@ struct Write {
     struct Request {
         RequestCommon common;
         uint64_t tableId;
+        ClientLease lease;
+        uint64_t rpcId;
+        uint64_t ackId;
         uint32_t length;              // Includes the total size of the
                                       // keysAndValue blob in bytes.These
                                       // follow immediately after this header

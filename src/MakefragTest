@@ -35,10 +35,14 @@ TESTS_SRCFILES := \
 		  src/CacheTraceTest.cc \
 		  src/CleanableSegmentManagerTest.cc \
 		  src/ClientExceptionTest.cc \
+		  src/ClientLeaseTest.cc \
+		  src/ClientTransactionManagerTest.cc \
+		  src/ClientTransactionTaskTest.cc \
 		  src/ClusterMetricsTest.cc \
 		  src/CRamCloudTest.cc \
 		  src/CommonTest.cc \
 		  src/ContextTest.cc \
+		  src/CoordinatorClusterClockTest.cc \
 		  src/CoordinatorRpcWrapperTest.cc \
 		  src/CoordinatorServerListTest.cc \
 		  src/CoordinatorServiceTest.cc \
@@ -63,6 +67,9 @@ TESTS_SRCFILES := \
 		  src/InMemoryStorageTest.cc \
 		  src/IpAddressTest.cc \
 		  src/KeyTest.cc \
+		  src/LeaseManagerTest.cc \
+		  src/LinearizableObjectRpcWrapperTest.cc \
+		  src/LockTableTest.cc \
 		  src/LogCleanerTest.cc \
 		  src/LogDigestTest.cc \
 		  src/LogEntryRelocatorTest.cc \
@@ -100,6 +107,7 @@ TESTS_SRCFILES := \
 		  src/PingServiceTest.cc \
 		  src/PortAlarm.cc \
 		  src/PortAlarmTest.cc \
+		  src/PreparedWritesTest.cc \
 		  src/PriorityTaskQueueTest.cc \
 		  src/ProtoBufTest.cc \
 		  src/RawMetricsTest.cc \
@@ -145,11 +153,15 @@ TESTS_SRCFILES := \
 		  src/TestUtil.cc \
 		  src/TestUtilTest.cc \
 		  src/ThreadIdTest.cc \
-		  src/TransportManagerTest.cc \
 		  src/TimeTraceTest.cc \
+		  src/TransactionTest.cc \
+		  src/TransportManagerTest.cc \
 		  src/TransportTest.cc \
+		  src/TxDecisionRecordTest.cc \
+		  src/TxRecoveryManagerTest.cc \
 		  src/TubTest.cc \
 		  src/UdpDriverTest.cc \
+		  src/UnackedRpcResultsTest.cc \
 		  src/UpdateReplicationEpochTaskTest.cc \
 		  src/UtilTest.cc \
 		  src/VarLenArrayTest.cc \

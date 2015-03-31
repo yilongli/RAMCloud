@@ -38,13 +38,13 @@ bool CoordinatorService::forceSynchronousInit = false;
  * \param deadServerTimeout
  *      Servers are presumed dead if they cannot respond to a ping request
  *      in this many milliseconds.
- * \param startRecoveryManager
- *      True means we should start the thread that manages crash recovery.
- *      False is typically used only during testing.
+ * \param unitTesting
+ *      False (typical usage) means we should start the various manager threads.
+ *      True is used only during testing to not run various background tasks.
  */
 CoordinatorService::CoordinatorService(Context* context,
                                        uint32_t deadServerTimeout,
-                                       bool startRecoveryManager,
+                                       bool unitTesting,
                                        uint32_t maxThreads,
                                        bool neverKill)
     : context(context)
@@ -52,6 +52,7 @@ CoordinatorService::CoordinatorService(Context* context,
     , deadServerTimeout(deadServerTimeout)
     , updateManager(context->externalStorage)
     , tableManager(context, &updateManager)
+    , leaseManager(context)
     , runtimeOptions()
     , recoveryManager(context, tableManager, &runtimeOptions)
     , threadLimit(maxThreads)
@@ -72,9 +73,9 @@ CoordinatorService::CoordinatorService(Context* context,
     // Thus we can't perform recovery synchronously here.
 
     if (forceSynchronousInit) {
-        init(this, startRecoveryManager);
+        init(this, unitTesting);
     } else {
-        std::thread(init, this, startRecoveryManager).detach();
+        std::thread(init, this, unitTesting).detach();
     }
 }
 
@@ -89,18 +90,19 @@ CoordinatorService::~CoordinatorService()
  * explanation in the constructor).
  * \param service
  *      Coordinator service that is being constructed.
- * \param startRecoveryManager
- *      True means start the thread that handles master recoveries (this
- *      should always be true, except during unit tests)
+ * \param unitTesting
+ *      False means don't start the various background tasks (this should always
+ *      be true, except during unit tests)
  */
 void
 CoordinatorService::init(CoordinatorService* service,
-        bool startRecoveryManager)
+        bool unitTesting)
 {
     // This is the top-level method in a thread, so it must catch all
     // exceptions.
     try {
         // Recover state (and incomplete operations) from external storage.
+        service->leaseManager.recover();
         uint64_t lastCompletedUpdate = service->updateManager.init();
         service->serverList->recover(lastCompletedUpdate);
         service->tableManager.recover(lastCompletedUpdate);
@@ -113,13 +115,16 @@ CoordinatorService::init(CoordinatorService* service,
         // for updating).
         service->serverList->startUpdater();
 
-        // When the recovery manager starts up below, it will resume
-        // recovery for crashed nodes; it isn't safe to do that until
-        // after the server list and table manager have recovered (e.g.
-        // it will need accurate information about which tables are stored on
-        // a crashed server).
-        if (startRecoveryManager)
+        if (!unitTesting) {
+            service->leaseManager.startUpdaters();
+            // When the recovery manager starts up below, it will resume
+            // recovery for crashed nodes; it isn't safe to do that until
+            // after the server list and table manager have recovered (e.g.
+            // it will need accurate information about which tables are stored
+            // on a crashed server).
             service->recoveryManager.start();
+        }
+
 
         service->initFinished = true;
     } catch (std::exception& e) {
@@ -182,6 +187,10 @@ CoordinatorService::dispatch(WireFormat::Opcode opcode,
             callHandler<WireFormat::GetBackupConfig, CoordinatorService,
                         &CoordinatorService::getBackupConfig>(rpc);
             break;
+        case WireFormat::GetLeaseInfo::opcode:
+            callHandler<WireFormat::GetLeaseInfo, CoordinatorService,
+                        &CoordinatorService::getLeaseInfo>(rpc);
+            break;
         case WireFormat::GetMasterConfig::opcode:
             callHandler<WireFormat::GetMasterConfig, CoordinatorService,
                         &CoordinatorService::getMasterConfig>(rpc);
@@ -205,6 +214,10 @@ CoordinatorService::dispatch(WireFormat::Opcode opcode,
         case WireFormat::RecoveryMasterFinished::opcode:
             callHandler<WireFormat::RecoveryMasterFinished, CoordinatorService,
                         &CoordinatorService::recoveryMasterFinished>(rpc);
+            break;
+        case WireFormat::RenewLease::opcode:
+            callHandler<WireFormat::RenewLease, CoordinatorService,
+                        &CoordinatorService::renewLease>(rpc);
             break;
         case WireFormat::ServerControlAll::opcode:
             callHandler<WireFormat::ServerControlAll, CoordinatorService,
@@ -371,6 +384,20 @@ CoordinatorService::getBackupConfig(
     backupConfig.serialize(backupConfigBuf);
     respHdr->backupConfigLength = ProtoBuf::serializeToResponse(
             rpc->replyPayload, &backupConfigBuf);
+}
+
+/**
+ * Handle the GET_LEASE_INFO RPC.
+ *
+ * \copydetails Service::ping
+ */
+void
+CoordinatorService::getLeaseInfo(
+    const WireFormat::GetLeaseInfo::Request* reqHdr,
+    WireFormat::GetLeaseInfo::Response* respHdr,
+    Rpc* rpc)
+{
+    respHdr->lease = leaseManager.getLeaseInfo(reqHdr->leaseId);
 }
 
 /**
@@ -580,6 +607,20 @@ CoordinatorService::recoveryMasterFinished(
                                                serverId,
                                                recoveryPartition,
                                                reqHdr->successful);
+}
+
+/**
+ * Handle the RENEW_LEASE RPC.
+ *
+ * \copydetails Service::ping
+ */
+void
+CoordinatorService::renewLease(
+    const WireFormat::RenewLease::Request* reqHdr,
+    WireFormat::RenewLease::Response* respHdr,
+    Rpc* rpc)
+{
+    respHdr->lease = leaseManager.renewLease(reqHdr->leaseId);
 }
 
 /**

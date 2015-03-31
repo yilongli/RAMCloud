@@ -1,4 +1,4 @@
-/* Copyright (c) 2014 Stanford University
+/* Copyright (c) 2014-2015 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,8 +14,25 @@
  */
 
 #include "UnackedRpcResults.h"
+#include "LeaseCommon.h"
+#include "MasterService.h"
 
 namespace RAMCloud {
+
+/**
+ * Default constructor
+ *
+ * \param context
+ *      Overall information about the RAMCloud server and provides access to
+ *      the dispatcher and masterService.
+ */
+UnackedRpcResults::UnackedRpcResults(Context* context)
+    : clients(20)
+    , mutex()
+    , default_rpclist_size(50)
+    , context(context)
+    , cleaner(this)
+{}
 
 /**
  * Default destructor
@@ -29,20 +46,12 @@ UnackedRpcResults::~UnackedRpcResults()
 }
 
 /**
- * Add a client's id and prepare the storage for tracking its unacked rpcs.
- * This function should be invoked when a client initially request
- * its registration as a user of linearizable RPCs.
- *
- * \param clientId
- *      Client's id to be registered. (Id should be > 0)
+ * Start background timer to perform cleaning clients entry with expired lease.
  */
 void
-UnackedRpcResults::addClient(uint64_t clientId)
+UnackedRpcResults::startCleaner()
 {
-    Lock lock(mutex);
-    ClientMap::iterator it = clients.find(clientId);
-    if (it == clients.end())
-        clients[clientId] = new Client(default_rpclist_size);
+    cleaner.start(0);
 }
 
 /**
@@ -56,6 +65,8 @@ UnackedRpcResults::addClient(uint64_t clientId)
  *      RPC's id to be checked.
  * \param ackId
  *      The ack number transmitted with the RPC whose id number is rpcId.
+ * \param leaseTerm
+ *      Client's lease expiration time.
  * \param[out] result
  *      If the RPC already has been completed, the pointer to its result (the \a
  *      result value previously passed to #UnackedRpcResults::recordCompletion)
@@ -67,11 +78,11 @@ UnackedRpcResults::addClient(uint64_t clientId)
  *      False if the \a rpcId has never been passed to this method
  *      for this client before.
  *
- * \throw NoClientInfo
- *      We do not have enough information to determine whether there was a
- *      duplicate RPC with same \a rpcId. Usually this happens when client
- *      is timed out in current master, and all status data are cleaned.
- * \throw StaleRpc
+ * \throw ExpiredLeaseException
+ *      The lease for \a clientId is already expired in coordinator.
+ *      Master rejects rpcs with expired lease, and client must obtain
+ *      brand-new lease from coordinator.
+ * \throw StaleRpcException
  *      The rpc with \a rpcId is already acknowledged by client, so we should
  *      not have received this request in the first place.
  */
@@ -79,17 +90,34 @@ bool
 UnackedRpcResults::checkDuplicate(uint64_t clientId,
                                   uint64_t rpcId,
                                   uint64_t ackId,
+                                  uint64_t leaseTerm,
                                   void** result)
 {
-    Lock lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     *result = NULL;
-    ClientMap::iterator it = clients.find(clientId);
-    if (it == clients.end()) {
-        throw NoClientInfo(HERE);
+    Client* client;
+
+    if (leaseTerm && leaseTerm < context->masterService->clusterTime) {
+        //contact coordinator for lease expiration and clusterTime.
+        WireFormat::ClientLease lease =
+            CoordinatorClient::getLeaseInfo(context, clientId);
+        context->masterService->updateClusterTime(lease.timestamp);
+        if (lease.leaseId == 0) {
+            throw ExpiredLeaseException(HERE);
+        }
     }
 
-    Client* client = it->second;
-    //1. Handle Ack.
+    ClientMap::iterator it = clients.find(clientId);
+    if (it == clients.end()) {
+        client = new Client(default_rpclist_size);
+        clients[clientId] = client;
+    } else {
+        client = it->second;
+    }
+
+    //1. Update leaseTerm and ack.
+    if (client->leaseTerm < leaseTerm)
+        client->leaseTerm = leaseTerm;
     if (client->maxAckId < ackId)
         client->maxAckId = ackId;
 
@@ -97,11 +125,12 @@ UnackedRpcResults::checkDuplicate(uint64_t clientId,
     //   There are four cases to handle.
     if (rpcId <= client->maxAckId) {
         //StaleRpc: rpc is already acknowledged.
-        throw StaleRpc(HERE);
+        throw StaleRpcException(HERE);
     } else if (client->maxRpcId < rpcId) {
         //Beyond the window of maxAckId and maxRpcId.
         client->maxRpcId = rpcId;
         client->recordNewRpc(rpcId);
+        client->numRpcsInProgress++;
         return false;
     } else if (client->hasRecord(rpcId)) {
         //Inside the window duplicate rpc.
@@ -110,6 +139,7 @@ UnackedRpcResults::checkDuplicate(uint64_t clientId,
     } else {
         //Inside the window new rpc.
         client->recordNewRpc(rpcId);
+        client->numRpcsInProgress++;
         return false;
     }
 }
@@ -157,7 +187,7 @@ UnackedRpcResults::shouldRecover(uint64_t clientId,
  * \param clientId
  *      RPC sender's id.
  * \param rpcId
- *      RPC's id to be checked.
+ *      Id of the RPC that just completed.
  * \param result
  *      The pointer to the result of rpc in log.
  */
@@ -172,14 +202,64 @@ UnackedRpcResults::recordCompletion(uint64_t clientId,
     Client* client = it->second;
 
     assert(client->maxAckId < rpcId);
-    if (client->maxRpcId < rpcId) {
-        client->maxRpcId = rpcId;
+    assert(client->maxRpcId >= rpcId);
+
+    client->updateResult(rpcId, result);
+    client->numRpcsInProgress--;
+}
+
+/**
+ * Recover a record of an RPC from RpcRecord log entry.
+ * It may insert a new clientId to #clients. (Protected with concurrent GC.)
+ * The leaseTerm is not provided and fetched from coordinator lazily while
+ * servicing an RPC from same client or during GC of cleanByTimeout().
+ *
+ * \param clientId
+ *      RPC sender's id.
+ * \param rpcId
+ *      RPC's id to be checked.
+ * \param ackId
+ *      The ack number transmitted with the RPC whose id number is rpcId.
+ * \param result
+ *      The reference to log entry of RpcRecord.
+ */
+void
+UnackedRpcResults::recoverRecord(uint64_t clientId,
+                                 uint64_t rpcId,
+                                 uint64_t ackId,
+                                 void* result)
+{
+    std::unique_lock<std::mutex> lock(mutex);
+    Client* client;
+
+    ClientMap::iterator it = clients.find(clientId);
+    if (it == clients.end()) {
+        client = new Client(default_rpclist_size);
+        clients[clientId] = client;
+    } else {
+        client = it->second;
     }
 
-    //TODO(seojin): PROBLEM. if rpc id is not in table yet during recovery?
-    //Sol1. explicit call of recordNewRpc from recovery service.
-    //Sol2. make a new function specifically for recovery.
-    client->updateResult(rpcId, result);
+    //1. Handle Ack.
+    if (client->maxAckId < ackId)
+        client->maxAckId = ackId;
+
+    //2. Check if the same RPC has been started.
+    //   There are four cases to handle.
+    if (rpcId <= client->maxAckId) {
+        //rpc is already acknowledged. No need to retain record.
+    } else if (client->maxRpcId < rpcId) {
+        //Beyond the window of maxAckId and maxRpcId.
+        client->maxRpcId = rpcId;
+        client->recordNewRpc(rpcId);
+        client->updateResult(rpcId, result);
+    } else if (client->hasRecord(rpcId)) {
+        LOG(WARNING, "Duplicate RpcRecord found during recovery.");
+    } else {
+        //Inside the window new rpc.
+        client->recordNewRpc(rpcId);
+        client->updateResult(rpcId, result);
+    }
 }
 
 /**
@@ -212,11 +292,84 @@ UnackedRpcResults::isRpcAcked(uint64_t clientId, uint64_t rpcId)
 
 /**
  * Clean up stale clients who haven't communicated long.
+ * Should not concurrently run this function in several threads.
+ * Serialized by Cleaner inherited from WorkerTimer.
  */
 void
 UnackedRpcResults::cleanByTimeout()
 {
-    //TODO(seojin): implement.
+    vector<uint64_t> victims;
+    {
+        Lock lock(mutex);
+
+        // Sweep table and pick candidates.
+        victims.reserve(Cleaner::maxCheckPerPeriod);
+
+        ClientMap::iterator it;
+        if (cleaner.nextClientToCheck) {
+            it = clients.find(cleaner.nextClientToCheck);
+        } else {
+            it = clients.begin();
+        }
+        for (int i = 0; i < Cleaner::maxIterPerPeriod && it != clients.end();
+                        //&& victims.size() < Cleaner::maxCheckPerPeriod;
+             ++i, ++it) {
+            Client* client = it->second;
+            if (client->leaseTerm <= context->masterService->clusterTime) {
+                victims.push_back(it->first);
+            }
+        }
+    }
+
+    // Check with coordinator whether the lease is expired.
+    // And erase entry if the lease is expired.
+    uint64_t maxClusterTime = 0;
+    for (uint32_t i = 0; i < victims.size(); ++i) {
+        Lock lock(mutex);
+        if (clients[victims[i]]->numRpcsInProgress)
+            continue;
+
+        WireFormat::ClientLease lease =
+            CoordinatorClient::getLeaseInfo(context, victims[i]);
+        if (lease.leaseId == 0) {
+            clients.erase(victims[i]);
+        } else {
+            clients[victims[i]]->leaseTerm = lease.leaseTerm;
+        }
+
+        if (maxClusterTime < lease.timestamp)
+            maxClusterTime = lease.timestamp;
+    }
+
+    if (maxClusterTime)
+        context->masterService->updateClusterTime(maxClusterTime);
+}
+
+/**
+ * Constructor for the UnackedRpcResults' Cleaner.
+ *
+ * \param unackedRpcResults
+ *      Provides access to the unackedRpcResults to perform cleaning.
+ */
+UnackedRpcResults::Cleaner::Cleaner(UnackedRpcResults* unackedRpcResults)
+    : WorkerTimer(unackedRpcResults->context->dispatch)
+    , unackedRpcResults(unackedRpcResults)
+    , nextClientToCheck(0)
+{
+}
+
+/**
+ * This handler performs a cleaning pass on UnackedRpcResults.
+ */
+void
+UnackedRpcResults::Cleaner::handleTimerEvent()
+{
+
+    unackedRpcResults->cleanByTimeout();
+
+    // Run once per 1/10 of lease term to keep expected garbage ~ 5%.
+    this->start(Cycles::rdtsc()+Cycles::fromNanoseconds(
+            LeaseCommon::LEASE_TERM_US * 100));
 }
 
 /**
@@ -287,7 +440,8 @@ UnackedRpcResults::Client::updateResult(uint64_t rpcId, void* result) {
  */
 void
 UnackedRpcResults::Client::resizeRpcs(int increment) {
-    int newLen = len + increment;
+    //int newLen = len + increment;
+    int newLen = len * 2;
     UnackedRpc* to = new UnackedRpc[newLen](); //initialize with <0, NULL>
 
     for (int i = 0; i < len; ++i) {

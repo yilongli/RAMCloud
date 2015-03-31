@@ -17,6 +17,7 @@
 
 #include "RamCloud.h"
 #include "CoordinatorSession.h"
+#include "LinearizableObjectRpcWrapper.h"
 #include "FailSession.h"
 #include "MasterClient.h"
 #include "MultiIncrement.h"
@@ -27,6 +28,7 @@
 #include "ProtoBuf.h"
 #include "ShortMacros.h"
 #include "TimeTrace.h"
+#include "RpcTracker.h"
 
 namespace RAMCloud {
 
@@ -66,7 +68,10 @@ RamCloud::RamCloud(const char* locator, const char* clusterName)
     , realClientContext()
     , clientContext(realClientContext.construct(false))
     , status(STATUS_OK)
+    , clientLease(this)
     , objectFinder(clientContext)
+    , rpcTracker()
+    , transactionManager(this)
 {
     clientContext->coordinatorSession->setLocation(locator, clusterName);
 }
@@ -82,7 +87,10 @@ RamCloud::RamCloud(Context* context, const char* locator,
     , realClientContext()
     , clientContext(context)
     , status(STATUS_OK)
+    , clientLease(this)
     , objectFinder(clientContext)
+    , rpcTracker()
+    , transactionManager(this)
 {
     clientContext->coordinatorSession->setLocation(locator, clusterName);
 }
@@ -298,7 +306,7 @@ DropTableRpc::DropTableRpc(RamCloud* ramcloud, const char* name)
 
 /**
  * Create a new index.
- * 
+ *
  * Creating an index has no impact on the existing objects in the table.
  * For example, it's possible that some of the objects in the table already
  * contain secondary keys corresponding to the new index;
@@ -306,7 +314,7 @@ DropTableRpc::DropTableRpc(RamCloud* ramcloud, const char* name)
  * To make these objects accessible via the index, the application must
  * rewrite them (for example, by enumerating all of the objects in the table
  * and rewriting each object with a key for the new index).
- * 
+ *
  * \param tableId
  *      Id of the table to which the index belongs.
  * \param indexId
@@ -371,7 +379,7 @@ CreateIndexRpc::CreateIndexRpc(RamCloud* ramcloud, uint64_t tableId,
  * For example, any secondary keys related to the deleted index will
  * remain in objects. To eliminate those secondary keys, an application must
  * enumerate all of the objects in the table and rewrite them without the keys.
- * 
+ *
  * \param tableId
  *      Id of the table to which the index belongs.
  * \param indexId
@@ -1051,7 +1059,7 @@ RamCloud::incrementDouble(uint64_t tableId, const void* key, uint16_t keyLength,
 
 /**
  * Constructor for IncrementDoubleRpc: initiates an RPC in the same way as
- * #RamCloud::incrementDouble, but returns once the RPC has been initiated, 
+ * #RamCloud::incrementDouble, but returns once the RPC has been initiated,
  * without waiting for it to complete.
  *
  * \param ramcloud
@@ -1459,17 +1467,17 @@ IndexServerControlRpc::wait()
  * The next RPC, if needed, would be initiated by the client by setting
  * firstKey in new request = nextKey from previous response, AND
  * firstAllowedKeyHash in new request = (nextKeyHash from previous resp) + 1.
- * 
+ *
  * This rpc would get sent to the server owning that firstKey.
  * This could be S1 in case it couldn't fit all the key hashes in a single RPC
  * the first time it sent the response, or a different server S2 in case S1
  * didn't own the new key range.
- * 
+ *
  * The caller can tell that the range is completely enumerated if the response
  * to an rpc has nextKeyLength = 0 (i.e., returns no nextKey) and
  * nextKeyHash = 0 (i.e., no nextKeyHash).
  *
- * 
+ *
  * \param tableId
  *      Id of the table in which lookup is to be done.
  * \param indexId
@@ -1687,7 +1695,7 @@ MigrateTabletRpc::MigrateTabletRpc(RamCloud* ramcloud, uint64_t tableId,
 }
 
 /**
- * Increment multiple objects. This method has two performance advantages over 
+ * Increment multiple objects. This method has two performance advantages over
  * calling RamCloud::increment separately for each object:
  * - If multiple objects are stored on a single server, this method
  *   issues a single RPC to increment all of them at once.
@@ -2640,16 +2648,19 @@ RamCloud::testingWaitForAllTabletsNormal(uint64_t tableId, uint64_t timeoutNs)
  * \param async
  *      If true, the new object will not be immediately replicated to backups.
  *      Data loss may occur!
+ * \param linearizable
+ *      RPC will be linearizable if we set this flag true.
+ *      See "Linearizable RPC" in designNotes for details.
  *
  * \exception RejectRulesException
  */
 void
 RamCloud::write(uint64_t tableId, const void* key, uint16_t keyLength,
         const void* buf, uint32_t length, const RejectRules* rejectRules,
-        uint64_t* version, bool async)
+        uint64_t* version, bool async, bool linearizable)
 {
     WriteRpc rpc(this, tableId, key, keyLength, buf, length, rejectRules,
-            async);
+            async, linearizable);
     rpc.wait(version);
 }
 
@@ -2682,19 +2693,22 @@ RamCloud::write(uint64_t tableId, const void* key, uint16_t keyLength,
  * \param async
  *      If true, the new object will not be immediately replicated to backups.
  *      Data loss may occur!
+ * \param linearizable
+ *      RPC will be linearizable if we set this flag true.
+ *      See "Linearizable RPC" in designNotes for details.
  *
  * \exception RejectRulesException
  */
 void
 RamCloud::write(uint64_t tableId, const void* key, uint16_t keyLength,
         const char* value, const RejectRules* rejectRules, uint64_t* version,
-        bool async)
+        bool async, bool linearizable)
 {
     uint32_t valueLength =
             (value == NULL) ? 0 : downCast<uint32_t>(strlen(value));
 
     WriteRpc rpc(this, tableId, key, keyLength, value, valueLength,
-                    rejectRules, async);
+                    rejectRules, async, linearizable);
     rpc.wait(version);
 }
 
@@ -2735,16 +2749,19 @@ RamCloud::write(uint64_t tableId, const void* key, uint16_t keyLength,
  * \param async
  *      If true, the new object will not be immediately replicated to backups.
  *      Data loss may occur!
+ * \param linearizable
+ *      RPC will be linearizable if we set this flag true.
+ *      See "Linearizable RPC" in designNotes for details.
  *
  * \exception RejectRulesException
  */
 void
 RamCloud::write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyList,
         const void* buf, uint32_t length, const RejectRules* rejectRules,
-        uint64_t* version, bool async)
+        uint64_t* version, bool async, bool linearizable)
 {
     WriteRpc rpc(this, tableId, numKeys, keyList, buf, length, rejectRules,
-            async);
+            async, linearizable);
     rpc.wait(version);
 }
 
@@ -2782,6 +2799,9 @@ RamCloud::write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyList,
  * \param async
  *      If true, the new object will not be immediately replicated to backups.
  *      Data loss may occur!
+ * \param linearizable
+ *      RPC will be linearizable if we set this flag true.
+ *      See "Linearizable RPC" in designNotes for details.
  *
  * \exception RejectRulesException
  */
@@ -2789,12 +2809,12 @@ RamCloud::write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyList,
 void
 RamCloud::write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyList,
         const char* value, const RejectRules* rejectRules, uint64_t* version,
-        bool async)
+        bool async, bool linearizable)
 {
     uint32_t valueLength =
             (value == NULL) ? 0 : downCast<uint32_t>(strlen(value));
     WriteRpc rpc(this, tableId, numKeys, keyList, value,
-            valueLength, rejectRules, async);
+            valueLength, rejectRules, async, linearizable);
     rpc.wait(version);
 }
 
@@ -2827,12 +2847,15 @@ RamCloud::write(uint64_t tableId, uint8_t numKeys, KeyInfo *keyList,
  * \param async
  *      If true, the new object will not be immediately replicated to backups.
  *      Data loss may occur!
+ * \param linearizable
+ *      RPC will be linearizable if we set this flag true.
+ *      See "Linearizable RPC" in designNotes for details.
  */
 WriteRpc::WriteRpc(RamCloud* ramcloud, uint64_t tableId,
         const void* key, uint16_t keyLength, const void* buf, uint32_t length,
-        const RejectRules* rejectRules, bool async)
-    : ObjectRpcWrapper(ramcloud, tableId, key, keyLength,
-            sizeof(WireFormat::Write::Response))
+        const RejectRules* rejectRules, bool async, bool linearizable)
+    : LinearizableObjectRpcWrapper(ramcloud, linearizable, tableId, key,
+            keyLength, sizeof(WireFormat::Write::Response))
 {
     WireFormat::Write::Request* reqHdr(allocHeader<WireFormat::Write>());
     reqHdr->tableId = tableId;
@@ -2847,11 +2870,14 @@ WriteRpc::WriteRpc(RamCloud* ramcloud, uint64_t tableId,
 
     Key primaryKey(tableId, key, currentKeyLength);
     Object::appendKeysAndValueToBuffer(primaryKey, buf, length,
-                                       &request, &totalLength);
+                                       &request, false, &totalLength);
 
     reqHdr->rejectRules = rejectRules ? *rejectRules : defaultRejectRules;
     reqHdr->async = async;
     reqHdr->length = totalLength;
+
+    fillLinearizabilityHeader<WireFormat::Write::Request>(reqHdr);
+
     send();
 }
 
@@ -2885,11 +2911,14 @@ WriteRpc::WriteRpc(RamCloud* ramcloud, uint64_t tableId,
  * \param async
  *      If true, the new object will not be immediately replicated to backups.
  *      Data loss may occur!
+ * \param linearizable
+ *      RPC will be linearizable if we set this flag true.
+ *      See "Linearizable RPC" in designNotes for details.
  */
 WriteRpc::WriteRpc(RamCloud* ramcloud, uint64_t tableId,
         uint8_t numKeys, KeyInfo *keyList, const void* buf, uint32_t length,
-        const RejectRules* rejectRules, bool async)
-    : ObjectRpcWrapper(ramcloud, tableId,
+        const RejectRules* rejectRules, bool async, bool linearizable)
+    : LinearizableObjectRpcWrapper(ramcloud, linearizable, tableId,
             keyList[0].key, keyList[0].keyLength,
             sizeof(WireFormat::Write::Response))
 {
@@ -2904,6 +2933,9 @@ WriteRpc::WriteRpc(RamCloud* ramcloud, uint64_t tableId,
     reqHdr->rejectRules = rejectRules ? *rejectRules : defaultRejectRules;
     reqHdr->async = async;
     reqHdr->length = totalLength;
+
+    fillLinearizabilityHeader<WireFormat::Write::Request>(reqHdr);
+
     send();
 }
 
@@ -2921,6 +2953,7 @@ WriteRpc::wait(uint64_t* version)
     waitInternal(ramcloud->clientContext->dispatch);
     const WireFormat::Write::Response* respHdr(
             getResponseHeader<WireFormat::Write>());
+
     if (version != NULL)
         *version = respHdr->version;
 

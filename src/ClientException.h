@@ -233,6 +233,15 @@ DEFINE_EXCEPTION(UnknownIndexException,
 DEFINE_EXCEPTION(InvalidParameterException,
                  STATUS_INVALID_PARAMETER,
                  ClientException)
+DEFINE_EXCEPTION(StaleRpcException,
+                 STATUS_STALE_RPC,
+                 ClientException)
+DEFINE_EXCEPTION(ExpiredLeaseException,
+                 STATUS_EXPIRED_LEASE,
+                 ClientException)
+DEFINE_EXCEPTION(TxOpAfterCommit,
+                 STATUS_TX_OP_AFTER_COMMIT,
+                 ClientException)
 
 } // namespace RAMCloud
 

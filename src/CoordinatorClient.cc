@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2014 Stanford University
+/* Copyright (c) 2010-2015 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -185,6 +185,63 @@ CoordinatorClient::getBackupList(Context* context,
 {
     GetServerListRpc rpc(context, {WireFormat::BACKUP_SERVICE});
     rpc.wait(serverList);
+}
+
+/**
+ * Return the lease information for a given leaseId.  Used by masters to check
+ * for lease validity.
+ *
+ * \param context
+ *      Overall information about this RAMCloud server or client.
+ * \param leaseId
+ *      Id of lease information requested.
+ * \return
+ *      ClientLease information for the lease requested.
+ */
+WireFormat::ClientLease
+CoordinatorClient::getLeaseInfo(Context* context, uint64_t leaseId)
+{
+    GetLeaseInfoRpc rpc(context, leaseId);
+    return rpc.wait();
+}
+
+/**
+ * Constructor for GetLeaseInfoRpc: initiates an RPC in the same way as
+ * #CoordinatorClient::getLeaseInfo, but returns once the RPC has been
+ * initiated, without waiting for it to complete.
+ *
+ * \param context
+ *      Overall information about the RAMCloud server or client.
+ * \param leaseId
+ *      Id of lease information requested.
+ */
+GetLeaseInfoRpc::GetLeaseInfoRpc(Context* context, uint64_t leaseId)
+    : CoordinatorRpcWrapper(context,
+            sizeof(WireFormat::GetLeaseInfo::Response))
+{
+    WireFormat::GetLeaseInfo::Request* reqHdr(
+            allocHeader<WireFormat::GetLeaseInfo>());
+    reqHdr->leaseId = leaseId;
+    send();
+}
+
+/**
+ * Wait for a getLeaseInfo RPC to complete, and return the same results as
+ * #CoordinatorClient::getLeaseInfo.
+ *
+ * \return
+ *      ClientLease information for the lease requested.
+ */
+WireFormat::ClientLease
+GetLeaseInfoRpc::wait()
+{
+    waitInternal(context->dispatch);
+    const WireFormat::GetLeaseInfo::Response* respHdr(
+            getResponseHeader<WireFormat::GetLeaseInfo>());
+    if (respHdr->common.status != STATUS_OK)
+        ClientException::throwException(HERE, respHdr->common.status);
+
+    return respHdr->lease;
 }
 
 /**
@@ -582,6 +639,64 @@ RecoveryMasterFinishedRpc::wait()
     if (respHdr->common.status != STATUS_OK)
         ClientException::throwException(HERE, respHdr->common.status);
     return respHdr->cancelRecovery;
+}
+
+/**
+ * Create a new lease or renew an existing one. This RPC is used internally by
+ * the RAMCloud client library to manage leases, which are used to ensure
+ * linearizability. It should not normally be invoked by application code.
+ *
+ * \param context
+ *      Overall information about this RAMCloud server or client.
+ * \param leaseId
+ *      Id of lease to be renewed if possible.
+ * \return
+ *      Valid ClientLease.
+ */
+WireFormat::ClientLease
+renewLease(Context* context, uint64_t leaseId)
+{
+    RenewLeaseRpc rpc(context, leaseId);
+    return rpc.wait();
+}
+
+/**
+ * Constructor for RenewLeaseRpc: initiates an RPC in the same way as
+ * #CoordinatorClient::renewLease, but returns once the RPC has been
+ * initiated, without waiting for it to complete.
+ *
+ * \param context
+ *      Overall information about the RAMCloud server or client.
+ * \param leaseId
+ *      Id of lease to be renewed if possible.
+ */
+RenewLeaseRpc::RenewLeaseRpc(Context* context, uint64_t leaseId)
+    : CoordinatorRpcWrapper(context,
+            sizeof(WireFormat::RenewLease::Response))
+{
+    WireFormat::RenewLease::Request* reqHdr(
+            allocHeader<WireFormat::RenewLease>());
+    reqHdr->leaseId = leaseId;
+    send();
+}
+
+/**
+ * Wait for a renewLease RPC to complete, and return the same results as
+ * #CoordinatorClient::renewLease.
+ *
+ * \return
+ *      Valid ClientLease.
+ */
+WireFormat::ClientLease
+RenewLeaseRpc::wait()
+{
+    waitInternal(context->dispatch);
+    const WireFormat::RenewLease::Response* respHdr(
+            getResponseHeader<WireFormat::RenewLease>());
+    if (respHdr->common.status != STATUS_OK)
+        ClientException::throwException(HERE, respHdr->common.status);
+
+    return respHdr->lease;
 }
 
 /**

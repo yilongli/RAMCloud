@@ -18,6 +18,8 @@
 #include "SegmentIterator.h"
 #include "ServerId.h"
 #include "ShortMacros.h"
+#include "PreparedWrites.h"
+#include "TxDecisionRecord.h"
 
 namespace RAMCloud {
 
@@ -78,11 +80,15 @@ RecoverySegmentBuilder::build(const void* buffer, uint32_t length,
             continue;
         }
         if (type != LOG_ENTRY_TYPE_OBJ && type != LOG_ENTRY_TYPE_OBJTOMB
-            && type != LOG_ENTRY_TYPE_SAFEVERSION)
+            && type != LOG_ENTRY_TYPE_SAFEVERSION
+            && type != LOG_ENTRY_TYPE_RPCRECORD
+            && type != LOG_ENTRY_TYPE_PREP
+            && type != LOG_ENTRY_TYPE_PREPTOMB
+            && type != LOG_ENTRY_TYPE_TXDECISION)
             continue;
 
         if (header == NULL) {
-            DIE("Found object or tombstone before header while "
+            DIE("Found log entry before header while "
                 "building recovery segments");
         }
 
@@ -117,6 +123,24 @@ RecoverySegmentBuilder::build(const void* buffer, uint32_t length,
             tableId = tomb.getTableId();
             keyHash = Key::getHash(tableId,
                                    tomb.getKey(), tomb.getKeyLength());
+        } else if (type == LOG_ENTRY_TYPE_RPCRECORD) {
+            RpcRecord rpcRecord(entryBuffer);
+            tableId = rpcRecord.getTableId();
+            keyHash = rpcRecord.getKeyHash();
+        } else if (type == LOG_ENTRY_TYPE_PREP) {
+            PreparedOp op(entryBuffer, 0, entryBuffer.size());
+            tableId = op.object.getTableId();
+            keyHash = Key::getHash(tableId,
+                                   op.object.getKey(),
+                                   op.object.getKeyLength());
+        } else if (type == LOG_ENTRY_TYPE_PREPTOMB) {
+            PreparedOpTombstone opTomb(entryBuffer, 0);
+            tableId = opTomb.header.tableId;
+            keyHash = opTomb.header.keyHash;
+        } else if (type == LOG_ENTRY_TYPE_TXDECISION) {
+            TxDecisionRecord decisionRecord(entryBuffer);
+            tableId = decisionRecord.getTableId();
+            keyHash = decisionRecord.getKeyHash();
         } else {
             LOG(WARNING, "Unknown LogEntry (id=%u)", type);
             throw SegmentRecoveryFailedException(HERE);

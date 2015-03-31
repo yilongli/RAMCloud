@@ -23,6 +23,9 @@ CLIENT_SRCFILES := \
 		   src/CRamCloud.cc \
 		   src/CacheTrace.cc \
 		   src/ClientException.cc \
+		   src/ClientLease.cc \
+		   src/ClientTransactionManager.cc \
+		   src/ClientTransactionTask.cc \
 		   src/ClusterMetrics.cc \
 		   src/CodeLocation.cc \
 		   src/Context.cc \
@@ -43,6 +46,7 @@ CLIENT_SRCFILES := \
 		   src/IndexRpcWrapper.cc \
 		   src/IpAddress.cc \
 		   src/Key.cc \
+		   src/LinearizableObjectRpcWrapper.cc \
 		   src/LogEntryTypes.cc \
 		   src/Logger.cc \
 		   src/LargeBlockOfMemory.cc \
@@ -69,6 +73,7 @@ CLIENT_SRCFILES := \
 		   src/PortAlarm.cc \
 		   src/RamCloud.cc \
 		   src/RawMetrics.cc \
+		   src/RpcTracker.cc \
 		   src/SegletAllocator.cc \
 		   src/Seglet.cc \
 		   src/Segment.cc \
@@ -90,6 +95,7 @@ CLIENT_SRCFILES := \
 		   src/ThreadId.cc \
 		   src/TimeCounter.cc \
 		   src/TimeTrace.cc \
+		   src/Transaction.cc \
 		   src/Transport.cc \
 		   src/TransportManager.cc \
 		   src/UdpDriver.cc \

@@ -20,6 +20,9 @@
 
 namespace RAMCloud {
 
+class LinearizableObjectRpcWrapper;
+class RamCloud;
+
 /**
  * A storage for outstanding rpc status whether the result of each rpc is
  * received or not.
@@ -40,8 +43,21 @@ class RpcTracker {
     ~RpcTracker();
 
     void rpcFinished(uint64_t rpcId);
-    uint64_t newRpcId();
+    uint64_t newRpcId(LinearizableObjectRpcWrapper* ptr);
+    // TODO(cstlee) : remove the hack below.
+    uint64_t newRpcId(uint64_t i) {
+        return newRpcId(reinterpret_cast<LinearizableObjectRpcWrapper*>(i));
+    }
     uint64_t ackId();
+    LinearizableObjectRpcWrapper* oldestOutstandingRpc();
+
+    /**
+     * Return true if there is a least one rpc that has started but not yet
+     * finished; false otherwise.
+     */
+    bool hasUnfinishedRpc() {
+        return firstMissing < nextRpcId;
+    }
 
   PRIVATE:
     void resizeRpcs(int increment);
@@ -65,25 +81,34 @@ class RpcTracker {
      * to keep records of all outstanding rpcs.
      *
      * Assuming slow RPC takes 4 times more than average, we can have
-     * at least 25 concurrent outstanding linearizable RPCs with the maximum
-     * distance value 100.
+     * at least 32 concurrent outstanding linearizable RPCs with the maximum
+     * distance value 128. Relatively small value was chosen to limit the effect
+     * of bad clients on master's storage burden.
+     *
+     * For fast indexing in window (using ANDing), the size should be always
+     * a power of two.
      */
-    static const int windowSize = 100;
+    static const int windowSize = 512;
 
     /**
-     * Array keeping RPC status (result received or not) for RPCs whose id is
+     * Bitmask to calculate index in rpcs array from rpcId.
+     */
+    static const int indexMask = windowSize - 1;
+
+    /**
+     * Array keeping pointers to RPC wrappers for RPCs whose id is
      * between firstMissing and (nextRpcId - 1).
      * The record of RPC with id i is stored at i % sizeof(rpcs).
-     * True value of the entry means the result of the RPC is received.
-     * False value means still waiting for the result.
+     * NULL value of the entry means the result of the RPC is received.
+     * Non-null pointer means still waiting for the result.
      *
      * At a timepoint, a consecutive (maybe looped around once) portion of
-     * array is used. (From <firstMissing % sizeof(rpcs)> to 
+     * array is used. (From <firstMissing % sizeof(rpcs)> to
      *                 <(nextRpcId - 1) % sizeof(rpcs)>)
      * As a rpcFinished is called to record receipt, it checks whether
      * we can advance firstMissing value.
      */
-    bool rpcs[windowSize];
+    LinearizableObjectRpcWrapper* rpcs[windowSize];
 
     DISALLOW_COPY_AND_ASSIGN(RpcTracker);
 };

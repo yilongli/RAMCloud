@@ -38,6 +38,9 @@ SHARED_SRCFILES := \
 		   src/ArpCache.cc \
 		   src/CacheTrace.cc \
 		   src/ClientException.cc \
+		   src/ClientLease.cc \
+		   src/ClientTransactionManager.cc \
+		   src/ClientTransactionTask.cc \
 		   src/Context.cc \
 		   src/CoordinatorClient.cc \
 		   src/CoordinatorRpcWrapper.cc \
@@ -72,6 +75,8 @@ SHARED_SRCFILES := \
 		   src/IpAddress.cc \
 		   src/Key.cc \
 		   src/LargeBlockOfMemory.cc \
+		   src/LinearizableObjectRpcWrapper.cc \
+		   src/LockTable.cc \
 		   src/Log.cc \
 		   src/LogCleaner.cc \
 		   src/LogDigest.cc \
@@ -107,6 +112,7 @@ SHARED_SRCFILES := \
 		   src/PingClient.cc \
 		   src/PingService.cc \
 		   src/PortAlarm.cc \
+		   src/PreparedWrites.cc \
 		   src/RamCloud.cc \
 		   src/RawMetrics.cc \
 		   src/ReplicaManager.cc \
@@ -142,7 +148,10 @@ SHARED_SRCFILES := \
 		   src/TimeTrace.cc \
 		   src/Transport.cc \
 		   src/TransportManager.cc \
+		   src/TxDecisionRecord.cc \
+		   src/TxRecoveryManager.cc \
 		   src/UdpDriver.cc \
+		   src/UnackedRpcResults.cc \
 		   src/Util.cc \
 		   src/WallTime.cc \
 		   src/WireFormat.cc \
