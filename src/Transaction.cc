@@ -335,7 +335,7 @@ Transaction::MultiReadOp::wait()
 
         if (entry == NULL) {
             // If no entry exists in cache an rpc must have been issued.
-            assert(rpc);
+            //assert(rpc);
 
             uint64_t version = requests[i]->version;
 

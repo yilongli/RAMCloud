@@ -215,6 +215,10 @@ def run_test(
         client_args['--numIndexlet'] = options.numIndexlet
     if options.numIndexes != None:
         client_args['--numIndexes'] = options.numIndexes
+    if options.numWarehouses != None:
+        client_args['--numWarehouses'] = options.numWarehouses
+    if options.num_servers != None:
+        client_args['--numServers'] = options.num_servers
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -565,6 +569,20 @@ def txCollision(name, options, cluster_args, client_args):
             (obj_path, flatten_args(client_args), name), **cluster_args)
     print(get_client_log(), end='')
 
+# This method is also used for multiReadThroughput
+def txTPCC(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '-t 10000 --segmentFrames 10000'
+    if cluster_args['timeout'] < 250:
+        cluster_args['timeout'] = 600
+    if options.num_servers == None:
+        cluster_args['num_servers'] = len(hosts) - 11
+    if 'num_clients' not in cluster_args:
+        cluster_args['num_clients'] = 10
+    cluster.run(client='%s/ClusterPerf %s %s' %
+            (obj_path, flatten_args(client_args), name), **cluster_args)
+    print(get_client_log(), end='')
+
 def writeDist(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '-t 2000'
@@ -620,7 +638,8 @@ simple_tests = [
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),
     Test("readNotFound", default),
-    Test("linearizableRpc", basic)
+    Test("linearizableRpc", basic),
+    Test("tcpTest", basic)
 ]
 
 graph_tests = [
@@ -640,6 +659,7 @@ graph_tests = [
     Test("transactionDistRandom", transactionDist),
     Test("transactionThroughput", transactionThroughput),
     Test("transactionContention", transactionThroughput),
+    Test("tpcc", txTPCC),
     Test("readDist", readDist),
     Test("readDistRandom", readDistRandom),
     Test("readDistWorkload", workloadDist),
@@ -733,6 +753,8 @@ if __name__ == '__main__':
     parser.add_option('--rcdf', action='store_true', default=False,
             dest='rcdf',
             help='Output reverse CDF data instead.')
+    parser.add_option('--numWarehouses', type=int,
+            help='Number of warehouses used during TPC-C benchmark.')
     (options, args) = parser.parse_args()
 
     # Invoke the requested tests (run all of them if no tests were specified)
