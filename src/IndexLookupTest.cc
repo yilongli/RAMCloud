@@ -26,12 +26,15 @@ namespace RAMCloud {
 // This class provides tablet map and indexlet map info to ObjectFinder.
 class IndexLookupRpcRefresher : public ObjectFinder::TableConfigFetcher {
   public:
-    IndexLookupRpcRefresher() : called(0) {}
-    void getTableConfig(uint64_t tableId,
-                        std::map<TabletKey, TabletWithLocator>* tableMap,
-                        std::multimap<std::pair<uint64_t, uint8_t>,
-                                      ObjectFinder::Indexlet>* tableIndexMap) {
+    IndexLookupRpcRefresher(ObjectFinder* objectFinder)
+        : called(0)
+        , tableMap(&objectFinder->tableMap)
+        , tableIndexMap(&objectFinder->tableIndexMap)
+    {}
 
+    ProtoBuf::TableConfig*
+    tryGetTableConfig(uint64_t tableId)
+    {
         called++;
         char buffer[100];
         uint64_t numTablets = 10;
@@ -59,14 +62,23 @@ class IndexLookupRpcRefresher : public ObjectFinder::TableConfigFetcher {
             char firstKey = static_cast<char>('a'+i);
             char firstNotOwnedKey = static_cast<char>('b'+i);
             snprintf(buffer, sizeof(buffer), "mock:indexserver=%u", i);
-            ObjectFinder::Indexlet indexlet(
+            IndexletWithLocator indexlet(
                 reinterpret_cast<void *>(&firstKey), 1,
                 reinterpret_cast<void *>(&firstNotOwnedKey), 1,
-                ServerId(), buffer);
+                buffer);
             tableIndexMap->insert(std::make_pair(id, indexlet));
         }
+        return new ProtoBuf::TableConfig();
     }
+
     uint32_t called;
+
+    std::map<TabletKey, TabletWithLocator>* tableMap;
+
+    std::multimap<std::pair<uint64_t, uint8_t>, IndexletWithLocator>*
+            tableIndexMap;
+
+    DISALLOW_COPY_AND_ASSIGN(IndexLookupRpcRefresher);
 };
 
 class IndexLookupTest : public ::testing::Test {
@@ -105,7 +117,8 @@ class IndexLookupTest : public ::testing::Test {
         transport.construct(ramcloud->clientContext);
 
         ramcloud->clientContext->objectFinder->tableConfigFetcher.reset(
-                new IndexLookupRpcRefresher);
+                new IndexLookupRpcRefresher(
+                        ramcloud->clientContext->objectFinder));
         ramcloud->clientContext->transportManager->registerMock(
                 transport.get());
 

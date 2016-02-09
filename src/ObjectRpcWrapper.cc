@@ -119,9 +119,21 @@ ObjectRpcWrapper::handleTransportError()
 void
 ObjectRpcWrapper::send()
 {
-    session = context->objectFinder->lookup(tableId, keyHash);
-    state = IN_PROGRESS;
-    session->sendRequest(&request, response, this);
+    try {
+        session = context->objectFinder->tryLookup(tableId, keyHash);
+        if (session) {
+            state = IN_PROGRESS;
+            session->sendRequest(&request, response, this);
+        } else {
+            // Unable to determine where to send the RPC; retry immediately
+            retry(0, 0);
+        }
+    } catch (TableDoesntExistException& e) {
+        response->truncate(0);
+        response->emplaceAppend<WireFormat::ResponseCommon>()->status =
+                STATUS_TABLE_DOESNT_EXIST;
+        completed();
+    }
 }
 
 } // namespace RAMCloud

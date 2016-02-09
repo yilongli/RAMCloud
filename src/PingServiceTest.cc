@@ -53,16 +53,17 @@ class MockTableConfigFetcher : public ObjectFinder::TableConfigFetcher {
     * \param locator
     *      stringLocator of the server that holds the table
     */
-    explicit MockTableConfigFetcher(string locator, uint64_t tableId)
+    explicit MockTableConfigFetcher(string locator, uint64_t tableId,
+                                    ObjectFinder* objectFinder)
         : locator(locator)
         , tableId(tableId)
+        , tableMap(&objectFinder->tableMap)
+        , tableIndexMap(&objectFinder->tableIndexMap)
     {}
-    void getTableConfig(
-        uint64_t tableId,
-        std::map<TabletKey, TabletWithLocator>* tableMap,
-        std::multimap< std::pair<uint64_t, uint8_t>,
-                                    ObjectFinder::Indexlet>* tableIndexMap) {
 
+    ProtoBuf::TableConfig*
+    tryGetTableConfig(uint64_t tableId)
+    {
         tableMap->clear();
         Tablet rawEntry({tableId, 0, uint64_t(~0), ServerId(),
                     Tablet::NORMAL, LogPosition()});
@@ -70,10 +71,17 @@ class MockTableConfigFetcher : public ObjectFinder::TableConfigFetcher {
 
         TabletKey key {entry.tablet.tableId, entry.tablet.startKeyHash};
         tableMap->insert(std::make_pair(key, entry));
+        return new ProtoBuf::TableConfig();
     }
     string locator;
     uint64_t tableId;
 
+    std::map<TabletKey, TabletWithLocator>* tableMap;
+
+    std::multimap<std::pair<uint64_t, uint8_t>, IndexletWithLocator>*
+            tableIndexMap;
+
+    DISALLOW_COPY_AND_ASSIGN(MockTableConfigFetcher);
 };
 
 

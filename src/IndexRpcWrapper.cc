@@ -145,6 +145,7 @@ IndexRpcWrapper::indexletNotFound()
 {
     LOG(DEBUG, "Index not found for tableId %lu, indexId %u",
             tableId, indexId);
+    response->truncate(0);
     response->emplaceAppend<WireFormat::ResponseCommon>()->status =
             STATUS_UNKNOWN_INDEX;
 }
@@ -153,17 +154,18 @@ IndexRpcWrapper::indexletNotFound()
 void
 IndexRpcWrapper::send()
 {
-    session = objectFinder->lookup(tableId, indexId, key, keyLength);
-
-    // This indexlet doesn't exist. No need to send an rpc or throw an
-    // exception. Instead, lets call indexletNotFound() which will do the
-    // appropriate thing, then call completed() so the rpc is never sent out.
-    if (session == Transport::SessionRef()) {
+    bool indexDoesntExist;
+    session = objectFinder->tryLookup(tableId, indexId, key, keyLength,
+                                      indexDoesntExist);
+    if (session) {
+        state = IN_PROGRESS;
+        session->sendRequest(&request, response, this);
+    } else if (indexDoesntExist) {
         indexletNotFound();
         completed();
     } else {
-        state = IN_PROGRESS;
-        session->sendRequest(&request, response, this);
+        // Unable to determine where to send the RPC; retry immediately
+        retry(0, 0);
     }
 }
 

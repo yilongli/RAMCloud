@@ -25,13 +25,15 @@ namespace RAMCloud {
 // different locator each time it is invoked.
 class ObjRpcWrapperRefresher : public ObjectFinder::TableConfigFetcher {
   public:
-    ObjRpcWrapperRefresher() : called(0) {}
-    void getTableConfig(
-        uint64_t tableId,
-        std::map<TabletKey, TabletWithLocator>* tableMap,
-        std::multimap< std::pair<uint64_t, uint8_t>,
-                                    ObjectFinder::Indexlet>* tableIndexMap) {
+    ObjRpcWrapperRefresher(ObjectFinder* objectFinder)
+        : called(0)
+        , tableMap(&objectFinder->tableMap)
+        , tableIndexMap(&objectFinder->tableIndexMap)
+    {}
 
+    ProtoBuf::TableConfig*
+    tryGetTableConfig(uint64_t tableId)
+    {
         called++;
         char buffer[100];
         snprintf(buffer, sizeof(buffer), "mock:refresh=%d", called);
@@ -43,8 +45,16 @@ class ObjRpcWrapperRefresher : public ObjectFinder::TableConfigFetcher {
 
         TabletKey key {entry.tablet.tableId, entry.tablet.startKeyHash};
         tableMap->insert(std::make_pair(key, entry));
+        return new ProtoBuf::TableConfig();
     }
     uint32_t called;
+
+    std::map<TabletKey, TabletWithLocator>* tableMap;
+
+    std::multimap<std::pair<uint64_t, uint8_t>, IndexletWithLocator>*
+            tableIndexMap;
+
+    DISALLOW_COPY_AND_ASSIGN(ObjRpcWrapperRefresher);
 };
 
 class ObjectRpcWrapperTest : public ::testing::Test {
@@ -57,7 +67,8 @@ class ObjectRpcWrapperTest : public ::testing::Test {
         , transport(ramcloud.clientContext)
     {
         ramcloud.clientContext->objectFinder->tableConfigFetcher.reset(
-                new ObjRpcWrapperRefresher);
+                new ObjRpcWrapperRefresher(ramcloud.clientContext->
+                        objectFinder));
         ramcloud.clientContext->transportManager->registerMock(&transport);
     }
 

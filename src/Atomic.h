@@ -183,7 +183,7 @@ class Atomic {
     /**
      * Return the current value.
      */
-    operator ValueType()
+    operator ValueType() const
     {
         return load();
     }

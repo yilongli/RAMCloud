@@ -60,6 +60,10 @@ SpinLock::SpinLock(string name)
     , contendedAcquisitions(0)
     , contendedTicks(0)
     , logWaits(false)
+#if TESTING
+    , hasher()
+    , ownerThreadIdHash(0)
+#endif
 {
     std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
     SpinLockTable::allLocks()->insert(this);
@@ -69,6 +73,29 @@ SpinLock::~SpinLock()
 {
     std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
     SpinLockTable::allLocks()->erase(this);
+}
+
+/**
+ * Assert that the lock is held by the current thread. This method only takes
+ * effect during debugging.
+ */
+void
+SpinLock::assertAcquired() const {
+#if TESTING
+    int state = mutex;
+    Fence::lfence();
+    if (state == 0) {
+        // the lock is not held by any thread
+        assert(false);
+    }
+
+    // If this lock is indeed held by the current thread, the following read
+    // of ownerThreadIdHash is thread-safe and the assertion will always hold;
+    // if not, there may be a race condition between this read and the write in
+    // lock()/tryLock(), so this read may see either the id hash value of the
+    // thread just acquired the lock or 0; in either case, the assertion fails.
+    assert(ownerThreadIdHash == hasher(std::this_thread::get_id()));
+#endif
 }
 
 /**
@@ -98,6 +125,9 @@ SpinLock::lock()
         }
     }
     Fence::enter();
+#if TESTING
+    ownerThreadIdHash = hasher(std::this_thread::get_id());
+#endif
 
     if (startOfContention != 0) {
         contendedTicks += (Cycles::rdtsc() - startOfContention);
@@ -120,6 +150,9 @@ SpinLock::try_lock()
     int old = mutex.exchange(1);
     if (old == 0) {
         Fence::enter();
+#if TESTING
+        ownerThreadIdHash = hasher(std::this_thread::get_id());
+#endif
         return true;
     }
     return false;
@@ -132,6 +165,9 @@ SpinLock::try_lock()
 void
 SpinLock::unlock()
 {
+#if TESTING
+    ownerThreadIdHash = 0;
+#endif
     Fence::leave();
     mutex.store(0);
 }

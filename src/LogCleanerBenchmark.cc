@@ -1838,6 +1838,9 @@ try
     ramcloud.createTable(options.tableName.c_str());
     uint64_t tableId = ramcloud.getTableId(options.tableName.c_str());
 
+    // TODO: The synchronous lookupTablet is now deprecated; rewrite the
+    // following code to use the ServerControlRpc and eliminate the use
+    // of the synchronous lookupTablet.
     string locator =
         context.objectFinder->lookupTablet(tableId, 0)->serviceLocator;
 

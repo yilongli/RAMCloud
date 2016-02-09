@@ -25,12 +25,15 @@ namespace RAMCloud {
 // different locator each time it is invoked.
 class IndexRpcWrapperRefresher : public ObjectFinder::TableConfigFetcher {
   public:
-    IndexRpcWrapperRefresher() : called(0) {}
-    void getTableConfig(uint64_t tableId,
-                        std::map<TabletKey, TabletWithLocator>* tableMap,
-                        std::multimap<std::pair<uint64_t, uint8_t>,
-                                      ObjectFinder::Indexlet>* tableIndexMap) {
+    IndexRpcWrapperRefresher(ObjectFinder* objectFinder)
+        : called(0)
+        , tableMap(&objectFinder->tableMap)
+        , tableIndexMap(&objectFinder->tableIndexMap)
+    {}
 
+    ProtoBuf::TableConfig*
+    tryGetTableConfig(uint64_t tableId)
+    {
         called++;
         char buffer[100];
         snprintf(buffer, sizeof(buffer), "mock:refresh=%d", called);
@@ -38,10 +41,18 @@ class IndexRpcWrapperRefresher : public ObjectFinder::TableConfigFetcher {
         tableIndexMap->clear();
         auto id = std::make_pair(10, 1); // Pair of table id and index id.
 
-        ObjectFinder::Indexlet indexlet("", 0, "", 0, ServerId(), buffer);
+        IndexletWithLocator indexlet("", 0, "", 0, buffer);
         tableIndexMap->insert(std::make_pair(id, indexlet));
+        return new ProtoBuf::TableConfig();
     }
     uint32_t called;
+
+    std::map<TabletKey, TabletWithLocator>* tableMap;
+
+    std::multimap<std::pair<uint64_t, uint8_t>, IndexletWithLocator>*
+            tableIndexMap;
+
+    DISALLOW_COPY_AND_ASSIGN(IndexRpcWrapperRefresher);
 };
 
 class IndexRpcWrapperTest : public ::testing::Test {
@@ -54,7 +65,8 @@ class IndexRpcWrapperTest : public ::testing::Test {
         , transport(ramcloud.clientContext)
     {
         ramcloud.clientContext->objectFinder->tableConfigFetcher.reset(
-                new IndexRpcWrapperRefresher);
+                new IndexRpcWrapperRefresher(
+                        ramcloud.clientContext->objectFinder));
         ramcloud.clientContext->transportManager->registerMock(&transport);
     }
 

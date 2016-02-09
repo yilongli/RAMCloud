@@ -36,6 +36,7 @@ class SpinLock {
   public:
     explicit SpinLock(string name);
     virtual ~SpinLock();
+    void assertAcquired() const;
     void lock();
     bool try_lock();
     void unlock();
@@ -71,6 +72,15 @@ class SpinLock {
 
     /// True means log when waiting for the lock; intended for unit tests only.
     bool logWaits;
+
+#if TESTING
+    /// The hash function for the thread id
+    std::hash<std::thread::id> hasher;
+
+    /// The hash value of the thread that currently owns this lock; intended
+    /// for debugging only.
+    Atomic<size_t> ownerThreadIdHash;
+#endif
 };
 
 /**

@@ -235,7 +235,7 @@ class RpcWrapper : public Transport::RpcNotifier {
     uint64_t retryTime;
 
     /// Expected size of the response header, in bytes.
-    uint32_t responseHeaderLength;
+    const uint32_t responseHeaderLength;
 
     /// Response header; filled in by isReady, so that wrapper functions
     /// don't have to recompute it.  Guaranteed to actually refer to at

@@ -44,12 +44,15 @@ namespace RAMCloud {
 // 0 and 99 to "mock:host=master".
 class MasterServiceRefresher : public ObjectFinder::TableConfigFetcher {
   public:
-    MasterServiceRefresher() : refreshCount(1) {}
-    void getTableConfig(
-            uint64_t tableId,
-            std::map<TabletKey, TabletWithLocator>* tableMap,
-            std::multimap< std::pair<uint64_t, uint8_t>,
-                    ObjectFinder::Indexlet>* tableIndexMap) {
+    MasterServiceRefresher(ObjectFinder* objectFinder)
+        : refreshCount(1)
+        , tableMap(&objectFinder->tableMap)
+        , tableIndexMap(&objectFinder->tableIndexMap)
+    {}
+
+    ProtoBuf::TableConfig*
+    tryGetTableConfig(uint64_t tableId)
+    {
         tableMap->clear();
 
         Tablet rawEntry({1, 0, uint64_t(~0), ServerId(),
@@ -69,11 +72,19 @@ class MasterServiceRefresher : public ObjectFinder::TableConfigFetcher {
 
         }
         refreshCount--;
+        return new ProtoBuf::TableConfig();
     }
     // After this many refreshes we stop including table 99 in the
     // map; used to detect that misdirected requests are rejected by
     // the target server.
     int refreshCount;
+
+    std::map<TabletKey, TabletWithLocator>* tableMap;
+
+    std::multimap<std::pair<uint64_t, uint8_t>, IndexletWithLocator>*
+            tableIndexMap;
+
+    DISALLOW_COPY_AND_ASSIGN(MasterServiceRefresher);
 };
 
 class MasterServiceTest : public ::testing::Test {
@@ -135,7 +146,7 @@ class MasterServiceTest : public ::testing::Test {
 
         ramcloud.construct(&context, "mock:host=coordinator");
         context.objectFinder->tableConfigFetcher.reset(
-                new MasterServiceRefresher);
+                new MasterServiceRefresher(context.objectFinder));
 
         service->tabletManager.addTablet(1, 0, ~0UL, TabletManager::NORMAL);
     }
