@@ -13,6 +13,7 @@ DEBUG ?= yes
 YIELD ?= no
 SSE ?= sse4.2
 COMPILER ?= gnu
+COVERAGE ?= no
 SANITIZER ?= none
 VALGRIND ?= no
 ONLOAD_DIR ?= /usr/local/openonload-201405
@@ -63,6 +64,11 @@ COMFLAGS := $(BASECFLAGS) $(OPTFLAG) -fno-strict-aliasing \
 	        $(DEBUGFLAGS)
 ifeq ($(COMPILER),gnu)
 COMFLAGS += -march=core2
+endif
+# Gcov must be used together with DEBUG=yes to produce accurate result
+ifeq ($(COVERAGE),yes)
+COMFLAGS += --coverage
+LDFLAGS += --coverage
 endif
 # Google sanitizers are not compatible with each other, so only apply one at a
 # time.

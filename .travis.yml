@@ -16,13 +16,15 @@ compiler:
 env:
 # Build Checks
   - CMD="make -j2"
-  - CMD="make DEBUG=NO -j2"
+  - CMD="make DEBUG=no -j2"
   - CMD="make ZOOKEEPER_LIB='-lzookeeper_mt' INFINIBAND=no -j2"
 # make tests w/o timing dependent tests
   - CMD="make -j2 obj.master/test && obj.master/test --gtest_filter=-PortAlarmTest.triple_alarm:WorkerTimerTest.stopInternal_handlerDoesntFinishQuickly"
 # Style Checks
   - CMD="make check"
   - CMD="make -j2 && hooks/pre-commit-90docs"
+# Code coverage
+  - CMD="COVERAGE=yes && make DEBUG=yes -j2 obj.master/test && obj.master/test --gtest_filter=-PortAlarmTest.triple_alarm:WorkerTimerTest.stopInternal_handlerDoesntFinishQuickly"
 
 before_install:
  - git submodule update --init --recursive
@@ -36,6 +38,8 @@ before_install:
  - export CC="gcc-4.9"
  - wget http://launchpadlibrarian.net/57653337/doxygen_1.7.1-2_amd64.deb
  - sudo dpkg -i doxygen_1.7.1-2_amd64.deb
+ - sudo apt-get install -y lcov
+ - gem install coveralls-lcov
 
 ## For if we ever decide to support multiple GCC versions.
 # - if [[ ${GCC_VERSION} ]]; then
@@ -47,6 +51,11 @@ before_install:
 script:
   - make clean
   - eval $CMD
+
+after_success:
+  - if [ "$COVERAGE" == "yes" ]; then
+      lcov -d obj.master -d src --no-external --capture --output-file coverage.info && coveralls-lcov coverage.info
+    fi
 
 notifications:
   email:
