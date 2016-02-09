@@ -14,12 +14,15 @@ compiler:
   - gcc
 
 env:
-# Code coverage
-  - CMD="COVERAGE=yes && make DEBUG=yes -j2 obj.master/test && obj.master/test --gtest_filter=-PortAlarmTest.triple_alarm:WorkerTimerTest.stopInternal_handlerDoesntFinishQuickly"
+  global:
+    - OBJDIR=obj.$TRAVIS_BRANCH
+  matrix:
+    # Code coverage
+    - CMD="export COVERAGE=yes && make DEBUG=yes -j2 $OBJDIR/test && $OBJDIR/test --gtest_filter=-PortAlarmTest.triple_alarm:WorkerTimerTest.stopInternal_handlerDoesntFinishQuickly"
 
 before_install:
  - git submodule update --init --recursive
- - git checkout master
+ - git checkout $TRAVIS_BRANCH
  - sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
  - sudo add-apt-repository -y 'deb http://us.archive.ubuntu.com/ubuntu/ trusty main universe'
  - sudo apt-get update
@@ -44,9 +47,7 @@ script:
   - eval $CMD
 
 after_success:
-  - if [ "$COVERAGE" == "yes" ]; then
-      lcov -d obj.master -d src --no-external --capture --output-file coverage.info && coveralls-lcov coverage.info
-    fi
+  - if [ "$COVERAGE" = "yes" ]; then lcov --gcov-tool gcov-4.9 -d $OBJDIR -d src --no-external --capture --output-file coverage.info && coveralls-lcov coverage.info; fi
 
 notifications:
   email:

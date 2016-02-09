@@ -1,5 +1,6 @@
 # RAMCloud
 [![Build Status](https://travis-ci.org/PlatformLab/RAMCloud.svg?branch=master)](https://travis-ci.org/PlatformLab/RAMCloud)
+[![Coverage Status](https://coveralls.io/repos/github/yilongli/RAMCloud/badge.svg?branch=gcov)](https://coveralls.io/github/yilongli/RAMCloud?branch=gcov)
 
 For up to date information on how to install and use RAMCloud, see the RAMCloud Wiki:
 https://ramcloud.stanford.edu/wiki/display/ramcloud
