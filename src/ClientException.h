@@ -227,8 +227,8 @@ DEFINE_EXCEPTION(RequestTooLargeException,
 DEFINE_EXCEPTION(UnknownIndexletException,
                  STATUS_UNKNOWN_INDEXLET,
                  ClientException)
-DEFINE_EXCEPTION(UnknownIndexException,
-                 STATUS_UNKNOWN_INDEX,
+DEFINE_EXCEPTION(IndexDoesntExistException,
+                 STATUS_INDEX_DOESNT_EXIST,
                  ClientException)
 DEFINE_EXCEPTION(InvalidParameterException,
                  STATUS_INVALID_PARAMETER,

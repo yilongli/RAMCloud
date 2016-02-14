@@ -60,7 +60,7 @@ class IndexRpcWrapper : public RpcWrapper {
   PROTECTED:
     virtual bool checkStatus();
     virtual bool handleTransportError();
-    virtual void indexletNotFound();
+    virtual void handleIndexDoesntExist();
     virtual void send();
 
     /// Overall information about the calling process.

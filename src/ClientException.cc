@@ -136,8 +136,8 @@ ClientException::throwException(const CodeLocation& where, Status status)
             throw RequestTooLargeException(where);
         case STATUS_UNKNOWN_INDEXLET:
             throw UnknownIndexletException(where);
-        case STATUS_UNKNOWN_INDEX:
-            throw UnknownIndexException(where);
+        case STATUS_INDEX_DOESNT_EXIST:
+            throw IndexDoesntExistException(where);
         case STATUS_INVALID_PARAMETER:
             throw InvalidParameterException(where);
         case STATUS_STALE_RPC:

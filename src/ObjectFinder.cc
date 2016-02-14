@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2015 Stanford University
+/* Copyright (c) 2010-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -16,100 +16,122 @@
 #include "Cycles.h"
 #include "IndexKey.h"
 #include "ObjectFinder.h"
-#include "ShortMacros.h"
-#include "Key.h"
 #include "FailSession.h"
 
 namespace RAMCloud {
 
 /**
  * The implementation of ObjectFinder::TableConfigFetcher that is used for
- * normal execution. Simply invokes CoordinatorClient::getTableConfig
+ * normal execution. This class is not thread-safe; requests to the class
+ * must be serialized externally.
  */
 class RealTableConfigFetcher : public ObjectFinder::TableConfigFetcher {
   public:
     explicit RealTableConfigFetcher(Context* context)
         : context(context)
-    {
+        , outstandingRpcs()
+    {}
+
+    ~RealTableConfigFetcher() {
+        clear();
     }
 
-    void getTableConfig(
-          uint64_t tableId,
-          std::map<TabletKey, TabletWithLocator>* tableMap,
-          std::multimap< std::pair<uint64_t, uint8_t>,
-                                   ObjectFinder::Indexlet>* tableIndexMap) {
+    void clear() {
+        outstandingRpcs.clear();
+    }
+
+    /**
+     * Attempt to retrieve the configuration information of a table from the
+     * coordinator.
+     *
+     * \param[in] tableId
+     *      The id of the table whose tablet configuration is to be retrieved.
+     * \param[out] tableMap
+     *      Reference to ObjectFinder::tableMap.
+     * \param[out] tableIndexMap
+     *      Reference to ObjectFinder::tableIndexMap.
+     * \return
+     *      True means the latest configuration information has been retrieved
+     *      and that the local cache has been updated accordingly. False means
+     *      that an RPC has been initiated but is not ready yet; the caller
+     *      should try again later.
+     * \pre
+     *      The stale configuration information of the table in the local cache
+     *      has been flushed.
+     *
+     * \throw TableDoesntExistException
+     *      The coordinator has no record of the table.
+     */
+    bool
+    tryGetTableConfig(uint64_t tableId,
+                      std::map<TabletKey, TabletWithLocator>* tableMap,
+                      std::multimap<std::pair<uint64_t, uint8_t>,
+                                    IndexletWithLocator>* tableIndexMap) {
+        GetTableConfigRpc* rpc;
+        std::unordered_map<uint64_t, Tub<GetTableConfigRpc>>::iterator iter =
+                outstandingRpcs.find(tableId);
+        if (iter == outstandingRpcs.end()) {
+            outstandingRpcs.emplace(tableId, Tub<GetTableConfigRpc>());
+            rpc = outstandingRpcs[tableId].construct();
+        } else {
+            rpc = iter->second.get();
+        }
+
+        // No need to invoke the poller here because this function must be
+        // triggered by some higher level rpc where the poller needs to be
+        // invoked anyway
+        if (!rpc->isReady()) {
+            return false;
+        }
 
         ProtoBuf::TableConfig tableConfig;
-        CoordinatorClient::getTableConfig(context, tableId, &tableConfig);
+        try {
+            rpc->wait(&tableConfig);
+        } catch (TableDoesntExistException& e) {
+            outstandingRpcs.erase(tableId);
+            throw e;
+        }
+        outstandingRpcs.erase(tableId);
+        for (const auto& tablet : tableConfig.tablet()) {
+            Tablet rawTablet(tableId,
+                             tablet.start_key_hash(),
+                             tablet.end_key_hash(),
+                             ServerId(tablet.server_id()),
+                             Tablet::Status(tablet.state()),
+                             LogPosition(tablet.ctime_log_head_id(),
+                                         tablet.ctime_log_head_offset()));
 
-        foreach (const ProtoBuf::TableConfig::Tablet& tablet,
-                 tableConfig.tablet()) {
-
-            uint64_t tableId = tablet.table_id();
-            uint64_t startKeyHash = tablet.start_key_hash();
-            uint64_t endKeyHash = tablet.end_key_hash();
-            ServerId serverId(tablet.server_id());
-            Tablet::Status state = Tablet::Status::RECOVERING;
-            if (tablet.state() == ProtoBuf::TableConfig_Tablet_State_NORMAL) {
-                state = Tablet::NORMAL;
-            }
-            LogPosition ctime(tablet.ctime_log_head_id(),
-                              tablet.ctime_log_head_offset());
-
-            Tablet rawTablet(tableId, startKeyHash, endKeyHash,
-                                            serverId, state, ctime);
-            string serviceLocator = tablet.service_locator();
-
-            TabletKey key{tablet.table_id(),
-                          tablet.start_key_hash()};
-            TabletWithLocator tabletWithLocator(rawTablet, serviceLocator);
-
-            tableMap->insert(std::make_pair(key, tabletWithLocator));
+            tableMap->emplace(
+                    TabletKey{tableId, tablet.start_key_hash()},
+                    TabletWithLocator(rawTablet, tablet.service_locator()));
         }
 
-        foreach (const ProtoBuf::TableConfig::Index& index,
-                                                    tableConfig.index()) {
+        for (const auto& index : tableConfig.index()) {
+            for (const auto& indexlet : index.indexlet()) {
+                const string &startKey = indexlet.start_key();
+                const string &endKey = indexlet.end_key();
+                Indexlet rawIndexlet(startKey.c_str(),
+                                     static_cast<KeyLength>(startKey.length()),
+                                     endKey.c_str(),
+                                     static_cast<KeyLength>(endKey.length()));
+                IndexletWithLocator indexletWithLocator(
+                        rawIndexlet, indexlet.service_locator());
 
-            uint64_t indexId = index.index_id();
-            foreach (const ProtoBuf::TableConfig::Index::Indexlet& indexlet,
-                                                            index.indexlet()) {
-                void* firstKey;
-                uint16_t firstKeyLength;
-                void* firstNotOwnedKey;
-                uint16_t firstNotOwnedKeyLength;
-
-                if (indexlet.start_key().compare("") != 0) {
-                    firstKey = const_cast<char *>(indexlet.start_key().c_str());
-                    firstKeyLength = (uint16_t)indexlet.start_key().length();
-                } else {
-                    firstKey = NULL;
-                    firstKeyLength = 0;
-                }
-
-                if (indexlet.end_key().compare("") != 0) {
-                    firstNotOwnedKey = const_cast<char *>
-                                                (indexlet.end_key().c_str());
-                    firstNotOwnedKeyLength =
-                                    (uint16_t)indexlet.end_key().length();
-                } else {
-                    firstNotOwnedKey = NULL;
-                    firstNotOwnedKeyLength = 0;
-                }
-
-                ServerId serverId(indexlet.server_id());
-                string serviceLocator = indexlet.service_locator();
-                ObjectFinder::Indexlet rawIndexlet(firstKey, firstKeyLength,
-                                    firstNotOwnedKey, firstNotOwnedKeyLength,
-                                    serverId, serviceLocator);
-
-                tableIndexMap->insert(std::make_pair(
-                        std::make_pair(tableId, indexId), rawIndexlet));
+                tableIndexMap->emplace(
+                        std::make_pair(tableId, index.index_id()),
+                        indexletWithLocator);
             }
         }
+
+        return true;
     }
 
   private:
-    Context* context;
+    Context* const context;
+
+    /// A cache of the outstanding RPCs indexed by their requesting table ids.
+    std::unordered_map<uint64_t, Tub<GetTableConfigRpc>> outstandingRpcs;
+
     DISALLOW_COPY_AND_ASSIGN(RealTableConfigFetcher);
 };
 
@@ -120,6 +142,7 @@ class RealTableConfigFetcher : public ObjectFinder::TableConfigFetcher {
  */
 ObjectFinder::ObjectFinder(Context* context)
     : context(context)
+    , mutex("ObjectFinder")
     , tableMap()
     , tableIndexMap()
     , tableConfigFetcher(new RealTableConfigFetcher(context))
@@ -135,8 +158,10 @@ ObjectFinder::ObjectFinder(Context* context)
  */
 void ObjectFinder::reset()
 {
+    SpinLock::Guard _(mutex);
     tableMap.clear();
     tableIndexMap.clear();
+    tableConfigFetcher->clear();
 }
 
 /**
@@ -149,7 +174,22 @@ void ObjectFinder::reset()
  *      The id of the table to be flushed.
  */
 void
-ObjectFinder::flush(uint64_t tableId) {
+ObjectFinder::flush(uint64_t tableId)
+{
+    SpinLock::Guard guard(mutex);
+    flushImpl(guard, tableId);
+}
+
+/**
+ * The actual implementation code of flush(); factored out so that other
+ * methods in this class can invoke it without acquiring the mutex.
+ *
+ * \param guard
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ */
+void
+ObjectFinder::flushImpl(const SpinLock::Guard& guard, uint64_t tableId)
+{
     TabletKey start {tableId, 0U};
     TabletKey end {tableId, std::numeric_limits<KeyHash>::max()};
     TabletIter lower = tableMap.lower_bound(start);
@@ -157,9 +197,9 @@ ObjectFinder::flush(uint64_t tableId) {
     tableMap.erase(lower, upper);
 
     IndexletIter indexLower = tableIndexMap.lower_bound
-                                    (std::make_pair(tableId, 0));
+            (std::make_pair(tableId, 0));
     IndexletIter indexUpper = tableIndexMap.upper_bound(
-                std::make_pair(tableId, std::numeric_limits<uint8_t>::max()));
+            std::make_pair(tableId, std::numeric_limits<uint8_t>::max()));
     tableIndexMap.erase(indexLower, indexUpper);
 }
 
@@ -171,7 +211,9 @@ ObjectFinder::flush(uint64_t tableId) {
  *      A human-readable string describing the contents of tableMap.
  */
 string
-ObjectFinder::debugString() const {
+ObjectFinder::debugString() const
+{
+    SpinLock::Guard _(mutex);
     std::map<TabletKey, TabletWithLocator>::const_iterator it;
     std::stringstream result;
     for (it = tableMap.begin(); it != tableMap.end(); it++) {
@@ -192,6 +234,10 @@ ObjectFinder::debugString() const {
 /**
  * Find information about the tablet containing a key in a given table.
  *
+ * \deprecated
+ *      All uses of this method should be converted to use its asynchronous
+ *      counterpart tryLookup() eventually.
+ *
  * \param tableId
  *      The table containing the desired object
  * \param key
@@ -200,13 +246,15 @@ ObjectFinder::debugString() const {
  * \param keyLength
  *      Size in bytes of the key.
  * \return
- *      Session for communication with the server who holds the tablet
+ *      Session for communication with the server who holds the tablet.
  *
  * \throw TableDoesntExistException
  *      The coordinator has no record of the table.
  */
 Transport::SessionRef
-ObjectFinder::lookup(uint64_t tableId, const void* key, uint16_t keyLength) {
+ObjectFinder::lookup(uint64_t tableId, const void* key, KeyLength keyLength)
+{
+    // No lock needed: doesn't access ObjectFinder object.
     KeyHash keyHash = Key::getHash(tableId, key, keyLength);
     return lookup(tableId, keyHash);
 }
@@ -216,12 +264,16 @@ ObjectFinder::lookup(uint64_t tableId, const void* key, uint16_t keyLength) {
  * looking up a key hash range in the table when you do not have a
  * specific key.
  *
+ * \deprecated
+ *      All uses of this method should be converted to use its asynchronous
+ *      counterpart tryLookup() eventually.
+ *
  * \param tableId
  *      The table containing the desired object.
  * \param keyHash
  *      A hash value in the space of key hashes.
-* \return
- *      Session for communication with the server who holds the tablet
+ * \return
+ *      Session for communication with the server who holds the tablet.
  *
  * \throw TableDoesntExistException
  *      The coordinator has no record of the table.
@@ -229,103 +281,16 @@ ObjectFinder::lookup(uint64_t tableId, const void* key, uint16_t keyLength) {
 Transport::SessionRef
 ObjectFinder::lookup(uint64_t tableId, KeyHash keyHash)
 {
-    TabletWithLocator* tablet = lookupTablet(tableId, keyHash);
-    if (tablet->session == NULL) {
-        tablet->session = context->transportManager->getSession(
-                tablet->serviceLocator);
+    // No lock needed: doesn't access ObjectFinder object.
+    Transport::SessionRef session;
+    while (true) {
+        session = tryLookup(tableId, keyHash);
+        if (session) return session;
     }
-    return tablet->session;
 }
 
 /**
- * Lookup the master holding the indexlet containing the given key.
- *
- * \param tableId
- *      The table containing the desired object.
- * \param indexId
- *      Id of a particular index in tableId.
- * \param key
- *      Blob corresponding to the key.
- * \param keyLength
- *      Length of key.
- *
- * \return
- *      Session for communication with the server who holds the indexlet.
- *      If the indexlet doesn't exist, return a NULL session.
- */
-Transport::SessionRef
-ObjectFinder::lookup(uint64_t tableId, uint8_t indexId,
-                     const void* key, uint16_t keyLength)
-{
-    Indexlet* indexlet = lookupIndexlet(tableId, indexId, key, keyLength);
-    // If indexlet doesn't exist, don't throw an exception.
-    if (indexlet == NULL) {
-        return Transport::SessionRef();
-    }
-    if (indexlet->session == NULL) {
-        indexlet->session = context->transportManager->getSession(
-                indexlet->serviceLocator);
-    }
-    return indexlet->session;
-}
-
-/**
- * Lookup the indexlet containing the given key.
- *
- * \param tableId
- *      The table containing the desired object.
- * \param indexId
- *      Id of a particular index in tableId.
- * \param key
- *      Blob corresponding to the key.
- * \param keyLength
- *      Length of key.
- *
- * \return
- *      Reference to Indexlet with the details of the server that owns
- *      the specified key. This reference may be invalidated by any future
- *      calls to the ObjectFinder.
- */
-ObjectFinder::Indexlet*
-ObjectFinder::lookupIndexlet(uint64_t tableId, uint8_t indexId,
-                             const void* key, uint16_t keyLength)
-{
-    std::pair<uint64_t, uint8_t> indexKey = std::make_pair(tableId, indexId);
-    IndexletIter iter;
-
-    for (int count = 0; count < 2; count++) {
-
-        std::pair <IndexletIter, IndexletIter> range;
-        range = tableIndexMap.equal_range(indexKey);
-
-        for (iter = range.first; iter != range.second; iter++) {
-
-            Indexlet* indexlet = &iter->second;
-            if (indexlet->firstKey != NULL &&
-                    IndexKey::keyCompare(key, keyLength,
-                            indexlet->firstKey, indexlet->firstKeyLength) < 0) {
-                continue;
-            }
-            if (indexlet->firstNotOwnedKey != NULL &&
-                    IndexKey::keyCompare(key, keyLength,
-                            indexlet->firstNotOwnedKey,
-                            indexlet->firstNotOwnedKeyLength) >= 0) {
-                continue;
-            }
-            return indexlet;
-        }
-
-        if (count == 0) {
-            flush(tableId);
-            tableConfigFetcher->getTableConfig(tableId, &tableMap,
-                    &tableIndexMap);
-        }
-    }
-    return NULL;
-}
-
-/**
- * Lookup the master for a particular key in a given table.
+ * Lookup the master for a particular key hash in a given table.
  * Only used internally in lookup() and for testing/debugging routines.
  *
  * \param tableId
@@ -344,31 +309,11 @@ ObjectFinder::lookupIndexlet(uint64_t tableId, uint8_t indexId,
 TabletWithLocator*
 ObjectFinder::lookupTablet(uint64_t tableId, KeyHash keyHash)
 {
-    bool haveRefreshed = false;
-    TabletKey key{tableId, keyHash};
-    TabletIter iter;
+    // No lock needed: doesn't access ObjectFinder object.
+    TabletWithLocator* tabletWithLocator;
     while (true) {
-        iter = tableMap.upper_bound(key);
-        if (!tableMap.empty() && iter != tableMap.begin()) {
-            TabletWithLocator* tabletWithLocator = &((--iter)->second);
-            if (tabletWithLocator->tablet.tableId == tableId &&
-              tabletWithLocator->tablet.startKeyHash <= keyHash &&
-              keyHash <= tabletWithLocator->tablet.endKeyHash) {
-
-                if (tabletWithLocator->tablet.status != Tablet::NORMAL) {
-                    if (haveRefreshed) usleep(10000);
-                    haveRefreshed = false;
-                } else {
-                    return tabletWithLocator;
-                }
-            }
-        }
-        if (haveRefreshed) {
-          throw TableDoesntExistException(HERE);
-        }
-        flush(tableId);
-        tableConfigFetcher->getTableConfig(tableId, &tableMap, &tableIndexMap);
-        haveRefreshed = true;
+        tabletWithLocator = tryLookupTablet(tableId, keyHash);
+        if (tabletWithLocator) return tabletWithLocator;
     }
 }
 
@@ -388,22 +333,20 @@ ObjectFinder::lookupTablet(uint64_t tableId, KeyHash keyHash)
 void
 ObjectFinder::flushSession(uint64_t tableId, KeyHash keyHash)
 {
-    try {
-        TabletWithLocator* tabletWithLocator = lookupTablet(tableId,
-                                                                keyHash);
+    SpinLock::Guard guard(mutex);
+    TabletKey key{tableId, keyHash};
+    TabletWithLocator* tabletWithLocator = lookupTabletInCache(guard, &key);
+    if (tabletWithLocator != NULL) {
         context->transportManager->flushSession(
-                                    tabletWithLocator->serviceLocator);
+                tabletWithLocator->serviceLocator);
         tabletWithLocator->session = NULL;
-    } catch (TableDoesntExistException& e) {
-        // We don't even store this tablet anymore, so there's nothing
-        // to worry about.
     }
 }
 
 /**
  * Delete the session connecting to the master that owns a particular
- * index entry, if such a session exists. This method is typically invoked after
- * an unrecoverable error has occurred on the session, so that a new
+ * index entry, if such a session exists. This method is typically invoked
+ * after an unrecoverable error has occurred on the session, so that a new
  * session will be created the next time someone wants to communicate
  * with that master.
  *
@@ -418,14 +361,302 @@ ObjectFinder::flushSession(uint64_t tableId, KeyHash keyHash)
  */
 void
 ObjectFinder::flushSession(uint64_t tableId, uint8_t indexId,
-                           const void* key, uint16_t keyLength)
+                           const void* key, KeyLength keyLength)
 {
-    Indexlet* indexlet = lookupIndexlet(tableId, indexId,
-                                              key, keyLength);
-    if (indexlet != NULL) {
+    SpinLock::Guard guard(mutex);
+    IndexletWithLocator* indexletWithLocator = lookupIndexletInCache(
+            guard, tableId, indexId, key, keyLength);
+    if (indexletWithLocator != NULL) {
         context->transportManager->flushSession(
-                        indexlet->serviceLocator);
-        indexlet->session = NULL;
+                indexletWithLocator->serviceLocator);
+        indexletWithLocator->session = NULL;
+    }
+}
+
+/**
+ * Lookup the master for a particular indexlet in the local cache of
+ * configuration information.
+ *
+ * \param guard
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ * \param tableId
+ *      The table containing the desired object.
+ * \param indexId
+ *      Id of a particular index in tableId.
+ * \param key
+ *      Blob corresponding to the key.
+ * \param keyLength
+ *      Length of key.
+ *
+ * \return
+ *      Reference to Indexlet with the details of the server that owns
+ *      the specified key. NULL means there is no information about such
+ *      indexlet in the local cache.
+ */
+IndexletWithLocator*
+ObjectFinder::lookupIndexletInCache(const SpinLock::Guard& guard,
+                                    uint64_t tableId, uint8_t indexId,
+                                    const void* key, KeyLength keyLength)
+{
+    TableIdIndexIdPair indexKey {tableId, indexId};
+    auto range = tableIndexMap.equal_range(indexKey);
+    for (auto iter = range.first; iter != range.second; iter++) {
+        IndexletWithLocator* indexletWithLocator = &iter->second;
+        Indexlet* indexlet = &indexletWithLocator->indexlet;
+        if (indexlet->firstKey != NULL &&
+            IndexKey::keyCompare(key, keyLength, indexlet->firstKey,
+                    indexlet->firstKeyLength) < 0) {
+            continue;
+        }
+        if (indexlet->firstNotOwnedKey != NULL &&
+            IndexKey::keyCompare(key, keyLength, indexlet->firstNotOwnedKey,
+                     indexlet->firstNotOwnedKeyLength) >= 0) {
+            continue;
+        }
+        return indexletWithLocator;
+    }
+    return NULL;
+}
+
+/**
+ * Lookup the master for a particular tablet in the local cache of
+ * configuration information.
+ *
+ * \param guard
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ * \param key
+ *      The tablet containing the desired object.
+ * \return
+ *      Reference to a tablet with the details of the server that owns
+ *      the specified key. NULL means there is no information about such
+ *      tablet in the local cache.
+ */
+TabletWithLocator*
+ObjectFinder::lookupTabletInCache(const SpinLock::Guard& guard,
+                                  const TabletKey* key)
+{
+    TabletIter iter = tableMap.upper_bound(*key);
+    if (!tableMap.empty() && iter != tableMap.begin()) {
+        TabletWithLocator *tabletWithLocator = &((--iter)->second);
+        if (tabletWithLocator->tablet.tableId == key->tableId &&
+            tabletWithLocator->tablet.startKeyHash <= key->keyHash &&
+            key->keyHash <= tabletWithLocator->tablet.endKeyHash) {
+
+            return tabletWithLocator;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * Find information about the tablet containing a key in a given table.
+ *
+ * \param tableId
+ *      The table containing the desired object
+ * \param key
+ *      Variable length key that uniquely identifies the object within tableId.
+ *      It does not necessarily have to be null terminated like a string.
+ * \param keyLength
+ *      Size in bytes of the key.
+ * \return
+ *      Session for communication with the server who holds the tablet. NULL
+ *      session means the result is not available yet and the caller should try
+ *      again later.
+ *
+ * \throw TableDoesntExistException
+ *      The coordinator has no record of the table.
+ */
+Transport::SessionRef
+ObjectFinder::tryLookup(uint64_t tableId, const void* key, KeyLength keyLength)
+{
+    // No lock needed: doesn't access ObjectFinder object.
+    KeyHash keyHash = Key::getHash(tableId, key, keyLength);
+    return tryLookup(tableId, keyHash);
+}
+
+/**
+ * Lookup the master for a key hash in a given table. Useful for
+ * looking up a key hash range in the table when you do not have a
+ * specific key.
+ *
+ * \param tableId
+ *      The table containing the desired object.
+ * \param keyHash
+ *      A hash value in the space of key hashes.
+ * \return
+ *      Session for communication with the server who holds the tablet.
+ *      NULL session means the result is not available yet and the caller
+ *      should try again later.
+ *
+ * \throw TableDoesntExistException
+ *      The coordinator has no record of the table.
+ */
+Transport::SessionRef
+ObjectFinder::tryLookup(uint64_t tableId, KeyHash keyHash)
+{
+    // No lock needed: doesn't access ObjectFinder object.
+    TabletWithLocator* tabletWithLocator = tryLookupTablet(tableId, keyHash);
+    if (tabletWithLocator != NULL) {
+        if (!tabletWithLocator->session) {
+            tabletWithLocator->session = context->transportManager->getSession(
+                    tabletWithLocator->serviceLocator);
+        }
+        return tabletWithLocator->session;
+    } else {
+        return Transport::SessionRef();
+    }
+}
+
+/**
+ * Attempts to find the master holding the indexlet containing a given key.
+ *
+ * \param tableId
+ *      The table containing the desired object.
+ * \param indexId
+ *      Id of a particular index in tableId.
+ * \param key
+ *      Blob corresponding to the key.
+ * \param keyLength
+ *      Length of key.
+ * \param[out] indexDoesntExist
+ *      True if the coordinator has no record of the index.
+ *
+ * \return
+ *      Session for communication with the server who holds the indexlet.
+ *      NULL session means either the indexlet doesn't exist in the system,
+ *      when indexDoesntExist is set to true, or the result is not available
+ *      yet, in which case the caller should try again later.
+ */
+Transport::SessionRef
+ObjectFinder::tryLookup(uint64_t tableId, uint8_t indexId,
+                        const void* key, KeyLength keyLength,
+                        bool& indexDoesntExist)
+{
+    // No lock needed: doesn't access ObjectFinder object.
+    IndexletWithLocator* indexletWithLocator = tryLookupIndexlet(
+            tableId, indexId, key, keyLength, indexDoesntExist);
+    if (!indexletWithLocator->session) {
+        indexletWithLocator->session = context->transportManager->getSession(
+                indexletWithLocator->serviceLocator);
+    }
+    return indexletWithLocator->session;
+}
+
+/**
+ * Lookup the indexlet containing the given key.
+ *
+ * \param tableId
+ *      The table containing the desired object.
+ * \param indexId
+ *      Id of a particular index in tableId.
+ * \param key
+ *      Blob corresponding to the key.
+ * \param keyLength
+ *      Length of key.
+ * \param[out] indexDoesntExist
+ *      True if the coordinator has no record of the index.
+ *
+ * \return
+ *      Reference to Indexlet with the details of the server that owns
+ *      the specified key. This reference may be invalidated by any future
+ *      calls to the ObjectFinder. NULL means either the index doesn't exist
+ *      in the system, when indexDoesntExist is set to true, or the result is
+ *      not available yet.
+ */
+IndexletWithLocator*
+ObjectFinder::tryLookupIndexlet(uint64_t tableId, uint8_t indexId,
+                                const void* key, KeyLength keyLength,
+                                bool& indexDoesntExist)
+{
+    SpinLock::Guard guard(mutex);
+    indexDoesntExist = false;
+    // First lookup the indexlet in our local cache
+    IndexletWithLocator* indexletWithLocator = lookupIndexletInCache(
+            guard, tableId, indexId, key, keyLength);
+    if (indexletWithLocator != NULL) {
+        // TODO(YilongL): maybe we should check the status of the indexlet
+        // to be normal here just like tryLookupTablet() if the recovering
+        // information is available
+        return indexletWithLocator;
+    }
+
+    // We do not have the latest information about the indexlet; try to fetch
+    // it from the coordinator but do not block here
+    flushImpl(guard, tableId);
+    try {
+        if (!tableConfigFetcher->tryGetTableConfig(
+                tableId, &tableMap, &tableIndexMap)) {
+            return NULL;
+        }
+    } catch (TableDoesntExistException& e) {
+        indexDoesntExist = true;
+        return NULL;
+    }
+
+    // The response of our last RPC to the coordinator has come back
+    indexletWithLocator = lookupIndexletInCache(
+            guard, tableId, indexId, key, keyLength);
+    if (indexletWithLocator == NULL) {
+        indexDoesntExist = true;
+        return NULL;
+    } else {
+        return indexletWithLocator;
+    }
+}
+/**
+ * Lookup the master for a particular key hash in a given table.
+ * Only used internally in tryLookup() and for testing/debugging routines.
+ *
+ * \deprecated
+ *
+ * \param tableId
+ *      The table containing the desired object (return value from a
+ *      previous call to getTableId).
+ * \param keyHash
+ *      A hash value in the space of key hashes.
+ * \return
+ *      Reference to a tablet with the details of the server that owns
+ *      the specified key. This reference may be invalidated by any future
+ *      calls to the ObjectFinder. NULL means the result is not available
+ *      yet.
+ *
+ * \throw TableDoesntExistException
+ *      The coordinator has no record of the table.
+ */
+TabletWithLocator*
+ObjectFinder::tryLookupTablet(uint64_t tableId, KeyHash keyHash)
+{
+    SpinLock::Guard guard(mutex);
+    // First lookup the tablet in our local cache
+    TabletKey key{tableId, keyHash};
+    TabletWithLocator* tabletWithLocator = lookupTabletInCache(guard, &key);
+    if (tabletWithLocator != NULL) {
+        if (tabletWithLocator->tablet.status == Tablet::Status::NORMAL) {
+            return tabletWithLocator;
+        }
+
+        if (Cycles::rdtsc() < tabletWithLocator->nextFetchTime) {
+            return NULL;
+        }
+    }
+
+    // We do not have the latest information about the tablet; try to fetch
+    // it from the coordinator but do not block here
+    flushImpl(guard, tableId);
+    if (!tableConfigFetcher->tryGetTableConfig(
+            tableId, &tableMap, &tableIndexMap)) {
+        return NULL;
+    }
+
+    // The response of our last RPC to the coordinator has come back; we can
+    // finally throw a TableDoesntExistException for sure if needed
+    tabletWithLocator = lookupTabletInCache(guard, &key);
+    if (tabletWithLocator == NULL) {
+        throw TableDoesntExistException(HERE);
+    } else if (tabletWithLocator->tablet.status != Tablet::Status::NORMAL) {
+        return NULL;
+    } else {
+        return tabletWithLocator;
     }
 }
 
@@ -440,16 +671,19 @@ void
 ObjectFinder::waitForTabletDown(uint64_t tableId)
 {
     RAMCLOUD_TEST_LOG("flushing object map");
-    flush(tableId);
     for (;;) {
-        tableConfigFetcher->getTableConfig(tableId, &tableMap, &tableIndexMap);
+        SpinLock::Guard guard(mutex);
+        flushImpl(guard, tableId);
+        while (!tableConfigFetcher->tryGetTableConfig(
+                tableId, &tableMap, &tableIndexMap)) {};
         TabletKey start {tableId, 0U};
         TabletKey end {tableId, std::numeric_limits<KeyHash>::max()};
         TabletIter lower = tableMap.lower_bound(start);
         TabletIter upper = tableMap.upper_bound(end);
         for (; lower != upper; ++lower) {
             const TabletWithLocator& tabletWithLocator = lower->second;
-            if (tabletWithLocator.tablet.status != Tablet::NORMAL) {
+            if (tabletWithLocator.tablet.status != Tablet::Status::NORMAL)
+            {
                 return;
             }
         }
@@ -470,21 +704,23 @@ ObjectFinder::waitForAllTabletsNormal(uint64_t tableId, uint64_t timeoutNs)
     RAMCLOUD_TEST_LOG("flushing object map");
     while (Cycles::toNanoseconds(Cycles::rdtsc() - start) < timeoutNs) {
         bool allNormal = true;
-        flush(tableId);
-        tableConfigFetcher->getTableConfig(tableId, &tableMap, &tableIndexMap);
+        SpinLock::Guard guard(mutex);
+        flushImpl(guard, tableId);
+        while (!tableConfigFetcher->tryGetTableConfig(
+                tableId, &tableMap, &tableIndexMap)) {};
         TabletKey start {tableId, 0U};
         TabletKey end {tableId, std::numeric_limits<KeyHash>::max()};
         TabletIter lower = tableMap.lower_bound(start);
         TabletIter upper = tableMap.upper_bound(end);
         for (; lower != upper; ++lower) {
             const TabletWithLocator& tabletWithLocator = lower->second;
-            if (tabletWithLocator.tablet.status != Tablet::NORMAL) {
+            if (tabletWithLocator.tablet.status != Tablet::Status::NORMAL) {
                 allNormal = false;
                 break;
             }
-        }
         if (allNormal && tableMap.size() > 0)
             return;
+        }
         usleep(10000);
     }
 }

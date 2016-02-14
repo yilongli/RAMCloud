@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2015 Stanford University
+/* Copyright (c) 2014-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -26,10 +26,11 @@ namespace RAMCloud {
 class IndexRpcWrapperRefresher : public ObjectFinder::TableConfigFetcher {
   public:
     IndexRpcWrapperRefresher() : called(0) {}
-    void getTableConfig(uint64_t tableId,
-                        std::map<TabletKey, TabletWithLocator>* tableMap,
-                        std::multimap<std::pair<uint64_t, uint8_t>,
-                                      ObjectFinder::Indexlet>* tableIndexMap) {
+    bool tryGetTableConfig(
+            uint64_t tableId,
+            std::map<TabletKey, TabletWithLocator>* tableMap,
+            std::multimap<std::pair<uint64_t, uint8_t>,
+                          IndexletWithLocator>* tableIndexMap) {
 
         called++;
         char buffer[100];
@@ -38,8 +39,9 @@ class IndexRpcWrapperRefresher : public ObjectFinder::TableConfigFetcher {
         tableIndexMap->clear();
         auto id = std::make_pair(10, 1); // Pair of table id and index id.
 
-        ObjectFinder::Indexlet indexlet("", 0, "", 0, ServerId(), buffer);
+        IndexletWithLocator indexlet("", 0, "", 0, buffer);
         tableIndexMap->insert(std::make_pair(id, indexlet));
+        return true;
     }
     uint32_t called;
 };
@@ -105,7 +107,7 @@ TEST_F(IndexRpcWrapperTest, indexletNotFound) {
     wrapper.request.fillFromString("100");
     wrapper.send();
     EXPECT_TRUE(wrapper.isReady());
-    EXPECT_STREQ("unknown index",
+    EXPECT_STREQ("index doesn't exist",
                  statusToString(wrapper.responseHeader->status));
 }
 
@@ -143,7 +145,7 @@ TEST_F(IndexRpcWrapperTest, send_noSession) {
     EXPECT_TRUE(wrapper.isReady());
     EXPECT_STREQ("FINISHED", wrapper.stateString());
     EXPECT_EQ("", transport.outputLog);
-    EXPECT_EQ("indexletNotFound: Index not found for tableId 10, indexId 2",
+    EXPECT_EQ("handleIndexDoesntExist: Index not found for tableId 10, indexId 2",
                 TestLog::get());
 }
 

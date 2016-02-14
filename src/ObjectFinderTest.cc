@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2015 Stanford University
+/* Copyright (c) 2010-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -20,11 +20,11 @@
 namespace RAMCloud {
 struct Refresher : public ObjectFinder::TableConfigFetcher {
     Refresher() : called(0) {}
-    void getTableConfig(
+    bool tryGetTableConfig(
          uint64_t tableId,
          std::map<TabletKey, TabletWithLocator>* tableMap,
          std::multimap< std::pair<uint64_t, uint8_t>,
-                                ObjectFinder::Indexlet>* tableIndexMap) {
+                                  IndexletWithLocator>* tableIndexMap) {
 
         called++;
         Tablet rawTablet2({1, 0, uint64_t(~0), ServerId(),
@@ -92,14 +92,16 @@ struct Refresher : public ObjectFinder::TableConfigFetcher {
         char* l = new char('l');
         char* w = new char('w');
 
-        ObjectFinder::Indexlet indexlet0(reinterpret_cast<void*>(b), 1,
-            reinterpret_cast<void*>(l), 1, ServerId(), "mock:host=server0");
-        ObjectFinder::Indexlet indexlet1(reinterpret_cast<void*>(l), 1,
-            reinterpret_cast<void*>(w), 1, ServerId(), "mock:host=server1");
-        ObjectFinder::Indexlet indexlet2(NULL, 0, reinterpret_cast<void*>(l)
-                                     , 1, ServerId(), "mock:host=server2");
-        ObjectFinder::Indexlet indexlet3(reinterpret_cast<void*>(l), 1, NULL
-                                     , 0, ServerId(), "mock:host=server3");
+        IndexletWithLocator indexlet0(reinterpret_cast<void*>(b), 1,
+                                      reinterpret_cast<void*>(l), 1,
+                                      "mock:host=server0");
+        IndexletWithLocator indexlet1(reinterpret_cast<void*>(l), 1,
+                                      reinterpret_cast<void*>(w), 1,
+                                      "mock:host=server1");
+        IndexletWithLocator indexlet2(NULL, 0, reinterpret_cast<void*>(l), 1,
+                                      "mock:host=server2");
+        IndexletWithLocator indexlet3(reinterpret_cast<void*>(l), 1, NULL, 0,
+                                      "mock:host=server3");
 
         tableIndexMap->insert(std::make_pair(
                                         std::make_pair(1, 0), indexlet0));
@@ -109,7 +111,7 @@ struct Refresher : public ObjectFinder::TableConfigFetcher {
                                         std::make_pair(1, 1), indexlet2));
         tableIndexMap->insert(std::make_pair(
                                         std::make_pair(1, 1), indexlet3));
-
+        return true;
     }
     uint32_t called;
 };
@@ -130,7 +132,7 @@ class ObjectFinderTest : public ::testing::Test {
         context.transportManager->registerMock(NULL);
 
         objectFinder.construct(&context);
-        refresher = new Refresher();
+        refresher = new Refresher;
         objectFinder->tableConfigFetcher.reset(refresher);
     }
 
@@ -227,24 +229,31 @@ TEST_F(ObjectFinderTest, lookup_keyHash) {
     EXPECT_EQ("mock:host=server1", session->getServiceLocator());
 
     // Make sure that the session was cached.
-    EXPECT_EQ(session, objectFinder->lookupTablet(1, 9999lu)->session);
+    EXPECT_EQ(session, objectFinder->lookup(1, 9999lu));
 }
 
 TEST_F(ObjectFinderTest, lookup_index_noSuchIndex) {
-    Transport::SessionRef session = objectFinder->lookup(2, 99, "abc", 3);
+    bool indexletNotFound;
+    Transport::SessionRef session = objectFinder->tryLookup(2, 99, "abc", 3,
+                                                            indexletNotFound);
     ASSERT_TRUE(session == NULL);
 }
-TEST_F(ObjectFinderTest, lookup_index_success) {
-    // Make sure that no session was cached initially.
-    EXPECT_TRUE(objectFinder->lookupIndexlet(1, 1, "abc", 3)->session
-            == NULL);
 
-    Transport::SessionRef session = objectFinder->lookup(1, 1, "abc", 3);
+TEST_F(ObjectFinderTest, lookup_index_success) {
+    bool indexletNotFound;
+    // Make sure that no session was cached initially.
+    EXPECT_TRUE(objectFinder->tryLookupIndexlet(
+            1, 1, "abc", 3, indexletNotFound)->session == NULL);
+    EXPECT_FALSE(indexletNotFound);
+
+    Transport::SessionRef session = objectFinder->tryLookup(1, 1, "abc", 3,
+                                                            indexletNotFound);
     ASSERT_TRUE(session != NULL);
     EXPECT_EQ("mock:host=server2", session->getServiceLocator());
 
     // Make sure that the session was cached.
-    EXPECT_EQ(session, objectFinder->lookupIndexlet(1, 1, "abc", 3)->session);
+    EXPECT_EQ(session, objectFinder->tryLookup(
+            1, 1, "abc", 3, indexletNotFound));
 }
 
 TEST_F(ObjectFinderTest, lookupIndexlet) {
@@ -254,59 +263,60 @@ TEST_F(ObjectFinderTest, lookupIndexlet) {
     char l = 'l';
     char w = 'w';
     char z = 'z';
+    bool indexletNotFound;
 
     // before any of the valid indexlets
-    Transport::SessionRef session0(objectFinder->lookup(1, 0,
-                                            reinterpret_cast<void*>(&a), 1));
+    Transport::SessionRef session0(objectFinder->
+            tryLookup(1, 0, reinterpret_cast<void*>(&a), 1, indexletNotFound));
     EXPECT_EQ(Transport::SessionRef(), session0);
 
     // start of the first indexlet
-    Transport::SessionRef session1(objectFinder->lookup(1, 0,
-                                            reinterpret_cast<void*>(&b), 1));
+    Transport::SessionRef session1(objectFinder->
+            tryLookup(1, 0, reinterpret_cast<void*>(&b), 1, indexletNotFound));
     EXPECT_EQ("mock:host=server0",
         static_cast<BindTransport::BindSession*>(session1.get())->
                 getServiceLocator());
 
     // middle of the first indexlet
-    Transport::SessionRef session2(objectFinder->lookup(1, 0,
-                                            reinterpret_cast<void*>(&g), 1));
+    Transport::SessionRef session2(objectFinder->
+            tryLookup(1, 0, reinterpret_cast<void*>(&g), 1, indexletNotFound));
     EXPECT_EQ("mock:host=server0",
         static_cast<BindTransport::BindSession*>(session2.get())->
                 getServiceLocator());
 
     // begin of the second indexlet
-    Transport::SessionRef session3(objectFinder->lookup(1, 0,
-                                            reinterpret_cast<void*>(&l), 1));
+    Transport::SessionRef session3(objectFinder->
+            tryLookup(1, 0, reinterpret_cast<void*>(&l), 1, indexletNotFound));
     EXPECT_EQ("mock:host=server1",
         static_cast<BindTransport::BindSession*>(session3.get())->
                 getServiceLocator());
 
     // end of the second or last indexlet
-    Transport::SessionRef session4(objectFinder->lookup(1, 0,
-                                            reinterpret_cast<void*>(&w), 1));
+    Transport::SessionRef session4(objectFinder->
+            tryLookup(1, 0, reinterpret_cast<void*>(&w), 1, indexletNotFound));
     EXPECT_EQ(Transport::SessionRef(), session4);
 
     // beyond the last indexlet
-    Transport::SessionRef session5(objectFinder->lookup(1, 0,
-                                            reinterpret_cast<void*>(&z), 1));
+    Transport::SessionRef session5(objectFinder->
+            tryLookup(1, 0, reinterpret_cast<void*>(&z), 1, indexletNotFound));
     EXPECT_EQ(Transport::SessionRef(), session5);
 
     // where first key is NULL
-    Transport::SessionRef session6(objectFinder->lookup(1, 1,
-                                            reinterpret_cast<void*>(&b), 1));
+    Transport::SessionRef session6(objectFinder->
+            tryLookup(1, 1, reinterpret_cast<void*>(&b), 1, indexletNotFound));
     EXPECT_EQ("mock:host=server2",
         static_cast<BindTransport::BindSession*>(session6.get())->
                 getServiceLocator());
 
     // where last key is NULL
-    Transport::SessionRef session7(objectFinder->lookup(1, 1,
-                                            reinterpret_cast<void*>(&z), 1));
+    Transport::SessionRef session7(objectFinder->
+            tryLookup(1, 1, reinterpret_cast<void*>(&z), 1, indexletNotFound));
     EXPECT_EQ("mock:host=server3",
         static_cast<BindTransport::BindSession*>(session7.get())->
                 getServiceLocator());
 }
 
-TEST_F(ObjectFinderTest, lookupTablet) {
+TEST_F(ObjectFinderTest, tryLookupTablet) {
 
     // expect nothing to be there before refreshing the coordinator
     EXPECT_EQ(objectFinder->debugString(), "");
@@ -380,7 +390,7 @@ TEST_F(ObjectFinderTest, flushSession_tablet) {
     EXPECT_FALSE(context.transportManager->sessionCache.find(
             "mock:host=server1")
             == context.transportManager->sessionCache.end());
-    EXPECT_TRUE(objectFinder->lookupTablet(1, 9999lu)->session != NULL);
+    EXPECT_TRUE(objectFinder->lookup(1, 9999lu) != NULL);
 
     TestLog::reset();
     objectFinder->flushSession(1, keyHash);
@@ -396,17 +406,21 @@ TEST_F(ObjectFinderTest, flushSession_tablet) {
 }
 
 TEST_F(ObjectFinderTest, flushSession_index) {
-    objectFinder->lookup(1, 1, "abc", 3);
+    bool indexletNotFound;
+    objectFinder->tryLookup(1, 1, "abc", 3, indexletNotFound);
     EXPECT_FALSE(context.transportManager->sessionCache.find(
             "mock:host=server2")
             == context.transportManager->sessionCache.end());
-    EXPECT_TRUE(objectFinder->lookupIndexlet(1, 1, "abc", 3)->session != NULL);
+    EXPECT_TRUE(objectFinder->tryLookupIndexlet(
+            1, 1, "abc", 3, indexletNotFound)->session != NULL);
+    EXPECT_FALSE(indexletNotFound);
 
     TestLog::reset();
     objectFinder->flushSession(1, 1, "abc", 3);
     // Make sure that the session is no longer cached either in ObjectFinder
     // or TransportManager.
-    EXPECT_TRUE(objectFinder->lookupIndexlet(1, 1, "abc", 3)->session == NULL);
+    EXPECT_TRUE(objectFinder->tryLookupIndexlet(
+            1, 1, "abc", 3, indexletNotFound)->session == NULL);
     EXPECT_TRUE(context.transportManager->sessionCache.find(
             "mock:host=server2")
             == context.transportManager->sessionCache.end());
@@ -416,5 +430,7 @@ TEST_F(ObjectFinderTest, flushSession_index) {
              TestLog::get());
     objectFinder->flushSession(99, 0);
 }
+
+// TODO: replace all uses of the synchronous calls with async ones then rename tests
 
 }  // namespace RAMCloud
