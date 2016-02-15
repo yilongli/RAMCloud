@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Stanford University
+/* Copyright (c) 2011-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -48,11 +48,12 @@ ServerList::~ServerList()
 // ServerList - Protected Methods (inherited from AbstractServerList)
 //////////////////////////////////////////////////////////////////////
 ServerDetails*
-ServerList::iget(ServerId id)
+ServerList::iget(const Lock& lock, ServerId id) const
 {
     uint32_t index = id.indexNumber();
     if ((index < serverList.size()) && serverList[index]) {
-        ServerDetails* details = serverList[index].get();
+        ServerDetails* details = const_cast<ServerDetails*>(
+                serverList[index].get());
         if (details->serverId == id)
             return details;
     }
@@ -60,9 +61,10 @@ ServerList::iget(ServerId id)
 }
 
 ServerDetails*
-ServerList::iget(uint32_t index)
+ServerList::iget(const Lock& lock, uint32_t index) const
 {
-    return (serverList[index]) ? serverList[index].get() : NULL;
+    return (serverList[index]) ?
+           const_cast<ServerDetails*>(serverList[index].get()) : NULL;
 }
 
 /**
@@ -70,7 +72,7 @@ ServerList::iget(uint32_t index)
  * that they're occupied, only that they are within the bounds of the array.
  */
 size_t
-ServerList::isize() const
+ServerList::isize(const Lock& lock) const
 {
     return serverList.size();
 }
@@ -85,9 +87,9 @@ ServerList::isize() const
  * false.
  */
 ServerId
-ServerList::operator[](uint32_t index)
+ServerList::operator[](uint32_t index) const
 {
-    Lock lock(mutex);
+    Lock _(mutex);
     if (index >= serverList.size() || !serverList[index])
         return ServerId(/* invalid id */);
     return serverList[index]->serverId;

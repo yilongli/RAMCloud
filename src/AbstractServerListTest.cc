@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2015 Stanford University
+/* Copyright (c) 2012-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -50,11 +50,12 @@ class AbstractServerListSubClass : public AbstractServerList {
     }
 
     ServerDetails*
-    iget(ServerId id)
+    iget(const Lock& lock, ServerId id) const
     {
         uint32_t index = id.indexNumber();
         if (index < servers.size()) {
-            ServerDetails* details = &servers[index];
+            ServerDetails* details = const_cast<ServerDetails*>(
+                    &servers[index]);
             if (details->serverId == id)
                 return details;
         }
@@ -62,19 +63,20 @@ class AbstractServerListSubClass : public AbstractServerList {
     }
 
     ServerDetails*
-    iget(uint32_t index) {
-        return &(servers.at(index));
+    iget(const Lock& lock, uint32_t index) const {
+        return const_cast<ServerDetails*>(&(servers.at(index)));
     }
 
     size_t
-    isize() const {
+    isize(const Lock& lock) const {
         return servers.size();
     }
 
     ServerId
     add(string locator, ServerStatus status,
             ServiceMask services = ServiceMask{WireFormat::MASTER_SERVICE}) {
-        ServerId id(downCast<uint32_t>(isize()), 0);
+        Lock lock(mutex);
+        ServerId id(downCast<uint32_t>(isize(lock)), 0);
 
         ServerDetails sd;
         sd.serverId = id;
@@ -162,8 +164,11 @@ TEST_F(AbstractServerListTest, isUp) {
     EXPECT_FALSE(sl.isUp(ServerId(1, 0)));
     ServerId id1 = sl.add("mock::2", ServerStatus::UP);
     ServerId id2 = sl.add("mock::3", ServerStatus::REMOVE);
-    EXPECT_TRUE(sl.iget(id1) != NULL);
-    EXPECT_TRUE(sl.iget(id2) != NULL);
+    {
+        AbstractServerList::Lock lock(sl.mutex);
+        EXPECT_TRUE(sl.iget(lock, id1) != NULL);
+        EXPECT_TRUE(sl.iget(lock, id2) != NULL);
+    }
     EXPECT_TRUE(sl.isUp(id1));
     EXPECT_FALSE(sl.isUp(ServerId(1, 2)));
     EXPECT_FALSE(sl.isUp(ServerId(2, 0)));

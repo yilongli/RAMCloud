@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2012 Stanford University
+/* Copyright (c) 2011-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -51,11 +51,12 @@ class ServerListTest : public ::testing::Test {
 
 TEST_F(ServerListTest, iget_serverId) {
     sl.testingAdd({{5, 2}, "mock:id=5", {}, 100, ServerStatus::UP});
-    EXPECT_TRUE(sl.iget({10, 0}) == NULL);
-    EXPECT_TRUE(sl.iget({2, 0}) == NULL);
-    EXPECT_TRUE(sl.iget({5, 1}) == NULL);
-    EXPECT_TRUE(sl.iget({5, 2}) != NULL);
-    EXPECT_EQ("mock:id=5", sl.iget({5, 2})->serviceLocator);
+    ServerList::Lock lock(sl.mutex);
+    EXPECT_TRUE(sl.iget(lock, {10, 0}) == NULL);
+    EXPECT_TRUE(sl.iget(lock, {2, 0}) == NULL);
+    EXPECT_TRUE(sl.iget(lock, {5, 1}) == NULL);
+    EXPECT_TRUE(sl.iget(lock, {5, 2}) != NULL);
+    EXPECT_EQ("mock:id=5", sl.iget(lock, {5, 2})->serviceLocator);
 }
 
 TEST_F(ServerListTest, indexOperator) {

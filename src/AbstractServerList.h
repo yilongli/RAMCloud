@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2013 Stanford University
+/* Copyright (c) 2011-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -233,13 +233,13 @@ class AbstractServerList {
     explicit AbstractServerList(Context* context);
     virtual ~AbstractServerList();
 
-    virtual bool contains(ServerId id);
-    string getLocator(ServerId id);
-    ServerStatus getStatus(ServerId id);
+    virtual bool contains(ServerId id) const;
+    string getLocator(ServerId id) const;
+    ServerStatus getStatus(ServerId id) const;
     void flushSession(ServerId id);
     Transport::SessionRef getSession(ServerId id);
     uint64_t getVersion() const;
-    bool isUp(ServerId id);
+    bool isUp(ServerId id) const;
     size_t size() const;
     ServerId nextServer(ServerId prev, ServiceMask services,
             bool* end = NULL, bool includeCrashed = false);
@@ -256,37 +256,44 @@ class AbstractServerList {
     // this definition).
     virtual void serverCrashed(ServerId serverId) { }
 
-    string toString(ServerId serverId);
+    string toString(ServerId serverId) const;
     static string toString(ServerStatus status);
-    string toString();
+    string toString() const;
 
   PROTECTED:
-    /// Internal Use Only - Does not grab locks
+    /// Monitor-style lock
+    typedef std::unique_lock<std::mutex> Lock;
 
     /**
      * Retrieve the ServerDetails for the given server, or NULL if there
      * is no server with that id.
      *
+     * \param lock
+     *      Ensures that the caller holds the monitor lock; not actually used.
      * \param id
      *      Identifies the desired server.
      */
-    virtual ServerDetails* iget(ServerId id) = 0;
+    virtual ServerDetails* iget(const Lock& lock, ServerId id) const = 0;
 
     /**
      * Retrieve the ServerDetails stored in the underlying subclass storage
      * at \a index, or NULL if there is no active server in that slot.
      *
+     * \param lock
+     *      Ensures that the caller holds the monitor lock; not actually used.
      * \param index
      *      Index into table of server entries.
      */
-    virtual ServerDetails* iget(uint32_t index) = 0;
+    virtual ServerDetails* iget(const Lock& lock, uint32_t index) const = 0;
 
     /**
      * Return the number of valid indexes in the list
      *
+     * \param lock
+     *      Ensures that the caller holds the monitor lock; not actually used.
      * \return size_t - number of valid indexes.
      */
-    virtual size_t isize() const = 0;
+    virtual size_t isize(const Lock& lock) const = 0;
 
     /// Shared RAMCloud information.
     Context* context;
@@ -314,8 +321,6 @@ class AbstractServerList {
     /// on the ServerId map. A Lock for this mutex MUST be held to read or
     /// modify any state in the server list.
     mutable std::mutex mutex;
-
-    typedef std::unique_lock<std::mutex> Lock;
 
     /**
      * The following variable is set to true during unit tests to skip

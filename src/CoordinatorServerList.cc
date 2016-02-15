@@ -541,13 +541,13 @@ CoordinatorServerList::setMasterRecoveryInfo(
 //////////////////////////////////////////////////////////////////////
 
 ServerDetails*
-CoordinatorServerList::iget(ServerId id)
+CoordinatorServerList::iget(const Lock& lock, ServerId id) const
 {
     return getEntry(id);
 }
 
 ServerDetails*
-CoordinatorServerList::iget(uint32_t index)
+CoordinatorServerList::iget(const Lock& lock, uint32_t index) const
 {
     return getEntry(index);
 }
@@ -557,7 +557,7 @@ CoordinatorServerList::iget(uint32_t index)
  * that they're occupied, only that they are within the bounds of the array.
  */
 size_t
-CoordinatorServerList::isize() const
+CoordinatorServerList::isize(const Lock& lock) const
 {
     return serverList.size();
 }
@@ -752,7 +752,7 @@ CoordinatorServerList::createReplicationGroups(const Lock& lock)
     // and are up. Note that this is a performance optimization and is not
     // required for correctness.
     vector<ServerId> freeBackups;
-    for (size_t i = 0; i < isize(); i++) {
+    for (size_t i = 0; i < isize(lock); i++) {
         if (serverList[i].entry &&
             serverList[i].entry->isBackup() &&
             serverList[i].entry->replicationId == 0) {
@@ -791,7 +791,7 @@ CoordinatorServerList::removeReplicationGroup(const Lock& lock,
     if (groupId == 0) {
         return;
     }
-    for (size_t i = 0; i < isize(); i++) {
+    for (size_t i = 0; i < isize(lock); i++) {
         if (serverList[i].entry &&
                 serverList[i].entry->isBackup() &&
                 serverList[i].entry->replicationId == groupId) {
@@ -823,7 +823,7 @@ CoordinatorServerList::repairReplicationGroups(const Lock& lock)
 
     // Scan through all of the servers to compute the number of servers
     // in each group.
-    for (size_t i = 0; i < isize(); i++) {
+    for (size_t i = 0; i < isize(lock); i++) {
         if (serverList[i].entry) {
             Entry* entry = serverList[i].entry.get();
             if (entry->isBackup() && entry->replicationId != 0) {

@@ -300,10 +300,9 @@ class CoordinatorServerList : public AbstractServerList{
         }
     };
 
-    /// Internal Use Only - Does not grab locks
-    ServerDetails* iget(ServerId id);
-    ServerDetails* iget(uint32_t index);
-    size_t isize() const;
+    ServerDetails* iget(const Lock& lock, ServerId id) const;
+    ServerDetails* iget(const Lock& lock, uint32_t index) const;
+    size_t isize(const Lock& lock) const;
 
     /// Functions related to modifying the server list
     uint32_t firstFreeIndex(const Lock& lock);

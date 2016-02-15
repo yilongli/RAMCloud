@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2012 Stanford University
+/* Copyright (c) 2011-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -47,14 +47,13 @@ class ServerList : public AbstractServerList {
     explicit ServerList(Context* context);
     ~ServerList();
 
-    ServerId operator[](uint32_t indexNumber);
+    ServerId operator[](uint32_t indexNumber) const;
     uint64_t applyServerList(const ProtoBuf::ServerList& list);
 
   PROTECTED:
-    /// Internal Use Only - Does not grab locks
-    ServerDetails* iget(ServerId id);
-    ServerDetails* iget(uint32_t index);
-    size_t isize() const;
+    virtual ServerDetails* iget(const Lock& lock, ServerId id) const;
+    virtual ServerDetails* iget(const Lock& lock, uint32_t index) const;
+    virtual size_t isize(const Lock& lock) const;
 
     /// Slots in the server list.
     std::vector<Tub<ServerDetails>> serverList;

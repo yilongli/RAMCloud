@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2015 Stanford University
+/* Copyright (c) 2011-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -68,10 +68,10 @@ AbstractServerList::~AbstractServerList()
  *      An exception is thrown if this ServerId is not in the list.
  */
 string
-AbstractServerList::getLocator(ServerId id)
+AbstractServerList::getLocator(ServerId id) const
 {
-    Lock _(mutex);
-    ServerDetails* details = iget(id);
+    Lock lock(mutex);
+    ServerDetails* details = iget(lock, id);
     if (details != NULL)
         return details->serviceLocator;
 
@@ -94,9 +94,9 @@ AbstractServerList::getLocator(ServerId id)
  *      and been fully recovered).
  */
 ServerStatus
-AbstractServerList::getStatus(ServerId id) {
-    Lock _(mutex);
-    ServerDetails* details = iget(id);
+AbstractServerList::getStatus(ServerId id) const {
+    Lock lock(mutex);
+    ServerDetails* details = iget(lock, id);
     if (details == NULL) {
         return ServerStatus::REMOVE;
     }
@@ -114,9 +114,9 @@ AbstractServerList::getStatus(ServerId id) {
  *      list and its state is "up"; returns false otherwise.
  */
 bool
-AbstractServerList::isUp(ServerId id) {
-    Lock _(mutex);
-    ServerDetails* details = iget(id);
+AbstractServerList::isUp(ServerId id) const {
+    Lock lock(mutex);
+    ServerDetails* details = iget(lock, id);
     return (details != NULL) && (details->status == ServerStatus::UP);
 }
 
@@ -138,8 +138,8 @@ AbstractServerList::getSession(ServerId id)
     // opened for it.
     string locator;
     {
-        Lock _(mutex);
-        ServerDetails* details = iget(id);
+        Lock lock(mutex);
+        ServerDetails* details = iget(lock, id);
         if ((details == NULL) || (details->status != ServerStatus::UP))
             return FailSession::get();
         if (details->session != NULL)
@@ -190,8 +190,8 @@ AbstractServerList::getSession(ServerId id)
     // list, assuming this ServerId is still valid and no one else has put a
     // session there first.
     {
-        Lock _(mutex);
-        ServerDetails* details = iget(id);
+        Lock lock(mutex);
+        ServerDetails* details = iget(lock, id);
         if (details == NULL)
             return FailSession::get();
         if (details->session == NULL)
@@ -210,8 +210,8 @@ AbstractServerList::getSession(ServerId id)
 void
 AbstractServerList::flushSession(ServerId id)
 {
-    Lock _(mutex);
-    ServerDetails* details = iget(id);
+    Lock lock(mutex);
+    ServerDetails* details = iget(lock, id);
     if (details != NULL) {
         details->session = NULL;
         RAMCLOUD_TEST_LOG("flushed session for id %s", id.toString().c_str());
@@ -224,10 +224,9 @@ AbstractServerList::flushSession(ServerId id)
  * rather than having to try and catch around the index operator.
  */
 bool
-AbstractServerList::contains(ServerId id) {
-    Lock _(mutex);
-
-    return iget(id) != NULL;
+AbstractServerList::contains(ServerId id) const {
+    Lock lock(mutex);
+    return iget(lock, id) != NULL;
 }
 
 /**
@@ -265,10 +264,10 @@ ServerId
 AbstractServerList::nextServer(ServerId prev, ServiceMask services,
         bool* end, bool includeCrashed)
 {
-    Lock _(mutex);
+    Lock lock(mutex);
     uint32_t startIndex = prev.isValid() ? prev.indexNumber() : -1U;
     uint32_t index = startIndex;
-    size_t size = isize();
+    size_t size = isize(lock);
     if (end != NULL)
         *end = false;
 
@@ -282,7 +281,7 @@ AbstractServerList::nextServer(ServerId prev, ServiceMask services,
             if (size == 0)
                 break;
         }
-        ServerDetails* details = iget(index);
+        ServerDetails* details = iget(lock, index);
         if ((details != NULL)
                 && ((details->status == ServerStatus::UP) || includeCrashed)
                 && details->services.hasAll(services)) {
@@ -310,7 +309,7 @@ AbstractServerList::nextServer(ServerId prev, ServiceMask services,
 void
 AbstractServerList::registerTracker(ServerTrackerInterface& tracker)
 {
-    Lock _(mutex);
+    Lock lock(mutex);
 
     if (isBeingDestroyed)
         throw ServerListException(HERE, "ServerList has entered its destruction"
@@ -327,8 +326,8 @@ AbstractServerList::registerTracker(ServerTrackerInterface& tracker)
     trackers.push_back(&tracker);
     tracker.setParent(this);
 
-    for (uint32_t n = 0; n < isize(); n++)  {
-        const ServerDetails* server = iget(n);
+    for (uint32_t n = 0; n < isize(lock); n++)  {
+        ServerDetails* server = iget(lock, n);
         if (!server)
             continue;
         tracker.enqueueChange(*server, server->status == ServerStatus::UP ?
@@ -379,8 +378,8 @@ AbstractServerList::getVersion() const
 size_t
 AbstractServerList::size() const
 {
-    Lock _(mutex);
-    return isize();
+    Lock lock(mutex);
+    return isize(lock);
 }
 
 /**
@@ -394,7 +393,7 @@ AbstractServerList::size() const
  *      ServerId.
  */
 string
-AbstractServerList::toString(ServerId id)
+AbstractServerList::toString(ServerId id) const
 {
     string locator;
     try {
@@ -436,13 +435,13 @@ AbstractServerList::toString(ServerStatus status)
  *      The string representing the contents of the list.
  */
 string
-AbstractServerList::toString()
+AbstractServerList::toString() const
 {
     Lock lock(mutex);
 
     string result;
-    for (uint32_t n = 0; n < isize(); n++) {
-        ServerDetails* server = iget(n);
+    for (uint32_t n = 0; n < isize(lock); n++) {
+        ServerDetails* server = iget(lock, n);
         if (!server)
             continue;
 
