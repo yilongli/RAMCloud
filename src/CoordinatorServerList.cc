@@ -1,4 +1,4 @@
-/* Copyright (c) 2011-2015 Stanford University
+/* Copyright (c) 2011-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -916,8 +916,8 @@ CoordinatorServerList::insertUpdate(const Lock& lock, Entry* entry,
 
 /**
  * Stops the background updater. It cancel()'s all pending update rpcs
- * and leaves the cluster potentially out-of-date. To force a
- * synchronization point before halting, call sync() first.
+ * and leaves the cluster potentially out-of-date. To force a synchronization
+ * point before halting, call sync() first. Intended for testing only.
  *
  * This will block until the updater thread stops.
  */
@@ -925,10 +925,11 @@ void
 CoordinatorServerList::haltUpdater()
 {
     // Signal stop
-    Lock lock(mutex);
-    stopUpdater = true;
-    hasUpdatesOrStop.notify_one();
-    lock.unlock();
+    {
+        Lock _(mutex);
+        stopUpdater = true;
+        hasUpdatesOrStop.notify_one();
+    }
 
     // Wait for Thread stop
     if (updaterThread && updaterThread->joinable()) {
@@ -1090,10 +1091,20 @@ void
 CoordinatorServerList::updateLoop()
 {
     try {
-        while (!stopUpdater) {
+        while (true) {
             checkUpdates();
             if (activeRpcs.empty()) {
-                waitForWork();
+                // Wait (sleep) for more work to do or the instruction to stop
+                // the updater thread
+                Lock lock(mutex);
+                while (maxConfirmedVersion == version && !stopUpdater) {
+                    updaterSleeping = true;
+                    hasUpdatesOrStop.wait(lock);
+                    updaterSleeping = false;
+                }
+                if (stopUpdater) {
+                    break;
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -1104,22 +1115,6 @@ CoordinatorServerList::updateLoop()
         throw;
     }
     TEST_LOG("Updater exited");
-}
-
-/**
- * Invoked by the updater thread to wait (sleep) until there are
- * more updates.
- */
-void
-CoordinatorServerList::waitForWork()
-{
-    Lock lock(mutex);
-
-    while (maxConfirmedVersion == version && !stopUpdater) {
-        updaterSleeping = true;
-        hasUpdatesOrStop.wait(lock);
-        updaterSleeping = false;
-    }
 }
 
 /**
