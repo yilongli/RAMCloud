@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2015 Stanford University
+/* Copyright (c) 2010-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -46,8 +46,9 @@ namespace RAMCloud {
  *    (i.e. use the Tub's boolean to determine that an argument was passed,
  *    rather than checking arg != NULL).
  *
- * Tub is CopyConstructible if and only if ElementType is CopyConstructible,
- * and Tub is Assignable if and only if ElementType is Assignable.
+ * Tub is CopyConstructible(MoveConstructible) if and only if ElementType is
+ * CopyConstructible(MoveConstructible), and Tub is (Move)Assignable if and
+ * only if ElementType is (Move)Assignable.
  *
  * \tparam ElementType
  *      The type of the object to be stored within the Tub.
@@ -96,6 +97,22 @@ class Tub {
     }
 
     /**
+     * Move constructor.
+     * The object will be initialized if and only if the source of the move is
+     * initialized.
+     * \pre
+     *      ElementType is MoveConstructible.
+     * \param other
+     *      Source of the move.
+     */
+    Tub(Tub<ElementType>&& other) // NOLINT
+        : occupied(false)
+    {
+        if (other.occupied)
+            construct(std::move(*other.object)); // use ElementType's move constructor
+    }
+
+    /**
      * Destructor: destroy the object if it was initialized.
      */
     ~Tub() {
@@ -113,16 +130,31 @@ class Tub {
         if (this != &other) {
             if (other.occupied) {
                 if (occupied) {
-#if __GNUC__ && __GNUC__ >= 4 && __GNUC_MINOR__ >= 7
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds"
-#endif
                     *object = *other.object; // use ElementType's assignment
-#if __GNUC__ && __GNUC__ >= 4 && __GNUC_MINOR__ >= 7
-#pragma GCC diagnostic pop
-#endif
                 } else {
                     construct(*other.object);
+                }
+            } else {
+                destroy();
+            }
+        }
+        return *this;
+    }
+
+    /**
+     * Move assignment: destroy current object if initialized, replace with
+     * source.  Result will be uninitialized if source is uninitialized.
+     * \pre
+     *      ElementType is MoveAssignable.
+     */
+    Tub<ElementType>&
+    operator=(Tub<ElementType>&& other) {
+        if (this != &other) {
+            if (other.occupied) {
+                if (occupied) {
+                    *object = std::move(*other.object); // use ElementType's move assignment
+                } else {
+                    construct(std::move(*other.object)); // use ElementType's move constructor
                 }
             } else {
                 destroy();

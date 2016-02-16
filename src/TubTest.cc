@@ -1,4 +1,4 @@
-/* Copyright (c) 2010 Stanford University
+/* Copyright (c) 2010-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -97,6 +97,23 @@ TEST(Tub, copyAndAssign) {
     // Assignment to a tub with an unconstructed value needs
     // to use the copy constructor instead of assignment operator.
     b1 = b2;
+}
+
+TEST(Tub, moveAndAssign) {
+    IntTub x;
+    x.construct(5);
+    IntTub y;
+    y = std::move(x);
+    EXPECT_EQ(5, *y);
+    IntTub z(std::move(y));
+    EXPECT_EQ(5, *z);
+
+    Tub<std::vector<int>> b1;
+    b1.construct();
+    for (int i : {1, 2, 3})
+        b1->push_back(i);
+    Tub<std::vector<int>> b2(std::move(b1));
+    EXPECT_EQ(6, (*b2)[0] + (*b2)[1] + (*b2)[2]);
 }
 
 TEST(Tub, putInVector) {
