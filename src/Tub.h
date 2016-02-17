@@ -96,6 +96,22 @@ class Tub {
     }
 
     /**
+     * Move constructor.
+     * The object will be initialized if and only if the source of the move is
+     * initialized.
+     * \pre
+     *      ElementType is MoveConstructible.
+     * \param other
+     *      Source of the move.
+     */
+    Tub(Tub<ElementType>&& other) // NOLINT
+        : occupied(false)
+    {
+        if (other.occupied)
+            construct(std::move(*other.object)); // use ElementType's move constructor
+    }
+
+    /**
      * Destructor: destroy the object if it was initialized.
      */
     ~Tub() {

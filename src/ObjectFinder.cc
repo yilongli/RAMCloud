@@ -32,10 +32,6 @@ class RealTableConfigFetcher : public ObjectFinder::TableConfigFetcher {
         , outstandingRpcs()
     {}
 
-    ~RealTableConfigFetcher() {
-        clear();
-    }
-
     void clear() {
         outstandingRpcs.clear();
     }
@@ -72,7 +68,7 @@ class RealTableConfigFetcher : public ObjectFinder::TableConfigFetcher {
                 outstandingRpcs.find(tableId);
         if (iter == outstandingRpcs.end()) {
             outstandingRpcs.emplace(tableId, Tub<GetTableConfigRpc>());
-            rpc = outstandingRpcs[tableId].construct();
+            rpc = outstandingRpcs[tableId].construct(context, tableId);
         } else {
             rpc = iter->second.get();
         }
