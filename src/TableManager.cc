@@ -651,7 +651,7 @@ TableManager::reassignTabletOwnership(
             || (tablet->endKeyHash != endKeyHash))
         throw NoSuchTablet(HERE);
     if (tablet->serverId == newOwner) {
-        RAMCLOUD_LOG(NOTICE, "Ownership of tablet [0x%lx,0x%lx] in table '%lu'"
+        RAMCLOUD_LOG(NOTICE, "Ownership of tablet [0x%lx,0x%lx] in tableId %lu"
                 " already transfered", startKeyHash, endKeyHash, tableId);
         return;
     }

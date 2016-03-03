@@ -442,6 +442,12 @@ TEST_F(TableManagerTest, reassignTabletOwnership_basics) {
     TestLog::reset();
     TestLog::Enable _("reassignTabletOwnership");
 
+    tableManager->reassignTabletOwnership(ServerId(1), 1, 0, 0x7fffffffffffffff,
+                99, 100);
+    EXPECT_EQ("reassignTabletOwnership: Ownership of tablet "
+            "[0x0,0x7fffffffffffffff] in tableId 1 already transfered",
+            TestLog::get());
+
     tableManager->reassignTabletOwnership(ServerId(2), 1, 0, 0x7fffffffffffffff,
                 99, 100);
     EXPECT_EQ("reassignTabletOwnership: Reassigning tablet "
