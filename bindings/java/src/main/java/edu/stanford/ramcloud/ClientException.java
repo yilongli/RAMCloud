@@ -91,7 +91,7 @@ public class ClientException extends RuntimeException {
                 throw new RequestTooLargeException();
             case STATUS_UNKNOWN_INDEXLET:
                 throw new UnknownIndexletException();
-            case STATUS_UNKNOWN_INDEX:
+            case STATUS_INDEX_DOESNT_EXIST:
                 throw new UnknownIndexException();
             case STATUS_INVALID_PARAMETER:
                 throw new InvalidParameterException();
