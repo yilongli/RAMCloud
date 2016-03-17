@@ -55,7 +55,6 @@ main(int argc, char *argv[])
     bool reset;
     bool neverKill;
     Context context(true);
-    CoordinatorServerList serverList(&context);
     try {
         OptionsDescription coordinatorOptions("Coordinator");
         coordinatorOptions.add_options()

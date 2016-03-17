@@ -148,9 +148,6 @@ TEST_F(ServerIdRpcWrapperTest, handleTransportError_nonexistentServer) {
 }
 
 TEST_F(ServerIdRpcWrapperTest, handleTransportError_callServerCrashed) {
-    // Set up a CoordinatorServerList, which requires a CoordinatorService.
-    CoordinatorServerList serverList(&context);
-    context.serverList = &serverList;
     MockExternalStorage storage(false);
     context.externalStorage = &storage;
     CoordinatorService coordinator(&context, 1000, true);
@@ -158,9 +155,10 @@ TEST_F(ServerIdRpcWrapperTest, handleTransportError_callServerCrashed) {
 
     // Don't let the server list updater run; can cause timing-dependent
     // crashes due to order dependencies among destructors.
-    serverList.haltUpdater();
+    context.coordinatorServerList->haltUpdater();
 
-    id = serverList.enlistServer({WireFormat::MASTER_SERVICE}, 0, 100, "mock:");
+    id = context.coordinatorServerList->enlistServer(
+            {WireFormat::MASTER_SERVICE}, 0, 100, "mock:");
     ServerIdRpcWrapper wrapper(&context, id, 4);
     wrapper.request.fillFromString("100");
     wrapper.send();
