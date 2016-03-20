@@ -17,7 +17,6 @@
 #include "CoordinatorService.h"
 #include "IndexKey.h"
 #include "Logger.h"
-#include "MasterClient.h"
 #include "ShortMacros.h"
 #include "TableManager.h"
 #include "TableManager.pb.h"
@@ -34,7 +33,7 @@ namespace RAMCloud {
  */
 TableManager::TableManager(Context* context,
         CoordinatorUpdateManager* updateManager)
-    : mutex()
+    : mutex("TableManager")
     , context(context)
     , updateManager(updateManager)
     , nextTableId(1)
@@ -42,6 +41,10 @@ TableManager::TableManager(Context* context,
     , directory()
     , idMap()
     , backingTableMap()
+    , incompleteUpdates()
+    , outstandingDropTabletOwnershipRpcs()
+    , outstandingSplitMasterTabletRpc()
+    , outstandingTakeTabletOwnershipRpcs()
 {
     context->tableManager = this;
 }
@@ -64,7 +67,7 @@ TableManager::~TableManager()
  */
 TableManager::Table::~Table()
 {
-    foreach (Tablet* tablet, tablets) {
+    for (Tablet* tablet : tablets) {
         delete tablet;
     }
 
@@ -80,7 +83,7 @@ TableManager::Table::~Table()
  */
 TableManager::Index::~Index()
 {
-    foreach (Indexlet* indexlet, indexlets) {
+    for (Indexlet* indexlet : indexlets) {
         delete indexlet;
     }
 }
@@ -355,7 +358,7 @@ TableManager::debugString(bool shortForm)
             result += format("Table { name: %s, id %lu,", table->name.c_str(),
                     table->id);
         }
-        foreach (Tablet* tablet, table->tablets) {
+        for (Tablet* tablet : table->tablets) {
             if (shortForm) {
                 result += format(" { 0x%lx-0x%lx on %s }",
                         tablet->startKeyHash, tablet->endKeyHash,
@@ -546,7 +549,7 @@ TableManager::indexletRecovered(
     Index* index = table->indexMap[indexId];
 
     bool foundIndexlet = 0;
-    foreach (Indexlet* indexlet, index->indexlets) {
+    for (Indexlet* indexlet : index->indexlets) {
         if ((indexlet->firstKeyLength == firstKeyLength)
            &&(indexlet->firstNotOwnedKeyLength == firstNotOwnedKeyLength)
            &&(bcmp(indexlet->firstKey, firstKey, firstKeyLength) == 0)
@@ -599,7 +602,7 @@ TableManager::markAllTabletsRecovering(ServerId serverId)
     for (Directory::iterator it = directory.begin(); it != directory.end();
             ++it) {
         Table* table = it->second;
-        foreach (Tablet* tablet, table->tablets) {
+        for (Tablet* tablet : table->tablets) {
             if (tablet->serverId == serverId) {
                 tablet->status = Tablet::RECOVERING;
                 results.push_back(*tablet);
@@ -683,6 +686,7 @@ TableManager::reassignTabletOwnership(
 
     // Finish up by notifying the relevant master.
     notifyReassignTablet(lock, &externalInfo);
+    waitForReassignTabletRpc(lock, &externalInfo);
     updateManager->updateFinished(externalInfo.sequence_number());
 }
 
@@ -717,7 +721,7 @@ TableManager::recover(uint64_t lastCompletedUpdate)
 
     // Each iteration through the following loop processes the metadata
     // for one table.
-    foreach (ExternalStorage::Object& object, objects) {
+    for (const ExternalStorage::Object& object : objects) {
         // First, parse the protocol buffer containing the table's metadata
         if (object.value == NULL)
             continue;
@@ -750,18 +754,28 @@ TableManager::recover(uint64_t lastCompletedUpdate)
         // Check for each possible update and clean up appropriately.
         if (info.has_created()) {
             notifyCreate(lock, table);
+            incompleteUpdates.emplace_back(
+                    IncompleteUpdate::NOTIFY_CREATE, info);
         }
         if (info.has_deleted()) {
             notifyDropTable(lock, &info);
+            incompleteUpdates.emplace_back(
+                    IncompleteUpdate::NOTIFY_DROP_TABLE, info);
         }
         if (info.has_split()) {
             notifySplitTablet(lock, &info);
+            incompleteUpdates.emplace_back(
+                    IncompleteUpdate::NOTIFY_SPLIT_TABLET, info);
         }
         if (info.has_reassign()) {
             notifyReassignTablet(lock, &info);
+            incompleteUpdates.emplace_back(
+                    IncompleteUpdate::NOTIFY_REASSIGN_TABLET, info);
         }
     }
-    LOG(NOTICE, "Table recovery complete: %lu table(s)", directory.size());
+    if (incompleteUpdates.empty()) {
+        LOG(NOTICE, "Table recovery complete: %lu table(s)", directory.size());
+    }
 }
 
 /**
@@ -785,7 +799,7 @@ TableManager::serializeTableConfig(ProtoBuf::TableConfig* tableConfig,
     Table* table = it->second;
 
     // filling tablets
-    foreach (Tablet* tablet, table->tablets) {
+    for (Tablet* tablet : table->tablets) {
         ProtoBuf::TableConfig::Tablet& entry(*tableConfig->add_tablet());
         tablet->serialize((ProtoBuf::Tablets::Tablet&)entry);
         try {
@@ -811,7 +825,7 @@ TableManager::serializeTableConfig(ProtoBuf::TableConfig* tableConfig,
         index_entry.set_index_type(index->indexType);
 
         // filling indexlets
-        foreach (Indexlet* indexlet, index->indexlets) {
+        for (Indexlet* indexlet : index->indexlets) {
             ProtoBuf::TableConfig::Index::Indexlet&
                    entry(*index_entry.add_indexlet());
             if (indexlet->firstKey != NULL) {
@@ -895,6 +909,7 @@ TableManager::splitTablet(const char* name, uint64_t splitKeyHash)
 
     // Finish up by notifying the relevant master.
     notifySplitTablet(lock, &externalInfo);
+    waitForSplitTabletRpc(lock, &externalInfo);
     updateManager->updateFinished(externalInfo.sequence_number());
 }
 
@@ -1089,6 +1104,7 @@ TableManager::createTable(const Lock& lock, const char* name,
 
     // Now notify all the masters about their new table assignments.
     notifyCreate(lock, table);
+    waitForTakeTabletRpcs(lock, table);
     updateManager->updateFinished(externalInfo.sequence_number());
     return table->id;
 }
@@ -1126,7 +1142,7 @@ TableManager::dropIndex(const Lock& lock, uint64_t tableId, uint8_t indexId)
     }
 
     Index* index = table->indexMap[indexId];
-    foreach (Indexlet* indexlet, index->indexlets) {
+    for (Indexlet* indexlet : index->indexlets) {
         backingTableMap.erase(indexlet->backingTableId);
     }
 
@@ -1200,6 +1216,7 @@ TableManager::dropTable(const Lock& lock, const char* name)
     idMap.erase(table->id);
     delete table;
     notifyDropTable(lock, &externalInfo);
+    waitForDropTabletRpcs(lock, &externalInfo);
     updateManager->updateFinished(externalInfo.sequence_number());
 }
 
@@ -1222,7 +1239,7 @@ TableManager::Indexlet*
 TableManager::findIndexlet(const Lock& lock, Index* index,
         const void* key, uint16_t keyLength)
 {
-    foreach (Indexlet* indexlet, index->indexlets) {
+    for (Indexlet* indexlet : index->indexlets) {
         if ((IndexKey::keyCompare(key, keyLength,
                 indexlet->firstKey, indexlet->firstKeyLength) >= 0) &&
             (IndexKey::keyCompare(key, keyLength,
@@ -1253,7 +1270,7 @@ TableManager::findIndexlet(const Lock& lock, Index* index,
 Tablet*
 TableManager::findTablet(const Lock& lock, Table* table, uint64_t keyHash)
 {
-    foreach (Tablet* tablet, table->tablets) {
+    for (Tablet* tablet : table->tablets) {
         if ((tablet->startKeyHash <= keyHash) &&
                 (tablet->endKeyHash >= keyHash)) {
             return tablet;
@@ -1277,25 +1294,17 @@ TableManager::findTablet(const Lock& lock, Table* table, uint64_t keyHash)
  *      Newly created table; notify the master for each tablet.
  */
 void
-TableManager::notifyCreate(const Lock& lock, Table* table)
+TableManager::notifyCreate(const Lock& lock, const Table* table)
 {
-    foreach (Tablet* tablet, table->tablets) {
-        try {
-            LOG(NOTICE, "Assigning table id %lu, key hashes 0x%lx-0x%lx, to "
-                    "master %s",
-                    table->id, tablet->startKeyHash, tablet->endKeyHash,
-                    tablet->serverId.toString().c_str());
-            MasterClient::takeTabletOwnership(context, tablet->serverId,
-                    tablet->tableId, tablet->startKeyHash, tablet->endKeyHash);
-        } catch (ServerNotUpException& e) {
-            // The master is apparently crashed. In that case, we can just
-            // ignore this master; this tablet will be reinstated elsewhere
-            // as part of recovering the master.
-            LOG(NOTICE, "takeTabletOwnership skipped for master %s (table %lu, "
-                    "key hashes 0x%lx-0x%lx) because server isn't running",
-                    tablet->serverId.toString().c_str(), table->id,
-                    tablet->startKeyHash, tablet->endKeyHash);
-        }
+    waitForRecoveryDone(lock);
+    for (Tablet* tablet : table->tablets) {
+        LOG(NOTICE, "Assigning table id %lu, key hashes 0x%lx-0x%lx, to "
+                "master %s",
+                table->id, tablet->startKeyHash, tablet->endKeyHash,
+                tablet->serverId.toString().c_str());
+        outstandingTakeTabletOwnershipRpcs.push_back(new TakeTabletOwnershipRpc(
+                context, tablet->serverId, tablet->tableId,
+                tablet->startKeyHash, tablet->endKeyHash));
     }
 }
 
@@ -1312,21 +1321,31 @@ TableManager::notifyCreate(const Lock& lock, Table* table)
 void
 TableManager::notifyCreateIndex(const Lock& lock, Index* index)
 {
-    foreach (Indexlet* indexlet, index->indexlets) {
+    waitForRecoveryDone(lock);
+    std::vector<TakeIndexletOwnershipRpc*> rpcs;
+    for (Indexlet* indexlet : index->indexlets) {
+        LOG(NOTICE, "Assigning table id %lu index id %u, "
+                "to master %s", index->tableId, index->indexId,
+                indexlet->serverId.toString().c_str());
+        rpcs.push_back(new TakeIndexletOwnershipRpc(context,
+                indexlet->serverId, index->tableId, index->indexId,
+                indexlet->backingTableId, indexlet->firstKey,
+                indexlet->firstKeyLength, indexlet->firstNotOwnedKey,
+                indexlet->firstNotOwnedKeyLength));
+    }
+
+    int i = 0;
+    for (Indexlet* indexlet : index->indexlets) {
         try {
-            LOG(NOTICE, "Assigning table id %lu index id %u, "
-                        "to master %s", index->tableId, index->indexId,
-                        indexlet->serverId.toString().c_str());
-            MasterClient::takeIndexletOwnership(context, indexlet->serverId,
-                index->tableId, index->indexId, indexlet->backingTableId,
-                indexlet->firstKey, indexlet->firstKeyLength,
-                indexlet->firstNotOwnedKey, indexlet->firstNotOwnedKeyLength);
-        } catch (ServerNotUpException& e) {
-            LOG(NOTICE, "takeIndexletOwnership skipped for master %s "
-                    "(table %lu, index %u) because server isn't running",
-                    indexlet->serverId.toString().c_str(),
-                    index->tableId, index->indexId);
+            rpcs[i]->wait();
+        } catch (const ServerNotUpException& e) {
+            LOG(NOTICE, "takeIndexletOwnership skipped for master %s (table "
+                    "%lu, index %u) because server isn't running",
+                    indexlet->serverId.toString().c_str(), index->tableId,
+                    index->indexId);
         }
+        delete rpcs[i];
+        i++;
     }
 }
 
@@ -1347,42 +1366,20 @@ TableManager::notifyCreateIndex(const Lock& lock, Index* index)
 void
 TableManager::notifyDropTable(const Lock& lock, ProtoBuf::Table* info)
 {
+    waitForRecoveryDone(lock);
     // Notify all of the masters storing tablets for the table.
     int numTablets = info->tablet_size();
     for (int i = 0; i < numTablets; i++) {
-        const ProtoBuf::Table::Tablet& tablet = info->tablet(i);
-        ServerId serverId(tablet.server_id());
-        try {
-            LOG(NOTICE, "Requesting master %s to drop table id %lu, "
-                    "key hashes 0x%lx-0x%lx",
-                    serverId.toString().c_str(), info->id(),
-                    tablet.start_key_hash(), tablet.end_key_hash());
-            MasterClient::dropTabletOwnership(context, serverId,
-                    info->id(), tablet.start_key_hash(), tablet.end_key_hash());
-        } catch (ServerNotUpException& e) {
-            // The master has apparently crashed. This is benign (a dead
-            // master can't continue serving the tablet), but log a message
-            // anyway.
-            LOG(NOTICE, "dropTabletOwnership skipped for master %s (table %lu, "
-                    "key hashes 0x%lx-0x%lx) because server isn't running",
-                    serverId.toString().c_str(), info->id(),
-                    tablet.start_key_hash(), tablet.end_key_hash());
-        }
+        const ProtoBuf::Table::Tablet* tablet = &info->tablet(i);
+        ServerId serverId(tablet->server_id());
+        LOG(NOTICE, "Requesting master %s to drop table id %lu, "
+                "key hashes 0x%lx-0x%lx",
+                serverId.toString().c_str(), info->id(),
+                tablet->start_key_hash(), tablet->end_key_hash());
+        outstandingDropTabletOwnershipRpcs.push_back(new DropTabletOwnershipRpc(
+                context, serverId, info->id(), tablet->start_key_hash(),
+                tablet->end_key_hash()));
     }
-
-    // If the deleted table's id is the largest one in use, we need
-    // to record this on external storage, so the id doesn't get reused
-    // if we crash now. Do this *before* removing the external storage record
-    // for the table (that record ensures that future coordinators know
-    // about its table id).
-    if (info->id() == (nextTableId-1)) {
-        syncNextTableId(lock);
-    }
-
-    // Remove the table's record in external storage.
-    string objectName("tables/");
-    objectName.append(info->name());
-    context->externalStorage->remove(objectName.c_str());
 }
 
 /**
@@ -1398,25 +1395,32 @@ TableManager::notifyDropTable(const Lock& lock, ProtoBuf::Table* info)
 void
 TableManager::notifyDropIndex(const Lock& lock, Index* index)
 {
-    foreach (Indexlet* indexlet, index->indexlets) {
-        try {
-            LOG(NOTICE, "Requesting master %s to drop table id %lu indexId %u",
-                        indexlet->serverId.toString().c_str(), index->tableId,
-                        index->indexId);
-            MasterClient::dropIndexletOwnership(context, indexlet->serverId,
-                index->tableId, index->indexId,
+    std::vector<DropIndexletOwnershipRpc*> rpcs;
+    for (Indexlet* indexlet : index->indexlets) {
+        LOG(NOTICE, "Requesting master %s to drop table id %lu indexId %u",
+                    indexlet->serverId.toString().c_str(), index->tableId,
+                    index->indexId);
+        rpcs.push_back(new DropIndexletOwnershipRpc(context,
+                indexlet->serverId, index->tableId, index->indexId,
                 indexlet->firstKey, indexlet->firstKeyLength,
-                indexlet->firstNotOwnedKey, indexlet->firstNotOwnedKeyLength);
-        } catch (ServerNotUpException& e) {
+                indexlet->firstNotOwnedKey, indexlet->firstNotOwnedKeyLength));
+    }
 
+    int i = 0;
+    for (Indexlet* indexlet : index->indexlets) {
+        try {
+            rpcs[i]->wait();
+        } catch (const ServerNotUpException& e) {
             // The master has apparently crashed. This is benign (a dead
             // master can't continue serving the tablet), but log a message
             // anyway.
-            LOG(NOTICE, "dropTabletOwnership skipped for master %s (table %lu, "
-                    "index %u) because server isn't running",
+            LOG(NOTICE, "dropTabletOwnership skipped for master %s "
+                    "(table %lu, index %u) because server isn't running",
                     indexlet->serverId.toString().c_str(), index->tableId,
                     index->indexId);
         }
+        delete rpcs[i];
+        i++;
     }
 }
 
@@ -1437,31 +1441,34 @@ TableManager::notifyDropIndex(const Lock& lock, Index* index)
 void
 TableManager::notifyReassignIndexlet(const Lock& lock, ProtoBuf::Table* info)
 {
-    const ProtoBuf::Table::ReassignIndexlet& reassignIndexlet =
-        info->reassign_indexlet();
-    ServerId serverId(reassignIndexlet.server_id());
+    const ProtoBuf::Table::ReassignIndexlet* reassignIndexlet =
+        &info->reassign_indexlet();
+    ServerId serverId(reassignIndexlet->server_id());
+    LOG(NOTICE, "Reassigning an indexlet of index id %u for table id %lu "
+            "having backing table id %lu to master %s",
+            reassignIndexlet->index_id(), info->id(),
+            reassignIndexlet->backing_table_id(),
+            serverId.toString().c_str());
+    TakeIndexletOwnershipRpc rpc(context, serverId, info->id(),
+            downCast<uint8_t>(reassignIndexlet->index_id()),
+            reassignIndexlet->backing_table_id(),
+            reassignIndexlet->first_key().c_str(),
+            downCast<uint16_t>(reassignIndexlet->first_key().length()),
+            reassignIndexlet->first_not_owned_key().c_str(),
+            downCast<uint16_t>(reassignIndexlet->first_not_owned_key().
+                    length()));
+
     try {
-        LOG(NOTICE, "Reassigning an indexlet of index id %u for table id %lu "
-                "having backing table id %lu to master %s",
-                reassignIndexlet.index_id(), info->id(),
-                reassignIndexlet.backing_table_id(),
-                serverId.toString().c_str());
-        MasterClient::takeIndexletOwnership(context, serverId,
-                info->id(), (uint8_t)reassignIndexlet.index_id(),
-                reassignIndexlet.backing_table_id(),
-                reassignIndexlet.first_key().c_str(),
-                (uint16_t)reassignIndexlet.first_key().length(),
-                reassignIndexlet.first_not_owned_key().c_str(),
-                (uint16_t)reassignIndexlet.first_not_owned_key().length());
+        rpc.wait();
     } catch (ServerNotUpException& e) {
         // The master has apparently crashed. This should be benign (we will
         // eventually recover the tablet as part of recovering the master),
         // but log a message anyway.
-        LOG(NOTICE, "takeIndexletOwnership failed during indexlet reassignment "
-                "for master %s (indexlet of index id %u for table id %lu) "
-                "because server isn't running",
+        LOG(NOTICE, "takeIndexletOwnership failed during indexlet "
+                "reassignment for master %s (indexlet of index id %u for "
+                "table id %lu) because server isn't running",
                 serverId.toString().c_str(),
-                reassignIndexlet.index_id(), info->id());
+                reassignIndexlet->index_id(), info->id());
     }
 }
 
@@ -1480,25 +1487,17 @@ TableManager::notifyReassignIndexlet(const Lock& lock, ProtoBuf::Table* info)
 void
 TableManager::notifyReassignTablet(const Lock& lock, ProtoBuf::Table* info)
 {
-    const ProtoBuf::Table::Reassign& reassign = info->reassign();
-    ServerId serverId(reassign.server_id());
-    try {
-        LOG(NOTICE, "Reassigning table id %lu, key hashes 0x%lx-0x%lx "
-                "to master %s",
-                info->id(), reassign.start_key_hash(), reassign.end_key_hash(),
-                serverId.toString().c_str());
-        MasterClient::takeTabletOwnership(context, serverId, info->id(),
-                reassign.start_key_hash(), reassign.end_key_hash());
-    } catch (ServerNotUpException& e) {
-        // The master has apparently crashed. This should be benign (we will
-        // eventually recover the tablet as part of recovering the master),
-        // but log a message anyway.
-        LOG(NOTICE, "takeTabletOwnership failed during tablet reassignment "
-                "for master %s (table %lu, key hashes 0x%lx-0x%lx) because "
-                "server isn't running",
-                serverId.toString().c_str(), info->id(),
-                reassign.start_key_hash(), reassign.end_key_hash());
-    }
+    waitForRecoveryDone(lock);
+    const ProtoBuf::Table::Reassign* reassign = &info->reassign();
+    ServerId serverId(reassign->server_id());
+    LOG(NOTICE, "Reassigning table id %lu, key hashes 0x%lx-0x%lx "
+            "to master %s",
+            info->id(), reassign->start_key_hash(), reassign->end_key_hash(),
+            serverId.toString().c_str());
+    outstandingTakeTabletOwnershipRpcs.push_back(new TakeTabletOwnershipRpc(
+            context, serverId, info->id(), reassign->start_key_hash(),
+            reassign->end_key_hash()));
+
 }
 
 /**
@@ -1514,24 +1513,15 @@ TableManager::notifyReassignTablet(const Lock& lock, ProtoBuf::Table* info)
 void
 TableManager::notifySplitTablet(const Lock& lock, ProtoBuf::Table* info)
 {
-    const ProtoBuf::Table::Split& split = info->split();
-    ServerId serverId(split.server_id());
-    try {
-        LOG(NOTICE, "Requesting master %s to split table id %lu "
-                "at key hash 0x%lx",
-                serverId.toString().c_str(), info->id(),
-                split.split_key_hash());
-        MasterClient::splitMasterTablet(context, serverId, info->id(),
-                split.split_key_hash());
-    } catch (ServerNotUpException& e) {
-        // The master has apparently crashed. This is benign (crash recovery
-        // will take care of splitting the tablet), but log a message
-        // anyway.
-        LOG(NOTICE, "splitMasterTablet skipped for master %s (table %lu, "
-                "split key hash 0x%lx) because server isn't running",
-                serverId.toString().c_str(), info->id(),
-                split.split_key_hash());
-    }
+    waitForRecoveryDone(lock);
+    const ProtoBuf::Table::Split* split = &info->split();
+    ServerId serverId(split->server_id());
+    LOG(NOTICE, "Requesting master %s to split table id %lu "
+            "at key hash 0x%lx",
+            serverId.toString().c_str(), info->id(),
+            split->split_key_hash());
+    outstandingSplitMasterTabletRpc.construct(context, serverId, info->id(),
+                                              split->split_key_hash());
 }
 
 /**
@@ -1613,7 +1603,7 @@ TableManager::serializeTable(const Lock& lock, Table* table,
 {
     externalInfo->set_name(table->name);
     externalInfo->set_id(table->id);
-    foreach (Tablet* tablet, table->tablets) {
+    for (Tablet* tablet : table->tablets) {
         ProtoBuf::Table::Tablet* externalTablet(externalInfo->add_tablet());
         externalTablet->set_start_key_hash(tablet->startKeyHash);
         externalTablet->set_end_key_hash(tablet->endKeyHash);
@@ -1735,13 +1725,188 @@ TableManager::testFindTablet(uint64_t tableId, uint64_t keyHash)
     if (it == idMap.end())
         return NULL;
     Table* table = it->second;
-    foreach (Tablet* tablet, table->tablets) {
+    for (Tablet* tablet : table->tablets) {
         if ((tablet->startKeyHash <= keyHash) &&
                 (tablet->endKeyHash >= keyHash)) {
             return tablet;
         }
     }
     return NULL;
+}
+
+/**
+ * Wait for the incomplete updates left over from the previous coordinator
+ * crash to finish.
+ *
+ * \param lock
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ */
+void
+TableManager::waitForRecoveryDone(const Lock &lock) {
+    bool hasIncompleteUpdates = !incompleteUpdates.empty();
+    for (std::list<IncompleteUpdate>::iterator it = incompleteUpdates.begin();
+         it != incompleteUpdates.end();
+         it = incompleteUpdates.erase(it)) {
+        const ProtoBuf::Table* info = &it->info;
+        switch (it->type) {
+            case IncompleteUpdate::NOTIFY_CREATE:
+                waitForTakeTabletRpcs(lock, directory[info->name()]);
+                break;
+            case IncompleteUpdate::NOTIFY_DROP_TABLE:
+                waitForDropTabletRpcs(lock, info);
+                break;
+            case IncompleteUpdate::NOTIFY_REASSIGN_TABLET:
+                waitForReassignTabletRpc(lock, info);
+                break;
+            case IncompleteUpdate::NOTIFY_SPLIT_TABLET:
+                waitForSplitTabletRpc(lock, info);
+                break;
+            default:
+                LOG(ERROR, "Unknown update type: %d", it->type);
+        }
+    }
+    if (hasIncompleteUpdates) {
+        LOG(NOTICE, "Table recovery complete: %lu table(s)", directory.size());
+    }
+}
+
+/**
+ * Wait for the DropTabletOwnershipRpc's sent by notifyDropTable to finish.
+ *
+ * \param lock
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ * \param info
+ *      Contains information about all of the tablets in the table.
+ */
+void
+TableManager::waitForDropTabletRpcs(const Lock &lock,
+                                    const ProtoBuf::Table* info)
+{
+    std::list<DropTabletOwnershipRpc*>::iterator it =
+            outstandingDropTabletOwnershipRpcs.begin();
+    for (int i = 0; i < info->tablet_size(); i++) {
+        try {
+            (*it)->wait();
+        } catch (const ServerNotUpException& e) {
+            // The master has apparently crashed. This is benign (a dead
+            // master can't continue serving the tablet), but log a message
+            // anyway.
+            const ProtoBuf::Table::Tablet* tablet = &info->tablet(i);
+            ServerId serverId(tablet->server_id());
+                    LOG(NOTICE, "dropTabletOwnership skipped for master %s "
+                    "(table %lu, key hashes 0x%lx-0x%lx) because server isn't "
+                    "running", serverId.toString().c_str(), info->id(),
+                    tablet->start_key_hash(), tablet->end_key_hash());
+        }
+        delete *it;
+        it = outstandingDropTabletOwnershipRpcs.erase(it);
+    }
+    assert(outstandingDropTabletOwnershipRpcs.empty());
+
+    // If the deleted table's id is the largest one in use, we need
+    // to record this on external storage, so the id doesn't get reused
+    // if we crash now. Do this *before* removing the external storage record
+    // for the table (that record ensures that future coordinators know
+    // about its table id).
+    if (info->id() == (nextTableId-1)) {
+        syncNextTableId(lock);
+    }
+
+    // Remove the table's record in external storage.
+    string objectName("tables/");
+    objectName.append(info->name());
+    context->externalStorage->remove(objectName.c_str());
+}
+
+/**
+ * Wait for the TakeTabletOwnershipRpc sent by notifyReassignTablet to finish.
+ *
+ * \param lock
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ * \param info
+ *      Contains information about all of the tablets in the table.
+ */
+void
+TableManager::waitForReassignTabletRpc(const Lock &lock,
+                                       const ProtoBuf::Table* info)
+{
+    assert(outstandingTakeTabletOwnershipRpcs.size() == 1);
+    TakeTabletOwnershipRpc* rpc = outstandingTakeTabletOwnershipRpcs.front();
+    try {
+        rpc->wait();
+    } catch (const ServerNotUpException& e) {
+        // The master has apparently crashed. This should be benign (we will
+        // eventually recover the tablet as part of recovering the master),
+        // but log a message anyway.
+        const ProtoBuf::Table::Reassign* reassign = &info->reassign();
+        ServerId serverId(reassign->server_id());
+        LOG(NOTICE, "takeTabletOwnership failed during tablet reassignment "
+                "for master %s (table %lu, key hashes 0x%lx-0x%lx) because "
+                "server isn't running",
+                serverId.toString().c_str(), info->id(),
+                reassign->start_key_hash(), reassign->end_key_hash());
+    }
+    delete rpc;
+    outstandingTakeTabletOwnershipRpcs.clear();
+}
+
+/**
+ * Wait for the SplitMasterTabletRpc sent by notifySplitTablet to finish.
+ *
+ * \param lock
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ * \param info
+ *      Contains information about all of the tablets in the table.
+ */
+void
+TableManager::waitForSplitTabletRpc(const Lock &lock,
+                                    const ProtoBuf::Table* info)
+{
+    try {
+        outstandingSplitMasterTabletRpc->wait();
+    } catch (const ServerNotUpException& e) {
+        // The master has apparently crashed. This is benign (crash recovery
+        // will take care of splitting the tablet), but log a message
+        // anyway.
+        const ProtoBuf::Table::Split* split = &info->split();
+        ServerId serverId(split->server_id());
+        LOG(NOTICE, "splitMasterTablet skipped for master %s (table %lu, "
+                "split key hash 0x%lx) because server isn't running",
+                serverId.toString().c_str(), info->id(),
+                split->split_key_hash());
+    }
+    outstandingSplitMasterTabletRpc.destroy();
+}
+
+/**
+ * Wait for the TakeTabletOwnershipRpc's sent by notifyCreate to finish.
+ *
+ * \param lock
+ *      Ensures that the caller holds the monitor lock; not actually used.
+ * \param table
+ *      Newly created table; notify the master for each tablet.
+ */
+void
+TableManager::waitForTakeTabletRpcs(const Lock &lock, const Table* table)
+{
+    std::list<TakeTabletOwnershipRpc*>::iterator it =
+            outstandingTakeTabletOwnershipRpcs.begin();
+    for (Tablet* tablet : table->tablets) {
+        try {
+            (*it)->wait();
+        } catch (const ServerNotUpException& e) {
+            // The master is apparently crashed. In that case, we can just
+            // ignore this master; this tablet will be reinstated elsewhere
+            // as part of recovering the master.
+            LOG(NOTICE, "takeTabletOwnership skipped for master %s (table %lu,"
+                    " key hashes 0x%lx-0x%lx) because server isn't running",
+                    tablet->serverId.toString().c_str(), table->id,
+                    tablet->startKeyHash, tablet->endKeyHash);
+        }
+        delete *it;
+        it = outstandingTakeTabletOwnershipRpcs.erase(it);
+    }
+    assert(outstandingDropTabletOwnershipRpcs.empty());
 }
 
 } // namespace RAMCloud

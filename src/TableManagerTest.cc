@@ -36,7 +36,7 @@ class TableManagerTest : public ::testing::Test {
     TableManager* tableManager;
     ServerConfig masterConfig;
 
-    std::mutex mutex;
+    SpinLock mutex;
     TableManager::Lock lock;
 
     TableManagerTest()
@@ -48,7 +48,7 @@ class TableManagerTest : public ::testing::Test {
         , updateManager(&service->updateManager)
         , tableManager(&service->tableManager)
         , masterConfig(ServerConfig::forTesting())
-        , mutex()
+        , mutex("TableManagerTest")
         , lock(mutex)
     {
         masterConfig.services = {WireFormat::MASTER_SERVICE,
@@ -515,6 +515,7 @@ TEST_F(TableManagerTest, recover_basics) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ(12346U, tableManager->nextTableId);
     EXPECT_EQ("Table { name: second, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
@@ -536,6 +537,7 @@ TEST_F(TableManagerTest, recover_nextTableId) {
     cluster.externalStorage.getResults.push(str);
 
     tableManager->recover(100);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ(1234u, tableManager->nextTableId);
     EXPECT_EQ("recover: initializing TableManager: nextTableId = 1234 | "
             "recover: Table recovery complete: 0 table(s)",
@@ -560,6 +562,7 @@ TEST_F(TableManagerTest, recover_ignoreNullValue) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("Table { name: second, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 88.0, status: NORMAL, ctime: 31.32 } }",
@@ -573,6 +576,7 @@ TEST_F(TableManagerTest, recover_parseError) {
     string message = "no exception";
     try {
         tableManager->recover(87);
+        tableManager->waitForRecoveryDone(lock);
     } catch (FatalError& e) {
         message = e.message;
     }
@@ -592,6 +596,7 @@ TEST_F(TableManagerTest, recover_dontRecreateDeletedTable) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("", tableManager->debugString());
 }
 TEST_F(TableManagerTest, recover_sequenceNumberCompleted) {
@@ -612,6 +617,7 @@ TEST_F(TableManagerTest, recover_sequenceNumberCompleted) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(89);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("Table { name: table1, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 1.0, status: NORMAL, ctime: 31.32 } }",
@@ -637,6 +643,7 @@ TEST_F(TableManagerTest, recover_incompleteCreate) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(88);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("Table { name: table1, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 1.0, status: NORMAL, ctime: 31.32 } }",
@@ -660,11 +667,13 @@ TEST_F(TableManagerTest, recover_incompleteDelete) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(88);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("notifyDropTable: Requesting master 1.0 to drop table id "
             "444, key hashes 0x800-0x900 | "
-            "notifyDropTable: dropTabletOwnership skipped for master 1.0 "
-            "(table 444, key hashes 0x800-0x900) because server isn't "
-            "running | recover: Table recovery complete: 0 table(s)",
+            "waitForDropTabletRpcs: dropTabletOwnership skipped for master "
+            "1.0 (table 444, key hashes 0x800-0x900) because server isn't "
+            "running | waitForRecoveryDone: Table recovery complete: 0 "
+            "table(s)",
             TestLog::get());
 }
 TEST_F(TableManagerTest, recover_incompleteSplitTablet) {
@@ -682,11 +691,12 @@ TEST_F(TableManagerTest, recover_incompleteSplitTablet) {
     cluster.externalStorage.getChildrenNames.push("table1");
     cluster.externalStorage.getChildrenValues.push(str);
 
-    TestLog::Enable _("notifySplitTablet");
+    TestLog::Enable _("notifySplitTablet", "waitForSplitTabletRpc", NULL);
     tableManager->recover(88);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("notifySplitTablet: Requesting master 2.0 to split table "
             "id 444 at key hash 0x1000 | "
-            "notifySplitTablet: splitMasterTablet skipped for master 2.0 "
+            "waitForSplitTabletRpc: splitMasterTablet skipped for master 2.0 "
             "(table 444, split key hash 0x1000) because server isn't running",
             TestLog::get());
 }
@@ -706,11 +716,13 @@ TEST_F(TableManagerTest, recover_incompleteReassignTablet) {
     cluster.externalStorage.getChildrenNames.push("table1");
     cluster.externalStorage.getChildrenValues.push(str);
 
-    TestLog::Enable _("notifyReassignTablet");
+    TestLog::Enable _("notifyReassignTablet", "waitForReassignTabletRpc",
+            NULL);
     tableManager->recover(88);
+    tableManager->waitForRecoveryDone(lock);
     EXPECT_EQ("notifyReassignTablet: Reassigning table id 444, "
             "key hashes 0x1000-0x2000 to master 2.0 | "
-            "notifyReassignTablet: takeTabletOwnership failed during "
+            "waitForReassignTabletRpc: takeTabletOwnership failed during "
             "tablet reassignment for master 2.0 (table 444, "
             "key hashes 0x1000-0x2000) because server isn't running",
             TestLog::get());
@@ -1060,9 +1072,10 @@ TEST_F(TableManagerTest, notifyCreate) {
     table.tablets.push_back(new Tablet(111, 0x600, 0x700, ServerId(2, 0),
             Tablet::NORMAL, LogPosition(70, 80)));
 
-    TestLog::Enable _("notifyCreate");
+    TestLog::Enable _("notifyCreate", "waitForTakeTabletRpcs", NULL);
     TestLog::reset();
     tableManager->notifyCreate(lock, &table);
+    tableManager->waitForTakeTabletRpcs(lock, &table);
     EXPECT_EQ(1U, master1->tabletManager.getNumTablets());
     EXPECT_EQ(2U, master2->tabletManager.getNumTablets());
     EXPECT_EQ("notifyCreate: Assigning table id 111, "
@@ -1071,11 +1084,11 @@ TEST_F(TableManagerTest, notifyCreate) {
             "key hashes 0x200-0x300, to master 2.0 | "
             "notifyCreate: Assigning table id 111, "
             "key hashes 0x400-0x500, to master 6.2 | "
-            "notifyCreate: takeTabletOwnership skipped for master 6.2 "
-            "(table 111, key hashes 0x400-0x500) because server "
-            "isn't running | "
             "notifyCreate: Assigning table id 111, "
-            "key hashes 0x600-0x700, to master 2.0",
+            "key hashes 0x600-0x700, to master 2.0 | "
+            "waitForTakeTabletRpcs: takeTabletOwnership skipped for master "
+            "6.2 (table 111, key hashes 0x400-0x500) because server "
+            "isn't running",
             TestLog::get());
 }
 
@@ -1096,6 +1109,7 @@ TEST_F(TableManagerTest, notifyDropTable_basics) {
             99, 41, 42);
 
     tableManager->notifyDropTable(lock, &table);
+    tableManager->waitForDropTabletRpcs(lock, &table);
     EXPECT_EQ("notifyDropTable: Requesting master 1.0 to drop "
             "table id 444, key hashes 0x200-0x300 | "
             "deleteTablet: Could not find tablet in tableId 444 with "
@@ -1104,8 +1118,9 @@ TEST_F(TableManagerTest, notifyDropTable_basics) {
             "tablet [0x200,0x300] in tableId 444 | "
             "notifyDropTable: Requesting master 99.0 to drop "
             "table id 444, key hashes 0x800-0x900 | "
-            "notifyDropTable: dropTabletOwnership skipped for master 99.0 "
-            "(table 444, key hashes 0x800-0x900) because server isn't running",
+            "waitForDropTabletRpcs: dropTabletOwnership skipped for master "
+            "99.0 (table 444, key hashes 0x800-0x900) because server isn't "
+            "running",
             TestLog::get());
     EXPECT_EQ("remove(tables/table1)",
             cluster.externalStorage.log);
@@ -1121,6 +1136,7 @@ TEST_F(TableManagerTest, notifyDropTable_syncNextTableId) {
 
     tableManager->nextTableId = 100;
     tableManager->notifyDropTable(lock, &table);
+    tableManager->waitForDropTabletRpcs(lock, &table);
     EXPECT_EQ("set(UPDATE, tableManager); remove(tables/table1)",
             cluster.externalStorage.log);
 }
@@ -1176,11 +1192,13 @@ TEST_F(TableManagerTest, notifyReassignTablet) {
     reassign->set_server_id(1);
     reassign->set_start_key_hash(0x1000);
     reassign->set_end_key_hash(0x2000);
-    TestLog::Enable _("notifyReassignTablet");
+    TestLog::Enable _("notifyReassignTablet", "waitForReassignTabletRpc",
+            NULL);
 
     // Success.
     EXPECT_EQ(0U, master1->tabletManager.getNumTablets());
     tableManager->notifyReassignTablet(lock, &info);
+    tableManager->waitForReassignTabletRpc(lock, &info);
     EXPECT_EQ(1U, master1->tabletManager.getNumTablets());
     EXPECT_EQ("notifyReassignTablet: Reassigning table id 1, "
             "key hashes 0x1000-0x2000 to master 1.0", TestLog::get());
@@ -1189,11 +1207,12 @@ TEST_F(TableManagerTest, notifyReassignTablet) {
     // No such server.
     reassign->set_server_id(5);
     tableManager->notifyReassignTablet(lock, &info);
+    tableManager->waitForReassignTabletRpc(lock, &info);
     EXPECT_EQ("notifyReassignTablet: Reassigning table id 1, "
             "key hashes 0x1000-0x2000 to master 5.0 | "
-            "notifyReassignTablet: takeTabletOwnership failed during tablet "
-            "reassignment for master 5.0 (table 1, key hashes 0x1000-0x2000) "
-            "because server isn't running",
+            "waitForReassignTabletRpc: takeTabletOwnership failed during "
+            "tablet reassignment for master 5.0 (table 1, key hashes "
+            "0x1000-0x2000) because server isn't running",
             TestLog::get());
 }
 
@@ -1210,11 +1229,12 @@ TEST_F(TableManagerTest, notifySplitTablet) {
     ProtoBuf::Table::Split* split = info.mutable_split();
     split->set_server_id(1);
     split->set_split_key_hash(4096);
-    TestLog::Enable _("notifySplitTablet");
+    TestLog::Enable _("notifySplitTablet", "waitForSplitTabletRpc", NULL);
 
     // Success.
     EXPECT_EQ(1U, master1->tabletManager.getNumTablets());
     tableManager->notifySplitTablet(lock, &info);
+    tableManager->waitForSplitTabletRpc(lock, &info);
     EXPECT_EQ(2U, master1->tabletManager.getNumTablets());
     EXPECT_EQ("notifySplitTablet: Requesting master 1.0 to split "
             "table id 1 at key hash 0x1000", TestLog::get());
@@ -1223,9 +1243,10 @@ TEST_F(TableManagerTest, notifySplitTablet) {
     // No such server.
     split->set_server_id(5);
     tableManager->notifySplitTablet(lock, &info);
+    tableManager->waitForSplitTabletRpc(lock, &info);
     EXPECT_EQ("notifySplitTablet: Requesting master 5.0 to split "
             "table id 1 at key hash 0x1000 | "
-            "notifySplitTablet: splitMasterTablet skipped for master 5.0 "
+            "waitForSplitTabletRpc: splitMasterTablet skipped for master 5.0 "
             "(table 1, split key hash 0x1000) because server isn't running",
             TestLog::get());
 }

@@ -20,11 +20,12 @@
 
 #include "Common.h"
 #include "CoordinatorUpdateManager.h"
+#include "Indexlet.h"
+#include "MasterClient.h"
 #include "ServerId.h"
 #include "Table.pb.h"
 #include "Tablet.h"
 #include "TableConfig.pb.h"
-#include "Indexlet.h"
 
 namespace RAMCloud {
 
@@ -97,6 +98,30 @@ class TableManager {
             uint64_t endKeyHash, ServerId serverId, LogPosition ctime);
 
   PRIVATE:
+    /// The following structure holds information about an update operation
+    /// that might not have finished when the previous coordinator crashes.
+    struct IncompleteUpdate
+    {
+        /// Defines the types of update operations.
+        enum UpdateType {
+            NOTIFY_CREATE,
+            NOTIFY_DROP_TABLE,
+            NOTIFY_REASSIGN_TABLET,
+            NOTIFY_SPLIT_TABLET
+        };
+
+        /// Type of update to be performed.
+        UpdateType type;
+
+        /// Contains information about the table concerned in this update.
+        const ProtoBuf::Table info;
+
+        IncompleteUpdate(UpdateType type, ProtoBuf::Table info)
+            : type(type)
+            , info(info)
+        {}
+    };
+
     /**
      * The following structure holds information about a indexlet of an index.
      * 
@@ -209,8 +234,8 @@ class TableManager {
      * A Lock for this mutex must be held to read or modify any state in
      * the tablet map.
      */
-    mutable std::mutex mutex;
-    typedef std::unique_lock<std::mutex> Lock;
+    mutable SpinLock mutex;
+    typedef SpinLock::Guard Lock;
 
     /// Shared information about the server.
     Context* context;
@@ -241,6 +266,16 @@ class TableManager {
     typedef std::unordered_map<uint64_t, Indexlet*> IndexletTableMap;
     IndexletTableMap backingTableMap;
 
+    /// Updates that might not have finished when the previous coordinator
+    /// crashes.
+    std::list<IncompleteUpdate> incompleteUpdates;
+
+    /// Outstanding RPCs used for notifying masters about the updates performed
+    /// on the coordinator.
+    std::list<DropTabletOwnershipRpc*> outstandingDropTabletOwnershipRpcs;
+    Tub<SplitMasterTabletRpc> outstandingSplitMasterTabletRpc;
+    std::list<TakeTabletOwnershipRpc*> outstandingTakeTabletOwnershipRpcs;
+
     uint64_t createTable(const Lock& lock, const char* name,
             uint32_t serverSpan, ServerId serverId = ServerId());
     void dropIndex(const Lock& lock, uint64_t tableId, uint8_t indexId);
@@ -248,7 +283,7 @@ class TableManager {
     TableManager::Indexlet* findIndexlet(const Lock& lock, Index* index,
             const void* key, uint16_t keyLength);
     Tablet* findTablet(const Lock& lock, Table* table, uint64_t keyHash);
-    void notifyCreate(const Lock& lock, Table* table);
+    void notifyCreate(const Lock& lock, const Table* table);
     void notifyCreateIndex(const Lock& lock, Index* index);
     void notifyDropTable(const Lock& lock, ProtoBuf::Table* info);
     void notifyDropIndex(const Lock& lock, Index* index);
@@ -264,6 +299,12 @@ class TableManager {
     void testAddTablet(const Tablet& tablet);
     void testCreateTable(const char* name, uint64_t id);
     Tablet* testFindTablet(uint64_t tableId, uint64_t keyHash);
+    void waitForRecoveryDone(const Lock &lock);
+    void waitForDropTabletRpcs(const Lock &lock, const ProtoBuf::Table *info);
+    void waitForReassignTabletRpc(const Lock &lock,
+                                  const ProtoBuf::Table *info);
+    void waitForSplitTabletRpc(const Lock &lock, const ProtoBuf::Table *info);
+    void waitForTakeTabletRpcs(const Lock &lock, const Table *table);
 
     DISALLOW_COPY_AND_ASSIGN(TableManager);
 };
