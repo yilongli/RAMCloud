@@ -1284,8 +1284,9 @@ TableManager::notifyCreate(const Lock& lock, const ProtoBuf::Table* info)
 {
     Table* table = idMap[info->id()];
     syncUpdate(lock, table->id);
-    Update* update = &outstandingUpdateMap[table->id];
-    *update = {&info, WireFormat::TAKE_TABLET_OWNERSHIP};
+    outstandingUpdateMap.erase(info->id());
+    Update* update = &outstandingUpdateMap.emplace(info->id(), Update(*info,
+            WireFormat::TAKE_TABLET_OWNERSHIP)).first->second;
     for (Tablet* tablet : table->tablets) {
         LOG(NOTICE, "Assigning table id %lu, key hashes 0x%lx-0x%lx, to "
                 "master %s",
@@ -1356,8 +1357,9 @@ void
 TableManager::notifyDropTable(const Lock& lock, const ProtoBuf::Table* info)
 {
     syncUpdate(lock, info->id());
-    Update* update = &outstandingUpdateMap[info->id()];
-    *update = {&info, WireFormat::DROP_TABLET_OWNERSHIP};
+    outstandingUpdateMap.erase(info->id());
+    Update* update = &outstandingUpdateMap.emplace(info->id(), Update(*info,
+            WireFormat::DROP_TABLET_OWNERSHIP)).first->second;
     // Notify all of the masters storing tablets for the table.
     int numTablets = info->tablet_size();
     for (int i = 0; i < numTablets; i++) {
@@ -1481,9 +1483,9 @@ TableManager::notifyReassignTablet(const Lock& lock,
                                    const ProtoBuf::Table* info)
 {
     syncUpdate(lock, info->id());
-    OutstandingUpdateMap::mapped_type* update =
-            &outstandingUpdateMap[info->id()];
-    *update = {&info, WireFormat::REASSIGN_TABLET_OWNERSHIP};
+    outstandingUpdateMap.erase(info->id());
+    Update* update = &outstandingUpdateMap.emplace(info->id(), Update(*info,
+            WireFormat::REASSIGN_TABLET_OWNERSHIP)).first->second;
     const ProtoBuf::Table::Reassign* reassign = &info->reassign();
     ServerId serverId(reassign->server_id());
     LOG(NOTICE, "Reassigning table id %lu, key hashes 0x%lx-0x%lx "
@@ -1508,15 +1510,16 @@ void
 TableManager::notifySplitTablet(const Lock& lock, const ProtoBuf::Table* info)
 {
     syncUpdate(lock, info->id());
-    Update* update = &outstandingUpdateMap[info->id()];
-    *update = {&info, WireFormat::SPLIT_TABLET};
+    outstandingUpdateMap.erase(info->id());
+    Update* update = &outstandingUpdateMap.emplace(info->id(), Update(*info,
+            WireFormat::SPLIT_TABLET)).first->second;
     const ProtoBuf::Table::Split* split = &info->split();
     ServerId serverId(split->server_id());
     LOG(NOTICE, "Requesting master %s to split table id %lu "
             "at key hash 0x%lx",
             serverId.toString().c_str(), info->id(),
             split->split_key_hash());
-    update->rpcs.push_pack(new SplitMasterTabletRpc(context, serverId,
+    update->rpcs.push_back(new SplitMasterTabletRpc(context, serverId,
             info->id(), split->split_key_hash()));
 }
 
@@ -1799,7 +1802,7 @@ template<typename RpcType>
 void
 TableManager::waitForRpcs(const Lock &lock, Update* update)
 {
-    for (std::list<RpcWrapper*>::iterator it = update->rpcs.begin();
+    for (std::list<ServerIdRpcWrapper*>::iterator it = update->rpcs.begin();
             it != update->rpcs.end(); it = update->rpcs.erase(it)) {
         RpcType* rpc = dynamic_cast<RpcType*>(*it);
         try {

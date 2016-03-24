@@ -218,19 +218,18 @@ class TableManager {
 
         /// List of RPCs sent out in the update. The entries are allocated
         /// and freed dynamically.
-        std::list<RpcWrapper*> rpcs;
-
-        // TODO: remove this empty constructor?
-        Update()
-            : info()
-            , opcode()
-            , rpcs()
-        {}
+        std::list<ServerIdRpcWrapper*> rpcs;
 
         Update(ProtoBuf::Table info, WireFormat::Opcode opcode)
             : info(info)
             , opcode(opcode)
             , rpcs()
+        {}
+
+        Update(const Update& other)
+            : info(other.info)
+            , opcode(other.opcode)
+            , rpcs(other.rpcs)
         {}
 
         ~Update()
