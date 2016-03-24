@@ -515,7 +515,7 @@ TEST_F(TableManagerTest, recover_basics) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ(12346U, tableManager->nextTableId);
     EXPECT_EQ("Table { name: second, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
@@ -537,7 +537,7 @@ TEST_F(TableManagerTest, recover_nextTableId) {
     cluster.externalStorage.getResults.push(str);
 
     tableManager->recover(100);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ(1234u, tableManager->nextTableId);
     EXPECT_EQ("recover: initializing TableManager: nextTableId = 1234 | "
             "recover: Table recovery complete: 0 table(s)",
@@ -562,7 +562,7 @@ TEST_F(TableManagerTest, recover_ignoreNullValue) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("Table { name: second, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 88.0, status: NORMAL, ctime: 31.32 } }",
@@ -576,7 +576,7 @@ TEST_F(TableManagerTest, recover_parseError) {
     string message = "no exception";
     try {
         tableManager->recover(87);
-        tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     } catch (FatalError& e) {
         message = e.message;
     }
@@ -596,7 +596,7 @@ TEST_F(TableManagerTest, recover_dontRecreateDeletedTable) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(87);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("", tableManager->debugString());
 }
 TEST_F(TableManagerTest, recover_sequenceNumberCompleted) {
@@ -617,7 +617,7 @@ TEST_F(TableManagerTest, recover_sequenceNumberCompleted) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(89);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("Table { name: table1, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 1.0, status: NORMAL, ctime: 31.32 } }",
@@ -643,7 +643,7 @@ TEST_F(TableManagerTest, recover_incompleteCreate) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(88);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("Table { name: table1, id 444, "
             "Tablet { startKeyHash: 0x800, endKeyHash: 0x900, "
             "serverId: 1.0, status: NORMAL, ctime: 31.32 } }",
@@ -667,12 +667,12 @@ TEST_F(TableManagerTest, recover_incompleteDelete) {
     cluster.externalStorage.getChildrenValues.push(str);
 
     tableManager->recover(88);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("notifyDropTable: Requesting master 1.0 to drop table id "
             "444, key hashes 0x800-0x900 | "
             "waitForDropTabletRpcs: dropTabletOwnership skipped for master "
             "1.0 (table 444, key hashes 0x800-0x900) because server isn't "
-            "running | waitForRecoveryDone: Table recovery complete: 0 "
+            "running | syncUpdates: Table recovery complete: 0 "
             "table(s)",
             TestLog::get());
 }
@@ -693,7 +693,7 @@ TEST_F(TableManagerTest, recover_incompleteSplitTablet) {
 
     TestLog::Enable _("notifySplitTablet", "waitForSplitTabletRpc", NULL);
     tableManager->recover(88);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("notifySplitTablet: Requesting master 2.0 to split table "
             "id 444 at key hash 0x1000 | "
             "waitForSplitTabletRpc: splitMasterTablet skipped for master 2.0 "
@@ -719,7 +719,7 @@ TEST_F(TableManagerTest, recover_incompleteReassignTablet) {
     TestLog::Enable _("notifyReassignTablet", "waitForReassignTabletRpc",
             NULL);
     tableManager->recover(88);
-    tableManager->waitForRecoveryDone(lock);
+        tableManager->syncUpdates(lock);
     EXPECT_EQ("notifyReassignTablet: Reassigning table id 444, "
             "key hashes 0x1000-0x2000 to master 2.0 | "
             "waitForReassignTabletRpc: takeTabletOwnership failed during "

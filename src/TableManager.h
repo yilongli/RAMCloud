@@ -17,6 +17,7 @@
 #define RAMCLOUD_TABLEMANAGER_H
 
 #include <mutex>
+#include <unordered_set>
 
 #include "Common.h"
 #include "CoordinatorUpdateManager.h"
@@ -98,30 +99,6 @@ class TableManager {
             uint64_t endKeyHash, ServerId serverId, LogPosition ctime);
 
   PRIVATE:
-    /// The following structure holds information about an update operation
-    /// that might not have finished when the previous coordinator crashes.
-    struct IncompleteUpdate
-    {
-        /// Defines the types of update operations.
-        enum UpdateType {
-            NOTIFY_CREATE,
-            NOTIFY_DROP_TABLE,
-            NOTIFY_REASSIGN_TABLET,
-            NOTIFY_SPLIT_TABLET
-        };
-
-        /// Type of update to be performed.
-        UpdateType type;
-
-        /// Contains information about the table concerned in this update.
-        const ProtoBuf::Table info;
-
-        IncompleteUpdate(UpdateType type, ProtoBuf::Table info)
-            : type(type)
-            , info(info)
-        {}
-    };
-
     /**
      * The following structure holds information about a indexlet of an index.
      * 
@@ -229,6 +206,39 @@ class TableManager {
         IndexMap indexMap;
     };
 
+    /// The following structure holds information about an update operation
+    /// that might not have finished when the previous coordinator crashes.
+    struct Update
+    {
+        /// Contains information about the table concerned in this update.
+        const ProtoBuf::Table info;
+
+        /// Opcode of the RPCs sent out in the update.
+        WireFormat::Opcode opcode;
+
+        /// List of RPCs sent out in the update. The entries are allocated
+        /// and freed dynamically.
+        std::list<RpcWrapper*> rpcs;
+
+        // TODO: remove this empty constructor?
+        Update()
+            : info()
+            , opcode()
+            , rpcs()
+        {}
+
+        Update(ProtoBuf::Table info, WireFormat::Opcode opcode)
+            : info(info)
+            , opcode(opcode)
+            , rpcs()
+        {}
+
+        ~Update()
+        {
+            assert(rpcs.empty());
+        }
+    };
+
     /**
      * Provides monitor-style protection for all operations on the tablet map.
      * A Lock for this mutex must be held to read or modify any state in
@@ -266,15 +276,13 @@ class TableManager {
     typedef std::unordered_map<uint64_t, Indexlet*> IndexletTableMap;
     IndexletTableMap backingTableMap;
 
-    /// Updates that might not have finished when the previous coordinator
-    /// crashes.
-    std::list<IncompleteUpdate> incompleteUpdates;
+    /// Set of tables on which we may have unfinished updates when the previous
+    /// coordinator crashes.
+    std::unordered_set<uint64_t> outdatedTables;
 
-    /// Outstanding RPCs used for notifying masters about the updates performed
-    /// on the coordinator.
-    std::list<DropTabletOwnershipRpc*> outstandingDropTabletOwnershipRpcs;
-    Tub<SplitMasterTabletRpc> outstandingSplitMasterTabletRpc;
-    std::list<TakeTabletOwnershipRpc*> outstandingTakeTabletOwnershipRpcs;
+    /// Map from table id to outstanding updates that might not have finished.
+    typedef std::unordered_map<uint64_t, Update> OutstandingUpdateMap;
+    OutstandingUpdateMap outstandingUpdateMap;
 
     uint64_t createTable(const Lock& lock, const char* name,
             uint32_t serverSpan, ServerId serverId = ServerId());
@@ -283,28 +291,25 @@ class TableManager {
     TableManager::Indexlet* findIndexlet(const Lock& lock, Index* index,
             const void* key, uint16_t keyLength);
     Tablet* findTablet(const Lock& lock, Table* table, uint64_t keyHash);
-    void notifyCreate(const Lock& lock, const Table* table);
+    void notifyCreate(const Lock& lock, const ProtoBuf::Table* info);
     void notifyCreateIndex(const Lock& lock, Index* index);
-    void notifyDropTable(const Lock& lock, ProtoBuf::Table* info);
+    void notifyDropTable(const Lock& lock, const ProtoBuf::Table* info);
     void notifyDropIndex(const Lock& lock, Index* index);
-    void notifySplitTablet(const Lock& lock, ProtoBuf::Table* info);
+    void notifySplitTablet(const Lock& lock, const ProtoBuf::Table* info);
     void notifyReassignIndexlet(const Lock& lock, ProtoBuf::Table* info);
-    void notifyReassignTablet(const Lock& lock, ProtoBuf::Table* info);
-    Table* recreateTable(const Lock& lock, ProtoBuf::Table* info);
+    void notifyReassignTablet(const Lock& lock, const ProtoBuf::Table* info);
+    void recreateTable(const Lock& lock, ProtoBuf::Table* info);
     void serializeTable(const Lock& lock, Table* table,
             ProtoBuf::Table* externalInfo);
     void syncNextTableId(const Lock& lock);
     void syncTable(const Lock& lock, Table* table,
             ProtoBuf::Table* externalInfo);
+    void syncUpdate(const Lock &lock, uint64_t tableId);
     void testAddTablet(const Tablet& tablet);
     void testCreateTable(const char* name, uint64_t id);
     Tablet* testFindTablet(uint64_t tableId, uint64_t keyHash);
-    void waitForRecoveryDone(const Lock &lock);
-    void waitForDropTabletRpcs(const Lock &lock, const ProtoBuf::Table *info);
-    void waitForReassignTabletRpc(const Lock &lock,
-                                  const ProtoBuf::Table *info);
-    void waitForSplitTabletRpc(const Lock &lock, const ProtoBuf::Table *info);
-    void waitForTakeTabletRpcs(const Lock &lock, const Table *table);
+    template<typename RpcType>
+    void waitForRpcs(const Lock &lock, Update* update);
 
     DISALLOW_COPY_AND_ASSIGN(TableManager);
 };
