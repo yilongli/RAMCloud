@@ -95,7 +95,7 @@ COMWARNS := -Wall -Wformat=2 -Wextra \
             -Wwrite-strings -Wno-unused-parameter -Wmissing-format-attribute
 CWARNS   := $(COMWARNS) -Wmissing-prototypes -Wmissing-declarations -Wshadow \
 		-Wbad-function-cast
-CXXWARNS := $(COMWARNS) -Wno-non-template-friend -Woverloaded-virtual \
+CXXWARNS := $(COMWARNS) -Woverloaded-virtual \
 		-Wcast-qual \
 		-Wcast-align -Wconversion
 ifeq ($(COMPILER),gnu)
@@ -124,8 +124,8 @@ ifeq ($(LOGCABIN),yes)
 INCLUDES := $(INCLUDES) -I$(LOGCABIN_DIR)/include
 endif
 
-CC ?= gcc
-CXX ?= g++
+CC := /home/yilongl/tools/clang/bin/clang
+CXX := /home/yilongl/tools/clang/bin/clang++
 AR ?= ar
 PERL ?= perl
 PYTHON ?= python
@@ -253,13 +253,14 @@ endif
 CFLAGS_BASE := $(COMFLAGS) -std=gnu11 $(INCLUDES)
 CFLAGS_SILENT := $(CFLAGS_BASE)
 CFLAGS_NOWERROR := $(CFLAGS_BASE) $(CWARNS)
-# CFLAGS := $(CFLAGS_BASE) $(CWARNS)
 CFLAGS := $(CFLAGS_BASE) -Werror $(CWARNS)
+
+# Disabled all warnings for now
+CXXWARNS := -w
 
 CXXFLAGS_BASE := $(COMFLAGS) -std=c++11 $(INCLUDES)
 CXXFLAGS_SILENT := $(CXXFLAGS_BASE) $(EXTRACXXFLAGS)
 CXXFLAGS_NOWERROR := $(CXXFLAGS_BASE) $(CXXWARNS) $(EXTRACXXFLAGS)
-# CXXFLAGS := $(CXXFLAGS_BASE) $(CXXWARNS) $(EXTRACXXFLAGS) $(PERF)
 CXXFLAGS := $(CXXFLAGS_BASE) -Werror $(CXXWARNS) $(EXTRACXXFLAGS) $(PERF)
 
 ifeq ($(COMPILER),intel)

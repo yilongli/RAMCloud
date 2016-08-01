@@ -46,7 +46,6 @@ class RuntimeOptions {
         uint32_t popFailRecoveryMasters();
         void checkAndCrashCoordinator(const char *crashPoint);
 
-    PRIVATE:
         /**
          * Interface for all configuration option parsers. Generally
          * parsers should subclass this and add a constructor which
@@ -60,6 +59,7 @@ class RuntimeOptions {
             virtual ~Parseable() {}
         };
 
+    PRIVATE:
         void registerOption(const char* option, Parseable* parser);
 
         /**

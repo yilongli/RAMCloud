@@ -338,7 +338,7 @@ try
 
     LOG(NOTICE, "Performing %u writes of %u byte objects",
         count, objectDataSize);
-    string keys[count];
+    std::vector<string> keys(count);
     for (int j = 0; j < count; j++)
         keys[j] = format("%d", j);
     b = Cycles::rdtsc();

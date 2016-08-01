@@ -162,7 +162,7 @@ class Tub {
     void
     destroy() {
         if (occupied) {
-            object->~ElementType();
+            //object->~ElementType();
             occupied = false;
         }
     }

@@ -1034,7 +1034,7 @@ class Benchmark {
     void
     writeNextObjects(const unsigned timeoutSeconds)
     {
-        Tub<OutstandingWrite> rpcs[options.pipelinedRpcs];
+        std::vector<Tub<OutstandingWrite>> rpcs(options.pipelinedRpcs);
         bool prefilling = !distribution.isPrefillDone();
 
         bool isDone = false;

@@ -1472,7 +1472,7 @@ MasterService::multiWrite(const WireFormat::MultiOp::Request* reqHdr,
     // so that we can later remove index entries corresponding to them.
     // This is space inefficient as it occupies numRequests times size of
     // Buffer on stack.
-    Buffer oldObjectBuffers[numRequests];
+    std::vector<Buffer> oldObjectBuffers(numRequests);
 
     // Each iteration extracts one request from the rpc, writes the object
     // if possible, and appends a status and version to the response buffer.

@@ -1295,7 +1295,7 @@ ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
     // for the old deleted version. Both cases lead to consistency problems.
     // The same argument holds for linearizability records; the linearizability
     // record should exist if and only if new object is written.
-    Log::AppendVector appends[2 + (rpcResult ? 1 : 0)];
+    std::vector<Log::AppendVector> appends(2 + (rpcResult ? 1 : 0));
 
     newObject.assembleForLog(appends[0].buffer);
     appends[0].type = LOG_ENTRY_TYPE_OBJ;
@@ -1320,7 +1320,8 @@ ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
         appends[rpcResultIndex].type = LOG_ENTRY_TYPE_RPCRESULT;
     }
 
-    if (!log.append(appends, (tombstone ? 2 : 1) + (rpcResult ? 1 : 0))) {
+    if (!log.append(appends.data(),
+            (tombstone ? 2 : 1) + (rpcResult ? 1 : 0))) {
         // The log is out of space. Tell the client to retry and hope
         // that the cleaner makes space soon.
         throw RetryException(HERE, 1000, 2000, "Must wait for cleaner");
@@ -2048,7 +2049,7 @@ ObjectManager::commitWrite(PreparedOp& op,
     uint64_t byteCount = 0;
     uint64_t recordCount = 0;
     int size = 2 + (newKey ? 0 : 1);
-    Log::AppendVector appends[size];
+    std::vector<Log::AppendVector> appends(size);
 
     prepOpTombstone.assembleForLog(appends[0].buffer);
     appends[0].type = LOG_ENTRY_TYPE_PREPTOMB;
@@ -2072,7 +2073,7 @@ ObjectManager::commitWrite(PreparedOp& op,
         throw RetryException(HERE, 1000, 2000, "Log is out of space!");
     }
 
-    if (!log.append(appends, size)) {
+    if (!log.append(appends.data(), size)) {
         // The log is out of space. Tell the client to retry and hope
         // that either the cleaner makes space soon or we shift load
         // off of this server.
@@ -2137,10 +2138,10 @@ ObjectManager::flushEntriesToLog(Buffer *logBuffer, uint32_t& numEntries)
     // This array will hold the references of all the entries
     // that get written to the log. This will be used
     // subsequently to update the hash table
-    Log::Reference references[numEntries];
+    std::vector<Log::Reference> references(numEntries);
 
     // atomically flush all the entries to the log
-    if (!log.append(logBuffer, references, numEntries)) {
+    if (!log.append(logBuffer, references.data(), numEntries)) {
         return false;
         // JIRA Issue: RAM-675
         // How to propagate this error
