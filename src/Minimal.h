@@ -53,6 +53,16 @@ using std::vector;
 #define PUBLIC public
 #endif
 
+// Sometimes it would be convenient in the unit tests if we could mutate some
+// const data. The following uppercase version of "CONST" can be used to work
+// around this problem: when compiling unit test files (anything that includes
+// TestUtil.h) the "CONST" modifiers are elided.
+#ifdef ELIDE_CONST
+#define CONST
+#else
+#define CONST const
+#endif
+
 namespace RAMCloud {
 
 /**

@@ -31,6 +31,7 @@
 #error "TestUtil.h must be included before Common.h"
 #endif
 #define EXPOSE_PRIVATES
+#define ELIDE_CONST
 
 #include "Common.h"
 #include "Cycles.h"

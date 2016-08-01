@@ -121,7 +121,7 @@ class BasicTransport : public Transport {
         // dynamically allocated and must be freed by the session.
         Driver::Address* serverAddress;
 
-        // True means the abort method has been invoked, sso this session
+        // True means the abort method has been invoked, so this session
         // is no longer usable.
         bool aborted;
 
@@ -566,20 +566,20 @@ class BasicTransport : public Transport {
     int tryToTransmitData();
 
     /// Shared RAMCloud information.
-    Context* context;
+    Context* const context;
 
     /// The Driver used to send and receive packets.
-    Driver* driver;
+    Driver* const driver;
 
     /// Allows us to get invoked during the dispatch polling loop.
     Poller poller;
 
     /// Maximum # bytes of message data that can fit in one packet.
-    uint32_t maxDataPerPacket;
+    CONST uint32_t maxDataPerPacket;
 
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
-    uint64_t clientId;
+    const uint64_t clientId;
 
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
@@ -651,29 +651,29 @@ class BasicTransport : public Transport {
     /// latency. Second, the receiver uses this to pace GRANT messages (it
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
-    uint32_t roundTripBytes;
+    CONST uint32_t roundTripBytes;
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
     /// GRANTS, but it can result in additional buffering in the network.
-    uint32_t grantIncrement;
+    CONST uint32_t grantIncrement;
 
     /// Used to implement functionality triggered by time, such as retries
     /// when packets are lost.
     Timer timer;
 
     /// Specifies the interval between timer wakeups, in units of rdtsc ticks.
-    uint64_t timerInterval;
+    CONST uint64_t timerInterval;
 
     /// If either client or server experiences this many timer wakeups without
     /// receiving any packets from the other end, then it will abort the
     /// request.
-    uint32_t timeoutIntervals;
+    CONST uint32_t timeoutIntervals;
 
     /// If a client experiences this many timer wakeups without receiving
     /// any packets from the server for particular RPC, then it sends a
     /// PING request.
-    uint32_t pingIntervals;
+    CONST uint32_t pingIntervals;
 
     // The following variables count networking issues (indications that
     // packets have been lost or delayed).

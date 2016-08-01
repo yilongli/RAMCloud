@@ -67,7 +67,11 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , roundTripBytes(getRoundTripBytes(locator))
     , grantIncrement(5*maxDataPerPacket)
     , timer(this, context->dispatch)
-    , timerInterval(0)
+    // Set up the timer to trigger at 2 ms intervals. We use this choice
+    // (as of 11/2015) because the Linux kernel appears to buffer packets
+    // for up to about 1 ms before delivering them to applications. Shorter
+    // intervals result in unnecessary retransmissions.
+    , timerInterval(Cycles::fromMicroseconds(2000))
 
     // As of 7/2016, the value for timeoutIntervals is set relatively high.
     // This is needed to handle issues on some machines (such as the NEC
@@ -77,11 +81,6 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , timeoutIntervals(40)
     , pingIntervals(3)
 {
-    // Set up the timer to trigger at 2 ms intervals. We use this choice
-    // (as of 11/2015) because the Linux kernel appears to buffer packets
-    // for up to about 1 ms before delivering them to applications. Shorter
-    // intervals result in unnecessary retransmissions.
-    timerInterval = Cycles::fromMicroseconds(2000);
     timer.start(Cycles::rdtsc() + timerInterval);
 
     LOG(NOTICE, "BasicTransport parameters: maxDataPerPacket %u, "

@@ -56,9 +56,9 @@ class Transport {
   public:
     class RpcNotifier;
 
-      /// Maximum allowable size for an RPC request or response message: must
-      /// be large enough to hold an 8MB segment plus header information.
-      static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
+    /// Maximum allowable size for an RPC request or response message: must
+    /// be large enough to hold an 8MB segment plus header information.
+    static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
 
     /**
      * An RPC request that has been received and is either being serviced or
@@ -104,16 +104,6 @@ class Transport {
          * used only off of the fast path).
          */
         virtual string getClientServiceLocator() = 0;
-
-        /**
-         * Returns false if the epoch was not set, else true. Used to assert
-         * that no RPCs are pushed through the WorkerManager without an epoch.
-         */
-        bool
-        epochIsSet()
-        {
-            return epoch != 0;
-        }
 
         /**
          * The incoming RPC payload, which contains a request.
@@ -365,7 +355,7 @@ class Transport {
      *
      * Each serverPort instance is freed with 'delete self' at
      * the watchdog timeout.
-     * So, severPort has to be dynamically instanciated to avoid
+     * So, severPort has to be dynamically instantiated to avoid
      * 'double free' error.
      *
      **/
