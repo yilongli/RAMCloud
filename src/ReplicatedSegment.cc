@@ -709,7 +709,7 @@ ReplicatedSegment::performWrite(Replica& replica)
         // backup unless it is discovered that that backup failed.
         // Not doing so risks the existence a lost open replica which
         // isn't recovered from properly.
-        ServerId constraints[replicas.numElements];
+        std::vector<ServerId> constraints(replicas.numElements);
         uint32_t numConstraints = 0;
         foreach (auto& constrainingReplica, replicas) {
             if (constrainingReplica.isActive)
@@ -719,10 +719,10 @@ ReplicatedSegment::performWrite(Replica& replica)
         ServerId backupId;
         if (replicaIsPrimary(replica)) {
             backupId = backupSelector.selectPrimary(numConstraints,
-                                                    constraints);
+                                                    constraints.data());
         } else {
             backupId = backupSelector.selectSecondary(numConstraints,
-                                                      constraints);
+                                                      constraints.data());
         }
 
         if (!backupId.isValid()) {

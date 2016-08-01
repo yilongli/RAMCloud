@@ -16,12 +16,7 @@
 #ifndef RAMCLOUD_LOGSEGMENT_H
 #define RAMCLOUD_LOGSEGMENT_H
 
-#if (__GNUC__ == 4 && __GNUC_MINOR__ >= 5) || (__GNUC__ > 4)
 #include <atomic>
-#else
-#include <cstdatomic>
-#endif
-
 #include "AbstractLog.h"
 #include "BoostIntrusive.h"
 #include "ReplicatedSegment.h"

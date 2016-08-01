@@ -36,7 +36,7 @@ $(APPOBJDIR)/recovery: $(APPOBJDIR)/RecoveryMain.o $(OBJDIR)/OptionParser.o $(OB
 
 apps: $(APPOBJDIR)/backuprecovery \
       $(APPOBJDIR)/client \
-      $(APPOBJDIR)/ClusterPerf \
+#      $(APPOBJDIR)/ClusterPerf \
       $(APPOBJDIR)/CoordinatorCrashRecovery \
       $(APPOBJDIR)/ensureServers \
       $(APPOBJDIR)/migrateTablet \

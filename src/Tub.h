@@ -162,7 +162,7 @@ class Tub {
     void
     destroy() {
         if (occupied) {
-            object->~ElementType();
+            reinterpret_cast<ElementType*>(object)->~ElementType();
             occupied = false;
         }
     }

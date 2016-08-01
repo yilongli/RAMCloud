@@ -1014,7 +1014,7 @@ Recovery::startRecoveryMasters()
         tracker->getServersWithService(WireFormat::MASTER_SERVICE);
     std::random_shuffle(masters.begin(), masters.end(), randomNumberGenerator);
     uint32_t started = 0;
-    Tub<MasterStartTask> recoverTasks[numPartitions];
+    std::vector<Tub<MasterStartTask>> recoverTasks(numPartitions);
     foreach (ServerId master, masters) {
         if (started == numPartitions)
             break;
@@ -1058,7 +1058,7 @@ Recovery::startRecoveryMasters()
     }
 
     // Tell the recovery masters to begin recovery.
-    parallelRun(recoverTasks, numPartitions, 10);
+    parallelRun(recoverTasks.data(), numPartitions, 10);
 
     // If all of the recovery masters failed to get off to a start then
     // skip waiting for them.
@@ -1188,11 +1188,11 @@ Recovery::broadcastRecoveryComplete()
     CycleCounter<RawMetric> ticks(&metrics->coordinator.recoveryCompleteTicks);
     std::vector<ServerId> backups =
         tracker->getServersWithService(WireFormat::BACKUP_SERVICE);
-    Tub<BackupEndTask> tasks[backups.size()];
+    std::vector<Tub<BackupEndTask>> tasks(backups.size());
     size_t taskNum = 0;
     foreach (ServerId backup, backups)
         tasks[taskNum++].construct(*this, backup, crashedServerId);
-    parallelRun(tasks, backups.size(), 10);
+    parallelRun(tasks.data(), backups.size(), 10);
 }
 
 } // namespace RAMCloud
