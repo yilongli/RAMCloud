@@ -2041,9 +2041,11 @@ doMultiRead(int dataLength, uint16_t keyLength,
         return 0;
     Buffer input;
 
-    MultiReadObject requestObjects[numMasters][objsPerMaster];
+    std::vector<std::vector<MultiReadObject>> requestObjects(numMasters,
+            std::vector<MultiReadObject>(objsPerMaster));
     MultiReadObject* requests[numMasters][objsPerMaster];
-    Tub<ObjectBuffer> values[numMasters][objsPerMaster];
+    std::vector<std::vector<Tub<ObjectBuffer>>> values(numMasters,
+            std::vector<Tub<ObjectBuffer>>(objsPerMaster));
     char keys[numMasters][objsPerMaster][keyLength];
 
     std::vector<uint64_t> tableIds(numMasters);
@@ -2130,9 +2132,11 @@ doMultiWrite(int dataLength, uint16_t keyLength,
         return 0;
 
     // MultiWrite Objects
-    MultiWriteObject writeRequestObjects[numMasters][objsPerMaster];
+    std::vector<std::vector<MultiReadObject>> writeRequestObjects(numMasters,
+            std::vector<MultiReadObject>(objsPerMaster));
     MultiWriteObject* writeRequests[numMasters][objsPerMaster];
-    Buffer values[numMasters][objsPerMaster];
+    std::vector<std::vector<Buffer>> values(numMasters,
+            std::vector<Buffer>(objsPerMaster));
     char keys[numMasters][objsPerMaster][keyLength];
 
     std::vector<uint64_t> tableIds(numMasters);
@@ -3354,7 +3358,7 @@ indexScalabilityCommonLookup(uint8_t numIndexlets, int numObjectsPerIndxlet,
     while (true) {
         int numRequests = concurrent;
 //        int numRequests = numIndexlets;
-        Buffer lookupResp[numRequests];
+        std::vector<Buffer> lookupResp(numRequests);
         uint32_t numHashes[numRequests];
         uint16_t nextKeyLength[numRequests];
         uint64_t nextKeyHash[numRequests];
@@ -3362,7 +3366,7 @@ indexScalabilityCommonLookup(uint8_t numIndexlets, int numObjectsPerIndxlet,
         char firstKey[numRequests][30];
         char lastKey[numRequests][30];
 
-        Tub<LookupIndexKeysRpc> rpcs[numRequests];
+        std::vector<Tub<LookupIndexKeysRpc>> rpcs(numRequests);
 
         for (int i =0; i < numRequests; i++) {
             char indexIdent = static_cast<char>(('a') +
@@ -3430,8 +3434,8 @@ indexScalabilityCommonLookup(uint8_t numIndexlets, int numObjectsPerIndxlet,
 
         uint64_t startTimes[numRequests];
         uint64_t stopTimes[numRequests];
-        Tub<IndexKey::IndexKeyRange> keyRanges[numRequests];
-        Tub<IndexLookup> rpcs[numRequests];
+        std::vector<Tub<IndexKey::IndexKeyRange>> keyRanges(numRequests);
+        std::vector<Tub<IndexLookup>> rpcs(numRequests);
         uint32_t readNumObjects[numRequests];
 
         for (int i =0; i < numRequests; i++) {
@@ -3944,7 +3948,8 @@ doTransaction(int dataLength, uint16_t keyLength,
     if (clientIndex != 0)
         return 0;
 
-    Buffer values[numMasters][writeOpPerMaster];
+    std::vector<std::vector<Buffer>> values(numMasters,
+            std::vector<Buffer>(writeOpPerMaster));
     char keys[numMasters][objsPerMaster][keyLength];
 
     std::vector<uint64_t> tableIds(numMasters);
