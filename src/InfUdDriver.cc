@@ -453,9 +453,9 @@ InfUdDriver::receivePackets(int maxPackets,
             }
             memcpy(buffer->payload, bd->buffer + sizeof(ethHdr), length);
         } else {
-            buffer->infAddress.construct(*infiniband,
+            buffer->sender.construct(*infiniband,
                     ibPhysicalPort, incoming->slid, incoming->src_qp);
-            sender = buffer->infAddress.get();
+            sender = buffer->sender.get();
             length = bd->messageBytes - GRH_SIZE;
             memcpy(buffer->payload, bd->buffer + GRH_SIZE, length);
         }

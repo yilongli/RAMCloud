@@ -94,20 +94,14 @@ class InfUdDriver : public Driver {
                                     // packets
     } __attribute__((packed));
 
-    /**
-     * Structure to hold an incoming packet.
-     */
-    struct PacketBuf {
-        PacketBuf() : infAddress(), macAddress() {}
-        /**
-         * Address of sender (used to send reply).
-         */
-        Tub<Address> infAddress;
+    struct PacketBuf : Driver::PacketBuf<Address, 2048 - GRH_SIZE> {
+        PacketBuf()
+            : Driver::PacketBuf<Address, 2048 - GRH_SIZE>()
+            , macAddress()
+        {}
+
+        /// Address of sender (if we are in Ethernet mode).
         Tub<MacAddress> macAddress;
-        /**
-         * Packet data (may not fill all of the allocated space).
-         */
-        char payload[2048 - GRH_SIZE];
     };
 
     /// Shared RAMCloud information.
