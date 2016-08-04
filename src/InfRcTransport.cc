@@ -370,13 +370,13 @@ InfRcTransport::setNonBlocking(int fd)
  */
 InfRcTransport::InfRcSession::InfRcSession(
     InfRcTransport *transport, const ServiceLocator* sl, uint32_t timeoutMs)
-    : transport(transport)
+    : Session(sl->getOriginalString())
+    , transport(transport)
     , serverAddress()
     , qp(NULL)
     , sessionAlarm(transport->context->sessionAlarmTimer, this,
             (timeoutMs != 0) ? timeoutMs : DEFAULT_TIMEOUT_MS)
 {
-    setServiceLocator(sl->getOriginalString());
     IpAddress address(sl);
     serverAddress = reinterpret_cast<struct sockaddr_in*>(
             &address.address)->sin_addr;
