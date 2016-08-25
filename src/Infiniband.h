@@ -280,7 +280,7 @@ class Infiniband {
         int getPhysicalPort() const { return physicalPort; }
         uint16_t getLid() const { return lid; }
         uint32_t getQpn() const { return qpn; }
-        ibv_ah* getHandle() const;
+        ibv_ah* getHandle(uint8_t sl) const;
 
         void operator=(Address&) = delete;
 
@@ -290,7 +290,7 @@ class Infiniband {
         int physicalPort;   // physical port number on local device
         uint16_t lid;       // local id (address)
         uint32_t qpn;       // queue pair number
-        mutable ibv_ah* ah; // address handle, may be NULL
+        mutable ibv_ah** ah; // address handle, may be NULL
     };
 
     // wrap an RX or TX buffer registered with the HCA
@@ -472,14 +472,16 @@ class Infiniband {
              BufferDescriptor* bd,
              uint32_t length,
              const Address* address = NULL,
-             uint32_t remoteQKey = 0);
+             uint32_t remoteQKey = 0,
+             uint8_t serviceLevel = 0);
 
     void
     postSendAndWait(QueuePair* qp,
                     BufferDescriptor* bd,
                     uint32_t length,
                     const Address* address = NULL,
-                    uint32_t remoteQKey = 0);
+                    uint32_t remoteQKey = 0,
+                    uint8_t serviceLevel = 0);
 
     ibv_cq*
     createCompletionQueue(int minimumEntries);
@@ -509,7 +511,7 @@ class Infiniband {
     // (as of 11/2015, these calls take 40-50us!). These entries are never
     // garbage collected, but there will be only one entry per host (and the
     // lids are only 16 bits), so the memory usage should be tolerable.
-    typedef std::unordered_map<uint16_t, ibv_ah*> AddressHandleMap;
+    typedef std::unordered_map<uint16_t, ibv_ah*[16]> AddressHandleMap;
     AddressHandleMap ahMap;
 
     uint64_t totalAddressHandleAllocCalls;

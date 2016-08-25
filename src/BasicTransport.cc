@@ -86,6 +86,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // we don't want those delays to result in RPC timeouts.
     , timeoutIntervals(40)
     , pingIntervals(3)
+    , highestPrio(driver->getHighestPacketPriority())
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -315,11 +316,11 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             // Entire message fits in a single packet.
             AllDataHeader header(rpcId, flags, downCast<uint16_t>(messageSize));
             Buffer::Iterator iter(message, 0, messageSize);
-            driver->sendPacket(address, &header, &iter);
+            driver->sendPacket(address, &header, &iter, highestPrio);
         } else {
             DataHeader header(rpcId, message->size(), curOffset, flags);
             Buffer::Iterator iter(message, curOffset, bytesThisPacket);
-            driver->sendPacket(address, &header, &iter);
+            driver->sendPacket(address, &header, &iter, 0);
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
@@ -795,7 +796,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         GrantHeader grant(header->common.rpcId,
                                 clientRpc->grantOffset, FROM_CLIENT);
                         driver->sendPacket(clientRpc->session->serverAddress,
-                                &grant, NULL);
+                                &grant, NULL, highestPrio);
                     }
                 }
                 if (retainPacket) {
@@ -871,7 +872,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // we're still alive.
                     AckHeader ack(header->common.rpcId, FROM_CLIENT);
                     driver->sendPacket(clientRpc->session->serverAddress,
-                            &ack, NULL);
+                            &ack, NULL, highestPrio);
                     return;
 
                 }
@@ -1025,7 +1026,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         GrantHeader grant(header->common.rpcId,
                                 serverRpc->grantOffset, FROM_SERVER);
                         driver->sendPacket(serverRpc->clientAddress,
-                                &grant, NULL);
+                                &grant, NULL, highestPrio);
                     }
                 }
                 serverDataDone:
@@ -1090,7 +1091,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                             downCast<uint32_t>(common->rpcId.sequence));
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, FROM_SERVER|RESTART);
-                    driver->sendPacket(received->sender, &resend, NULL);
+                    driver->sendPacket(received->sender, &resend, NULL,
+                            highestPrio);
                     return;
                 }
                 uint32_t resendEnd = header->offset + header->length;
@@ -1112,7 +1114,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // we're still alive.
                     AckHeader ack(serverRpc->rpcId, FROM_SERVER);
                     driver->sendPacket(serverRpc->clientAddress,
-                            &ack, NULL);
+                            &ack, NULL, highestPrio);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1368,7 +1370,7 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
     }
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
             whoFrom);
-    t->driver->sendPacket(address, &resend, NULL);
+    t->driver->sendPacket(address, &resend, NULL, t->highestPrio);
     return endOffset;
 }
 
@@ -1487,7 +1489,7 @@ BasicTransport::checkTimeouts()
                 // The RESEND packet is effectively a grant...
                 clientRpc->grantOffset = roundTripBytes;
                 driver->sendPacket(clientRpc->session->serverAddress,
-                        &resend, NULL);
+                        &resend, NULL, highestPrio);
             }
         } else {
             // We have received part of the response. If the server has gone

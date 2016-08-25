@@ -211,6 +211,15 @@ InfUdDriver::~InfUdDriver()
 /*
  * See docs in the ``Driver'' class.
  */
+uint8_t
+InfUdDriver::getHighestPacketPriority()
+{
+    return LOWEST_PRIO_SERVICE_LEVEL;
+}
+
+/*
+ * See docs in the ``Driver'' class.
+ */
 uint32_t
 InfUdDriver::getMaxPacketSize()
 {
@@ -343,7 +352,8 @@ void
 InfUdDriver::sendPacket(const Driver::Address *addr,
                         const void *header,
                         uint32_t headerLen,
-                        Buffer::Iterator *payload)
+                        Buffer::Iterator *payload,
+                        uint8_t priority)
 {
     uint32_t totalLength = headerLen +
                            (payload ? payload->size() : 0);
@@ -402,7 +412,8 @@ InfUdDriver::sendPacket(const Driver::Address *addr,
     // completion notification.
     workRequest.wr_id = reinterpret_cast<uint64_t>(bd);
     const Address* address = static_cast<const Address*>(addr);
-    workRequest.wr.ud.ah = address->getHandle();
+    workRequest.wr.ud.ah = address->getHandle(
+            downCast<uint8_t>(LOWEST_PRIO_SERVICE_LEVEL - priority));
     workRequest.wr.ud.remote_qpn = address->getQpn();
     workRequest.wr.ud.remote_qkey = QKEY;
     workRequest.next = NULL;
@@ -644,11 +655,12 @@ InfUdDriver::BufferPool::~BufferPool()
     if (memoryRegion != NULL) {
         ibv_dereg_mr(memoryRegion);
     }
-    delete bufferMemory;
+    // `bufferMemory` and `descriptors` are allocated using malloc.
+    free(bufferMemory);
     for (uint32_t i = 0; i < numBuffers; i++) {
         descriptors[i].~BufferDescriptor();
     }
-    delete descriptors;
+    free(descriptors);
 }
 
 } // namespace RAMCloud

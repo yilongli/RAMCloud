@@ -292,12 +292,15 @@ Infiniband::postSrqReceive(ibv_srq* srq, BufferDescriptor *bd)
  *      UD queue pairs only. The address of the host to send to. 
  * \param[in] remoteQKey
  *      UD queue pairs only. The Q_Key of the remote pair to send to.
+ * \param[in] serviceLevel
+ *      Service level used to transmit the packet.
  * \throw TransportException
  *      if the send post fails.
  */
 void
 Infiniband::postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
-                     const Address* address, uint32_t remoteQKey)
+                     const Address* address, uint32_t remoteQKey,
+                     uint8_t serviceLevel)
 {
     if (qp->type == IBV_QPT_UD) {
         assert(address != NULL);
@@ -316,7 +319,7 @@ Infiniband::postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
     memset(&txWorkRequest, 0, sizeof(txWorkRequest));
     txWorkRequest.wr_id = reinterpret_cast<uint64_t>(bd);// stash descriptor ptr
     if (qp->type == IBV_QPT_UD) {
-        txWorkRequest.wr.ud.ah = address->getHandle();
+        txWorkRequest.wr.ud.ah = address->getHandle(serviceLevel);
         txWorkRequest.wr.ud.remote_qpn = address->getQpn();
         txWorkRequest.wr.ud.remote_qkey = remoteQKey;
     }
@@ -353,15 +356,18 @@ Infiniband::postSend(QueuePair* qp, BufferDescriptor *bd, uint32_t length,
  *      UD queue pairs only. The address of the host to send to. 
  * \param[in] remoteQKey
  *      UD queue pairs only. The Q_Key of the remote pair to send to.
+ * \param[in] serviceLevel
+ *      Service level used to transmit the packet.
  * \throw
  *      TransportException if the send does not result in success
  *      (IBV_WC_SUCCESS).
  */
 void
 Infiniband::postSendAndWait(QueuePair* qp, BufferDescriptor *bd,
-    uint32_t length, const Address* address, uint32_t remoteQKey)
+    uint32_t length, const Address* address, uint32_t remoteQKey,
+    uint8_t serviceLevel)
 {
-    postSend(qp, bd, length, address, remoteQKey);
+    postSend(qp, bd, length, address, remoteQKey, serviceLevel);
     CycleCounter<RawMetric> _(&metrics->transport.transmit.dmaTicks);
 
     ibv_wc wc;
@@ -628,6 +634,7 @@ Infiniband::QueuePair::plumb(QueuePairTuple *qpt)
     qpa.min_rnr_timer = 12;
     qpa.ah_attr.is_global = 0;
     qpa.ah_attr.dlid = qpt->getLid();
+    // TODO: what about here? how to set the SL here?
     qpa.ah_attr.sl = 0;
     qpa.ah_attr.src_path_bits = 0;
     qpa.ah_attr.port_num = downCast<uint8_t>(ibPhysicalPort);
@@ -924,22 +931,25 @@ Infiniband::Address::toString() const
  * Performance note: The first time this is called for a particular lid, it
  * will allocate memory for the address handle, which is an expensive
  * operation.
+ * \param sl
+ *      The service level to use in the packet transmitted via this handle.
  *
  * \throw TransportException
  *      if ibv_create_ah fails
  */
 ibv_ah*
-Infiniband::Address::getHandle() const
+Infiniband::Address::getHandle(uint8_t sl) const
 {
-    if (ah != NULL) {
-        return ah;
+    if (ah != NULL && ah[sl] != NULL) {
+        return ah[sl];
     }
 
     // See if we have a cached value.
     AddressHandleMap::iterator it = infiniband.ahMap.find(lid);
-    if (it != infiniband.ahMap.end()) {
+    if (it == infiniband.ahMap.end()) {
+        ah = infiniband.ahMap[lid];
+    } else {
         ah = it->second;
-        return ah;
     }
 
     // Must allocate a new address handle.
@@ -947,16 +957,15 @@ Infiniband::Address::getHandle() const
     attr.dlid = lid;
     attr.src_path_bits = 0;
     attr.is_global = 0;
-    attr.sl = 0;
+    attr.sl = sl;
     attr.port_num = downCast<uint8_t>(physicalPort);
     infiniband.totalAddressHandleAllocCalls += 1;
     uint64_t start = Cycles::rdtsc();
-    ah = ibv_create_ah(infiniband.pd.pd, &attr);
+    ah[sl] = ibv_create_ah(infiniband.pd.pd, &attr);
     infiniband.totalAddressHandleAllocTime += Cycles::rdtsc() - start;
-    if (ah == NULL)
+    if (ah[sl] == NULL)
         throw TransportException(HERE, "failed to create ah", errno);
-    infiniband.ahMap[lid] = ah;
-    return ah;
+    return ah[sl];
 }
 
 } // namespace

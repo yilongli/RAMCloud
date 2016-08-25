@@ -687,6 +687,8 @@ class BasicTransport : public Transport {
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
 
+    const uint8_t highestPrio;
+
     DISALLOW_COPY_AND_ASSIGN(BasicTransport);
 };
 

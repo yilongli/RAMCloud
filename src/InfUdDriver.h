@@ -46,6 +46,7 @@ class InfUdDriver : public Driver {
             const ServiceLocator* localServiceLocator, bool ethernet);
     virtual ~InfUdDriver();
     virtual void dumpStats() { infiniband->dumpStats(); }
+    virtual uint8_t getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
     virtual void receivePackets(int maxPackets,
@@ -53,7 +54,8 @@ class InfUdDriver : public Driver {
     virtual void registerMemory(void* base, size_t bytes);
     virtual void release(char *payload);
     virtual void sendPacket(const Driver::Address *addr, const void *header,
-                            uint32_t headerLen, Buffer::Iterator *payload);
+                            uint32_t headerLen, Buffer::Iterator *payload,
+                            uint8_t priority = 0);
     virtual string getServiceLocator();
 
     virtual Driver::Address* newAddress(const ServiceLocator* serviceLocator) {
@@ -152,6 +154,26 @@ class InfUdDriver : public Driver {
 
     /// Maximum number of transmit buffers that may be outstanding at once.
     static const uint32_t MAX_TX_QUEUE_DEPTH = 50;
+
+#ifndef NUM_IB_VIRTUAL_LANES
+#define NUM_IB_VIRTUAL_LANES 16
+#endif
+    // TODO: is there a better way to obtain this number? `ibv_query_port`?
+    /// Infiniband packets can be marked with a Service Level (SL) for traffic
+    /// prioritization. For transmission, the SL will be mapped to a Virtual
+    /// Lane (VL) at the CA or switch. The SL-to-VL mapping and the priority
+    /// of each VL are configurable in each HCA or switch. While there are
+    /// 16 SLs (SL 0..15), the number of VLs supported by the hardware can be
+    /// less than 16. Furthermore, one VL (i.e., VL 15) is reserved for
+    /// network management and not eligible for normal data transmission.
+    /// Given an IB subnet with N VLs (i.e., VL 0..N-2,15), we assume that
+    /// the HCAs and switches are configured in the following way:
+    /// 1) SL k (k <= N-2) is mapped to VL k;
+    /// 2) SL k (k > N-2) is mapped to VL 15 (i.e., drop this SL);
+    /// 3) Smaller VL number means higher priority (because we would like to
+    /// be consistent with the default OpenSM configuration which uses VL 0
+    /// as the highest priority VL).
+    static const uint8_t LOWEST_PRIO_SERVICE_LEVEL = NUM_IB_VIRTUAL_LANES - 2;
 
     /*
      * Note that in UD mode, Infiniband receivers prepend a 40-byte
