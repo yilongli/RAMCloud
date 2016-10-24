@@ -23,12 +23,9 @@ by running a collection of servers and clients.
 from __future__ import division, print_function
 from common import *
 import config
-import itertools
 import log
 import os
 import random
-import pprint
-import re
 import subprocess
 import sys
 import time
@@ -70,6 +67,7 @@ coord_locator_templates = {
     'basic+dpdk': 'basic+udp:host=%(host)s,port=%(port)d',
 }
 
+
 def server_locator(transport, host, port=server_port):
     """Generate a service locator for a master/backup process.
 
@@ -93,6 +91,7 @@ def server_locator(transport, host, port=server_port):
                 'id': host[2]})
     return locator
 
+
 def coord_locator(transport, host):
     """Generate a service locator for a coordinator process.
 
@@ -111,6 +110,7 @@ def coord_locator(transport, host):
                 'port': coordinator_port,
                 'id': host[2]})
     return locator
+
 
 class Cluster(object):
     """Helper context manager for scripting and coordinating RAMCloud on a
@@ -184,7 +184,7 @@ class Cluster(object):
             if self.verbose:
                 print ('Cluster name exists')
         else:
-            self.cluster_name = 'cluster_' +  ''.join([chr(random.choice(
+            self.cluster_name = 'cluster_' + ''.join([chr(random.choice(
                                  range(ord('a'), ord('z'))))
                                     for c in range(20)])
         if self.verbose:
@@ -285,7 +285,7 @@ class Cluster(object):
             print('Coordinator started on %s at %s' %
                    (self.coordinator_host[0], self.coordinator_locator))
             print('Coordinator command line arguments %s' %
-                   (command))
+                  command)
         return self.coordinator
 
     def start_server(self,
@@ -383,13 +383,13 @@ class Cluster(object):
 
         path = '%s/logs/shm' % os.getcwd()
         files = sorted([f for f in os.listdir(path)
-           if os.path.isfile( os.path.join(path, f) )])
+           if os.path.isfile(os.path.join(path, f))])
 
         for file in files:
-            f = open('%s/logs/shm/%s' % (os.getcwd(), file),'r')
+            f = open('%s/logs/shm/%s' % (os.getcwd(), file), 'r')
             service_locator = f.read()
 
-            if (locator in service_locator):
+            if locator in service_locator:
                 to_kill = '1'
                 mhost = file
                 subprocess.Popen(['ssh', mhost.split('_')[0],
@@ -402,7 +402,6 @@ class Cluster(object):
                     pass
             else:
                 f.close()
-
 
     def ensure_servers(self, numMasters=None, numBackups=None, timeout=30):
         """Poll the coordinator and block until the specified number of
@@ -492,17 +491,17 @@ class Cluster(object):
         """
         root = self.log_subdir
         for item in os.listdir(root):
-           path = os.path.join(root, item)
-           if os.path.isfile(path):
-             if os.path.getsize(path) == 0:
-                os.remove(path)
-           elif os.path.isdir(path):
-             try:
-                os.rmdir(path)
-             except:
-                None
+            path = os.path.join(root, item)
+            if os.path.isfile(path):
+                if os.path.getsize(path) == 0:
+                    os.remove(path)
+            elif os.path.isdir(path):
+                try:
+                    os.rmdir(path)
+                except:
+                    None
 
-    def shutdown():
+    def shutdown(self):
         """Kill all remaining processes started as part of this cluster and
         wait for their exit. Usually called implicitly if 'with' keyword is
         used with the cluster."""
@@ -518,6 +517,7 @@ class Cluster(object):
         self.sandbox.__exit__(exc_type, exc_value, exc_tb)
         self.remove_empty_files()
         return False # rethrow exception, if any
+
 
 def run(
         num_servers=4,             # Number of hosts on which to start
@@ -577,8 +577,8 @@ def run(
         old_master_args='',        # Additional arguments to run on the
                                    # old master (e.g. total RAM).
         enable_logcabin=False,     # Do not enable logcabin.
-        valgrind=False,		   # Do not run under valgrind
-        valgrind_args='',	   # Additional arguments for valgrind
+        valgrind=False,            # Do not run under valgrind
+        valgrind_args='',          # Additional arguments for valgrind
         disjunct=False,            # Disjunct entities on a server
         coordinator_host=None
         ):
@@ -590,16 +590,15 @@ def run(
     """
 #    client_hosts = [('rc52', '192.168.1.152', 52)]
 
-    if client:
-        if num_clients == 0:
-            num_clients = 1
+    if client and num_clients == 0:
+        num_clients = 1
 
     if verbose:
         print('num_servers=(%d), available hosts=(%d) defined in config.py'
               % (num_servers, len(getHosts())))
         print ('disjunct=', disjunct)
 
-# When disjunct=True, disjuncts Coordinator and Clients on Server nodes.
+    # When disjunct=True, disjuncts Coordinator and Clients on Server nodes.
     if disjunct:
         if num_servers + num_clients + 1 > len(getHosts()):
             raise Exception('num_servers (%d)+num_clients (%d)+1(coord) exceeds the available hosts (%d)'
@@ -635,16 +634,14 @@ def run(
 
         if not coordinator_host:
             coordinator_host = cluster.hosts[len(cluster.hosts)-1]
-        coordinator = cluster.start_coordinator(coordinator_host,
-                                                coordinator_args)
+        cluster.start_coordinator(coordinator_host, coordinator_args)
         if disjunct:
             cluster.hosts.pop(0)
 
         if old_master_host:
-            oldMaster = cluster.start_server(old_master_host,
-                                             old_master_args,
-                                             backup=False)
-            oldMaster.ignoreFailures = True
+            old_master = cluster.start_server(old_master_host,
+                    old_master_args, backup=False)
+            old_master.ignoreFailures = True
             masters_started += 1
             cluster.ensure_servers(timeout=60)
 
@@ -697,54 +694,50 @@ def run(
 
 if __name__ == '__main__':
     parser = OptionParser(description=
-            'Start RAMCloud servers and run a client application.',
+            'Start RAMCloud servers and (optionally) run multiple instances '
+            'of a client application.',
             conflict_handler='resolve')
-    parser.add_option('--backupArgs', metavar='ARGS', default='',
-            dest='backup_args',
-            help='Additional command-line arguments to pass to '
-                 'each backup')
-    parser.add_option('-b', '--backupDisks', type=int, default=1,
-            metavar='N', dest='backup_disks_per_server',
+    parser.add_option('--backupArgs', default='', dest='backup_args',
+            help='Additional command-line arguments to pass to each backup')
+    parser.add_option('-b', '--backupDisks', type=int, default=2,
+            dest='backup_disks_per_server',
             help='Number of backup disks to run on each server host '
-                 '(0, 1, or 2)')
-    parser.add_option('--client', metavar='ARGS',
+                 '(0, 1, or 2) [default: %default]')
+    parser.add_option('--client',
             help='Command line to invoke the client application '
                  '(additional arguments will be inserted at the beginning '
                  'of the argument list)')
-    parser.add_option('-n', '--clients', type=int, default=1,
-            metavar='N', dest='num_clients',
+    parser.add_option('-n', '--clients', type=int, default=0,
+            dest='num_clients',
             help='Number of instances of the client application '
-                 'to run')
-    parser.add_option('--coordinatorArgs', metavar='ARGS', default='',
-            dest='coordinator_args',
+                 'to run [default: %default]')
+    parser.add_option('--coordinatorArgs', default='', dest='coordinator_args',
             help='Additional command-line arguments to pass to the '
                  'cluster coordinator')
     parser.add_option('--debug', action='store_true', default=False,
             help='Pause after starting servers but before running '
                  'clients to enable debugging setup')
     parser.add_option('--disk1', default=default_disk1,
-            help='Server arguments to specify disk for first backup')
+            help='Server arguments to specify disk for the first backup '
+                 '[default: %default]')
     parser.add_option('--disk2', default=default_disk2,
-            help='Server arguments to specify disk for second backup')
+            help='Server arguments to specify disk for the second backup '
+                 '[default: %default]')
     parser.add_option('-l', '--logLevel', default='NOTICE',
             choices=['DEBUG', 'NOTICE', 'WARNING', 'ERROR', 'SILENT'],
-            metavar='L', dest='log_level',
-            help='Controls degree of logging in servers')
-    parser.add_option('-d', '--logDir', default='logs',
-            metavar='DIR',
-            dest='log_dir',
-            help='Top level directory for log files; the files for '
-                 'each invocation will go in a subdirectory.')
-    parser.add_option('--masterArgs', metavar='ARGS', default='',
-            dest='master_args',
-            help='Additional command-line arguments to pass to '
-                 'each master')
+            dest='log_level',
+            help='Controls degree of logging in servers [default: %default]')
+    parser.add_option('-d', '--logDir', default='logs', dest='log_dir',
+            help='Top level directory for log files; the files for each '
+                 'invocation will go in a subdirectory. [default: %default]')
+    parser.add_option('--masterArgs', default='', dest='master_args',
+            help='Additional command-line arguments to pass to each master')
     parser.add_option('-r', '--replicas', type=int, default=3,
-            metavar='N',
-            help='Number of disk backup copies for each segment')
+            help='Number of disk backup copies for each segment '
+                 '[default: %default]')
     parser.add_option('-s', '--servers', type=int, default=4,
-            metavar='N', dest='num_servers',
-            help='Number of hosts on which to run servers')
+            dest='num_servers',
+            help='Number of hosts on which to run servers [default: %default]')
     parser.add_option('--shareHosts', action='store_true', default=False,
             dest='share_hosts',
             help='Allow clients to run on machines running servers '
@@ -752,17 +745,16 @@ if __name__ == '__main__':
                  'the servers, though multiple clients may run on a '
                  'single machine)')
     parser.add_option('-t', '--timeout', type=int, default=20,
-            metavar='SECS',
             help="Abort if the client application doesn't finish within "
-            'SECS seconds')
+            'TIMEOUT seconds [default: %default]')
     parser.add_option('-T', '--transport', default='basic+infud',
-            help='Transport to use for communication with servers')
+            help='Transport protocol to use for communication with servers '
+                 '[default: %default]')
     parser.add_option('-v', '--verbose', action='store_true', default=False,
             help='Print progress messages')
     parser.add_option('--valgrind', action='store_true', default=False,
             help='Run all the processes under valgrind')
-    parser.add_option('--valgrindArgs', metavar='ARGS', default='',
-            dest='valgrind_args',
+    parser.add_option('--valgrindArgs', default='', dest='valgrind_args',
             help='Arguments to pass to valgrind')
     parser.add_option('--disjunct', action='store_true', default=False,
             help='Disjunct entities (disable collocation) on each server')
@@ -773,7 +765,7 @@ if __name__ == '__main__':
     try:
         run(**vars(options))
     finally:
-        logInfo = log.scan("logs/latest", ["WARNING", "ERROR"])
+        logInfo = log.scan(options.log_dir + "/latest", ["WARNING", "ERROR"])
         if len(logInfo) > 0:
             print(logInfo, file=sys.stderr)
             status = 1
