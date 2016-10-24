@@ -36,9 +36,6 @@ coordinator_binary = '%s/coordinator' % config.hooks.get_remote_obj_path()
 server_binary = '%s/server' % config.hooks.get_remote_obj_path()
 ensure_servers_bin = '%s/ensureServers' % config.hooks.get_remote_obj_path()
 
-# valgrind
-valgrind_command = ''
-
 # Info used to construct service locators for each of the transports
 # supported by RAMCloud.  In some cases the locator for the coordinator
 # needs to be different from that for the servers.
@@ -149,6 +146,8 @@ class Cluster(object):
                       this cluster will log.
     @ivar sandbox: Nested context manager that cleans up processes when the
                    the context of this cluster is exited.
+    @ivar valgrind_command: Command line to invoke Valgrind (empty string means
+                            no to invoke Valgrind)
     """
 
     def __init__(self, log_dir='logs', log_exists=False,
@@ -178,6 +177,7 @@ class Cluster(object):
         self.replicas = 3
         self.disk = default_disk1
         self.disjunct = False
+        self.valgrind_command = ''
 
         if cluster_name_exists: # do nothing if it exists
             self.cluster_name = None
@@ -246,7 +246,7 @@ class Cluster(object):
         if not self.enable_logcabin:
             command = (
                 '%s %s -C %s -l %s --logFile %s/coordinator.%s.log %s' %
-                (valgrind_command,
+                (self.valgrind_command,
                  coordinator_binary, self.coordinator_locator,
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
@@ -259,7 +259,7 @@ class Cluster(object):
             command = (
                 '%s %s -C %s -z logcabin21:61023 -l %s '
                 '--logFile %s/coordinator.%s.log %s' %
-                (valgrind_command,
+                (self.valgrind_command,
                  coordinator_binary, self.coordinator_locator,
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
@@ -322,7 +322,7 @@ class Cluster(object):
 
         command = ('%s %s -C %s -L %s -r %d -l %s --clusterName __unnamed__ '
                    '--logFile %s.log --preferredIndex %d %s' %
-                   (valgrind_command,
+                   (self.valgrind_command,
                     server_binary, self.coordinator_locator,
                     server_locator(self.transport, host, port),
                     self.replicas,
@@ -456,7 +456,7 @@ class Cluster(object):
         for i, client_host in enumerate(hosts):
             command = ('%s %s -C %s --numClients %d --clientIndex %d '
                        '--logFile %s/client%d.%s.log %s' %
-                       (valgrind_command,
+                       (self.valgrind_command,
                         client_bin, self.coordinator_locator, num_clients,
                         i, self.log_subdir, self.next_client_id,
                         client_host[0], client_args))
@@ -617,10 +617,6 @@ def run(
     masters_started = 0
     backups_started = 0
 
-    global valgrind_command
-    if valgrind:
-        valgrind_command = ('valgrind %s' % valgrind_args)
-
     with Cluster(log_dir) as cluster:
         cluster.log_level = log_level
         cluster.verbose = verbose
@@ -631,6 +627,8 @@ def run(
         cluster.enable_logcabin = enable_logcabin
         cluster.disjunct = disjunct
         cluster.hosts = getHosts()
+        if valgrind:
+            cluster.valgrind_command = ('valgrind %s' % valgrind_args)
 
         if not coordinator_host:
             coordinator_host = cluster.hosts[len(cluster.hosts)-1]

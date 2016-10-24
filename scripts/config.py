@@ -20,7 +20,7 @@ of RAMCloud binaries.  This should be the only file you have to modify to
 run RAMCloud scripts at your site.
 """
 
-from common import captureSh
+from common import captureSh, getHosts
 import os
 import re
 import subprocess
