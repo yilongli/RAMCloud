@@ -343,7 +343,8 @@ void
 InfUdDriver::sendPacket(const Driver::Address *addr,
                         const void *header,
                         uint32_t headerLen,
-                        Buffer::Iterator *payload)
+                        Buffer::Iterator *payload,
+                        uint8_t priority)
 {
     uint32_t totalLength = headerLen +
                            (payload ? payload->size() : 0);
@@ -651,11 +652,12 @@ InfUdDriver::BufferPool::~BufferPool()
     if (memoryRegion != NULL) {
         ibv_dereg_mr(memoryRegion);
     }
-    delete bufferMemory;
+    // `bufferMemory` and `descriptors` are allocated using malloc.
+    free(bufferMemory);
     for (uint32_t i = 0; i < numBuffers; i++) {
         descriptors[i].~BufferDescriptor();
     }
-    delete descriptors;
+    free(descriptors);
 }
 
 } // namespace RAMCloud

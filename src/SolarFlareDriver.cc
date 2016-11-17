@@ -532,10 +532,11 @@ SolarFlareDriver::newAddress(const ServiceLocator& serviceLocator) {
 
 /// See docs in the ``Driver'' class.
 void
-SolarFlareDriver::sendPacket(const Driver::Address* recipient,
-                             const void* header,
-                             const uint32_t headerLen,
-                             Buffer::Iterator *payload)
+SolarFlareDriver::sendPacket(const Driver::Address *recipient,
+                             const void *header,
+                             uint32_t headerLen,
+                             Buffer::Iterator *payload,
+                             uint8_t priority)
 {
 
     uint32_t udpPayloadLen = downCast<uint32_t>(headerLen

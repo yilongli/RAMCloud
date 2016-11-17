@@ -54,7 +54,8 @@ class InfUdDriver : public Driver {
     virtual void registerMemory(void* base, size_t bytes);
     virtual void release(char *payload);
     virtual void sendPacket(const Driver::Address *addr, const void *header,
-                            uint32_t headerLen, Buffer::Iterator *payload);
+                            uint32_t headerLen, Buffer::Iterator *payload,
+                            uint8_t priority = 0);
     virtual string getServiceLocator();
 
     virtual Driver::Address* newAddress(const ServiceLocator* serviceLocator) {

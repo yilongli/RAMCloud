@@ -362,7 +362,8 @@ void
 DpdkDriver::sendPacket(const Address *addr,
                        const void *header,
                        uint32_t headerLen,
-                       Buffer::Iterator *payload)
+                       Buffer::Iterator *payload,
+                       uint8_t priority)
 {
     struct rte_mbuf *mbuf = NULL;
     char *data = NULL;

@@ -67,7 +67,8 @@ class DpdkDriver : public Driver
     virtual void sendPacket(const Address *addr,
                             const void *header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload);
+                            Buffer::Iterator *payload,
+                            uint8_t priority = 0);
     virtual string getServiceLocator();
 
     typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;

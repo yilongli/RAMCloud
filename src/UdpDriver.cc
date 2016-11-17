@@ -224,7 +224,8 @@ void
 UdpDriver::sendPacket(const Address *addr,
                       const void *header,
                       uint32_t headerLen,
-                      Buffer::Iterator *payload)
+                      Buffer::Iterator *payload,
+                      uint8_t priority)
 {
     if (socketFd == -1)
         return;
