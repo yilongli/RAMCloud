@@ -16,6 +16,7 @@
 
 #include "BasicTransport.h"
 #include "CycleCounter.h"
+#include "HomaTransport.h"
 #include "OptionParser.h"
 #include "ShortMacros.h"
 #include "RawMetrics.h"
@@ -119,6 +120,28 @@ struct BasicDpdkTransportFactory : public TransportFactory {
     DISALLOW_COPY_AND_ASSIGN(BasicDpdkTransportFactory);
 };
 static BasicDpdkTransportFactory basicDpdkTransportFactory;
+
+struct HomaDpdkTransportFactory : public TransportFactory {
+    HomaDpdkTransportFactory()
+        : TransportFactory("homa+dpdk", "homa+dpdk"), driver(NULL)  {}
+    Transport* createTransport(Context* context,
+            const ServiceLocator* localServiceLocator) {
+        if (driver == NULL) {
+            LOG(WARNING, "Tried to use homa+dpdk transport, but DPDK is "
+                    "not enabled (did you specify the --dpdkPort "
+                    "command-line option?)");
+            throw TransportException(HERE, "DPDK is not enabled");
+        }
+        return new HomaTransport(context, localServiceLocator,
+                driver, generateRandom());
+    }
+    void setDpdkDriver(DpdkDriver* driver) {
+        this->driver = driver;
+    }
+    DpdkDriver* driver;
+    DISALLOW_COPY_AND_ASSIGN(HomaDpdkTransportFactory);
+};
+static HomaDpdkTransportFactory homaDpdkTransportFactory;
 #endif
 
 /**
@@ -151,10 +174,13 @@ TransportManager::TransportManager(Context* context)
 #endif
 #ifdef DPDK
     transportFactories.push_back(&basicDpdkTransportFactory);
+    transportFactories.push_back(&homaDpdkTransportFactory);
     if (context->options != NULL) {
         int dpdkPort = context->options->getDpdkPort();
         if (dpdkPort >= 0) {
             basicDpdkTransportFactory.setDpdkDriver(
+                    new DpdkDriver(context, dpdkPort));
+            homaDpdkTransportFactory.setDpdkDriver(
                     new DpdkDriver(context, dpdkPort));
         }
     }
