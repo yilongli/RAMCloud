@@ -258,7 +258,19 @@ DpdkDriver::~DpdkDriver()
 }
 
 // See docs in Driver class.
+uint8_t
+DpdkDriver::getHighestPacketPriority()
+{
+#ifdef ETHERNET_DOT1P
+    // Assume we are allowed to use all 8 ethernet priorities specified
+    // in the Priority Code Point (PCP) field.
+    return 7;
+#else
+    return 0;
+#endif
+}
 
+// See docs in Driver class.
 uint32_t
 DpdkDriver::getMaxPacketSize()
 {
@@ -319,7 +331,8 @@ DpdkDriver::receivePackets(int maxPackets,
             // Perform packet filtering by software to skip irrelevant
             // packets such as ipmi or kernel TCP/IP traffics.
             char *data = rte_pktmbuf_mtod(m, char *);
-            auto& eth_header = *reinterpret_cast<EthernetHeader*>(data);
+            auto& eth_header =
+                    *reinterpret_cast<NetUtil::EthernetHeader*>(data);
             if (eth_header.etherType !=
                     HTONS(NetUtil::EthPayloadType::RAMCLOUD)) {
                 packetBufPool.destroy(buffer);
@@ -393,12 +406,17 @@ DpdkDriver::sendPacket(const Address *addr,
         return;
     }
 
-    NetUtil::EthernetHeader* ethHdr = reinterpret_cast<
-            NetUtil::EthernetHeader*>(p);
+    NetUtil::EthernetHeader* ethHdr =
+            reinterpret_cast<NetUtil::EthernetHeader*>(p);
 
     rte_memcpy(&ethHdr->destAddress,
             static_cast<const MacAddress*>(addr)->address, 6);
     rte_memcpy(&ethHdr->srcAddress, localMac->address, 6);
+#ifdef ETHERNET_DOT1P
+    ethHdr->tpid = HTONS(NetUtil::EthPayloadType::VLAN_TAGGED);
+    ethHdr->tci[0] = downCast<uint8_t>(priority << 5);
+    ethHdr->tci[1] = 0;
+#endif
     ethHdr->etherType = HTONS(NetUtil::EthPayloadType::RAMCLOUD);
     p += sizeof(*ethHdr);
     rte_memcpy(p, header, headerLen);

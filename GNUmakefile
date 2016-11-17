@@ -242,6 +242,10 @@ DPDK_AR_LIBS := $(DPDK_LIB_DIR)/libintel_dpdk.a
 LIBS += -Wl,--whole-archive $(DPDK_AR_LIBS) -Wl,--no-whole-archive -ldl
 endif
 
+ifeq ($(ETHERNET_DOT1P),yes)
+COMFLAGS += -DETHERNET_DOT1P
+endif
+
 # End of DPDK definitions
 # =======
 endif
