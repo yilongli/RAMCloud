@@ -146,7 +146,10 @@ DpdkDriver::DpdkDriver(Context* context, int port)
     // Fix-up the locator string to reflect the real MAC address.
     rte_eth_macaddr_get(portId, &mac);
     localMac.construct(mac.addr_bytes);
-    locatorString = format("basic+dpdk:mac=%s",
+//    locatorString = format("basic+dpdk:mac=%s",
+//            localMac->toString().c_str());
+    // TODO(YilongL): I don't understand the code here
+    locatorString = format("homa+dpdk:mac=%s",
             localMac->toString().c_str());
 
     // configure some default NIC port parameters

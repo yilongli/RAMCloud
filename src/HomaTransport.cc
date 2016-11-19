@@ -394,7 +394,8 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
             }
             const HomaTransport::GrantHeader* grant =
                     static_cast<const HomaTransport::GrantHeader*>(packet);
-            result += format(", offset %u", grant->offset);
+            result += format(", offset %u, prio %u", grant->offset,
+                    grant->prio);
             break;
         }
         case HomaTransport::PacketOpcode::LOG_TIME_TRACE:

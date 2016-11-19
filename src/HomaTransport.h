@@ -486,6 +486,10 @@ class HomaTransport : public Transport {
                                      // sender should now transmit all data up
                                      // to (but not including) this offset, if
                                      // it hasn't already.
+        uint8_t prio;                // Packet priority to use; the sender
+                                     // should transmit all future data using
+                                     // this priority as soon as it receives
+                                     // this GRANT.
 
         GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags)
             : common(PacketOpcode::GRANT, rpcId, flags), offset(offset) {}
