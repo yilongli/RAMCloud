@@ -417,7 +417,17 @@ DpdkDriver::sendPacket(const Address *addr,
     rte_memcpy(&ethHdr->srcAddress, localMac->address, 6);
 #ifdef ETHERNET_DOT1P
     ethHdr->tpid = HTONS(NetUtil::EthPayloadType::VLAN_TAGGED);
-    ethHdr->tci[0] = downCast<uint8_t>(priority << 5);
+    uint8_t pcp;
+    if (priority == 0) {
+        // PCP = 1 is the lowest priority: Background (BK)
+        pcp = 1;
+    } else if (priority == 1) {
+        // PCP = 0 is the 2nd lowest priority: Best Effort (BE)
+        pcp = 0;
+    } else {
+        pcp = priority;
+    }
+    ethHdr->tci[0] = downCast<uint8_t>(pcp << 5);
     ethHdr->tci[1] = 0;
 #endif
     ethHdr->etherType = HTONS(NetUtil::EthPayloadType::RAMCLOUD);

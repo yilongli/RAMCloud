@@ -47,6 +47,7 @@ class HomaTransport : public Transport {
         // any transport or driver state.
         return new Session(this, serviceLocator, timeoutMs);
     }
+    uint8_t getUnschedTrafficPrio(uint32_t messageSize);
     void registerMemory(void* base, size_t bytes) {
         driver->registerMemory(base, bytes);
     }
@@ -214,6 +215,11 @@ class HomaTransport : public Transport {
         /// been sent.
         uint32_t transmitOffset;
 
+        /// Packet priority to use for the rest of the request message;
+        /// the server may instruct to use a different value by embedding
+        /// the new priority in the GRANT packet.
+        uint8_t transmitPriority;
+
         /// The number of bytes in the request message that it's OK for
         /// us to transmit. Bytes after this cannot be transmitted until
         /// we receive a GRANT for them.
@@ -263,6 +269,7 @@ class HomaTransport : public Transport {
             , response(response)
             , notifier(notifier)
             , transmitOffset(0)
+            , transmitPriority(0)
             , transmitLimit(0)
             , transmitSequenceNumber(0)
             , lastTransmitTime(0)
@@ -306,6 +313,11 @@ class HomaTransport : public Transport {
         /// transmit to the client; all preceding bytes have already
         /// been sent.
         uint32_t transmitOffset;
+
+        /// Packet priority to use for the rest of the response message;
+        /// the client may instruct to use a different value by embedding
+        /// the new priority in the GRANT packet.
+        uint8_t transmitPriority;
 
         /// The number of bytes in the response message that it's OK for
         /// us to transmit. Bytes after this cannot be transmitted until
@@ -362,6 +374,7 @@ class HomaTransport : public Transport {
             , clientAddress(clientAddress)
             , rpcId(rpcId)
             , transmitOffset(0)
+            , transmitPriority(0)
             , transmitLimit(0)
             , transmitSequenceNumber(0)
             , lastTransmitTime(0)
@@ -377,6 +390,33 @@ class HomaTransport : public Transport {
         {}
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
+    };
+
+    /**
+     * Schedules messages on the receiver side.
+     */
+    class MessageScheduler {
+
+        // TODO: find out the element type of the vector;
+        // rtti or extract an interface class for ClientRpc & ServerRpc
+        std::vector<void *> bufferedMessages;
+
+        std::vector<void *> backupMessages;
+
+        /// The highest priority currently granted to the incoming messages that
+        /// are scheduled by this transport. The valid range of this value is
+        /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
+        /// by the transport.
+        int highestGrantedPrio;
+
+        // iterate over bufferedMessages to find out its rank
+        uint32_t getRank(void* bufferedMessage);
+
+        void enterNewMessage(void* message);
+
+        void messageFinishes(void* message);
+
+        void updateRemainingBytes(void* message);
     };
 
     /**
@@ -491,8 +531,11 @@ class HomaTransport : public Transport {
                                      // this priority as soon as it receives
                                      // this GRANT.
 
-        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags)
-            : common(PacketOpcode::GRANT, rpcId, flags), offset(offset) {}
+        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags, uint8_t prio)
+            : common(PacketOpcode::GRANT, rpcId, flags)
+            , offset(offset)
+            , prio(prio)
+        {}
     } __attribute__((packed));
 
     /**
@@ -567,8 +610,8 @@ class HomaTransport : public Transport {
     static string opcodeSymbol(uint8_t opcode);
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
-            uint8_t flags, bool partialOK = false);
-    int tryToTransmitData();
+            uint8_t flags, uint8_t priority, bool partialOK = false);
+    bool tryToTransmitData();
 
     /// Shared RAMCloud information.
     Context* context;
@@ -585,6 +628,15 @@ class HomaTransport : public Transport {
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
     uint64_t clientId;
+
+    /// The highest priority currently granted to the incoming messages that
+    /// are scheduled by this transport. The valid range of this value is
+    /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
+    /// by the transport.
+    int highestGrantedPrio;
+
+    /// The lowest priority to use for unscheduled traffic.
+    const uint8_t lowestUnschedPrio;
 
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
@@ -654,6 +706,10 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ServerRpc, timerLinks) ServerTimerList;
     ServerTimerList serverTimerList;
 
+    /// Maximum # incoming messages that can be actively granted by the
+    /// transport at any time.
+    const uint32_t redundancyFactor;
+
     /// The number of bytes corresponding to a round-trip time between
     /// two machines.  This serves two purposes. First, senders may
     /// transmit this many initial bytes without receiving a GRANT; this
@@ -690,6 +746,14 @@ class HomaTransport : public Transport {
     /// any packets from the server for particular RPC, then it sends a
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
+
+    /// The maximum packet priority supported by HomaTransport.
+#define MAX_PACKET_PRIORITY 31
+
+    /// if the number at index i is the first element that is larger than the
+    /// size of a message, then the sender should use the (i+1)-th highest
+    /// priority for the entire unscheduled portion of the message.
+    uint32_t unschedTrafficPrioBrackets[MAX_PACKET_PRIORITY+1];
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
