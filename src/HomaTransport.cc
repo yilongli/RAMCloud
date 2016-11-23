@@ -64,6 +64,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , clientId(clientId)
     , highestGrantedPrio(-1)
     , lowestUnschedPrio((driver->getHighestPacketPriority()+1)>>1)
+    , messageScheduler(2)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , transmitSequenceNumber(1)
@@ -75,7 +76,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
-    , redundancyFactor(2)
     , roundTripBytes(getRoundTripBytes(locator))
     , grantIncrement(maxDataPerPacket)
     , timerInterval(0)
@@ -801,6 +801,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->offset, received->len, header->common.flags);
                 if (!clientRpc->accumulator) {
                     clientRpc->accumulator.construct(this, clientRpc->response);
+                    clientRpc->messageLength = header->totalLength;
                 }
                 retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
@@ -1020,6 +1021,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
                             &serverRpc->requestPayload);
+                    serverRpc->messageLength = header->totalLength;
                     serverTimerList.push_back(*serverRpc);
                 } else if (serverRpc->requestComplete) {
                     // We've already received the full message, so
