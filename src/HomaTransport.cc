@@ -813,47 +813,25 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
-                if (clientRpc->response->size() >= header->totalLength) {
-                    // Response complete.
-                    if (clientRpc->response->size() > header->totalLength) {
-                        // We have more bytes than we want. This can happen
-                        // if the last packet gets padded by the network
-                        // layer to meet minimum size requirements. Just
-                        // truncate the response.
-                        clientRpc->response->truncate(header->totalLength);
-                    }
-                    clientRpc->notifier->completed();
-                    if (clientRpc->totalLength > roundTripBytes) {
-                        scheduledMessageReceivePacket(clientRpc);
-                    }
-                    deleteClientRpc(clientRpc);
-                } else {
-                    if (clientRpc->totalLength > roundTripBytes) {
-                        scheduledMessageReceivePacket(clientRpc);
-                    }
-//                    // See if we need to output a GRANT.
-//                    if ((header->common.flags & NEED_GRANT) &&
-//                            (clientRpc->grantOffset <
-//                            (clientRpc->response->size() + roundTripBytes)) &&
-//                            (clientRpc->grantOffset < header->totalLength)) {
-//                        clientRpc->grantOffset = clientRpc->response->size()
-//                                + roundTripBytes + grantIncrement;
-//                        timeTrace(
-//                                "client sending GRANT, sequence %u, offset %u",
-//                                downCast<uint32_t>(
-//                                header->common.rpcId.sequence),
-//                                clientRpc->grantOffset);
-//                        GrantHeader grant(header->common.rpcId,
-//                                clientRpc->grantOffset, FROM_CLIENT);
-//                        driver->sendPacket(clientRpc->session->serverAddress,
-//                                &grant, NULL,
-//                                driver->getHighestPacketPriority());
-//                    }
+                if (clientRpc->response->size() > header->totalLength) {
+                    // We have more bytes than we want. This can happen
+                    // if the last packet gets padded by the network
+                    // layer to meet minimum size requirements. Just
+                    // truncate the response.
+                    clientRpc->response->truncate(header->totalLength);
                 }
-                // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
-                // TODO: YilongL: always need to output a GRANT?
-                // TODO: DOESN'T LOOK RIGHT TO ONLY GRANT PACKET UPON RECEIVING ONE?
-                grantOnePacket();
+                if (clientRpc->totalLength > roundTripBytes) {
+                    scheduledMessageReceivePacket(clientRpc);
+                    // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
+                    // TODO: YilongL: always need to output a GRANT?
+                    // TODO: DOESN'T LOOK RIGHT TO ONLY GRANT PACKET UPON RECEIVING ONE?
+                    grantOnePacket();
+                }
+                if (clientRpc->response->size() == header->totalLength) {
+                    // Response complete.
+                    clientRpc->notifier->completed();
+                    deleteClientRpc(clientRpc);
+                }
 
                 if (retainPacket) {
                     uint32_t dummy;
@@ -1058,48 +1036,23 @@ HomaTransport::handlePacket(Driver::Received* received)
                             WireFormat::RequestCommon>()->opcode,
                             header->totalLength);
                 }
-                if (serverRpc->requestPayload.size() >= header->totalLength) {
+                if (serverRpc->requestPayload.size() > header->totalLength) {
+                    // We have more bytes than we want. This can happen
+                    // if the last packet gets padded by the network
+                    // layer to meet minimum size requirements. Just
+                    // truncate the request.
+                    serverRpc->requestPayload.truncate(header->totalLength);
+                }
+                if (serverRpc->totalLength > roundTripBytes) {
+                    scheduledMessageReceivePacket(serverRpc);
+                    grantOnePacket();
+                }
+                if (serverRpc->requestPayload.size() == header->totalLength) {
                     // Message complete; start servicing the RPC.
-                    if (serverRpc->requestPayload.size()
-                            > header->totalLength) {
-                        // We have more bytes than we want. This can happen
-                        // if the last packet gets padded by the network
-                        // layer to meet minimum size requirements. Just
-                        // truncate the request.
-                        serverRpc->requestPayload.truncate(header->totalLength);
-                    }
                     erase(serverTimerList, *serverRpc);
                     serverRpc->requestComplete = true;
-                    if (serverRpc->totalLength > roundTripBytes) {
-                        scheduledMessageReceivePacket(serverRpc);
-                    }
                     context->workerManager->handleRpc(serverRpc);
-                } else {
-                    if (serverRpc->totalLength > roundTripBytes) {
-                        scheduledMessageReceivePacket(serverRpc);
-                    }
-//                    // See if we need to output a GRANT.
-//                    if ((header->common.flags & NEED_GRANT) &&
-//                            (serverRpc->grantOffset <
-//                            (serverRpc->requestPayload.size()
-//                            + roundTripBytes)) &&
-//                            (serverRpc->grantOffset < header->totalLength)) {
-//                        serverRpc->grantOffset =
-//                                serverRpc->requestPayload.size()
-//                                + roundTripBytes + grantIncrement;
-//                        timeTrace(
-//                                "server sending GRANT, sequence %u, offset %u",
-//                                downCast<uint32_t>(
-//                                header->common.rpcId.sequence),
-//                                serverRpc->grantOffset);
-//                        GrantHeader grant(header->common.rpcId,
-//                                serverRpc->grantOffset, FROM_SERVER);
-//                        driver->sendPacket(serverRpc->clientAddress,
-//                                &grant, NULL,
-//                                driver->getHighestPacketPriority());
-//                    }
                 }
-                // TODO: SEND GRANT
                 serverDataDone:
                 if (retainPacket) {
                     uint32_t dummy;
@@ -1649,7 +1602,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* message)
 }
 
 /**
- * TODO
+ * TODO:
  */
 void
 HomaTransport::grantOnePacket()
@@ -1664,14 +1617,17 @@ HomaTransport::grantOnePacket()
                 m->grantOffset = m->getReceived()->size() + roundTripBytes;
             }
             m->grantOffset += grantIncrement;
+            string fmt;
+            if (dynamic_cast<ClientRpc*>(m)) {
+                fmt = "client sending GRANT, sequence %u, offset %u, prio %u";
+            } else {
+                fmt = "server sending GRANT, sequence %u, offset %u, prio %u";
+            }
             uint8_t grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
-            timeTrace(
-                    "client sending GRANT, sequence %u, offset %u,"
-                    " prio %u", downCast<uint32_t>(
-                    header->common.rpcId.sequence),
+            timeTrace(fmt.data(), downCast<uint32_t>(m->getRpcId().sequence),
                     m->grantOffset, grantPrio);
-            GrantHeader grant(header->common.rpcId, m->grantOffset,
-                    FROM_CLIENT, grantPrio);
+            GrantHeader grant(m->getRpcId(), m->grantOffset, FROM_CLIENT,
+                    grantPrio);
             driver->sendPacket(m->senderAddress(), &grant, NULL,
                     driver->getHighestPacketPriority());
             break;

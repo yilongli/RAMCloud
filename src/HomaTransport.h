@@ -197,7 +197,19 @@ class HomaTransport : public Transport {
         {}
 
         virtual ~IncomingMessage() {}
+
+        /**
+         * Return the buffer that holds all of the data that has been received
+         * for the message so far, up to the first byte that has not yet been
+         * received.
+         */
         virtual Buffer* getReceived() = 0;
+
+        /**
+         * Get the unique identifier for the RPC this message belongs to.
+         */
+        virtual RpcId getRpcId() = 0;
+
         virtual const Driver::Address* senderAddress() = 0;
 
         /**
@@ -311,6 +323,10 @@ class HomaTransport : public Transport {
             return response;
         }
 
+        RpcId getRpcId() {
+            return RpcId(session->t->clientId, sequence);
+        }
+
         const Driver::Address* senderAddress() {
             return session->serverAddress;
         }
@@ -419,6 +435,10 @@ class HomaTransport : public Transport {
 
         Buffer* getReceived() {
             return &requestPayload;
+        }
+
+        RpcId getRpcId() {
+            return rpcId;
         }
 
         const Driver::Address* senderAddress() {
