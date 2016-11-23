@@ -16,9 +16,7 @@
 
 #include "HomaTransport.h"
 #include "Service.h"
-#include "ServiceLocator.h"
 #include "TimeTrace.h"
-#include "WireFormat.h"
 #include "WorkerManager.h"
 
 namespace RAMCloud {
@@ -62,7 +60,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
     , clientId(clientId)
-    , lowestUnschedPrio((driver->getHighestPacketPriority()+1)>>1)
+    , lowestUnschedPrio(downCast<uint8_t>(
+            (driver->getHighestPacketPriority() + 1) >> 1))
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , transmitSequenceNumber(1)
@@ -90,10 +89,11 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , unschedTrafficPrioBrackets{}
 
     // TODO: document the init values
+#define REDUNDANCY_FACTOR 2
     , backupMessages(50)
-    , grantedMessages(2)
+    , grantedMessages(REDUNDANCY_FACTOR)
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(2)
+    , maxGrantedMessages(REDUNDANCY_FACTOR)
 
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
@@ -109,10 +109,10 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
 
     // Set up the initial unscheduled traffic priority brackets for messages.
     assert(MAX_PACKET_PRIORITY >= driver->getHighestPacketPriority());
-    uint8_t numUnschedPrio = driver->getHighestPacketPriority() -
+    int numUnschedPrio = driver->getHighestPacketPriority() -
             lowestUnschedPrio + 1;
     unschedTrafficPrioBrackets[0] = driver->getMaxPacketSize() + 1;
-    for (uint8_t i = 1; i < numUnschedPrio-1; i++) {
+    for (int i = 1; i < numUnschedPrio - 1; i++) {
         unschedTrafficPrioBrackets[i] = unschedTrafficPrioBrackets[i-1] << 1;
     }
     unschedTrafficPrioBrackets[numUnschedPrio-1] = ~0u;
@@ -169,11 +169,11 @@ HomaTransport::getServiceLocator()
  */
 uint8_t
 HomaTransport::getUnschedTrafficPrio(uint32_t messageSize) {
-    uint8_t numUnschedPrio = driver->getHighestPacketPriority() -
+    int numUnschedPrio = driver->getHighestPacketPriority() -
             lowestUnschedPrio + 1;
-    for (uint8_t i = 0; i < numUnschedPrio-1; i++) {
+    for (int i = 0; i < numUnschedPrio - 1; i++) {
         if (messageSize < unschedTrafficPrioBrackets[i]) {
-            return driver->getHighestPacketPriority() + i;
+            return downCast<uint8_t>(driver->getHighestPacketPriority() - i);
         }
     }
     return lowestUnschedPrio;
@@ -1703,7 +1703,7 @@ void
 HomaTransport::insertNewGrantedMessage(IncomingMessage* message)
 {
     grantedMessages.push_back(message);
-    for (int i = grantedMessages.size() - 2; i > 0; i--) {
+    for (size_t i = grantedMessages.size() - 2; i > 0; i--) {
         if (lessThan(grantedMessages[i], message)) {
             grantedMessages[i + 1] = message;
             break;

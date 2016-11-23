@@ -644,7 +644,7 @@ class HomaTransport : public Transport {
     void addScheduledMessage(IncomingMessage* message);
     void grantOnePacket();
     void scheduledMessageReceivePacket(IncomingMessage* message);
-    bool lessThan(IncomingMessage* a, IncomingMessage* b) {
+    static bool lessThan(IncomingMessage* a, IncomingMessage* b) {
         return a->getUnreceivedBytes() < b->getUnreceivedBytes();
     }
     void insertNewGrantedMessage(IncomingMessage* message);
