@@ -62,9 +62,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
     , clientId(clientId)
-    , highestGrantedPrio(-1)
     , lowestUnschedPrio((driver->getHighestPacketPriority()+1)>>1)
-    , messageScheduler(2)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , transmitSequenceNumber(1)
@@ -90,6 +88,13 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , timeoutIntervals(40)
     , pingIntervals(3)
     , unschedTrafficPrioBrackets{}
+
+    // TODO: document the init values
+    , backupMessages(50)
+    , grantedMessages(2)
+    , highestGrantedPrio(-1)
+    , maxGrantedMessages(2)
+
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -98,9 +103,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
 
-    // The redundancy factor must be smaller than or equal to the number of
+    // The # messages granted must be smaller than or equal to the number of
     // priority levels used for scheduled traffic.
-    assert(redundancyFactor <= lowestUnschedPrio);
+    assert(maxGrantedMessages <= lowestUnschedPrio);
 
     // Set up the initial unscheduled traffic priority brackets for messages.
     assert(MAX_PACKET_PRIORITY >= driver->getHighestPacketPriority());
@@ -801,14 +806,16 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->offset, received->len, header->common.flags);
                 if (!clientRpc->accumulator) {
                     clientRpc->accumulator.construct(this, clientRpc->response);
-                    clientRpc->messageLength = header->totalLength;
+                    clientRpc->totalLength = header->totalLength;
+                    if (clientRpc->totalLength > roundTripBytes) {
+                        addScheduledMessage(clientRpc);
+                    }
                 }
                 retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
                 if (clientRpc->response->size() >= header->totalLength) {
                     // Response complete.
-                    if (clientRpc->response->size()
-                            > header->totalLength) {
+                    if (clientRpc->response->size() > header->totalLength) {
                         // We have more bytes than we want. This can happen
                         // if the last packet gets padded by the network
                         // layer to meet minimum size requirements. Just
@@ -816,27 +823,38 @@ HomaTransport::handlePacket(Driver::Received* received)
                         clientRpc->response->truncate(header->totalLength);
                     }
                     clientRpc->notifier->completed();
+                    if (clientRpc->totalLength > roundTripBytes) {
+                        scheduledMessageReceivePacket(clientRpc);
+                    }
                     deleteClientRpc(clientRpc);
                 } else {
-                    // See if we need to output a GRANT.
-                    if ((header->common.flags & NEED_GRANT) &&
-                            (clientRpc->grantOffset <
-                            (clientRpc->response->size() + roundTripBytes)) &&
-                            (clientRpc->grantOffset < header->totalLength)) {
-                        clientRpc->grantOffset = clientRpc->response->size()
-                                + roundTripBytes + grantIncrement;
-                        timeTrace(
-                                "client sending GRANT, sequence %u, offset %u",
-                                downCast<uint32_t>(
-                                header->common.rpcId.sequence),
-                                clientRpc->grantOffset);
-                        GrantHeader grant(header->common.rpcId,
-                                clientRpc->grantOffset, FROM_CLIENT);
-                        driver->sendPacket(clientRpc->session->serverAddress,
-                                &grant, NULL,
-                                driver->getHighestPacketPriority());
+                    if (clientRpc->totalLength > roundTripBytes) {
+                        scheduledMessageReceivePacket(clientRpc);
                     }
+//                    // See if we need to output a GRANT.
+//                    if ((header->common.flags & NEED_GRANT) &&
+//                            (clientRpc->grantOffset <
+//                            (clientRpc->response->size() + roundTripBytes)) &&
+//                            (clientRpc->grantOffset < header->totalLength)) {
+//                        clientRpc->grantOffset = clientRpc->response->size()
+//                                + roundTripBytes + grantIncrement;
+//                        timeTrace(
+//                                "client sending GRANT, sequence %u, offset %u",
+//                                downCast<uint32_t>(
+//                                header->common.rpcId.sequence),
+//                                clientRpc->grantOffset);
+//                        GrantHeader grant(header->common.rpcId,
+//                                clientRpc->grantOffset, FROM_CLIENT);
+//                        driver->sendPacket(clientRpc->session->serverAddress,
+//                                &grant, NULL,
+//                                driver->getHighestPacketPriority());
+//                    }
                 }
+                // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
+                // TODO: YilongL: always need to output a GRANT?
+                // TODO: DOESN'T LOOK RIGHT TO ONLY GRANT PACKET UPON RECEIVING ONE?
+                grantOnePacket();
+
                 if (retainPacket) {
                     uint32_t dummy;
                     received->steal(&dummy);
@@ -1021,8 +1039,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
                             &serverRpc->requestPayload);
-                    serverRpc->messageLength = header->totalLength;
+                    serverRpc->totalLength = header->totalLength;
                     serverTimerList.push_back(*serverRpc);
+                    if (serverRpc->totalLength > roundTripBytes) {
+                        addScheduledMessage(serverRpc);
+                    }
                 } else if (serverRpc->requestComplete) {
                     // We've already received the full message, so
                     // ignore this packet.
@@ -1049,29 +1070,36 @@ HomaTransport::handlePacket(Driver::Received* received)
                     }
                     erase(serverTimerList, *serverRpc);
                     serverRpc->requestComplete = true;
+                    if (serverRpc->totalLength > roundTripBytes) {
+                        scheduledMessageReceivePacket(serverRpc);
+                    }
                     context->workerManager->handleRpc(serverRpc);
                 } else {
-                    // See if we need to output a GRANT.
-                    if ((header->common.flags & NEED_GRANT) &&
-                            (serverRpc->grantOffset <
-                            (serverRpc->requestPayload.size()
-                            + roundTripBytes)) &&
-                            (serverRpc->grantOffset < header->totalLength)) {
-                        serverRpc->grantOffset =
-                                serverRpc->requestPayload.size()
-                                + roundTripBytes + grantIncrement;
-                        timeTrace(
-                                "server sending GRANT, sequence %u, offset %u",
-                                downCast<uint32_t>(
-                                header->common.rpcId.sequence),
-                                serverRpc->grantOffset);
-                        GrantHeader grant(header->common.rpcId,
-                                serverRpc->grantOffset, FROM_SERVER);
-                        driver->sendPacket(serverRpc->clientAddress,
-                                &grant, NULL,
-                                driver->getHighestPacketPriority());
+                    if (serverRpc->totalLength > roundTripBytes) {
+                        scheduledMessageReceivePacket(serverRpc);
                     }
+//                    // See if we need to output a GRANT.
+//                    if ((header->common.flags & NEED_GRANT) &&
+//                            (serverRpc->grantOffset <
+//                            (serverRpc->requestPayload.size()
+//                            + roundTripBytes)) &&
+//                            (serverRpc->grantOffset < header->totalLength)) {
+//                        serverRpc->grantOffset =
+//                                serverRpc->requestPayload.size()
+//                                + roundTripBytes + grantIncrement;
+//                        timeTrace(
+//                                "server sending GRANT, sequence %u, offset %u",
+//                                downCast<uint32_t>(
+//                                header->common.rpcId.sequence),
+//                                serverRpc->grantOffset);
+//                        GrantHeader grant(header->common.rpcId,
+//                                serverRpc->grantOffset, FROM_SERVER);
+//                        driver->sendPacket(serverRpc->clientAddress,
+//                                &grant, NULL,
+//                                driver->getHighestPacketPriority());
+//                    }
                 }
+                // TODO: SEND GRANT
                 serverDataDone:
                 if (retainPacket) {
                     uint32_t dummy;
@@ -1254,7 +1282,6 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     : t(t)
     , buffer(buffer)
     , fragments()
-    , grantOffset(0)
 { }
 
 /**
@@ -1597,6 +1624,135 @@ HomaTransport::checkTimeouts()
                     serverRpc->clientAddress, serverRpc->rpcId,
                     serverRpc->grantOffset, roundTripBytes, FROM_SERVER);
         }
+    }
+}
+
+/**
+ * When a new message that requires scheduling arrives, this method is called
+ * enter the new message into the scheduler.
+ */
+void
+HomaTransport::addScheduledMessage(IncomingMessage* message)
+{
+    if (grantedMessages.size() < maxGrantedMessages) {
+        // We have not buffered enough messages.
+        highestGrantedPrio++;
+        insertNewGrantedMessage(message);
+    } else if (lessThan(grantedMessages.back(), message)) {
+        // The new message should replace the "worst" granted message.
+        backupMessages.push_back(grantedMessages.back());
+        grantedMessages.pop_back();
+        insertNewGrantedMessage(message);
+    } else {
+        backupMessages.push_back(message);
+    }
+}
+
+/**
+ * TODO
+ */
+void
+HomaTransport::grantOnePacket()
+{
+    int rank = 0;
+    for (IncomingMessage* m : grantedMessages) {
+        if ((m->getUnreceivedBytes() > 0) && (m->grantOffset <
+                (m->getReceived()->size() + roundTripBytes))) {
+            // TODO: the grant mechanism in BasicTransport seems to inc. grantOffset way more aggressively
+            // TODO: WAIT is it correct? it's only ok if grantOffset is set to 1RTT initially?
+            if (m->grantOffset == 0) {
+                m->grantOffset = m->getReceived()->size() + roundTripBytes;
+            }
+            m->grantOffset += grantIncrement;
+            uint8_t grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
+            timeTrace(
+                    "client sending GRANT, sequence %u, offset %u,"
+                    " prio %u", downCast<uint32_t>(
+                    header->common.rpcId.sequence),
+                    m->grantOffset, grantPrio);
+            GrantHeader grant(header->common.rpcId, m->grantOffset,
+                    FROM_CLIENT, grantPrio);
+            driver->sendPacket(m->senderAddress(), &grant, NULL,
+                    driver->getHighestPacketPriority());
+            break;
+        }
+        rank++;
+    }
+}
+
+/**
+ * When a scheduled message receives one more data packet, this method is
+ * called to allow the scheduler to make a change in its scheduling decision.
+ *
+ * \param message
+ *      The message that receives new data.
+ */
+void
+HomaTransport::scheduledMessageReceivePacket(IncomingMessage* message)
+{
+    std::vector<IncomingMessage*>::iterator it = std::find(
+            grantedMessages.begin(), grantedMessages.end(), message);
+    if (message->getUnreceivedBytes() > 0) {
+        // The message is not finished yet
+        if (it != grantedMessages.end()) {
+            // Maintain the ordering within granted messages.
+            for (; it != grantedMessages.begin(); it--) {
+                if (lessThan(*std::prev(it), *it)) {
+                    *it = message;
+                    break;
+                }
+                *it = *std::prev(it);
+            }
+        } else if (lessThan(message, grantedMessages.back())) {
+            // Slow path: a backup message should be promoted to a granted
+            // one (and replace the "worst" existing granted message).
+            it = std::find(backupMessages.begin(), backupMessages.end(),
+                    message);
+            (*it) = grantedMessages.back();
+            grantedMessages.pop_back();
+            insertNewGrantedMessage(message);
+        }
+    } else {
+        // The message is now finished
+        if (it != grantedMessages.end()) {
+            // TODO: ALSO SLOW
+            // An old granted message finishes. Remove this message and
+            // select a new message to grant from the backup messages.
+            if (it == grantedMessages.begin()) {
+                highestGrantedPrio--;
+            }
+            grantedMessages.erase(it);
+            it = std::min_element(backupMessages.begin(),
+                    backupMessages.end(), lessThan);
+            if (it != backupMessages.end()) {
+                grantedMessages.push_back(*it);
+                backupMessages.erase(it);
+            }
+        } else {
+            // Slow path: a backup message somehow finishes before the
+            // granted ones; we need to remove this message from the
+            // (relatively large) backup message list.
+            it = std::find(backupMessages.begin(), backupMessages.end(),
+                    message);
+            backupMessages.erase(it);
+        }
+    }
+}
+
+/**
+ * Insert a message to the list of granted messages while maintaining the
+ * correct order within the list.
+ */
+void
+HomaTransport::insertNewGrantedMessage(IncomingMessage* message)
+{
+    grantedMessages.push_back(message);
+    for (int i = grantedMessages.size() - 2; i > 0; i--) {
+        if (lessThan(grantedMessages[i], message)) {
+            grantedMessages[i + 1] = message;
+            break;
+        }
+        grantedMessages[i + 1] = grantedMessages[i];
     }
 }
 

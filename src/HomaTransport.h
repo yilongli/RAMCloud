@@ -145,8 +145,9 @@ class HomaTransport : public Transport {
         bool addPacket(DataHeader *header, uint32_t length);
         bool appendFragment(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(HomaTransport *t,
-                const Driver::Address* address, RpcId grantOffset,
-                uint32_t limit, uint32_t roundTripBytes, uint8_t whoFrom);
+                const Driver::Address* address, RpcId rpcId,
+                uint32_t grantOffset, uint32_t roundTripBytes,
+                uint8_t whoFrom);
 
         /// Transport that is managing this object.
         HomaTransport* t;
@@ -181,11 +182,6 @@ class HomaTransport : public Transport {
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
 
-        /// Offset into the message of the most recent GRANT packet
-        /// we have sent (i.e., we've already authorized the sender to
-        /// transmit bytes up to this point in the message).
-        uint32_t grantOffset;
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
@@ -193,27 +189,41 @@ class HomaTransport : public Transport {
     /**
      * TODO(YilongL)
      */
-    class MessageReceiver {
+    class IncomingMessage {
       public:
-        MessageReceiver() : messageLength(0) {}
+        IncomingMessage()
+            : grantOffset(0)
+            , totalLength(0)
+        {}
 
-        virtual ~MessageReceiver() {}
+        virtual ~IncomingMessage() {}
+        virtual Buffer* getReceived() = 0;
+        virtual const Driver::Address* senderAddress() = 0;
 
         /**
          * Return # bytes not yet received in the incoming message.
          */
-        virtual uint32_t getUnreceivedBytes() = 0;
+        uint32_t getUnreceivedBytes() {
+            return totalLength - getReceived()->size();
+        }
 
-        /// Total # bytes in the message being received. 0 means that we have
+        /// Offset from the most recent GRANT packet we have sent for
+        /// this incoming message, or 0 if we haven't sent any GRANTs.
+        uint32_t grantOffset;
+
+        /// Total # bytes in the message being received. 0 means we have
         /// not received the first packet of the message.
-        uint32_t messageLength;
+        uint32_t totalLength;
+
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
     };
 
     /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    class ClientRpc : public MessageReceiver {
+    class ClientRpc : public IncomingMessage {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
@@ -253,10 +263,6 @@ class HomaTransport : public Transport {
         /// data bytes of the request.
         uint64_t lastTransmitTime;
 
-        /// Offset from the most recent GRANT packet we have sent for
-        /// the response for this RPC, or 0 if we haven't sent any GRANTs.
-        uint32_t grantOffset;
-
         /// The sum of the offset and length fields from the most recent
         /// RESEND we have sent, 0 if no RESEND has been sent for this
         /// RPC. Used to detect unnecessary RESENDs (because the original
@@ -293,7 +299,6 @@ class HomaTransport : public Transport {
             , transmitLimit(0)
             , transmitSequenceNumber(0)
             , lastTransmitTime(0)
-            , grantOffset(0)
             , resendLimit(0)
             , silentIntervals(0)
             , needGrantFlag(0)
@@ -302,9 +307,12 @@ class HomaTransport : public Transport {
             , outgoingRequestLinks()
         {}
 
-        uint32_t
-        getUnreceivedBytes() {
-            return messageLength - response->size();
+        Buffer* getReceived() {
+            return response;
+        }
+
+        const Driver::Address* senderAddress() {
+            return session->serverAddress;
         }
 
       PRIVATE:
@@ -314,7 +322,7 @@ class HomaTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc, MessageReceiver {
+    class ServerRpc : public Transport::ServerRpc, public IncomingMessage {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -356,10 +364,6 @@ class HomaTransport : public Transport {
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the response.
         uint64_t lastTransmitTime;
-
-        /// Offset from the most recent GRANT packet we have sent for
-        /// the request message, or 0 if we haven't sent any GRANTs.
-        uint32_t grantOffset;
 
         /// The sum of the offset and length fields from the most recent
         /// RESEND we have sent, 0 if no RESEND has been sent for this
@@ -403,7 +407,6 @@ class HomaTransport : public Transport {
             , transmitLimit(0)
             , transmitSequenceNumber(0)
             , lastTransmitTime(0)
-            , grantOffset(0)
             , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
@@ -414,133 +417,15 @@ class HomaTransport : public Transport {
             , outgoingResponseLinks()
         {}
 
-        uint32_t
-        getUnreceivedBytes() {
-            return messageLength - requestPayload.size();
+        Buffer* getReceived() {
+            return &requestPayload;
+        }
+
+        const Driver::Address* senderAddress() {
+            return clientAddress;
         }
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
-    };
-
-    /**
-     * Schedules messages on the receiver side.
-     */
-    class MessageScheduler {
-      public:
-        MessageScheduler(uint32_t redundancyFactor)
-            : backupMessages(20)
-            , grantedMessages(redundancyFactor)
-            , highestGrantedPrio(-1)
-            , maxGrantedMessages(redundancyFactor)
-        {}
-
-        /**
-         * When a new message that requires scheduling arrives, this method
-         * is called to enter the new message into the scheduler.
-         */
-        void add(MessageReceiver* message) {
-            if (grantedMessages.size() < maxGrantedMessages) {
-                // We have not buffered enough messages.
-                insertNewGrantedMessage(message);
-            } else if (lessThan(grantedMessages.back(), message)) {
-                // The new message should replace the last buffered message.
-                backupMessages.push_back(grantedMessages.back());
-                grantedMessages.pop_back();
-                insertNewGrantedMessage(message);
-            } else {
-                backupMessages.push_back(message);
-            }
-        }
-
-        /**
-         * When a scheduled message finishes, this method is called to remove
-         * its state from the scheduler.
-         */
-        void remove(MessageReceiver* message) {
-            std::vector<MessageReceiver*>::iterator it = std::find(
-                    grantedMessages.begin(), grantedMessages.end(), message);
-            if (it != grantedMessages.end()) {
-                // TODO: ALSO SLOW
-                // Remove the finished granted message and select a new
-                // message to grant from the backup messages.
-                grantedMessages.erase(it);
-                it = std::min_element(backupMessages.begin(),
-                        backupMessages.end(), lessThan);
-                if (it != backupMessages.end()) {
-                    grantedMessages.push_back(*it);
-                    backupMessages.erase(it);
-                }
-            } else {
-                // Slow path: a backup message somehow finishes before the
-                // granted ones; we need to remove this message from the
-                // (relatively large) backup message list.
-                it = std::find(backupMessages.begin(), backupMessages.end(),
-                        message);
-                backupMessages.erase(it);
-            }
-        }
-
-        /**
-         * When a scheduled message receives one or more data packets, this
-         * method is called to allow the scheduler to make a change in its
-         * scheduling decision.
-         *
-         * \param message
-         *      The message that receives new data.
-         */
-        void receivePackets(MessageReceiver* message) {
-            std::vector<MessageReceiver*>::iterator it = std::find(
-                    grantedMessages.begin(), grantedMessages.end(), message);
-            if (it != grantedMessages.end()) {
-                // Maintain the ordering within granted messages.
-                for (; it != grantedMessages.begin(); it--) {
-                    if (lessThan(*std::prev(it), *it)) {
-                        *it = message;
-                        break;
-                    }
-                    *it = *std::prev(it);
-                }
-            } else if (lessThan(message, grantedMessages.back())) {
-                // Slow path: a backup message should be promoted to a granted
-                // one (and replace the "worst" existing granted message).
-                it = std::find(backupMessages.begin(), backupMessages.end(),
-                        message);
-                (*it) = grantedMessages.back();
-                grantedMessages.pop_back();
-                insertNewGrantedMessage(message);
-            }
-        }
-
-      private:
-        bool lessThan(MessageReceiver* a, MessageReceiver* b) {
-            return a->getUnreceivedBytes() < b->getUnreceivedBytes();
-        }
-
-        void insertNewGrantedMessage(MessageReceiver* message) {
-            grantedMessages.push_back(message);
-            for (int i = grantedMessages.size() - 2; i > 0; i--) {
-                if (lessThan(grantedMessages[i], message)) {
-                    grantedMessages[i + 1] = message;
-                    break;
-                }
-                grantedMessages[i + 1] = grantedMessages[i];
-            }
-        }
-
-        std::vector<MessageReceiver*> backupMessages;
-
-        std::vector<MessageReceiver*> grantedMessages;
-
-        /// The highest priority currently granted to the incoming messages that
-        /// are scheduled by this transport. The valid range of this value is
-        /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
-        /// by the transport.
-        int highestGrantedPrio;
-
-        /// Maximum # incoming messages that can be actively granted by the
-        /// transport at any time.
-        const uint32_t maxGrantedMessages;
-
     };
 
     /**
@@ -736,6 +621,13 @@ class HomaTransport : public Transport {
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
+    void addScheduledMessage(IncomingMessage* message);
+    void grantOnePacket();
+    void scheduledMessageReceivePacket(IncomingMessage* message);
+    bool lessThan(IncomingMessage* a, IncomingMessage* b) {
+        return a->getUnreceivedBytes() < b->getUnreceivedBytes();
+    }
+    void insertNewGrantedMessage(IncomingMessage* message);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -753,16 +645,8 @@ class HomaTransport : public Transport {
     /// identification for RPCs).
     uint64_t clientId;
 
-    /// The highest priority currently granted to the incoming messages that
-    /// are scheduled by this transport. The valid range of this value is
-    /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
-    /// by the transport.
-    int highestGrantedPrio;
-
     /// The lowest priority to use for unscheduled traffic.
     const uint8_t lowestUnschedPrio;
-
-    MessageScheduler messageScheduler;
 
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
@@ -876,6 +760,26 @@ class HomaTransport : public Transport {
     /// size of a message, then the sender should use the (i+1)-th highest
     /// priority for the entire unscheduled portion of the message.
     uint32_t unschedTrafficPrioBrackets[MAX_PACKET_PRIORITY+1];
+
+    /// -----------------
+    /// MESSAGE SCHEDULER
+    /// -----------------
+
+    /// TODO
+    std::vector<IncomingMessage*> backupMessages;
+
+    /// TODO
+    std::vector<IncomingMessage*> grantedMessages;
+
+    /// The highest priority currently granted to the incoming messages that
+    /// are scheduled by this transport. The valid range of this value is
+    /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
+    /// by the transport.
+    int highestGrantedPrio;
+
+    /// Maximum # incoming messages that can be actively granted by the
+    /// transport at any time.
+    const uint32_t maxGrantedMessages;
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
