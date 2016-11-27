@@ -823,9 +823,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (clientRpc->totalLength > roundTripBytes) {
                     scheduledMessageReceivePacket(clientRpc);
                     // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
-                    // TODO: YilongL: always need to output a GRANT?
-                    // TODO: DOESN'T LOOK RIGHT TO ONLY GRANT PACKET UPON RECEIVING ONE?
-                    grantOnePacket();
                 }
                 if (clientRpc->response->size() == header->totalLength) {
                     // Response complete.
@@ -1045,7 +1042,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 if (serverRpc->totalLength > roundTripBytes) {
                     scheduledMessageReceivePacket(serverRpc);
-                    grantOnePacket();
                 }
                 if (serverRpc->requestPayload.size() == header->totalLength) {
                     // Message complete; start servicing the RPC.
@@ -1235,6 +1231,7 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     : t(t)
     , buffer(buffer)
     , fragments()
+    , estimatedReceivedBytes(0)
 { }
 
 /**
@@ -1276,12 +1273,16 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
-        fragments[header->offset] = MessageFragment(header, length);
+        if (fragments.find(header->offset) == fragments.end()) {
+            estimatedReceivedBytes += length;
+            fragments[header->offset] = MessageFragment(header, length);
+        }
         return true;
     }
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
+    estimatedReceivedBytes += length;
     bool result = appendFragment(header, length);
     while (true) {
         FragmentMap::iterator it = fragments.begin();
@@ -1323,6 +1324,7 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
 {
     uint32_t bytesToSkip = buffer->size() - header->offset;
     length -= sizeof32(DataHeader);
+    estimatedReceivedBytes -= std::min(bytesToSkip, length);
     if (bytesToSkip >= length) {
         // This entire fragment is redundant.
         return false;
@@ -1602,32 +1604,54 @@ HomaTransport::addScheduledMessage(IncomingMessage* message)
 }
 
 /**
- * TODO:
+ * TODO: WHAT IS THE RIGHT TIMING OF CALLING THIS METHOD?
+ * TODO: INLINE THIS METHOD (USE LABEL AND GOTO) IN scheduledMessageReceivePacket?
+ * When a granted message receives a data packet, this method is called to
+ * grant another data packet.
  */
 void
 HomaTransport::grantOnePacket()
 {
     int rank = 0;
     for (IncomingMessage* m : grantedMessages) {
-        if ((m->getUnreceivedBytes() > 0) && (m->grantOffset <
-                (m->getReceived()->size() + roundTripBytes))) {
-            // TODO: the grant mechanism in BasicTransport seems to inc. grantOffset way more aggressively
-            // TODO: WAIT is it correct? it's only ok if grantOffset is set to 1RTT initially?
-            if (m->grantOffset == 0) {
-                m->grantOffset = m->getReceived()->size() + roundTripBytes;
+        if (m->grantOffset < m->accumulator->estimatedReceivedBytes +
+                roundTripBytes) {
+            uint32_t ungrantedBytes;
+            if (m->grantOffset > 0) {
+                // TODO: IF WE ONLY GRANT ONE MORE PACKET WHEN WE RECEIVE ONE,
+                // HOW CAN WE MAKE SURE WE DO NOT LAG BEHIND WHEN PACKETS GET LOST?
+                ungrantedBytes = m->totalLength - m->grantOffset;
+                m->grantOffset = std::min(m->grantOffset + maxDataPerPacket,
+                        m->totalLength);
+            } else {
+                ungrantedBytes = m->totalLength - roundTripBytes;
+                m->grantOffset = std::min(roundTripBytes + maxDataPerPacket,
+                        m->totalLength);
             }
-            m->grantOffset += grantIncrement;
+
+            uint8_t flags;
             string fmt;
-            if (dynamic_cast<ClientRpc*>(m)) {
+            if (m->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
+                flags = FROM_CLIENT;
                 fmt = "client sending GRANT, sequence %u, offset %u, prio %u";
             } else {
+                flags = FROM_SERVER;
                 fmt = "server sending GRANT, sequence %u, offset %u, prio %u";
             }
-            uint8_t grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
+
+            uint8_t grantPrio;
+            if (ungrantedBytes <= roundTripBytes) {
+                // For the last 1 RTT remaining bytes of a message, use the
+                // same priority as unscheduled messages.
+                // TODO: THIS IS NOT CONSISTENT WIHT USING ONLY ONE PRIO INSIDE EACH UNSCHED MSG
+                grantPrio = getUnschedTrafficPrio(ungrantedBytes);
+            } else {
+                grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
+            }
+
             timeTrace(fmt.data(), downCast<uint32_t>(m->getRpcId().sequence),
                     m->grantOffset, grantPrio);
-            GrantHeader grant(m->getRpcId(), m->grantOffset, FROM_CLIENT,
-                    grantPrio);
+            GrantHeader grant(m->getRpcId(), m->grantOffset, flags, grantPrio);
             driver->sendPacket(m->senderAddress(), &grant, NULL,
                     driver->getHighestPacketPriority());
             break;
@@ -1637,8 +1661,9 @@ HomaTransport::grantOnePacket()
 }
 
 /**
- * When a scheduled message receives one more data packet, this method is
- * called to allow the scheduler to make a change in its scheduling decision.
+ * When a scheduled message receives a data packet, this method is called to
+ * to check if the scheduler needs to 1) make a change in its scheduling
+ * decision and 2) send out a grant for another data packet.
  *
  * \param message
  *      The message that receives new data.
@@ -1648,7 +1673,7 @@ HomaTransport::scheduledMessageReceivePacket(IncomingMessage* message)
 {
     std::vector<IncomingMessage*>::iterator it = std::find(
             grantedMessages.begin(), grantedMessages.end(), message);
-    if (message->getUnreceivedBytes() > 0) {
+    if (message->getRemainingBytes() > 0) {
         // The message is not finished yet
         if (it != grantedMessages.end()) {
             // Maintain the ordering within granted messages.
@@ -1659,6 +1684,7 @@ HomaTransport::scheduledMessageReceivePacket(IncomingMessage* message)
                 }
                 *it = *std::prev(it);
             }
+            grantOnePacket();
         } else if (lessThan(message, grantedMessages.back())) {
             // Slow path: a backup message should be promoted to a granted
             // one (and replace the "worst" existing granted message).
@@ -1684,6 +1710,7 @@ HomaTransport::scheduledMessageReceivePacket(IncomingMessage* message)
                 grantedMessages.push_back(*it);
                 backupMessages.erase(it);
             }
+            grantOnePacket();
         } else {
             // Slow path: a backup message somehow finishes before the
             // granted ones; we need to remove this message from the

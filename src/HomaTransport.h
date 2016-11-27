@@ -182,28 +182,34 @@ class HomaTransport : public Transport {
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
 
+        // TODO: it's estimated because according to doc of MsgAccumulator, a data packet
+        // can be partly redundant (!?), the current algo will not be able to figure out whether the
+        // `fragments` map contains redundant bytes until we actually try to assemble the fragment.
+        /// Total # (non-redundant) bytes received.
+        uint32_t estimatedReceivedBytes;
+
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
 
     /**
-     * TODO(YilongL)
+     * This class represents the schedulable entity of the receiver-side
+     * message scheduler. It is a common interface extracted from ClientRpc
+     * and ServerRpc that is required by the scheduler.
      */
     class IncomingMessage {
       public:
-        IncomingMessage()
-            : grantOffset(0)
+        IncomingMessage(RpcKind rpcKind)
+            : accumulator()
+            , grantOffset(0)
+            , rpcKind(rpcKind)
             , totalLength(0)
         {}
 
-        virtual ~IncomingMessage() {}
+        /// This enum defines the `rpcKind` field values for IncomingMessage's.
+        enum RpcKind { CLIENT_RPC, SERVER_RPC };
 
-        /**
-         * Return the buffer that holds all of the data that has been received
-         * for the message so far, up to the first byte that has not yet been
-         * received.
-         */
-        virtual Buffer* getReceived() = 0;
+        virtual ~IncomingMessage() {}
 
         /**
          * Get the unique identifier for the RPC this message belongs to.
@@ -213,15 +219,21 @@ class HomaTransport : public Transport {
         virtual const Driver::Address* senderAddress() = 0;
 
         /**
-         * Return # bytes not yet received in the incoming message.
+         * Return # bytes not yet received or assembled in the message.
          */
-        uint32_t getUnreceivedBytes() {
-            return totalLength - getReceived()->size();
+        uint32_t getRemainingBytes() {
+            return totalLength - accumulator->buffer->size();
         }
+
+        /// Holds state of a partially-received multi-packet message.
+        Tub<MessageAccumulator> accumulator;
 
         /// Offset from the most recent GRANT packet we have sent for
         /// this incoming message, or 0 if we haven't sent any GRANTs.
         uint32_t grantOffset;
+
+        /// The kind of RPC this message belongs to.
+        const RpcKind rpcKind;
 
         /// Total # bytes in the message being received. 0 means we have
         /// not received the first packet of the message.
@@ -293,15 +305,13 @@ class HomaTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
-        /// Holds state of partially-received multi-packet responses.
-        Tub<MessageAccumulator> accumulator;
-
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : session(session)
+            : IncomingMessage(CLIENT_RPC)
+            , session(session)
             , sequence(sequence)
             , request(request)
             , response(response)
@@ -315,13 +325,8 @@ class HomaTransport : public Transport {
             , silentIntervals(0)
             , needGrantFlag(0)
             , transmitPending(false)
-            , accumulator()
             , outgoingRequestLinks()
         {}
-
-        Buffer* getReceived() {
-            return response;
-        }
 
         RpcId getRpcId() {
             return RpcId(session->t->clientId, sequence);
@@ -403,9 +408,6 @@ class HomaTransport : public Transport {
         /// data packets.
         uint8_t needGrantFlag;
 
-        /// Holds state of partially-received multi-packet requests.
-        Tub<MessageAccumulator> accumulator;
-
         /// Used to link this object into t->serverTimerList.
         IntrusiveListHook timerLinks;
 
@@ -414,7 +416,8 @@ class HomaTransport : public Transport {
 
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : t(transport)
+            : IncomingMessage(SERVER_RPC)
+            , t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
@@ -428,14 +431,9 @@ class HomaTransport : public Transport {
             , requestComplete(false)
             , sendingResponse(false)
             , needGrantFlag(0)
-            , accumulator()
             , timerLinks()
             , outgoingResponseLinks()
         {}
-
-        Buffer* getReceived() {
-            return &requestPayload;
-        }
 
         RpcId getRpcId() {
             return rpcId;
@@ -645,7 +643,7 @@ class HomaTransport : public Transport {
     void grantOnePacket();
     void scheduledMessageReceivePacket(IncomingMessage* message);
     static bool lessThan(IncomingMessage* a, IncomingMessage* b) {
-        return a->getUnreceivedBytes() < b->getUnreceivedBytes();
+        return a->getRemainingBytes() < b->getRemainingBytes();
     }
     void insertNewGrantedMessage(IncomingMessage* message);
 
