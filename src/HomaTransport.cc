@@ -1589,6 +1589,8 @@ HomaTransport::checkTimeouts()
 void
 HomaTransport::addScheduledMessage(IncomingMessage* message)
 {
+    // TODO: THERE IS NO (EASY) WAY TO FIND OUT THE SENDER OF A RESPONSE MSG (ie. THE CLIENTID USED BY THE SERVER)
+    // OR SHOULD I COMPARE Driver::Address instead?
     if (grantedMessages.size() < maxGrantedMessages) {
         // We have not buffered enough messages.
         highestGrantedPrio++;
@@ -1599,19 +1601,78 @@ HomaTransport::addScheduledMessage(IncomingMessage* message)
         grantedMessages.pop_back();
         insertNewGrantedMessage(message);
     } else {
+        // The new message is noticed.
         backupMessages.push_back(message);
     }
 }
 
 /**
- * TODO: WHAT IS THE RIGHT TIMING OF CALLING THIS METHOD?
- * TODO: INLINE THIS METHOD (USE LABEL AND GOTO) IN scheduledMessageReceivePacket?
- * When a granted message receives a data packet, this method is called to
- * grant another data packet.
+ * When a scheduled message receives a data packet, this method is called to
+ * to check if the scheduler needs to 1) make a change in its scheduling
+ * decision and 2) send out a grant for another data packet.
+ *
+ * \param message
+ *      The message that receives new data.
  */
 void
-HomaTransport::grantOnePacket()
+HomaTransport::scheduledMessageReceivePacket(IncomingMessage* message)
 {
+    std::vector<IncomingMessage*>::iterator it = std::find(
+            grantedMessages.begin(), grantedMessages.end(), message);
+    // TODO: WAIT, A GRANTED MESSAGE SHOULD BE REMOVED FROM THE LIST WHENEVER ALL ITS BYTES HAVE BEEN GRANTED (NOT RECEIVED!)
+    if (message->getRemainingBytes() > 0) {
+        // The message is not finished yet
+        if (it != grantedMessages.end()) {
+            // Maintain the ordering within granted messages.
+            for (; it != grantedMessages.begin(); it--) {
+                if (lessThan(*std::prev(it), *it)) {
+                    *it = message;
+                    break;
+                }
+                *it = *std::prev(it);
+            }
+            goto grantOnePacket;
+        } else if (lessThan(message, grantedMessages.back())) {
+            // Slow path: a backup message should be promoted to a granted
+            // one (and replace the "worst" existing granted message).
+            it = std::find(backupMessages.begin(), backupMessages.end(),
+                    message);
+            (*it) = grantedMessages.back();
+            grantedMessages.pop_back();
+            insertNewGrantedMessage(message);
+            return;
+        }
+    } else {
+        // The message is now finished
+        if (it != grantedMessages.end()) {
+            // Slow path: an old granted message finishes. Remove this message
+            // and select a new message to grant from the backup messages.
+            if (it == grantedMessages.begin()) {
+                highestGrantedPrio--;
+            }
+            grantedMessages.erase(it);
+            it = std::min_element(backupMessages.begin(),
+                    backupMessages.end(), lessThan);
+            if (it != backupMessages.end()) {
+                grantedMessages.push_back(*it);
+                backupMessages.erase(it);
+            }
+            goto grantOnePacket;
+        } else {
+            // Slow path: a backup message somehow finishes before the
+            // granted ones; we need to remove this message from the
+            // (relatively large) backup message list.
+            it = std::find(backupMessages.begin(), backupMessages.end(),
+                    message);
+            backupMessages.erase(it);
+            return;
+        }
+    }
+
+    // TODO: WHAT IS THE RIGHT TIMING OF CALLING THIS METHOD?
+
+    // When a granted message receives a data packet, grant another packet.
+    grantOnePacket:
     int rank = 0;
     for (IncomingMessage* m : grantedMessages) {
         if (m->grantOffset < m->accumulator->estimatedReceivedBytes +
@@ -1629,12 +1690,16 @@ HomaTransport::grantOnePacket()
                         m->totalLength);
             }
 
+            const Driver::Address* senderAddress;
             uint8_t flags;
             string fmt;
             if (m->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
+                senderAddress = static_cast<ClientRpc*>(m)->session
+                        ->serverAddress;
                 flags = FROM_CLIENT;
                 fmt = "client sending GRANT, sequence %u, offset %u, prio %u";
             } else {
+                senderAddress = static_cast<ServerRpc*>(m)->clientAddress;
                 flags = FROM_SERVER;
                 fmt = "server sending GRANT, sequence %u, offset %u, prio %u";
             }
@@ -1652,73 +1717,11 @@ HomaTransport::grantOnePacket()
             timeTrace(fmt.data(), downCast<uint32_t>(m->getRpcId().sequence),
                     m->grantOffset, grantPrio);
             GrantHeader grant(m->getRpcId(), m->grantOffset, flags, grantPrio);
-            driver->sendPacket(m->senderAddress(), &grant, NULL,
+            driver->sendPacket(senderAddress, &grant, NULL,
                     driver->getHighestPacketPriority());
             break;
         }
         rank++;
-    }
-}
-
-/**
- * When a scheduled message receives a data packet, this method is called to
- * to check if the scheduler needs to 1) make a change in its scheduling
- * decision and 2) send out a grant for another data packet.
- *
- * \param message
- *      The message that receives new data.
- */
-void
-HomaTransport::scheduledMessageReceivePacket(IncomingMessage* message)
-{
-    std::vector<IncomingMessage*>::iterator it = std::find(
-            grantedMessages.begin(), grantedMessages.end(), message);
-    if (message->getRemainingBytes() > 0) {
-        // The message is not finished yet
-        if (it != grantedMessages.end()) {
-            // Maintain the ordering within granted messages.
-            for (; it != grantedMessages.begin(); it--) {
-                if (lessThan(*std::prev(it), *it)) {
-                    *it = message;
-                    break;
-                }
-                *it = *std::prev(it);
-            }
-            grantOnePacket();
-        } else if (lessThan(message, grantedMessages.back())) {
-            // Slow path: a backup message should be promoted to a granted
-            // one (and replace the "worst" existing granted message).
-            it = std::find(backupMessages.begin(), backupMessages.end(),
-                    message);
-            (*it) = grantedMessages.back();
-            grantedMessages.pop_back();
-            insertNewGrantedMessage(message);
-        }
-    } else {
-        // The message is now finished
-        if (it != grantedMessages.end()) {
-            // TODO: ALSO SLOW
-            // An old granted message finishes. Remove this message and
-            // select a new message to grant from the backup messages.
-            if (it == grantedMessages.begin()) {
-                highestGrantedPrio--;
-            }
-            grantedMessages.erase(it);
-            it = std::min_element(backupMessages.begin(),
-                    backupMessages.end(), lessThan);
-            if (it != backupMessages.end()) {
-                grantedMessages.push_back(*it);
-                backupMessages.erase(it);
-            }
-            grantOnePacket();
-        } else {
-            // Slow path: a backup message somehow finishes before the
-            // granted ones; we need to remove this message from the
-            // (relatively large) backup message list.
-            it = std::find(backupMessages.begin(), backupMessages.end(),
-                    message);
-            backupMessages.erase(it);
-        }
     }
 }
 

@@ -216,8 +216,6 @@ class HomaTransport : public Transport {
          */
         virtual RpcId getRpcId() = 0;
 
-        virtual const Driver::Address* senderAddress() = 0;
-
         /**
          * Return # bytes not yet received or assembled in the message.
          */
@@ -332,10 +330,6 @@ class HomaTransport : public Transport {
             return RpcId(session->t->clientId, sequence);
         }
 
-        const Driver::Address* senderAddress() {
-            return session->serverAddress;
-        }
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(ClientRpc);
     };
@@ -437,10 +431,6 @@ class HomaTransport : public Transport {
 
         RpcId getRpcId() {
             return rpcId;
-        }
-
-        const Driver::Address* senderAddress() {
-            return clientAddress;
         }
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
@@ -640,8 +630,8 @@ class HomaTransport : public Transport {
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
     void addScheduledMessage(IncomingMessage* message);
-    void grantOnePacket();
     void scheduledMessageReceivePacket(IncomingMessage* message);
+    // TODO: BETTER CONSTRUCT TO USE THAN STATIC FUNCTION?
     static bool lessThan(IncomingMessage* a, IncomingMessage* b) {
         return a->getRemainingBytes() < b->getRemainingBytes();
     }
@@ -774,7 +764,7 @@ class HomaTransport : public Transport {
     /// The maximum packet priority supported by HomaTransport.
 #define MAX_PACKET_PRIORITY 31
 
-    /// if the number at index i is the first element that is larger than the
+    /// If the number at index i is the first element that is larger than the
     /// size of a message, then the sender should use the (i+1)-th highest
     /// priority for the entire unscheduled portion of the message.
     uint32_t unschedTrafficPrioBrackets[MAX_PACKET_PRIORITY+1];
@@ -783,10 +773,15 @@ class HomaTransport : public Transport {
     /// MESSAGE SCHEDULER
     /// -----------------
 
-    /// TODO
+    /// TODO: PROBABLY NEEDS IMPROVEMENT
+    /// Messages in this list are awared by the scheduler but they will not get
+    /// grants from the scheduler.
     std::vector<IncomingMessage*> backupMessages;
 
-    /// TODO
+    /// TODO: messages in this list have to be from different senders
+    /// The scheduler tries to keep 1 RTT in-flight packets from each of the
+    /// messages in this list. The messages are required to be sent from
+    /// different senders.
     std::vector<IncomingMessage*> grantedMessages;
 
     /// The highest priority currently granted to the incoming messages that
