@@ -630,7 +630,7 @@ class HomaTransport : public Transport {
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
     void addScheduledMessage(IncomingMessage* message);
-    void scheduledMessageReceivePacket(IncomingMessage* message);
+    void scheduledMessageReceiveData(IncomingMessage* message, bool scheduled);
     // TODO: BETTER CONSTRUCT TO USE THAN STATIC FUNCTION?
     static bool lessThan(IncomingMessage* a, IncomingMessage* b) {
         return a->getRemainingBytes() < b->getRemainingBytes();
@@ -773,16 +773,24 @@ class HomaTransport : public Transport {
     /// MESSAGE SCHEDULER
     /// -----------------
 
-    /// TODO: PROBABLY NEEDS IMPROVEMENT
+    // TODO: messages in this list have to be from different senders
+    /// The scheduler sends out grants to messages in this list regularly to
+    /// keep 1 RTT in-flight packets from each of these messages. Once a
+    /// message has been granted in its entirety, it will be moved to the list
+    /// of retiring messages. Furthermore, the messages in this list should have
+    /// different senders.
+    std::vector<IncomingMessage*> activeMessages;
+
     /// Messages in this list are awared by the scheduler but they will not get
-    /// grants from the scheduler.
+    /// grants as long as they stay in the list. A backup message may be chosen
+    /// to become an active message when a former active message is granted
+    /// completely.
     std::vector<IncomingMessage*> backupMessages;
 
-    /// TODO: messages in this list have to be from different senders
-    /// The scheduler tries to keep 1 RTT in-flight packets from each of the
-    /// messages in this list. The messages are required to be sent from
-    /// different senders.
-    std::vector<IncomingMessage*> grantedMessages;
+    /// Messages in this list have been granted completely. Once a message in
+    /// this list has also been received completely, the scheduler can remove
+    /// the message from its state.
+    std::vector<IncomingMessage*> retiringMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is
