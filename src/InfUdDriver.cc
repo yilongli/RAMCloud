@@ -554,7 +554,7 @@ InfUdDriver::getServiceLocator()
 }
 
 // See docs in Driver class.
-int
+uint32_t
 InfUdDriver::getBandwidth()
 {
     return bandwidthGbps*1000;

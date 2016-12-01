@@ -233,7 +233,7 @@ class Driver {
      * Returns the bandwidth of the network in Mbits/second. If the
      * driver cannot determine the network bandwidth, then it returns 0. 
      */
-    virtual int getBandwidth()
+    virtual uint32_t getBandwidth()
     {
         return 0;
     }

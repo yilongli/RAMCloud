@@ -465,7 +465,7 @@ DpdkDriver::getServiceLocator()
 }
 
 // See docs in Driver class.
-int
+uint32_t
 DpdkDriver::getBandwidth()
 {
     return bandwidthMbps;

@@ -60,7 +60,7 @@ class DpdkDriver : public Driver
     void close();
     virtual uint8_t getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
-    virtual int getBandwidth();
+    virtual uint32_t getBandwidth();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
     virtual void receivePackets(int maxPackets,
             std::vector<Received>* receivedPackets);

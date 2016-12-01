@@ -186,6 +186,7 @@ class HomaTransport : public Transport {
         // can be partly redundant (!?), the current algo will not be able to figure out whether the
         // `fragments` map contains redundant bytes until we actually try to assemble the fragment.
         /// Total # (non-redundant) bytes received.
+        // TODO: there is quite some complexity in maintaining this value; need better impl. doc.
         uint32_t estimatedReceivedBytes;
 
       PRIVATE:
@@ -199,13 +200,6 @@ class HomaTransport : public Transport {
      */
     class IncomingMessage {
       public:
-        IncomingMessage(RpcKind rpcKind)
-            : accumulator()
-            , grantOffset(0)
-            , rpcKind(rpcKind)
-            , totalLength(0)
-        {}
-
         /// This enum defines the `rpcKind` field values for IncomingMessage's.
         enum RpcKind { CLIENT_RPC, SERVER_RPC };
 
@@ -223,8 +217,19 @@ class HomaTransport : public Transport {
             return totalLength - accumulator->buffer->size();
         }
 
+        /**
+         * Return the unique identifier for the sender of this message.
+         */
+        virtual uint64_t getSenderId() = 0;
+
         /// Holds state of a partially-received multi-packet message.
         Tub<MessageAccumulator> accumulator;
+
+        /// Used to link this object into t->activeMessages.
+        IntrusiveListHook activeMessageLinks;
+
+        /// Used to link this object into t->backupMessages.
+        IntrusiveListHook backupMessageLinks;
 
         /// Offset from the most recent GRANT packet we have sent for
         /// this incoming message, or 0 if we haven't sent any GRANTs.
@@ -236,6 +241,16 @@ class HomaTransport : public Transport {
         /// Total # bytes in the message being received. 0 means we have
         /// not received the first packet of the message.
         uint32_t totalLength;
+
+        IncomingMessage(RpcKind rpcKind)
+            : accumulator()
+            , activeMessageLinks()
+            , backupMessageLinks()
+            , grantOffset(0)
+            , rpcKind(rpcKind)
+            , totalLength(0)
+
+        {}
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
@@ -326,8 +341,14 @@ class HomaTransport : public Transport {
             , outgoingRequestLinks()
         {}
 
-        RpcId getRpcId() {
+        virtual RpcId getRpcId() {
             return RpcId(session->t->clientId, sequence);
+        }
+
+        virtual uint64_t getSenderId() {
+            // TODO: THE INCOMING MSG IS THE RESPONSE SENT FROM THE SERVER;
+            // HOWEVER, THERE IS NO WAY TO TELL THE SERVER'S
+            return 7;
         }
 
       PRIVATE:
@@ -429,8 +450,12 @@ class HomaTransport : public Transport {
             , outgoingResponseLinks()
         {}
 
-        RpcId getRpcId() {
+        virtual RpcId getRpcId() {
             return rpcId;
+        }
+
+        virtual uint64_t getSenderId() {
+            return rpcId.clientId;
         }
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
@@ -629,13 +654,13 @@ class HomaTransport : public Transport {
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
-    void addScheduledMessage(IncomingMessage* message);
+    void addScheduledMessage(IncomingMessage* newMessage);
     void scheduledMessageReceiveData(IncomingMessage* message, bool scheduled);
     // TODO: BETTER CONSTRUCT TO USE THAN STATIC FUNCTION?
-    static bool lessThan(IncomingMessage* a, IncomingMessage* b) {
-        return a->getRemainingBytes() < b->getRemainingBytes();
+    static bool lessThan(IncomingMessage& a, IncomingMessage& b) {
+        return a.getRemainingBytes() < b.getRemainingBytes();
     }
-    void insertNewGrantedMessage(IncomingMessage* message);
+    void scheduleNewMessage(IncomingMessage *newMessage);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -773,24 +798,26 @@ class HomaTransport : public Transport {
     /// MESSAGE SCHEDULER
     /// -----------------
 
-    // TODO: messages in this list have to be from different senders
-    /// The scheduler sends out grants to messages in this list regularly to
-    /// keep 1 RTT in-flight packets from each of these messages. Once a
-    /// message has been granted in its entirety, it will be moved to the list
-    /// of retiring messages. Furthermore, the messages in this list should have
-    /// different senders.
-    std::vector<IncomingMessage*> activeMessages;
+    /// Holds a list of messages that are sent from distinct senders and
+    /// receive grants regularly. The scheduler attempts to keep 1 RTT
+    /// in-flight packets from each of these messages. Once a message has
+    /// been granted in its entirety, it will be removed from the list.
+    INTRUSIVE_LIST_TYPEDEF(IncomingMessage, activeMessageLinks)
+            ActiveMessageList;
+    ActiveMessageList activeMessages;
 
-    /// Messages in this list are awared by the scheduler but they will not get
-    /// grants as long as they stay in the list. A backup message may be chosen
-    /// to become an active message when a former active message is granted
-    /// completely.
-    std::vector<IncomingMessage*> backupMessages;
+    /// Holds the so-called backup messages that are awared by the scheduler
+    /// but do not get grants. A backup message may be chosen to become an
+    /// active message when a former active message is granted completely.
+    INTRUSIVE_LIST_TYPEDEF(IncomingMessage, backupMessageLinks)
+            BackupMessageList;
+    BackupMessageList backupMessages;
 
-    /// Messages in this list have been granted completely. Once a message in
-    /// this list has also been received completely, the scheduler can remove
-    /// the message from its state.
-    std::vector<IncomingMessage*> retiringMessages;
+    // TODO: DO WE REALLY NEED THIS LIST? WHAT IS IT USED?
+    // Messages in this list have been granted completely. Once a message in
+    // this list has also been received completely, the scheduler can remove
+    // the message from its state.
+//    std::vector<IncomingMessage*> retiringMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is
