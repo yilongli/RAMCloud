@@ -157,6 +157,12 @@ class HomaTransport : public Transport {
         /// first byte that has not yet been received.
         Buffer* buffer;
 
+        /// Estimates the total # non-redundant payload bytes received. This
+        /// value cannot be precisely computed at all time because we cannot
+        /// tell how many redundant bytes a new data packet carries in its
+        /// payload before we actually manage to assemble it in the buffer.
+        uint32_t estimatedReceivedBytes;
+
         /// Describes a portion of an incoming message.
         struct MessageFragment {
             /// Address of first byte of a DATA packet, as returned by
@@ -182,13 +188,6 @@ class HomaTransport : public Transport {
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
 
-        // TODO: it's estimated because according to doc of MsgAccumulator, a data packet
-        // can be partly redundant (!?), the current algo will not be able to figure out whether the
-        // `fragments` map contains redundant bytes until we actually try to assemble the fragment.
-        /// Total # (non-redundant) bytes received.
-        // TODO: there is quite some complexity in maintaining this value; need better impl. doc.
-        uint32_t estimatedReceivedBytes;
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
@@ -213,7 +212,7 @@ class HomaTransport : public Transport {
         /**
          * Return # bytes not yet received or assembled in the message.
          */
-        uint32_t getRemainingBytes() {
+        uint32_t getRemainingBytes() const {
             return totalLength - accumulator->buffer->size();
         }
 
@@ -251,6 +250,17 @@ class HomaTransport : public Transport {
             , totalLength(0)
 
         {}
+
+        /**
+         * Comparison function used by the message scheduler.
+         */
+        bool operator<(IncomingMessage& other) const
+        {
+            // This function is undefined if the total length of either message
+            // is unknown.
+            assert(totalLength > 0 && other.totalLength > 0);
+            return getRemainingBytes() < other.getRemainingBytes();
+        }
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
@@ -655,11 +665,7 @@ class HomaTransport : public Transport {
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
     void addScheduledMessage(IncomingMessage* newMessage);
-    void scheduledMessageReceiveData(IncomingMessage* message, bool scheduled);
-    // TODO: BETTER CONSTRUCT TO USE THAN STATIC FUNCTION?
-    static bool lessThan(IncomingMessage& a, IncomingMessage& b) {
-        return a.getRemainingBytes() < b.getRemainingBytes();
-    }
+    void scheduledMessageReceiveData(IncomingMessage* message);
     void scheduleNewMessage(IncomingMessage *newMessage);
 
     /// Shared RAMCloud information.
@@ -812,12 +818,6 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(IncomingMessage, backupMessageLinks)
             BackupMessageList;
     BackupMessageList backupMessages;
-
-    // TODO: DO WE REALLY NEED THIS LIST? WHAT IS IT USED?
-    // Messages in this list have been granted completely. Once a message in
-    // this list has also been received completely, the scheduler can remove
-    // the message from its state.
-//    std::vector<IncomingMessage*> retiringMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is

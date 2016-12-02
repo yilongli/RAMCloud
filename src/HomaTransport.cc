@@ -92,7 +92,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
 #define REDUNDANCY_FACTOR 2
     , activeMessages()
     , backupMessages()
-//    , retiringMessages(10)
     , highestGrantedPrio(-1)
     , maxGrantedMessages(REDUNDANCY_FACTOR)
 
@@ -819,9 +818,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     clientRpc->response->truncate(header->totalLength);
                 }
                 if (clientRpc->totalLength > roundTripBytes) {
-                    scheduledMessageReceiveData(clientRpc, header->offset +
-                            received->len - sizeof32(DataHeader) >
-                            roundTripBytes);
+                    scheduledMessageReceiveData(clientRpc);
                     // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
                 }
                 if (clientRpc->response->size() == header->totalLength) {
@@ -1041,9 +1038,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     serverRpc->requestPayload.truncate(header->totalLength);
                 }
                 if (serverRpc->totalLength > roundTripBytes) {
-                    scheduledMessageReceiveData(serverRpc, header->offset +
-                           received->len - sizeof32(DataHeader) >
-                           roundTripBytes);
+                    scheduledMessageReceiveData(serverRpc);
                 }
                 if (serverRpc->requestPayload.size() == header->totalLength) {
                     // Message complete; start servicing the RPC.
@@ -1232,8 +1227,8 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
         Buffer* buffer)
     : t(t)
     , buffer(buffer)
-    , fragments()
     , estimatedReceivedBytes(0)
+    , fragments()
 { }
 
 /**
@@ -1272,19 +1267,25 @@ bool
 HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         uint32_t length)
 {
+    // Assume the payload contains no redundant bytes for now. The redundant
+    // portion will be deducted when this packet is discarded/assembled.
+    length -= sizeof32(DataHeader);
+    estimatedReceivedBytes += length;
+
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
         if (fragments.find(header->offset) == fragments.end()) {
-            estimatedReceivedBytes += length;
             fragments[header->offset] = MessageFragment(header, length);
+            return true;
+        } else {
+            estimatedReceivedBytes -= length;
+            return false;
         }
-        return true;
     }
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
-    estimatedReceivedBytes += length;
     bool result = appendFragment(header, length);
     while (true) {
         FragmentMap::iterator it = fragments.begin();
@@ -1312,7 +1313,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
  * \param header
  *      Address of the first byte of a DATA packet.
  * \param length
- *      Total size of the packet at *header (including header).
+ *      Total size of the packet at payload.
  * \return
  *      True means that (some of) the data in this fragment was
  *      incorporated into the message buffer. False means that
@@ -1325,7 +1326,6 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
         uint32_t length)
 {
     uint32_t bytesToSkip = buffer->size() - header->offset;
-    length -= sizeof32(DataHeader);
     estimatedReceivedBytes -= std::min(bytesToSkip, length);
     if (bytesToSkip >= length) {
         // This entire fragment is redundant.
@@ -1594,7 +1594,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
 {
     for (IncomingMessage& m : activeMessages) {
         if (m.getSenderId() == newMessage->getSenderId()) {
-            if (lessThan(*newMessage, m)) {
+            if (*newMessage < m) {
                 // The new message should replace an active message that is from
                 // the same sender.
                 erase(activeMessages, m);
@@ -1613,7 +1613,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
         // priority in use for scheduled packets.
         highestGrantedPrio++;
         scheduleNewMessage(newMessage);
-    } else if (lessThan(*newMessage, activeMessages.back())) {
+    } else if (*newMessage < activeMessages.back()) {
         // The new message should replace the "worst" active message.
         backupMessages.push_back(activeMessages.back());
         activeMessages.pop_back();
@@ -1630,14 +1630,12 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
  *
  * \param message
  *      The message that receives new data.
- * \param scheduled
- *      True if the data packet received is a scheduled packet,
- *      false otherwise.
  */
 void
-HomaTransport::scheduledMessageReceiveData(IncomingMessage* message,
-                                           bool scheduled)
+HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 {
+    // The remaining bytes of a scheduled message decreases. This could result
+    // in a change of our scheduling decision.
     if (message->getRemainingBytes() > 0) {
         // The message has not been fully received.
         if (message->grantOffset < message->totalLength) {
@@ -1647,11 +1645,11 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message,
             if (it != activeMessages.end()) {
                 // The message is among active messages.
                 if (it == activeMessages.begin()
-                        || !lessThan(*it, *std::prev(it))) {
+                        || !(*it < *std::prev(it))) {
                     activeMessages.erase(it);
                     scheduleNewMessage(message);
                 }
-            } else if (lessThan(*message, activeMessages.back())) {
+            } else if (*message < activeMessages.back()) {
                 // The message is a backup message and should be promoted to
                 // replace the "worst" current active message provided that
                 // no other active messages are from the same sender as it.
@@ -1676,43 +1674,58 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message,
         // granted.
     }
 
-    if (!scheduled) {
+    // Only send back a grant if the data packet received is from an active
+    // message.
+    if (activeMessages.iterator_to(*message) == activeMessages.end()) {
         return;
     }
-    // TODO: EXPLAIN TO BEHNAM WHY WE WOULD SEND A GRANT EVEN IF THE DATA PACKET IS FROM A MSG THAT IS NOW IN THE BACKUP LIST
-    // Whenever we receive a scheduled data packet, send out another grant to
-    // the active message that has the highest priority and needs a grant.
     int rank = 0;
     for (IncomingMessage& incomingMessage : activeMessages) {
         IncomingMessage* m = &incomingMessage;
         if (m->grantOffset < m->accumulator->estimatedReceivedBytes +
                 roundTripBytes) {
-            uint32_t oldGrantOffset;
-            if (m->grantOffset > 0) {
-                oldGrantOffset = m->totalLength - m->grantOffset;
-                m->grantOffset += maxDataPerPacket;
-            } else {
-                oldGrantOffset = m->totalLength - roundTripBytes;
-                m->grantOffset = roundTripBytes + maxDataPerPacket;
-            }
-
+            uint32_t oldGrantOffset = m->grantOffset > 0
+                    ? m->grantOffset : roundTripBytes;
+            m->grantOffset = oldGrantOffset + maxDataPerPacket;
             if (m->grantOffset >= m->totalLength) {
                 // Slow path: a message has been fully granted. Purge this
-                // message and select a new message to grant from the backups.
+                // message, select a new message to grant from the backups
+                // and reclaim the highestGrantedPrio if possible.
                 m->grantOffset = m->totalLength;
-                if (m == &activeMessages.front()) {
-                    //
-                    highestGrantedPrio--;
+                bool topMessagePurged = m == &activeMessages.front();
+                erase(activeMessages, *m);
+
+                IncomingMessage* selectedMessage = NULL;
+                for (IncomingMessage& backupMessage : backupMessages) {
+                    if (selectedMessage != NULL
+                            && !(backupMessage < *selectedMessage)) {
+                        continue;
+                    }
+
+                    bool sameSender = false;
+                    for (IncomingMessage& activeMessage : activeMessages) {
+                        if (activeMessage.getSenderId() ==
+                                backupMessage.getSenderId()) {
+                            sameSender = true;
+                            break;
+                        }
+                    }
+
+                    if (!sameSender) {
+                        selectedMessage = &backupMessage;
+                    }
                 }
-                erase(activeMessages, m);
-                if (!backupMessages.empty()) {
-                    // TODO: NEED TO CHECK SAME SENDER! EXTRACT A COMMON METHOD THAT
-                    // REPLACE ACTIVE MESSAGE.
-                    BackupMessageList::iterator it = std::min_element(
-                            backupMessages.begin(), backupMessages.end(),
-                            lessThan);
-                    activeMessages.push_back(*it);
-                    backupMessages.erase(it);
+                if (selectedMessage) {
+                    activeMessages.push_back(*selectedMessage);
+                    erase(backupMessages, *selectedMessage);
+                }
+                if (topMessagePurged && downCast<uint32_t>(highestGrantedPrio)
+                        >= activeMessages.size()) {
+                    // We can reclaim the highest granted priority only when
+                    // the previous top message is fully granted and priority
+                    // levels 0 to highestGrantedPrio-1 are still capable of
+                    // accomodating the updated active message list.
+                    highestGrantedPrio--;
                 }
             }
 
@@ -1732,10 +1745,11 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message,
 
             uint8_t grantPrio;
             if (oldGrantOffset <= roundTripBytes) {
-                // For the last 1 RTT remaining bytes of a message, use the
-                // same priority as unscheduled messages.
-                // TODO: THIS IS NOT CONSISTENT WIHT USING ONLY ONE PRIO INSIDE EACH UNSCHED MSG
-                grantPrio = getUnschedTrafficPrio(oldGrantOffset);
+                // For the last 1 RTT remaining bytes of a scheduled message
+                // with size (1+a)RTT, use the same priority as an unscheduled
+                // message that has size min{1, a}*RTT.
+                grantPrio = getUnschedTrafficPrio(std::min(roundTripBytes,
+                        m->totalLength - roundTripBytes));
             } else {
                 grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
             }
@@ -1759,7 +1773,7 @@ void
 HomaTransport::scheduleNewMessage(IncomingMessage *newMessage)
 {
     for (IncomingMessage& m : activeMessages) {
-        if (lessThan(*newMessage, m)) {
+        if (*newMessage < m) {
             insertBefore(activeMessages, *newMessage, m);
             return;
         }
