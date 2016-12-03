@@ -1594,7 +1594,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
 {
     int rank = 0;
     for (IncomingMessage& m : activeMessages) {
-        if (m.getSenderId() == newMessage->getSenderId()) {
+        if (m.senderId == newMessage->senderId) {
             if (*newMessage < m) {
                 // The new message should replace an active message that is from
                 // the same sender.
@@ -1672,7 +1672,7 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
                 // no other active messages are from the same sender as it.
                 IncomingMessage* sameSender = NULL;
                 for (IncomingMessage& m : activeMessages) {
-                    if (m.getSenderId() == message->getSenderId()) {
+                    if (m.senderId == message->senderId) {
                         sameSender = &m;
                         break;
                     }
@@ -1721,8 +1721,7 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 
                     bool sameSender = false;
                     for (IncomingMessage& activeMessage : activeMessages) {
-                        if (activeMessage.getSenderId() ==
-                                backupMessage.getSenderId()) {
+                        if (activeMessage.senderId == backupMessage.senderId) {
                             sameSender = true;
                             break;
                         }

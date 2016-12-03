@@ -216,11 +216,6 @@ class HomaTransport : public Transport {
             return totalLength - accumulator->buffer->size();
         }
 
-        /**
-         * Return the unique identifier for the sender of this message.
-         */
-        virtual uint64_t getSenderId() = 0;
-
         /// Holds state of a partially-received multi-packet message.
         Tub<MessageAccumulator> accumulator;
 
@@ -237,18 +232,21 @@ class HomaTransport : public Transport {
         /// The kind of RPC this message belongs to.
         const RpcKind rpcKind;
 
+        /// The (likely) unique identifier for the sender of this message.
+        const uint64_t senderId;
+
         /// Total # bytes in the message being received. 0 means we have
         /// not received the first packet of the message.
         uint32_t totalLength;
 
-        IncomingMessage(RpcKind rpcKind)
+        IncomingMessage(RpcKind rpcKind, const Driver::Address* senderAddress)
             : accumulator()
             , activeMessageLinks()
             , backupMessageLinks()
             , grantOffset(0)
             , rpcKind(rpcKind)
+            , senderId(std::hash<std::string>{}(senderAddress->toString()))
             , totalLength(0)
-
         {}
 
         /**
@@ -333,7 +331,7 @@ class HomaTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : IncomingMessage(CLIENT_RPC)
+            : IncomingMessage(CLIENT_RPC, session->serverAddress)
             , session(session)
             , sequence(sequence)
             , request(request)
@@ -353,12 +351,6 @@ class HomaTransport : public Transport {
 
         virtual RpcId getRpcId() {
             return RpcId(session->t->clientId, sequence);
-        }
-
-        virtual uint64_t getSenderId() {
-            // TODO: THE INCOMING MSG IS THE RESPONSE SENT FROM THE SERVER;
-            // HOWEVER, THERE IS NO WAY TO TELL THE SERVER'S
-            return 7;
         }
 
       PRIVATE:
@@ -441,7 +433,7 @@ class HomaTransport : public Transport {
 
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : IncomingMessage(SERVER_RPC)
+            : IncomingMessage(SERVER_RPC, clientAddress)
             , t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
@@ -462,10 +454,6 @@ class HomaTransport : public Transport {
 
         virtual RpcId getRpcId() {
             return rpcId;
-        }
-
-        virtual uint64_t getSenderId() {
-            return rpcId.clientId;
         }
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
