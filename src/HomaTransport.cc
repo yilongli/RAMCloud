@@ -1592,6 +1592,7 @@ HomaTransport::checkTimeouts()
 void
 HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
 {
+    int rank = 0;
     for (IncomingMessage& m : activeMessages) {
         if (m.getSenderId() == newMessage->getSenderId()) {
             if (*newMessage < m) {
@@ -1600,17 +1601,26 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
                 erase(activeMessages, m);
                 backupMessages.push_back(m);
                 scheduleNewMessage(newMessage);
+                if (newMessage == &activeMessages.front() && rank > 0
+                        && highestGrantedPrio + 1 < lowestUnschedPrio) {
+                    // We have a new top message that is not from the sender
+                    // of the previous top message. Bump the highest granted
+                    // priority if we haven't used up all the priority levels
+                    // for scheduled packets.
+                    highestGrantedPrio++;
+                }
             } else {
                 backupMessages.push_back(*newMessage);
             }
             return;
         }
+        rank++;
     }
 
     if (activeMessages.size() < maxGrantedMessages) {
         // We have not buffered enough messages. This also means we have not
         // used up our priority levels for scheduled packets. Bump the highest
-        // priority in use for scheduled packets.
+        // granted priority.
         highestGrantedPrio++;
         scheduleNewMessage(newMessage);
     } else if (*newMessage < activeMessages.back()) {
@@ -1618,6 +1628,13 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
         backupMessages.push_back(activeMessages.back());
         activeMessages.pop_back();
         scheduleNewMessage(newMessage);
+        if (newMessage == &activeMessages.front()
+                && highestGrantedPrio + 1 < lowestUnschedPrio) {
+            // We have a new top message. Bump the highest granted priority
+            // if we haven't used up all the priority levels for scheduled
+            // packets.
+            highestGrantedPrio++;
+        }
     } else {
         backupMessages.push_back(*newMessage);
     }
@@ -1719,12 +1736,15 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
                     activeMessages.push_back(*selectedMessage);
                     erase(backupMessages, *selectedMessage);
                 }
-                if (topMessagePurged && downCast<uint32_t>(highestGrantedPrio)
-                        >= activeMessages.size()) {
+                if (topMessagePurged
+                        && selectedMessage != &activeMessages.front()
+                        && downCast<uint32_t>(highestGrantedPrio)
+                            >= activeMessages.size()) {
                     // We can reclaim the highest granted priority only when
-                    // the previous top message is fully granted and priority
-                    // levels 0 to highestGrantedPrio-1 are still capable of
-                    // accomodating the updated active message list.
+                    // 1) the previous top message is fully granted, 2) the new
+                    // selected message doesn't become the new top message and
+                    // 3) priority levels 0 to highestGrantedPrio-1 are still
+                    // capable of accomodating the updated active message list.
                     highestGrantedPrio--;
                 }
             }
