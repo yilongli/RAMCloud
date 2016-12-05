@@ -146,8 +146,7 @@ class HomaTransport : public Transport {
         bool appendFragment(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(HomaTransport *t,
                 const Driver::Address* address, RpcId rpcId,
-                uint32_t grantOffset, uint32_t roundTripBytes,
-                uint8_t whoFrom);
+                uint32_t grantOffset, uint8_t whoFrom);
 
         /// Transport that is managing this object.
         HomaTransport* t;
@@ -187,6 +186,14 @@ class HomaTransport : public Transport {
         /// corresponding fragment, which is a stolen Driver::Received.
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
+
+        // Used to detect lost packets faster than using timeouts. When a new
+        // packet arrives but cannot be added to buffer because some preceding
+        // packets are missing, the indicator is incremented. The larger this
+        // number becomes, the more likely that the preceding packets are lost.
+        // The indicator is reset when a retransmission is initiated or a new
+        // packet arrives that can be added into the buffer.
+        uint32_t packetLossIndicator;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
@@ -308,6 +315,7 @@ class HomaTransport : public Transport {
         /// data bytes of the request.
         uint64_t lastTransmitTime;
 
+        // TODO: HOW IS IT ACTUALLY USED?
         /// The sum of the offset and length fields from the most recent
         /// RESEND we have sent, 0 if no RESEND has been sent for this
         /// RPC. Used to detect unnecessary RESENDs (because the original

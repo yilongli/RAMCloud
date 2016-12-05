@@ -87,14 +87,10 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , timeoutIntervals(40)
     , pingIntervals(3)
     , unschedTrafficPrioBrackets{}
-
-    // TODO: document the init values
-#define REDUNDANCY_FACTOR 2
     , activeMessages()
     , backupMessages()
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(REDUNDANCY_FACTOR)
-
+    , maxGrantedMessages(3)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -103,12 +99,18 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
 
-    // The # messages granted must be smaller than or equal to the number of
-    // priority levels used for scheduled traffic.
-    assert(maxGrantedMessages <= lowestUnschedPrio);
+    // The # messages granted must be smaller than or equal to # priority
+    // levels used for scheduled traffic. The highest packet priority supported
+    // by the driver must be less than or equal to that supported by Homa.
+    if (maxGrantedMessages > lowestUnschedPrio
+            || driver->getHighestPacketPriority() > MAX_PACKET_PRIORITY) {
+        DIE("HomaTransport fails to be instantiated: maxGrantedMessages %u, "
+                "lowestUnschedPrio %u, highestPacketPriority %u",
+                maxGrantedMessages, lowestUnschedPrio,
+                driver->getHighestPacketPriority());
+    }
 
     // Set up the initial unscheduled traffic priority brackets for messages.
-    assert(MAX_PACKET_PRIORITY >= driver->getHighestPacketPriority());
     int numUnschedPrio = driver->getHighestPacketPriority() -
             lowestUnschedPrio + 1;
     unschedTrafficPrioBrackets[0] = driver->getMaxPacketSize() + 1;
@@ -810,6 +812,13 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
+                if (clientRpc->accumulator->packetLossIndicator > 2) {
+                    clientRpc->resendLimit =
+                            clientRpc->accumulator->requestRetransmission(this,
+                            clientRpc->session->serverAddress,
+                            RpcId(clientId, clientRpc->sequence),
+                            clientRpc->grantOffset, FROM_CLIENT);
+                }
                 if (clientRpc->response->size() > header->totalLength) {
                     // We have more bytes than we want. This can happen
                     // if the last packet gets padded by the network
@@ -1030,6 +1039,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                             WireFormat::RequestCommon>()->opcode,
                             header->totalLength);
                 }
+                if (serverRpc->accumulator->packetLossIndicator > 2) {
+                    serverRpc->resendLimit =
+                            serverRpc->accumulator->requestRetransmission(this,
+                            serverRpc->clientAddress, serverRpc->rpcId,
+                            serverRpc->grantOffset, FROM_SERVER);
+                }
                 if (serverRpc->requestPayload.size() > header->totalLength) {
                     // We have more bytes than we want. This can happen
                     // if the last packet gets padded by the network
@@ -1229,6 +1244,7 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     , buffer(buffer)
     , estimatedReceivedBytes(0)
     , fragments()
+    , packetLossIndicator(0)
 { }
 
 /**
@@ -1275,6 +1291,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
+        packetLossIndicator++;
         if (fragments.find(header->offset) == fragments.end()) {
             fragments[header->offset] = MessageFragment(header, length);
             return true;
@@ -1286,6 +1303,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
+    uint32_t oldSize = buffer->size();
     bool result = appendFragment(header, length);
     while (true) {
         FragmentMap::iterator it = fragments.begin();
@@ -1301,6 +1319,9 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
             t->driver->release(fragment.header);
         };
         fragments.erase(it);
+    }
+    if (buffer->size() > oldSize) {
+        packetLossIndicator = 0;
     }
     return result;
 }
@@ -1353,9 +1374,6 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
  *      this is how many total bytes we should have received already).
  *      May be 0 if the client never requested a grant (meaning that it
  *      planned to transmit the entire message unilaterally).
- * \param roundTripBytes
- *      Number of bytes that can be transmitted during the time it takes
- *      for a round-trip latency.
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that we are the client, or
  *      FROM_SERVER, indicating that we are the server.
@@ -1367,11 +1385,12 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
 uint32_t
 HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
-        uint32_t roundTripBytes, uint8_t whoFrom)
+        uint8_t whoFrom)
 {
     if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
         DIE("Bad fragment pointer: %p", &fragments);
     }
+    packetLossIndicator = 0;
     uint32_t endOffset;
     FragmentMap::iterator it = fragments.begin();
 
@@ -1387,7 +1406,7 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         // We haven't issued a GRANT for this message; just request
         // the first round-trip's worth of data. Once this data arrives,
         // the normal grant mechanism should kick in if it's still needed.
-        endOffset = roundTripBytes;
+        endOffset = t->roundTripBytes;
     }
     assert(endOffset > buffer->size());
     if (whoFrom == FROM_SERVER) {
@@ -1506,7 +1525,7 @@ HomaTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->response->size() == 0) {
+        if (clientRpc->accumulator->estimatedReceivedBytes == 0) {
             // We haven't received any part of the response message.
             // Send occasional RESEND packets, which should produce some
             // response from the server, so that we know it's still alive
@@ -1523,18 +1542,20 @@ HomaTransport::checkTimeouts()
                 driver->sendPacket(clientRpc->session->serverAddress,
                         &resend, NULL, driver->getHighestPacketPriority());
             }
-        } else {
-            // We have received part of the response. If the server has gone
-            // silent, this must mean packets were lost, so request
-            // retransmission.
+        } else if (activeMessages.iterator_to(*clientRpc) !=
+                activeMessages.end()) {
+            // We have received part of the response and we are granting the
+            // response regularly. If the server has gone silent, this must
+            // mean packets were lost, grants were lost, or the server has
+            // preempted this response for higher priority messages, so request
+            // retransmission anyway.
             assert(clientRpc->accumulator);
             if (clientRpc->silentIntervals >= 2) {
-                // TODO: SHOULDN'T WE ONLY REQUEST RETRANSMISSION FOR GRANTED MESSAGES?
                 clientRpc->resendLimit =
                         clientRpc->accumulator->requestRetransmission(this,
                         clientRpc->session->serverAddress,
                         RpcId(clientId, sequence),
-                        clientRpc->grantOffset, roundTripBytes, FROM_CLIENT);
+                        clientRpc->grantOffset, FROM_CLIENT);
             }
         }
     }
@@ -1576,11 +1597,13 @@ HomaTransport::checkTimeouts()
 
         // See if we need to request retransmission for part of the request
         // message.
-        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete) {
+        if ((serverRpc->silentIntervals >= 2) &&
+                (activeMessages.iterator_to(*serverRpc) !=
+                activeMessages.end())) {
             serverRpc->resendLimit =
                     serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId,
-                    serverRpc->grantOffset, roundTripBytes, FROM_SERVER);
+                    serverRpc->grantOffset, FROM_SERVER);
         }
     }
 }
