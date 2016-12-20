@@ -252,11 +252,15 @@ DpdkDriver::~DpdkDriver()
         LOG(ERROR, "DpdkDriver deleted with %d packets still in use",
             packetBufsUtilized);
 
-    // Currently DPDK does not provide methods for freeing the various
-    // allocated resources (e.g. ring, mempool) and releasing the NIC.
-    // All we can do at this point is stop the packet reception
-    // by disabling the activated NIC port.
+    // Free the various allocated resources (e.g. ring, mempool) and release
+    // the NIC.
     rte_eth_dev_stop(portId);
+    rte_eth_dev_close(portId);
+    char devname[RTE_ETH_NAME_MAX_LEN+1];
+    if (rte_eth_dev_detach(portId, devname) != 0) {
+        LOG(ERROR, "DpdkDriver failed to detach Ethernet device: "
+                "portId = %u, devname = %s", portId, devname);
+    }
     rte_openlog_stream(NULL);
 }
 
