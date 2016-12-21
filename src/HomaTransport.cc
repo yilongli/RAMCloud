@@ -60,8 +60,11 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
     , clientId(clientId)
-    , lowestUnschedPrio(downCast<uint8_t>(
-            (driver->getHighestPacketPriority() + 1) >> 1))
+
+    // For now, assume we can use all the priorities supported by the driver.
+    , highestAvailPriority(driver->getHighestPacketPriority())
+    , controlPacketPriority(highestAvailPriority)
+    , lowestUnschedPrio(downCast<uint8_t>((highestAvailPriority + 1) >> 1))
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , transmitSequenceNumber(1)
@@ -88,7 +91,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , pingIntervals(3)
     , unschedTrafficPrioBrackets{}
     , activeMessages()
-    , backupMessages()
+    , interativeMessages()
     , highestGrantedPrio(-1)
     , maxGrantedMessages(3)
 {
@@ -103,16 +106,14 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // levels used for scheduled traffic. The highest packet priority supported
     // by the driver must be less than or equal to that supported by Homa.
     if (maxGrantedMessages > lowestUnschedPrio
-            || driver->getHighestPacketPriority() > MAX_PACKET_PRIORITY) {
+            || highestAvailPriority > MAX_PACKET_PRIORITY) {
         DIE("HomaTransport fails to be instantiated: maxGrantedMessages %u, "
                 "lowestUnschedPrio %u, highestPacketPriority %u",
-                maxGrantedMessages, lowestUnschedPrio,
-                driver->getHighestPacketPriority());
+                maxGrantedMessages, lowestUnschedPrio, highestAvailPriority);
     }
 
     // Set up the initial unscheduled traffic priority brackets for messages.
-    int numUnschedPrio = driver->getHighestPacketPriority() -
-            lowestUnschedPrio + 1;
+    int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
     unschedTrafficPrioBrackets[0] = driver->getMaxPacketSize() + 1;
     for (int i = 1; i < numUnschedPrio - 1; i++) {
         unschedTrafficPrioBrackets[i] = unschedTrafficPrioBrackets[i-1] << 1;
@@ -161,27 +162,6 @@ HomaTransport::getServiceLocator()
 }
 
 /**
- * Decides which packet priority should be used to transmit the unscheduled
- * portion of a message.
- *
- * \param messageSize
- *      The size of the message to be transmitted.
- * \return
- *      The packet priority to use.
- */
-uint8_t
-HomaTransport::getUnschedTrafficPrio(uint32_t messageSize) {
-    int numUnschedPrio = driver->getHighestPacketPriority() -
-            lowestUnschedPrio + 1;
-    for (int i = 0; i < numUnschedPrio - 1; i++) {
-        if (messageSize < unschedTrafficPrioBrackets[i]) {
-            return downCast<uint8_t>(driver->getHighestPacketPriority() - i);
-        }
-    }
-    return lowestUnschedPrio;
-}
-
-/**
  * When we are finished processing an outgoing RPC, this method is
  * invoked to delete the ClientRpc object and remove it from all
  * existing data structures.
@@ -199,7 +179,7 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
     outgoingRpcs.erase(clientRpc->sequence);
     erase(outgoingRequests, *clientRpc);
     erase(activeMessages, *clientRpc);
-    erase(backupMessages, *clientRpc);
+    erase(interativeMessages, *clientRpc);
     clientRpcPool.destroy(clientRpc);
 }
 
@@ -223,7 +203,7 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
     erase(outgoingResponses, *serverRpc);
     erase(serverTimerList, *serverRpc);
     erase(activeMessages, *serverRpc);
-    erase(backupMessages, *serverRpc);
+    erase(interativeMessages, *serverRpc);
     serverRpcPool.destroy(serverRpc);
 }
 
@@ -282,6 +262,26 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
     roundTripBytes = ((roundTripBytes+maxDataPerPacket-1)/maxDataPerPacket)
             * maxDataPerPacket;
     return roundTripBytes;
+}
+
+/**
+ * Decides which packet priority should be used to transmit the unscheduled
+ * portion of a message.
+ *
+ * \param messageSize
+ *      The size of the message to be transmitted.
+ * \return
+ *      The packet priority to use.
+ */
+uint8_t
+HomaTransport::getUnschedTrafficPrio(uint32_t messageSize) {
+    int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
+    for (int i = 0; i < numUnschedPrio - 1; i++) {
+        if (messageSize < unschedTrafficPrioBrackets[i]) {
+            return downCast<uint8_t>(highestAvailPriority - i);
+        }
+    }
+    return lowestUnschedPrio;
 }
 
 /**
@@ -440,8 +440,8 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
             }
             const HomaTransport::GrantHeader* grant =
                     static_cast<const HomaTransport::GrantHeader*>(packet);
-            result += format(", offset %u, prio %u", grant->offset,
-                    grant->prio);
+            result += format(", offset %u, priority %u", grant->offset,
+                    grant->priority);
             break;
         }
         case HomaTransport::PacketOpcode::LOG_TIME_TRACE:
@@ -804,9 +804,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->offset, received->len, header->common.flags);
                 if (!clientRpc->accumulator) {
-                    clientRpc->accumulator.construct(this, clientRpc->response);
-                    clientRpc->totalLength = header->totalLength;
-                    if (clientRpc->totalLength > roundTripBytes) {
+                    clientRpc->accumulator.construct(this, clientRpc->response,
+                            header->totalLength);
+                    if (clientRpc->accumulator->totalLength > roundTripBytes) {
                         addScheduledMessage(clientRpc);
                     }
                 }
@@ -826,7 +826,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // truncate the response.
                     clientRpc->response->truncate(header->totalLength);
                 }
-                if (clientRpc->totalLength > roundTripBytes) {
+                if (clientRpc->accumulator->totalLength > roundTripBytes) {
                     scheduledMessageReceiveData(clientRpc);
                     // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
                 }
@@ -853,7 +853,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->offset);
                 if (header->offset > clientRpc->transmitLimit) {
                     clientRpc->transmitLimit = header->offset;
-                    clientRpc->transmitPriority = header->prio;
+                    clientRpc->transmitPriority = header->priority;
                 }
                 return;
             }
@@ -910,7 +910,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // we're still alive.
                     AckHeader ack(header->common.rpcId, FROM_CLIENT);
                     driver->sendPacket(clientRpc->session->serverAddress,
-                            &ack, NULL, driver->getHighestPacketPriority());
+                            &ack, NULL, controlPacketPriority);
                     return;
 
                 }
@@ -922,13 +922,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                // Use the higest priority for retransmission
+                // TODO: Use the higest priority for retransmission?
                 sendBytes(clientRpc->session->serverAddress,
                         header->common.rpcId, clientRpc->request,
                         header->offset, header->length,
                         FROM_CLIENT|RETRANSMISSION|clientRpc->needGrantFlag,
-                        driver->getHighestPacketPriority(),
-                        true);
+                        highestAvailPriority, true);
                 clientRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
@@ -1019,10 +1018,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload);
-                    serverRpc->totalLength = header->totalLength;
+                            &serverRpc->requestPayload, header->totalLength);
                     serverTimerList.push_back(*serverRpc);
-                    if (serverRpc->totalLength > roundTripBytes) {
+                    if (serverRpc->accumulator->totalLength > roundTripBytes) {
                         addScheduledMessage(serverRpc);
                     }
                 } else if (serverRpc->requestComplete) {
@@ -1052,7 +1050,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // truncate the request.
                     serverRpc->requestPayload.truncate(header->totalLength);
                 }
-                if (serverRpc->totalLength > roundTripBytes) {
+                if (serverRpc->accumulator->totalLength > roundTripBytes) {
                     scheduledMessageReceiveData(serverRpc);
                 }
                 if (serverRpc->requestPayload.size() == header->totalLength) {
@@ -1087,7 +1085,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 if (header->offset > serverRpc->transmitLimit) {
                     serverRpc->transmitLimit = header->offset;
-                    serverRpc->transmitPriority = header->prio;
+                    serverRpc->transmitPriority = header->priority;
                 }
                 return;
             }
@@ -1125,7 +1123,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, FROM_SERVER|RESTART);
                     driver->sendPacket(received->sender, &resend, NULL,
-                            driver->getHighestPacketPriority());
+                            controlPacketPriority);
                     return;
                 }
                 uint32_t resendEnd = header->offset + header->length;
@@ -1146,8 +1144,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // retransmit; just return an ACK so the client knows
                     // we're still alive.
                     AckHeader ack(serverRpc->rpcId, FROM_SERVER);
-                    driver->sendPacket(serverRpc->clientAddress,
-                            &ack, NULL, driver->getHighestPacketPriority());
+                    driver->sendPacket(serverRpc->clientAddress, &ack, NULL,
+                            controlPacketPriority);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1158,13 +1156,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                // Use the higest priority for retransmission
+                // TODO: Use the higest priority for retransmission?
                 sendBytes(serverRpc->clientAddress,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
                         RETRANSMISSION|FROM_SERVER|serverRpc->needGrantFlag,
-                        driver->getHighestPacketPriority(),
-                        true);
+                        highestAvailPriority, true);
                 serverRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
@@ -1237,13 +1234,16 @@ HomaTransport::ServerRpc::sendReply()
  *      The complete message will be assembled here; caller should ensure
  *      that this is initially empty. The caller owns the storage for this
  *      and must ensure that it persists as long as this object persists.
+ * \param totalLength
+ *      Total # bytes in the message.
  */
 HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
-        Buffer* buffer)
+        Buffer* buffer, uint32_t totalLength)
     : t(t)
     , buffer(buffer)
     , estimatedReceivedBytes(0)
     , fragments()
+    , totalLength(totalLength)
     , packetLossIndicator(0)
 { }
 
@@ -1334,7 +1334,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
  * \param header
  *      Address of the first byte of a DATA packet.
  * \param length
- *      Total size of the packet at payload.
+ *      Size of the payload, in bytes.
  * \return
  *      True means that (some of) the data in this fragment was
  *      incorporated into the message buffer. False means that
@@ -1357,6 +1357,14 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
             + bytesToSkip, length - bytesToSkip, t->driver,
             reinterpret_cast<char*>(header));
     return true;
+}
+
+/**
+ * Return # bytes not yet received or assembled in the `buffer`.
+ */
+uint32_t
+HomaTransport::MessageAccumulator::getRemainingBytes() const {
+    return totalLength - buffer->size();
 }
 
 /**
@@ -1420,8 +1428,7 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
     }
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
             whoFrom);
-    t->driver->sendPacket(address, &resend, NULL,
-            t->driver->getHighestPacketPriority());
+    t->driver->sendPacket(address, &resend, NULL, t->controlPacketPriority);
     return endOffset;
 }
 
@@ -1525,7 +1532,7 @@ HomaTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->accumulator->estimatedReceivedBytes == 0) {
+        if (!clientRpc->accumulator) {
             // We haven't received any part of the response message.
             // Send occasional RESEND packets, which should produce some
             // response from the server, so that we know it's still alive
@@ -1540,16 +1547,15 @@ HomaTransport::checkTimeouts()
                 // The RESEND packet is effectively a grant...
                 clientRpc->grantOffset = roundTripBytes;
                 driver->sendPacket(clientRpc->session->serverAddress,
-                        &resend, NULL, driver->getHighestPacketPriority());
+                        &resend, NULL, controlPacketPriority);
             }
-        } else if (activeMessages.iterator_to(*clientRpc) !=
-                activeMessages.end()) {
-            // We have received part of the response and we are granting the
-            // response regularly. If the server has gone silent, this must
-            // mean packets were lost, grants were lost, or the server has
-            // preempted this response for higher priority messages, so request
-            // retransmission anyway.
-            assert(clientRpc->accumulator);
+        } else if (clientRpc->isUnscheduled()
+                || contains(activeMessages, *clientRpc)) {
+            // We have received part of the response and the response message
+            // is either a unscheduled or active message. If the server has
+            // gone silent, this must mean packets were lost, grants were lost,
+            // or the server has preempted this response for higher priority
+            // messages, so request retransmission anyway.
             if (clientRpc->silentIntervals >= 2) {
                 clientRpc->resendLimit =
                         clientRpc->accumulator->requestRetransmission(this,
@@ -1597,9 +1603,8 @@ HomaTransport::checkTimeouts()
 
         // See if we need to request retransmission for part of the request
         // message.
-        if ((serverRpc->silentIntervals >= 2) &&
-                (activeMessages.iterator_to(*serverRpc) !=
-                activeMessages.end())) {
+        if ((serverRpc->silentIntervals >= 2) && (serverRpc->isUnscheduled()
+                || contains(activeMessages, *serverRpc))) {
             serverRpc->resendLimit =
                     serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId,
@@ -1611,6 +1616,9 @@ HomaTransport::checkTimeouts()
 /**
  * When a new message that requires scheduling arrives, this method is called
  * to enter the new message into the scheduler.
+ *
+ * \param newMessage
+ *      A message that cannot be sent as unscheduled bytes in its entirety.
  */
 void
 HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
@@ -1622,7 +1630,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
                 // The new message should replace an active message that is from
                 // the same sender.
                 erase(activeMessages, m);
-                backupMessages.push_back(m);
+                interativeMessages.push_back(m);
                 scheduleNewMessage(newMessage);
                 if (newMessage == &activeMessages.front() && rank > 0
                         && highestGrantedPrio + 1 < lowestUnschedPrio) {
@@ -1633,7 +1641,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
                     highestGrantedPrio++;
                 }
             } else {
-                backupMessages.push_back(*newMessage);
+                interativeMessages.push_back(*newMessage);
             }
             return;
         }
@@ -1648,7 +1656,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
         scheduleNewMessage(newMessage);
     } else if (*newMessage < activeMessages.back()) {
         // The new message should replace the "worst" active message.
-        backupMessages.push_back(activeMessages.back());
+        interativeMessages.push_back(activeMessages.back());
         activeMessages.pop_back();
         scheduleNewMessage(newMessage);
         if (newMessage == &activeMessages.front()
@@ -1659,7 +1667,7 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
             highestGrantedPrio++;
         }
     } else {
-        backupMessages.push_back(*newMessage);
+        interativeMessages.push_back(*newMessage);
     }
 }
 
@@ -1676,9 +1684,9 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 {
     // The remaining bytes of a scheduled message decreases. This could result
     // in a change of our scheduling decision.
-    if (message->getRemainingBytes() > 0) {
+    if (message->accumulator->getRemainingBytes() > 0) {
         // The message has not been fully received.
-        if (message->grantOffset < message->totalLength) {
+        if (message->grantOffset < message->accumulator->totalLength) {
             // Check if the scheduler needs to change its scheduling decision.
             ActiveMessageList::iterator it =
                     activeMessages.iterator_to(*message);
@@ -1701,8 +1709,8 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
                     }
                 }
                 if (sameSender == NULL || sameSender == &activeMessages.back()) {
-                    erase(backupMessages, *message);
-                    backupMessages.push_back(activeMessages.back());
+                    erase(interativeMessages, *message);
+                    interativeMessages.push_back(activeMessages.back());
                     activeMessages.pop_back();
                     scheduleNewMessage(message);
                 }
@@ -1727,16 +1735,16 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
             uint32_t oldGrantOffset = m->grantOffset > 0
                     ? m->grantOffset : roundTripBytes;
             m->grantOffset = oldGrantOffset + maxDataPerPacket;
-            if (m->grantOffset >= m->totalLength) {
+            if (m->grantOffset >= m->accumulator->totalLength) {
                 // Slow path: a message has been fully granted. Purge this
                 // message, select a new message to grant from the backups
                 // and reclaim the highestGrantedPrio if possible.
-                m->grantOffset = m->totalLength;
+                m->grantOffset = m->accumulator->totalLength;
                 bool topMessagePurged = m == &activeMessages.front();
                 erase(activeMessages, *m);
 
                 IncomingMessage* selectedMessage = NULL;
-                for (IncomingMessage& backupMessage : backupMessages) {
+                for (IncomingMessage& backupMessage : interativeMessages) {
                     if (selectedMessage != NULL
                             && !(backupMessage < *selectedMessage)) {
                         continue;
@@ -1756,7 +1764,7 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
                 }
                 if (selectedMessage) {
                     activeMessages.push_back(*selectedMessage);
-                    erase(backupMessages, *selectedMessage);
+                    erase(interativeMessages, *selectedMessage);
                 }
                 if (topMessagePurged
                         && selectedMessage != &activeMessages.front()
@@ -1773,16 +1781,16 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 
             const Driver::Address* senderAddress;
             uint8_t flags;
-            string fmt;
+            char* fmt;
             if (m->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
                 senderAddress = static_cast<ClientRpc*>(m)->session
                         ->serverAddress;
                 flags = FROM_CLIENT;
-                fmt = "client sending GRANT, sequence %u, offset %u, prio %u";
+                fmt = "client sending GRANT, sequence %u, offset %u, priority %u";
             } else {
                 senderAddress = static_cast<ServerRpc*>(m)->clientAddress;
                 flags = FROM_SERVER;
-                fmt = "server sending GRANT, sequence %u, offset %u, prio %u";
+                fmt = "server sending GRANT, sequence %u, offset %u, priority %u";
             }
 
             uint8_t grantPrio;
@@ -1791,16 +1799,16 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
                 // with size (1+a)RTT, use the same priority as an unscheduled
                 // message that has size min{1, a}*RTT.
                 grantPrio = getUnschedTrafficPrio(std::min(roundTripBytes,
-                        m->totalLength - roundTripBytes));
+                        m->accumulator->totalLength - roundTripBytes));
             } else {
                 grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
             }
 
-            timeTrace(fmt.data(), downCast<uint32_t>(m->getRpcId().sequence),
+            timeTrace(fmt, downCast<uint32_t>(m->rpcId.sequence),
                     m->grantOffset, grantPrio);
-            GrantHeader grant(m->getRpcId(), m->grantOffset, flags, grantPrio);
+            GrantHeader grant(m->rpcId, m->grantOffset, flags, grantPrio);
             driver->sendPacket(senderAddress, &grant, NULL,
-                    driver->getHighestPacketPriority());
+                    controlPacketPriority);
             break;
         }
         rank++;
@@ -1810,17 +1818,20 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 /**
  * Insert a message to the active message list while maintaining the correct
  * ordering within the list.
+ *
+ * \param message
+ *      A message that is scheduled to receive grants regularly from now on.
  */
 void
-HomaTransport::scheduleNewMessage(IncomingMessage *newMessage)
+HomaTransport::scheduleNewMessage(IncomingMessage *message)
 {
     for (IncomingMessage& m : activeMessages) {
-        if (*newMessage < m) {
-            insertBefore(activeMessages, *newMessage, m);
+        if (*message < m) {
+            insertBefore(activeMessages, *message, m);
             return;
         }
     }
-    activeMessages.push_back(*newMessage);
+    activeMessages.push_back(*message);
 }
 
 }  // namespace RAMCloud

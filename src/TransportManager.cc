@@ -178,10 +178,10 @@ TransportManager::TransportManager(Context* context)
     if (context->options != NULL) {
         int dpdkPort = context->options->getDpdkPort();
         if (dpdkPort >= 0) {
-            basicDpdkTransportFactory.setDpdkDriver(
-                    new DpdkDriver(context, dpdkPort));
-            homaDpdkTransportFactory.setDpdkDriver(
-                    new DpdkDriver(context, dpdkPort));
+            // TODO: THIS IS NOT ENOUGH; BOTH BASIC & HOMA TRANSPORT WILL CALL `delete driver` in their destructors!
+            DpdkDriver* dpdkDriver = new DpdkDriver(context, dpdkPort);
+            basicDpdkTransportFactory.setDpdkDriver(dpdkDriver);
+            homaDpdkTransportFactory.setDpdkDriver(dpdkDriver);
         }
     }
 #endif

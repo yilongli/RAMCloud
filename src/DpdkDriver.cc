@@ -265,7 +265,7 @@ DpdkDriver::~DpdkDriver()
 }
 
 // See docs in Driver class.
-uint8_t
+int
 DpdkDriver::getHighestPacketPriority()
 {
 #ifdef ETHERNET_DOT1P
@@ -379,11 +379,11 @@ DpdkDriver::release(char *payload)
 
 // See docs in Driver class.
 void
-DpdkDriver::sendPacket(const Address *addr,
-                       const void *header,
+DpdkDriver::sendPacket(const Address* addr,
+                       const void* header,
                        uint32_t headerLen,
-                       Buffer::Iterator *payload,
-                       uint8_t priority)
+                       Buffer::Iterator* payload,
+                       int priority)
 {
     struct rte_mbuf *mbuf = NULL;
     char *data = NULL;

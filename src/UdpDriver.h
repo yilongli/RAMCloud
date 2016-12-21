@@ -48,11 +48,11 @@ class UdpDriver : public Driver {
     virtual void receivePackets(int maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
-    virtual void sendPacket(const Address *addr,
-                            const void *header,
+    virtual void sendPacket(const Address* addr,
+                            const void* header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload,
-                            uint8_t priority = 0);
+                            Buffer::Iterator* payload,
+                            int priority = 0);
     virtual string getServiceLocator();
 
     virtual Address* newAddress(const ServiceLocator* serviceLocator) {

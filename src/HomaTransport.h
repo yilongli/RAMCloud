@@ -47,7 +47,6 @@ class HomaTransport : public Transport {
         // any transport or driver state.
         return new Session(this, serviceLocator, timeoutMs);
     }
-    uint8_t getUnschedTrafficPrio(uint32_t messageSize);
     void registerMemory(void* base, size_t bytes) {
         driver->registerMemory(base, bytes);
     }
@@ -140,10 +139,12 @@ class HomaTransport : public Transport {
      */
     class MessageAccumulator {
       public:
-        MessageAccumulator(HomaTransport* t, Buffer* buffer);
+        MessageAccumulator(HomaTransport* t, Buffer* buffer,
+                uint32_t totalLength);
         ~MessageAccumulator();
         bool addPacket(DataHeader *header, uint32_t length);
         bool appendFragment(DataHeader *header, uint32_t length);
+        uint32_t getRemainingBytes() const;
         uint32_t requestRetransmission(HomaTransport *t,
                 const Driver::Address* address, RpcId rpcId,
                 uint32_t grantOffset, uint8_t whoFrom);
@@ -187,6 +188,9 @@ class HomaTransport : public Transport {
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
 
+        /// Total # bytes in the message.
+        const uint32_t totalLength;
+
         // Used to detect lost packets faster than using timeouts. When a new
         // packet arrives but cannot be added to buffer because some preceding
         // packets are missing, the indicator is incremented. The larger this
@@ -206,22 +210,46 @@ class HomaTransport : public Transport {
      */
     class IncomingMessage {
       public:
-        /// This enum defines the `rpcKind` field values for IncomingMessage's.
-        enum RpcKind { CLIENT_RPC, SERVER_RPC };
+        IncomingMessage(RpcId rpcId, RpcKind rpcKind,
+                const Driver::Address* senderAddress)
+            : accumulator()
+            , activeMessageLinks()
+            , interactiveMessageLinks()
+            , grantOffset(0)
+            , rpcId(rpcId)
+            , rpcKind(rpcKind)
+            , senderId(std::hash<std::string>{}(senderAddress->toString()))
+        {}
 
         virtual ~IncomingMessage() {}
 
         /**
-         * Get the unique identifier for the RPC this message belongs to.
+         * Comparison function for scheduled messages, for use in the message
+         * scheduler.
+         *
+         * \return
+         *      True means the first message should have a higher precedence
+         *      over the second message in the scheduler; false, otherwise.
          */
-        virtual RpcId getRpcId() = 0;
+        bool operator<(IncomingMessage& other) const
+        {
+            // This function is undefined if we haven't received at least one
+            // packet from each of these two messages.
+            return accumulator->getRemainingBytes() <
+                    other.accumulator->getRemainingBytes();
+        }
 
         /**
-         * Return # bytes not yet received or assembled in the message.
+         * TODO:
+         * @return
          */
-        uint32_t getRemainingBytes() const {
-            return totalLength - accumulator->buffer->size();
+        bool isUnscheduled() {
+            // TODO: move this method into MsgAccumulator?
+            return accumulator->totalLength <= unscheduledBytes;
         }
+
+        /// This enum defines the `rpcKind` field values for IncomingMessage's.
+        enum RpcKind { CLIENT_RPC, SERVER_RPC };
 
         /// Holds state of a partially-received multi-packet message.
         Tub<MessageAccumulator> accumulator;
@@ -229,43 +257,26 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->activeMessages.
         IntrusiveListHook activeMessageLinks;
 
-        /// Used to link this object into t->backupMessages.
-        IntrusiveListHook backupMessageLinks;
+        /// Used to link this object into t->interactiveMessages.
+        IntrusiveListHook interactiveMessageLinks;
 
         /// Offset from the most recent GRANT packet we have sent for
         /// this incoming message, or 0 if we haven't sent any GRANTs.
         uint32_t grantOffset;
 
+        /// Unique identifier for this RPC.
+        RpcId rpcId;
+
         /// The kind of RPC this message belongs to.
         const RpcKind rpcKind;
 
-        /// The (likely) unique identifier for the sender of this message.
+        /// (Ideally) unique identifier for the message sender. The identifier
+        /// is currently computed as a hash from `senderAddress` for the sake
+        /// of simplicity, so it isn't truly unique at present.
         const uint64_t senderId;
 
-        /// Total # bytes in the message being received. 0 means we have
-        /// not received the first packet of the message.
-        uint32_t totalLength;
-
-        IncomingMessage(RpcKind rpcKind, const Driver::Address* senderAddress)
-            : accumulator()
-            , activeMessageLinks()
-            , backupMessageLinks()
-            , grantOffset(0)
-            , rpcKind(rpcKind)
-            , senderId(std::hash<std::string>{}(senderAddress->toString()))
-            , totalLength(0)
-        {}
-
-        /**
-         * Comparison function used by the message scheduler.
-         */
-        bool operator<(IncomingMessage& other) const
-        {
-            // This function is undefined if the total length of either message
-            // is unknown.
-            assert(totalLength > 0 && other.totalLength > 0);
-            return getRemainingBytes() < other.getRemainingBytes();
-        }
+        // TODO: move it into MsgAccumulator?
+        uint32_t unscheduledBytes;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
@@ -297,9 +308,8 @@ class HomaTransport : public Transport {
         /// been sent.
         uint32_t transmitOffset;
 
-        /// Packet priority to use for the rest of the request message;
-        /// the server may instruct to use a different value by embedding
-        /// the new priority in the GRANT packet.
+        /// Packet priority to use for transmitting the rest of the request
+        /// message up to `transmitLimit`.
         uint8_t transmitPriority;
 
         /// The number of bytes in the request message that it's OK for
@@ -307,6 +317,7 @@ class HomaTransport : public Transport {
         /// we receive a GRANT for them.
         uint32_t transmitLimit;
 
+        // TODO: remove states related to FIFO?
         /// Generated from t->transmitSequenceNumber, used to prioritize
         /// transmission of the request message.
         uint64_t transmitSequenceNumber;
@@ -339,7 +350,8 @@ class HomaTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : IncomingMessage(CLIENT_RPC, session->serverAddress)
+            : IncomingMessage(RpcId(session->t->clientId, sequence),
+                    CLIENT_RPC, session->serverAddress)
             , session(session)
             , sequence(sequence)
             , request(request)
@@ -356,10 +368,6 @@ class HomaTransport : public Transport {
             , transmitPending(false)
             , outgoingRequestLinks()
         {}
-
-        virtual RpcId getRpcId() {
-            return RpcId(session->t->clientId, sequence);
-        }
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(ClientRpc);
@@ -385,17 +393,13 @@ class HomaTransport : public Transport {
         /// Where to send the response once the RPC has executed.
         const Driver::Address* clientAddress;
 
-        /// Unique identifier for this RPC.
-        RpcId rpcId;
-
         /// Offset within the response message of the next byte we should
         /// transmit to the client; all preceding bytes have already
         /// been sent.
         uint32_t transmitOffset;
 
-        /// Packet priority to use for the rest of the response message;
-        /// the client may instruct to use a different value by embedding
-        /// the new priority in the GRANT packet.
+        /// Packet priority to use for transmitting the rest of the response
+        /// message up to `transmitLimit`.
         uint8_t transmitPriority;
 
         /// The number of bytes in the response message that it's OK for
@@ -441,7 +445,7 @@ class HomaTransport : public Transport {
 
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : IncomingMessage(SERVER_RPC, clientAddress)
+            : IncomingMessage(rpcId, SERVER_RPC, clientAddress)
             , t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
@@ -459,10 +463,6 @@ class HomaTransport : public Transport {
             , timerLinks()
             , outgoingResponseLinks()
         {}
-
-        virtual RpcId getRpcId() {
-            return rpcId;
-        }
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
     };
@@ -550,6 +550,7 @@ class HomaTransport : public Transport {
         CommonHeader common;         // Common header fields.
         uint32_t totalLength;        // Total # bytes in the message (*not*
                                      // this packet!).
+        // TODO: unscheduledBytes
         uint32_t offset;             // Offset within the message of the first
                                      // byte of data in this packet.
 
@@ -574,15 +575,15 @@ class HomaTransport : public Transport {
                                      // sender should now transmit all data up
                                      // to (but not including) this offset, if
                                      // it hasn't already.
-        uint8_t prio;                // Packet priority to use; the sender
-                                     // should transmit all future data using
-                                     // this priority as soon as it receives
-                                     // this GRANT.
+        uint8_t priority;            // Packet priority to use; the sender
+                                     // should transmit all data up to `offset`
+                                     // using this priority.
 
-        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags, uint8_t prio)
+        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags,
+                uint8_t priority)
             : common(PacketOpcode::GRANT, rpcId, flags)
             , offset(offset)
-            , prio(prio)
+            , priority(priority)
         {}
     } __attribute__((packed));
 
@@ -653,6 +654,7 @@ class HomaTransport : public Transport {
     void deleteClientRpc(ClientRpc* clientRpc);
     void deleteServerRpc(ServerRpc* serverRpc);
     uint32_t getRoundTripBytes(const ServiceLocator* locator);
+    uint8_t getUnschedTrafficPrio(uint32_t messageSize);
     void handlePacket(Driver::Received* received);
     static string headerToString(const void* header, uint32_t headerLength);
     static string opcodeSymbol(uint8_t opcode);
@@ -662,7 +664,7 @@ class HomaTransport : public Transport {
     bool tryToTransmitData();
     void addScheduledMessage(IncomingMessage* newMessage);
     void scheduledMessageReceiveData(IncomingMessage* message);
-    void scheduleNewMessage(IncomingMessage *newMessage);
+    void scheduleNewMessage(IncomingMessage *message);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -679,6 +681,13 @@ class HomaTransport : public Transport {
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
     uint64_t clientId;
+
+    /// The highest packet priority that is supported by the underlying driver
+    /// and available to us.
+    const int highestAvailPriority;
+
+    /// The packet priority used for sending control packets.
+    const int controlPacketPriority;
 
     /// The lowest priority to use for unscheduled traffic.
     const uint8_t lowestUnschedPrio;
@@ -800,20 +809,26 @@ class HomaTransport : public Transport {
     /// MESSAGE SCHEDULER
     /// -----------------
 
-    /// Holds a list of messages that are sent from distinct senders and
-    /// receive grants regularly. The scheduler attempts to keep 1 RTT
+    /// Holds a list of scheduled messages that are sent from distinct senders
+    /// and receive grants regularly. The scheduler attempts to keep 1 RTT
     /// in-flight packets from each of these messages. Once a message has
     /// been granted in its entirety, it will be removed from the list.
+    /// This list always maintains an ordering of the messages based on the
+    /// comparison function defined in #IncomingMessage.
     INTRUSIVE_LIST_TYPEDEF(IncomingMessage, activeMessageLinks)
             ActiveMessageList;
     ActiveMessageList activeMessages;
 
-    /// Holds the so-called backup messages that are awared by the scheduler
-    /// but do not get grants. A backup message may be chosen to become an
-    /// active message when a former active message is granted completely.
-    INTRUSIVE_LIST_TYPEDEF(IncomingMessage, backupMessageLinks)
-            BackupMessageList;
-    BackupMessageList backupMessages;
+    /// Holds a list of scheduled messages that we have received at least one
+    /// packet for each of them, but haven't yet fully granted them and aren't
+    /// actively sending grants to them in order to avoid overloading the
+    /// network. One of these messages may be chosen to become an active message
+    /// when a former active message is granted completely. The list doesn't
+    /// maintain any particular ordering of the messages within it.
+    // TODO: document why not sorted
+    INTRUSIVE_LIST_TYPEDEF(IncomingMessage, interactiveMessageLinks)
+            InteractiveMessageList;
+    InteractiveMessageList interativeMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is

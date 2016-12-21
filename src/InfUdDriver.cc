@@ -340,11 +340,11 @@ InfUdDriver::release(char *payload)
  * See docs in the ``Driver'' class.
  */
 void
-InfUdDriver::sendPacket(const Driver::Address *addr,
-                        const void *header,
+InfUdDriver::sendPacket(const Driver::Address* addr,
+                        const void* header,
                         uint32_t headerLen,
-                        Buffer::Iterator *payload,
-                        uint8_t priority)
+                        Buffer::Iterator* payload,
+                        int priority)
 {
     uint32_t totalLength = headerLen +
                            (payload ? payload->size() : 0);

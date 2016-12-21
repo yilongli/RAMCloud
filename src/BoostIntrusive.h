@@ -141,6 +141,12 @@ erase(List& list, Node& node) {
     list.erase(list.iterator_to(node));
 }
 
+template<typename List, typename Node>
+bool
+contains(List& list, Node& node) {
+    return list.iterator_to(node) != list.end();
+}
+
 } // end RAMCloud
 
 #endif  // RAMCLOUD_BOOSTINTRUSIVE_H

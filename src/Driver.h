@@ -211,13 +211,13 @@ class Driver {
     virtual void dumpStats() {}
 
     /**
-     * The highest packet priority level this Driver supports (0 is always
+     * Returns the highest packet priority level this Driver supports (0 is
      * the lowest priority level). The larger the number, the more priority
      * levels are available. For example, if the highest priority level is 7
      * then the Driver has 8 priority levels, ranging from 0 (lowest priority)
      * to 7 (highest priority).
      */
-    virtual uint8_t getHighestPacketPriority()
+    virtual int getHighestPacketPriority()
     {
         // Default: support only one priority level.
         return 0;
@@ -353,13 +353,13 @@ class Driver {
      *      data (but not the actual iterator) even after the method returns,
      *      since the data may not yet have been transmitted.
      * \param priority
-     *      The priority level of this packet.
+     *      The priority level of this packet. 0 is the lowest priority.
      */
     virtual void sendPacket(const Address *recipient,
                             const void *header,
                             uint32_t headerLen,
                             Buffer::Iterator *payload,
-                            uint8_t priority = 0) = 0;
+                            int priority = 0) = 0;
 
     /**
      * Alternate form of sendPacket.
@@ -378,13 +378,13 @@ class Driver {
      *      data (but not the actual iterator) even after the method returns,
      *      since the data may not yet have been transmitted.
      * \param priority
-     *      The priority level of this packet.
+     *      The priority level of this packet. 0 is the lowest priority.
      */
     template<typename T>
     void sendPacket(const Address* recipient,
                     const T* header,
-                    Buffer::Iterator *payload,
-                    uint8_t priority = 0)
+                    Buffer::Iterator* payload,
+                    int priority = 0)
     {
         sendPacket(recipient, header, sizeof(T), payload, priority);
     }

@@ -58,18 +58,18 @@ class DpdkDriver : public Driver
     explicit DpdkDriver(Context* context, int port = 0);
     virtual ~DpdkDriver();
     void close();
-    virtual uint8_t getHighestPacketPriority();
+    virtual int getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
     virtual void receivePackets(int maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
-    virtual void sendPacket(const Address *addr,
-                            const void *header,
+    virtual void sendPacket(const Address* addr,
+                            const void* header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload,
-                            uint8_t priority = 0);
+                            Buffer::Iterator* payload,
+                            int priority = 0);
     virtual string getServiceLocator();
 
     typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;
