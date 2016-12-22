@@ -806,34 +806,39 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (!clientRpc->accumulator) {
                     clientRpc->accumulator.construct(this, clientRpc->response,
                             header->totalLength);
-                    if (clientRpc->accumulator->totalLength > roundTripBytes) {
-                        addScheduledMessage(clientRpc);
+                    if (!clientRpc->isUnscheduled()) {
+                        clientRpc->grantOffset = header->unscheduledBytes;
+                        tryToSchedule(clientRpc);
                     }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
-                if (clientRpc->accumulator->packetLossIndicator > 2) {
-                    clientRpc->resendLimit =
-                            clientRpc->accumulator->requestRetransmission(this,
-                            clientRpc->session->serverAddress,
-                            RpcId(clientId, clientRpc->sequence),
-                            clientRpc->grantOffset, FROM_CLIENT);
-                }
-                if (clientRpc->response->size() > header->totalLength) {
-                    // We have more bytes than we want. This can happen
-                    // if the last packet gets padded by the network
-                    // layer to meet minimum size requirements. Just
-                    // truncate the response.
-                    clientRpc->response->truncate(header->totalLength);
-                }
-                if (clientRpc->accumulator->totalLength > roundTripBytes) {
-                    scheduledMessageReceiveData(clientRpc);
-                    // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
-                }
-                if (clientRpc->response->size() == header->totalLength) {
+                if (clientRpc->response->size() >= header->totalLength) {
                     // Response complete.
+                    if (clientRpc->response->size() > header->totalLength) {
+                        // We have more bytes than we want. This can happen
+                        // if the last packet gets padded by the network
+                        // layer to meet minimum size requirements. Just
+                        // truncate the response.
+                        clientRpc->response->truncate(header->totalLength);
+                    }
                     clientRpc->notifier->completed();
                     deleteClientRpc(clientRpc);
+                } else {
+                    // See if we need to request retransmission.
+                    if (clientRpc->accumulator->packetLossIndicator > 2) {
+                        clientRpc->resendLimit =
+                                clientRpc->accumulator->requestRetransmission(
+                                this, clientRpc->session->serverAddress,
+                                RpcId(clientId, clientRpc->sequence),
+                                clientRpc->grantOffset, FROM_CLIENT);
+                    }
+
+                    // See if we need to adjust our scheduling decision.
+                    if (!clientRpc->isUnscheduled()) {
+                        scheduledMessageReceiveData(clientRpc);
+                        // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
+                    }
                 }
 
                 if (retainPacket) {
@@ -1020,8 +1025,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     serverRpc->accumulator.construct(this,
                             &serverRpc->requestPayload, header->totalLength);
                     serverTimerList.push_back(*serverRpc);
-                    if (serverRpc->accumulator->totalLength > roundTripBytes) {
-                        addScheduledMessage(serverRpc);
+                    if (!serverRpc->isUnscheduled()) {
+                        serverRpc->grantOffset = header->unscheduledBytes;
+                        tryToSchedule(serverRpc);
                     }
                 } else if (serverRpc->requestComplete) {
                     // We've already received the full message, so
@@ -1037,27 +1043,32 @@ HomaTransport::handlePacket(Driver::Received* received)
                             WireFormat::RequestCommon>()->opcode,
                             header->totalLength);
                 }
-                if (serverRpc->accumulator->packetLossIndicator > 2) {
-                    serverRpc->resendLimit =
-                            serverRpc->accumulator->requestRetransmission(this,
-                            serverRpc->clientAddress, serverRpc->rpcId,
-                            serverRpc->grantOffset, FROM_SERVER);
-                }
-                if (serverRpc->requestPayload.size() > header->totalLength) {
-                    // We have more bytes than we want. This can happen
-                    // if the last packet gets padded by the network
-                    // layer to meet minimum size requirements. Just
-                    // truncate the request.
-                    serverRpc->requestPayload.truncate(header->totalLength);
-                }
-                if (serverRpc->accumulator->totalLength > roundTripBytes) {
-                    scheduledMessageReceiveData(serverRpc);
-                }
-                if (serverRpc->requestPayload.size() == header->totalLength) {
+                if (serverRpc->requestPayload.size() >= header->totalLength) {
                     // Message complete; start servicing the RPC.
+                    if (serverRpc->requestPayload.size()
+                            > header->totalLength) {
+                        // We have more bytes than we want. This can happen
+                        // if the last packet gets padded by the network
+                        // layer to meet minimum size requirements. Just
+                        // truncate the request.
+                        serverRpc->requestPayload.truncate(header->totalLength);
+                    }
                     erase(serverTimerList, *serverRpc);
                     serverRpc->requestComplete = true;
                     context->workerManager->handleRpc(serverRpc);
+                } else {
+                    // See if we need to request retransmission.
+                    if (serverRpc->accumulator->packetLossIndicator > 2) {
+                        serverRpc->resendLimit = serverRpc->accumulator->
+                                requestRetransmission(this,
+                                serverRpc->clientAddress, serverRpc->rpcId,
+                                serverRpc->grantOffset, FROM_SERVER);
+                    }
+
+                    // See if we need to adjust our scheduling decision.
+                    if (!serverRpc->isUnscheduled()) {
+                        scheduledMessageReceiveData(serverRpc);
+                    }
                 }
                 serverDataDone:
                 if (retainPacket) {
@@ -1621,54 +1632,102 @@ HomaTransport::checkTimeouts()
  *      A message that cannot be sent as unscheduled bytes in its entirety.
  */
 void
-HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
+HomaTransport::tryToSchedule(IncomingMessage* message)
 {
-    int rank = 0;
+    // The following loop handles the special case where some active message
+    // comes from the same sender as the new message to avoid violating the
+    // constraint that active messages must come from distinct senders.
     for (IncomingMessage& m : activeMessages) {
-        if (m.senderId == newMessage->senderId) {
-            if (*newMessage < m) {
-                // The new message should replace an active message that is from
-                // the same sender.
-                erase(activeMessages, m);
-                interativeMessages.push_back(m);
-                scheduleNewMessage(newMessage);
-                if (newMessage == &activeMessages.front() && rank > 0
-                        && highestGrantedPrio + 1 < lowestUnschedPrio) {
-                    // We have a new top message that is not from the sender
-                    // of the previous top message. Bump the highest granted
-                    // priority if we haven't used up all the priority levels
-                    // for scheduled packets.
-                    highestGrantedPrio++;
-                }
-            } else {
-                interativeMessages.push_back(*newMessage);
-            }
-            return;
+        if (m.senderId != message->senderId) {
+            continue;
         }
-        rank++;
+
+        if (*message < m) {
+            // The new message should replace an active message that is from
+            // the same sender.
+            demoteActiveMessage(&m);
+            activateMessage(message);
+//
+//            bool replaceTopMessage = (&m == &activeMessages.front());
+//            erase(activeMessages, m);
+//            interativeMessages.push_back(m);
+//            scheduleNewMessage(newMessage);
+//            // TODO: RENAME scheduleNewMessage and return a position?
+//            if (newMessage == &activeMessages.front() && !replaceTopMessage
+//                    && highestGrantedPrio + 1 < lowestUnschedPrio) {
+//                // We have a new top message that is not from the sender
+//                // of the previous top message. Bump the highest granted
+//                // priority if we haven't used up all the priority levels
+//                // for scheduled packets.
+//                highestGrantedPrio++;
+//            }
+        } else {
+            interativeMessages.push_back(*message);
+        }
+        return;
     }
 
+    // From now on, we can assume that the new message has a different sender
+    // than the active messages.
     if (activeMessages.size() < maxGrantedMessages) {
-        // We have not buffered enough messages. This also means we have not
+        // We have not buffered enough messages. This also implies we have not
         // used up our priority levels for scheduled packets. Bump the highest
         // granted priority.
-        highestGrantedPrio++;
-        scheduleNewMessage(newMessage);
-    } else if (*newMessage < activeMessages.back()) {
+//        highestGrantedPrio++;
+//        scheduleNewMessage(newMessage);
+        activateMessage(message);
+    } else if (*message < activeMessages.back()) {
         // The new message should replace the "worst" active message.
-        interativeMessages.push_back(activeMessages.back());
-        activeMessages.pop_back();
-        scheduleNewMessage(newMessage);
-        if (newMessage == &activeMessages.front()
-                && highestGrantedPrio + 1 < lowestUnschedPrio) {
-            // We have a new top message. Bump the highest granted priority
-            // if we haven't used up all the priority levels for scheduled
-            // packets.
-            highestGrantedPrio++;
-        }
+        demoteActiveMessage(&activeMessages.back());
+        activateMessage(message);
+//        interativeMessages.push_back(activeMessages.back());
+//        activeMessages.pop_back();
+//        scheduleNewMessage(newMessage);
+//        if (newMessage == &activeMessages.front()
+//                && highestGrantedPrio + 1 < lowestUnschedPrio) {
+//            // We have a new top message. Bump the highest granted priority
+//            // if we haven't used up all the priority levels for scheduled
+//            // packets.
+//            highestGrantedPrio++;
+//        }
     } else {
-        interativeMessages.push_back(*newMessage);
+        interativeMessages.push_back(*message);
     }
+}
+
+void
+HomaTransport::activateMessage(IncomingMessage* message, bool newMessage = true)
+{
+    assert(activeMessages.size() < maxGrantedMessages);
+    if (!newMessage) {
+        erase(interativeMessages, *message);
+    }
+
+    bool needPreemption = true;
+    for (IncomingMessage& m : activeMessages) {
+        if (*message < m) {
+            insertBefore(activeMessages, *message, m);
+            goto updateGrantPrio;
+        }
+        needPreemption = false;
+    }
+    activeMessages.push_back(*message);
+
+    updateGrantPrio:
+    if (needPreemption && highestGrantedPrio + 1 < lowestUnschedPrio
+            || highestGrantedPrio + 1 < activeMessages.size()) {
+        highestGrantedPrio++;
+    }
+}
+
+void
+HomaTransport::demoteActiveMessage(IncomingMessage* activeMessage)
+{
+    if (&activeMessage == &activeMessages.front()) {
+        highestGrantedPrio--;
+    }
+    erase(activeMessages, activeMessage);
+    interativeMessages.push_back(*activeMessage);
 }
 
 /**
@@ -1682,137 +1741,204 @@ HomaTransport::addScheduledMessage(IncomingMessage* newMessage)
 void
 HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 {
-    // The remaining bytes of a scheduled message decreases. This could result
-    // in a change of our scheduling decision.
-    if (message->accumulator->getRemainingBytes() > 0) {
-        // The message has not been fully received.
-        if (message->grantOffset < message->accumulator->totalLength) {
-            // Check if the scheduler needs to change its scheduling decision.
-            ActiveMessageList::iterator it =
-                    activeMessages.iterator_to(*message);
-            if (it != activeMessages.end()) {
-                // The message is among active messages.
-                if (it == activeMessages.begin()
-                        || !(*it < *std::prev(it))) {
-                    activeMessages.erase(it);
-                    scheduleNewMessage(message);
-                }
-            } else if (*message < activeMessages.back()) {
-                // The message is a backup message and should be promoted to
-                // replace the "worst" current active message provided that
-                // no other active messages are from the same sender as it.
-                IncomingMessage* sameSender = NULL;
-                for (IncomingMessage& m : activeMessages) {
-                    if (m.senderId == message->senderId) {
-                        sameSender = &m;
-                        break;
-                    }
-                }
-                if (sameSender == NULL || sameSender == &activeMessages.back()) {
-                    erase(interativeMessages, *message);
-                    interativeMessages.push_back(activeMessages.back());
-                    activeMessages.pop_back();
-                    scheduleNewMessage(message);
-                }
+    // A scheduled message will be purged from the scheduler once it was
+    // fully granted.
+    assert(message->grantOffset < message->accumulator->totalLength);
+
+    // See if we need to adjust the scheduling precedence of this message.
+    ActiveMessageList::iterator it = activeMessages.iterator_to(*message);
+    if (it != activeMessages.end()) {
+        // This message is an active message. See if we need to move it
+        // forward.
+        IncomingMessage* insertBeforeMe = NULL;
+        while (it != activeMessages.begin()) {
+            it--;
+            if (*message < *it) {
+                insertBeforeMe = &(*it);
+            } else {
+                break;
             }
         }
-    } else {
-        // The message is now received completely. Do nothing because this
-        // message must have been purged from the scheduler when it was fully
-        // granted.
+
+        if (insertBeforeMe) {
+            erase(activeMessages, message);
+            insertBefore(activeMessages, *message, *insertBeforeMe);
+        }
+//        if (it != activeMessages.begin() && !(*it < *std::prev(it))) {
+//            activeMessages.erase(it);
+//            scheduleNewMessage(message);
+//        }
+    } else if (*message < activeMessages.back()) {
+        // This message is an interactive message which has the chance to be
+        // promoted to an active message.
+        erase(interativeMessages, *message);
+        tryToSchedule(message);
+
+//        // The message is a backup message and should be promoted to
+//        // replace the "worst" current active message provided that
+//        // no other active messages are from the same sender as it.
+//        IncomingMessage* sameSender = NULL;
+//        for (IncomingMessage& m : activeMessages) {
+//            if (m.senderId == message->senderId) {
+//                sameSender = &m;
+//                break;
+//            }
+//        }
+//        if (sameSender == NULL || sameSender == &activeMessages.back()) {
+//            erase(interativeMessages, *message);
+//            interativeMessages.push_back(activeMessages.back());
+//            activeMessages.pop_back();
+//            scheduleNewMessage(message);
+//        }
     }
 
-    // Only send back a grant if the data packet received is from an active
-    // message.
-    if (activeMessages.iterator_to(*message) == activeMessages.end()) {
+    if (contains(activeMessages, *message)) {
+        // No need to output a GRANT if the data packet received is not from
+        // an active message.
         return;
     }
+
+    // The following loop picks an active message to output a GRANT.
+    IncomingMessage* messageToGrant = NULL;
     int rank = 0;
-    for (IncomingMessage& incomingMessage : activeMessages) {
-        IncomingMessage* m = &incomingMessage;
-        if (m->grantOffset < m->accumulator->estimatedReceivedBytes +
-                roundTripBytes) {
-            uint32_t oldGrantOffset = m->grantOffset > 0
-                    ? m->grantOffset : roundTripBytes;
-            m->grantOffset = oldGrantOffset + maxDataPerPacket;
-            if (m->grantOffset >= m->accumulator->totalLength) {
-                // Slow path: a message has been fully granted. Purge this
-                // message, select a new message to grant from the backups
-                // and reclaim the highestGrantedPrio if possible.
-                m->grantOffset = m->accumulator->totalLength;
-                bool topMessagePurged = m == &activeMessages.front();
-                erase(activeMessages, *m);
-
-                IncomingMessage* selectedMessage = NULL;
-                for (IncomingMessage& backupMessage : interativeMessages) {
-                    if (selectedMessage != NULL
-                            && !(backupMessage < *selectedMessage)) {
-                        continue;
-                    }
-
-                    bool sameSender = false;
-                    for (IncomingMessage& activeMessage : activeMessages) {
-                        if (activeMessage.senderId == backupMessage.senderId) {
-                            sameSender = true;
-                            break;
-                        }
-                    }
-
-                    if (!sameSender) {
-                        selectedMessage = &backupMessage;
-                    }
-                }
-                if (selectedMessage) {
-                    activeMessages.push_back(*selectedMessage);
-                    erase(interativeMessages, *selectedMessage);
-                }
-                if (topMessagePurged
-                        && selectedMessage != &activeMessages.front()
-                        && downCast<uint32_t>(highestGrantedPrio)
-                            >= activeMessages.size()) {
-                    // We can reclaim the highest granted priority only when
-                    // 1) the previous top message is fully granted, 2) the new
-                    // selected message doesn't become the new top message and
-                    // 3) priority levels 0 to highestGrantedPrio-1 are still
-                    // capable of accomodating the updated active message list.
-                    highestGrantedPrio--;
-                }
-            }
-
-            const Driver::Address* senderAddress;
-            uint8_t flags;
-            char* fmt;
-            if (m->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
-                senderAddress = static_cast<ClientRpc*>(m)->session
-                        ->serverAddress;
-                flags = FROM_CLIENT;
-                fmt = "client sending GRANT, sequence %u, offset %u, priority %u";
-            } else {
-                senderAddress = static_cast<ServerRpc*>(m)->clientAddress;
-                flags = FROM_SERVER;
-                fmt = "server sending GRANT, sequence %u, offset %u, priority %u";
-            }
-
-            uint8_t grantPrio;
-            if (oldGrantOffset <= roundTripBytes) {
-                // For the last 1 RTT remaining bytes of a scheduled message
-                // with size (1+a)RTT, use the same priority as an unscheduled
-                // message that has size min{1, a}*RTT.
-                grantPrio = getUnschedTrafficPrio(std::min(roundTripBytes,
-                        m->accumulator->totalLength - roundTripBytes));
-            } else {
-                grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
-            }
-
-            timeTrace(fmt, downCast<uint32_t>(m->rpcId.sequence),
-                    m->grantOffset, grantPrio);
-            GrantHeader grant(m->rpcId, m->grantOffset, flags, grantPrio);
-            driver->sendPacket(senderAddress, &grant, NULL,
-                    controlPacketPriority);
-            break;
+    for (IncomingMessage& m : activeMessages) {
+        // TODO: DO WE WANT TO MAKE THE OUTSTANDING BYTES CONFIGURABLE?
+        if (m.grantOffset <
+                m.accumulator->estimatedReceivedBytes + roundTripBytes) {
+            messageToGrant = &m;
         }
         rank++;
     }
+    if (!messageToGrant) {
+        return;
+    }
+
+    // Output a grant for the selected message.
+    const Driver::Address* senderAddress;
+    uint8_t flags;
+    char* fmt;
+    if (messageToGrant->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
+        senderAddress = static_cast<ClientRpc*>(messageToGrant)->session
+                ->serverAddress;
+        flags = FROM_CLIENT;
+        fmt = "client sending GRANT, sequence %u, offset %u, priority %u";
+    } else {
+        senderAddress = static_cast<ServerRpc*>(messageToGrant)->clientAddress;
+        flags = FROM_SERVER;
+        fmt = "server sending GRANT, sequence %u, offset %u, priority %u";
+    }
+
+    uint8_t grantPrio;
+    if (messageToGrant->grantOffset <= roundTripBytes) {
+        // For the last 1 RTT remaining bytes of a scheduled message
+        // with size (1+a)RTT, use the same priority as an unscheduled
+        // message that has size min{1, a}*RTT.
+        grantPrio = getUnschedTrafficPrio(std::min(roundTripBytes,
+                messageToGrant->accumulator->totalLength - roundTripBytes));
+    } else {
+        grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
+    }
+
+    timeTrace(fmt, downCast<uint32_t>(messageToGrant->rpcId.sequence),
+            messageToGrant->grantOffset, grantPrio);
+    GrantHeader grant(messageToGrant->rpcId, messageToGrant->grantOffset,
+            flags, grantPrio);
+    driver->sendPacket(senderAddress, &grant, NULL, controlPacketPriority);
+
+    messageToGrant->grantOffset += maxDataPerPacket;
+    if (messageToGrant->grantOffset >=
+            messageToGrant->accumulator->totalLength) {
+        // Slow path: a message has been fully granted. Purge this message,
+        // promote one of the interactive messages to grant, and reclaim
+        // priority level if possible.
+        messageToGrant->grantOffset = messageToGrant->accumulator->totalLength;
+        // TODO: NOW WHAT?
+    }
+
+//    for (IncomingMessage& incomingMessage : activeMessages) {
+//        IncomingMessage* m = &incomingMessage;
+//        if (m->grantOffset < m->accumulator->estimatedReceivedBytes +
+//                roundTripBytes) {
+//            uint32_t oldGrantOffset = m->grantOffset;
+//            m->grantOffset += maxDataPerPacket;
+//            if (m->grantOffset >= m->accumulator->totalLength) {
+//                // Slow path: a message has been fully granted. Purge this
+//                // message, select a new message to grant from the backups
+//                // and reclaim the highestGrantedPrio if possible.
+//                m->grantOffset = m->accumulator->totalLength;
+//                bool topMessagePurged = m == &activeMessages.front();
+//                erase(activeMessages, *m);
+//
+//                IncomingMessage* selectedMessage = NULL;
+//                for (IncomingMessage& backupMessage : interativeMessages) {
+//                    if (selectedMessage != NULL
+//                            && !(backupMessage < *selectedMessage)) {
+//                        continue;
+//                    }
+//
+//                    bool sameSender = false;
+//                    for (IncomingMessage& activeMessage : activeMessages) {
+//                        if (activeMessage.senderId == backupMessage.senderId) {
+//                            sameSender = true;
+//                            break;
+//                        }
+//                    }
+//
+//                    if (!sameSender) {
+//                        selectedMessage = &backupMessage;
+//                    }
+//                }
+//                if (selectedMessage) {
+//                    activeMessages.push_back(*selectedMessage);
+//                    erase(interativeMessages, *selectedMessage);
+//                }
+//                if (topMessagePurged
+//                        && selectedMessage != &activeMessages.front()
+//                        && downCast<uint32_t>(highestGrantedPrio)
+//                            >= activeMessages.size()) {
+//                    // We can reclaim the highest granted priority only when
+//                    // 1) the previous top message is fully granted, 2) the new
+//                    // selected message doesn't become the new top message and
+//                    // 3) priority levels 0 to highestGrantedPrio-1 are still
+//                    // capable of accomodating the updated active message list.
+//                    highestGrantedPrio--;
+//                }
+//            }
+//
+//            const Driver::Address* senderAddress;
+//            uint8_t flags;
+//            char* fmt;
+//            if (m->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
+//                senderAddress = static_cast<ClientRpc*>(m)->session
+//                        ->serverAddress;
+//                flags = FROM_CLIENT;
+//                fmt = "client sending GRANT, sequence %u, offset %u, priority %u";
+//            } else {
+//                senderAddress = static_cast<ServerRpc*>(m)->clientAddress;
+//                flags = FROM_SERVER;
+//                fmt = "server sending GRANT, sequence %u, offset %u, priority %u";
+//            }
+//
+//            uint8_t grantPrio;
+//            if (oldGrantOffset <= roundTripBytes) {
+//                // For the last 1 RTT remaining bytes of a scheduled message
+//                // with size (1+a)RTT, use the same priority as an unscheduled
+//                // message that has size min{1, a}*RTT.
+//                grantPrio = getUnschedTrafficPrio(std::min(roundTripBytes,
+//                        m->accumulator->totalLength - roundTripBytes));
+//            } else {
+//                grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
+//            }
+//
+//            timeTrace(fmt, downCast<uint32_t>(m->rpcId.sequence),
+//                    m->grantOffset, grantPrio);
+//            GrantHeader grant(m->rpcId, m->grantOffset, flags, grantPrio);
+//            driver->sendPacket(senderAddress, &grant, NULL,
+//                    controlPacketPriority);
+//            break;
+//        }
+//        rank++;
+//    }
 }
 
 /**

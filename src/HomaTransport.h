@@ -550,17 +550,20 @@ class HomaTransport : public Transport {
         CommonHeader common;         // Common header fields.
         uint32_t totalLength;        // Total # bytes in the message (*not*
                                      // this packet!).
-        // TODO: unscheduledBytes
         uint32_t offset;             // Offset within the message of the first
                                      // byte of data in this packet.
+        uint32_t unscheduledBytes;    // # unscheduled bytes in the message.
 
         // The remaining packet bytes after the header constitute message
         // data starting at the given offset.
 
         DataHeader(RpcId rpcId, uint32_t totalLength, uint32_t offset,
                 uint8_t flags)
-            : common(PacketOpcode::DATA, rpcId, flags),
-            totalLength(totalLength), offset(offset) {}
+            : common(PacketOpcode::DATA, rpcId, flags)
+            , totalLength(totalLength)
+            , offset(offset)
+            , unscheduledBytes(0) // TODO:
+        {}
     } __attribute__((packed));
 
     /**
@@ -662,9 +665,13 @@ class HomaTransport : public Transport {
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
-    void addScheduledMessage(IncomingMessage* newMessage);
+    void tryToSchedule(IncomingMessage* message);
+    void activateMessage(IncomingMessage* message, bool newMessage);
+    void demoteActiveMessage(IncomingMessage* activeMessage);
     void scheduledMessageReceiveData(IncomingMessage* message);
-    void scheduleNewMessage(IncomingMessage *message);
+    void scheduleNewMessage(IncomingMessage* message);
+    void updateActiveMessages(IncomingMessage* messageToRemove,
+            IncomingMessage* messageToAdd);
 
     /// Shared RAMCloud information.
     Context* context;
