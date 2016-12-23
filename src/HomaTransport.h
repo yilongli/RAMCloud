@@ -666,6 +666,9 @@ class HomaTransport : public Transport {
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
     bool tryToSchedule(IncomingMessage* message, bool newMessage = true);
+    bool insert(IncomingMessage* message);
+    void replaceActiveMessage(IncomingMessage* oldMessage,
+            IncomingMessage* replacement/*, bool purgeOldMessage, bool isNewMsg*/);
     void activateMessage(IncomingMessage* message, bool newMessage);
     void deactivateMessage(IncomingMessage *message, bool purge = false);
     void scheduledMessageReceiveData(IncomingMessage* message);
