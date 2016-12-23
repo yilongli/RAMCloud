@@ -665,13 +665,10 @@ class HomaTransport : public Transport {
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
-    void tryToSchedule(IncomingMessage* message);
+    bool tryToSchedule(IncomingMessage* message, bool newMessage = true);
     void activateMessage(IncomingMessage* message, bool newMessage);
-    void demoteActiveMessage(IncomingMessage* activeMessage);
+    void deactivateMessage(IncomingMessage *message, bool purge = false);
     void scheduledMessageReceiveData(IncomingMessage* message);
-    void scheduleNewMessage(IncomingMessage* message);
-    void updateActiveMessages(IncomingMessage* messageToRemove,
-            IncomingMessage* messageToAdd);
 
     /// Shared RAMCloud information.
     Context* context;

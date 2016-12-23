@@ -1625,19 +1625,24 @@ HomaTransport::checkTimeouts()
 }
 
 /**
- * When a new message that requires scheduling arrives, this method is called
- * to enter the new message into the scheduler.
+ * Attempts to schedule a message by placing it in the active message list.
  *
+ * \param message
+ *      A message that cannot be completely sent as unscheduled bytes.
  * \param newMessage
- *      A message that cannot be sent as unscheduled bytes in its entirety.
+ *      True means the scheduler has no prior knowledge about this message.
+ *      False means this is an interactive message the scheduler knows about.
+ * \return
+ *      True if the message will start to receive grants regularly after this
+ *      method returns; false, otherwise.
  */
-void
-HomaTransport::tryToSchedule(IncomingMessage* message)
+bool
+HomaTransport::tryToSchedule(IncomingMessage* message, bool newMessage)
 {
     // The following loop handles the special case where some active message
     // comes from the same sender as the new message to avoid violating the
     // constraint that active messages must come from distinct senders.
-    for (IncomingMessage& m : activeMessages) {
+    for (IncomingMessage &m : activeMessages) {
         if (m.senderId != message->senderId) {
             continue;
         }
@@ -1645,26 +1650,12 @@ HomaTransport::tryToSchedule(IncomingMessage* message)
         if (*message < m) {
             // The new message should replace an active message that is from
             // the same sender.
-            demoteActiveMessage(&m);
-            activateMessage(message);
-//
-//            bool replaceTopMessage = (&m == &activeMessages.front());
-//            erase(activeMessages, m);
-//            interativeMessages.push_back(m);
-//            scheduleNewMessage(newMessage);
-//            // TODO: RENAME scheduleNewMessage and return a position?
-//            if (newMessage == &activeMessages.front() && !replaceTopMessage
-//                    && highestGrantedPrio + 1 < lowestUnschedPrio) {
-//                // We have a new top message that is not from the sender
-//                // of the previous top message. Bump the highest granted
-//                // priority if we haven't used up all the priority levels
-//                // for scheduled packets.
-//                highestGrantedPrio++;
-//            }
+            deactivateMessage(&m);
+            activateMessage(message, newMessage);
         } else {
             interativeMessages.push_back(*message);
         }
-        return;
+        return true;
     }
 
     // From now on, we can assume that the new message has a different sender
@@ -1673,61 +1664,74 @@ HomaTransport::tryToSchedule(IncomingMessage* message)
         // We have not buffered enough messages. This also implies we have not
         // used up our priority levels for scheduled packets. Bump the highest
         // granted priority.
-//        highestGrantedPrio++;
-//        scheduleNewMessage(newMessage);
-        activateMessage(message);
+        activateMessage(message, newMessage);
     } else if (*message < activeMessages.back()) {
         // The new message should replace the "worst" active message.
-        demoteActiveMessage(&activeMessages.back());
-        activateMessage(message);
-//        interativeMessages.push_back(activeMessages.back());
-//        activeMessages.pop_back();
-//        scheduleNewMessage(newMessage);
-//        if (newMessage == &activeMessages.front()
-//                && highestGrantedPrio + 1 < lowestUnschedPrio) {
-//            // We have a new top message. Bump the highest granted priority
-//            // if we haven't used up all the priority levels for scheduled
-//            // packets.
-//            highestGrantedPrio++;
-//        }
-    } else {
+        deactivateMessage(&activeMessages.back());
+        activateMessage(message, newMessage);
+    } else if (newMessage) {
         interativeMessages.push_back(*message);
     }
 }
 
+/**
+ * Insert a message into the right place of the active message list that
+ * reflects its precedence among the active messages. Bump the highest
+ * priority level for grants when necessary.
+ *
+ * \param message
+ *      A soon-to-be active message.
+ * \param newMessage
+ *      True means the scheduler has no prior knowledge about this message.
+ *      False means this is an interactive message the scheduler knows about.
+ */
 void
-HomaTransport::activateMessage(IncomingMessage* message, bool newMessage = true)
+HomaTransport::activateMessage(IncomingMessage* message, bool newMessage)
 {
     assert(activeMessages.size() < maxGrantedMessages);
     if (!newMessage) {
         erase(interativeMessages, *message);
     }
 
-    bool needPreemption = true;
+    bool topMessagePreempted = true;
     for (IncomingMessage& m : activeMessages) {
         if (*message < m) {
             insertBefore(activeMessages, *message, m);
             goto updateGrantPrio;
         }
-        needPreemption = false;
+        topMessagePreempted = false;
     }
     activeMessages.push_back(*message);
 
     updateGrantPrio:
-    if (needPreemption && highestGrantedPrio + 1 < lowestUnschedPrio
+    if (topMessagePreempted && highestGrantedPrio + 1 < lowestUnschedPrio
             || highestGrantedPrio + 1 < activeMessages.size()) {
         highestGrantedPrio++;
     }
 }
 
+/**
+ * Remove a message from the active message list and reclaim the highest
+ * priority level for grants when necessary.
+ *
+ * @param message
+ *      The message to be descheduled.
+ * @param purge
+ *      When the message is fully granted, this parameter is set to true and
+ *      this message should be purged from the scheduler instead of being
+ *      demoted to an interactive message.
+ */
 void
-HomaTransport::demoteActiveMessage(IncomingMessage* activeMessage)
+HomaTransport::deactivateMessage(IncomingMessage *message, bool purge)
 {
-    if (&activeMessage == &activeMessages.front()) {
+    assert(contains(activeMessages, *message));
+    if (&message == &activeMessages.front()) {
         highestGrantedPrio--;
     }
-    erase(activeMessages, activeMessage);
-    interativeMessages.push_back(*activeMessage);
+    erase(activeMessages, message);
+    if (!purge) {
+        interativeMessages.push_back(*message);
+    }
 }
 
 /**
@@ -1764,32 +1768,10 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
             erase(activeMessages, message);
             insertBefore(activeMessages, *message, *insertBeforeMe);
         }
-//        if (it != activeMessages.begin() && !(*it < *std::prev(it))) {
-//            activeMessages.erase(it);
-//            scheduleNewMessage(message);
-//        }
     } else if (*message < activeMessages.back()) {
         // This message is an interactive message which has the chance to be
         // promoted to an active message.
-        erase(interativeMessages, *message);
-        tryToSchedule(message);
-
-//        // The message is a backup message and should be promoted to
-//        // replace the "worst" current active message provided that
-//        // no other active messages are from the same sender as it.
-//        IncomingMessage* sameSender = NULL;
-//        for (IncomingMessage& m : activeMessages) {
-//            if (m.senderId == message->senderId) {
-//                sameSender = &m;
-//                break;
-//            }
-//        }
-//        if (sameSender == NULL || sameSender == &activeMessages.back()) {
-//            erase(interativeMessages, *message);
-//            interativeMessages.push_back(activeMessages.back());
-//            activeMessages.pop_back();
-//            scheduleNewMessage(message);
-//        }
+        tryToSchedule(message, false);
     }
 
     if (contains(activeMessages, *message)) {
@@ -1798,7 +1780,7 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
         return;
     }
 
-    // The following loop picks an active message to output a GRANT.
+    // Pick an active message to grant.
     IncomingMessage* messageToGrant = NULL;
     int rank = 0;
     for (IncomingMessage& m : activeMessages) {
@@ -1809,7 +1791,7 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
         }
         rank++;
     }
-    if (!messageToGrant) {
+    if (messageToGrant == NULL) {
         return;
     }
 
@@ -1852,112 +1834,30 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
         // promote one of the interactive messages to grant, and reclaim
         // priority level if possible.
         messageToGrant->grantOffset = messageToGrant->accumulator->totalLength;
-        // TODO: NOW WHAT?
-    }
+        deactivateMessage(messageToGrant, true);
 
-//    for (IncomingMessage& incomingMessage : activeMessages) {
-//        IncomingMessage* m = &incomingMessage;
-//        if (m->grantOffset < m->accumulator->estimatedReceivedBytes +
-//                roundTripBytes) {
-//            uint32_t oldGrantOffset = m->grantOffset;
-//            m->grantOffset += maxDataPerPacket;
-//            if (m->grantOffset >= m->accumulator->totalLength) {
-//                // Slow path: a message has been fully granted. Purge this
-//                // message, select a new message to grant from the backups
-//                // and reclaim the highestGrantedPrio if possible.
-//                m->grantOffset = m->accumulator->totalLength;
-//                bool topMessagePurged = m == &activeMessages.front();
-//                erase(activeMessages, *m);
-//
-//                IncomingMessage* selectedMessage = NULL;
-//                for (IncomingMessage& backupMessage : interativeMessages) {
-//                    if (selectedMessage != NULL
-//                            && !(backupMessage < *selectedMessage)) {
-//                        continue;
-//                    }
-//
-//                    bool sameSender = false;
-//                    for (IncomingMessage& activeMessage : activeMessages) {
-//                        if (activeMessage.senderId == backupMessage.senderId) {
-//                            sameSender = true;
-//                            break;
-//                        }
-//                    }
-//
-//                    if (!sameSender) {
-//                        selectedMessage = &backupMessage;
-//                    }
-//                }
-//                if (selectedMessage) {
-//                    activeMessages.push_back(*selectedMessage);
-//                    erase(interativeMessages, *selectedMessage);
-//                }
-//                if (topMessagePurged
-//                        && selectedMessage != &activeMessages.front()
-//                        && downCast<uint32_t>(highestGrantedPrio)
-//                            >= activeMessages.size()) {
-//                    // We can reclaim the highest granted priority only when
-//                    // 1) the previous top message is fully granted, 2) the new
-//                    // selected message doesn't become the new top message and
-//                    // 3) priority levels 0 to highestGrantedPrio-1 are still
-//                    // capable of accomodating the updated active message list.
-//                    highestGrantedPrio--;
-//                }
-//            }
-//
-//            const Driver::Address* senderAddress;
-//            uint8_t flags;
-//            char* fmt;
-//            if (m->rpcKind == IncomingMessage::RpcKind::CLIENT_RPC) {
-//                senderAddress = static_cast<ClientRpc*>(m)->session
-//                        ->serverAddress;
-//                flags = FROM_CLIENT;
-//                fmt = "client sending GRANT, sequence %u, offset %u, priority %u";
-//            } else {
-//                senderAddress = static_cast<ServerRpc*>(m)->clientAddress;
-//                flags = FROM_SERVER;
-//                fmt = "server sending GRANT, sequence %u, offset %u, priority %u";
-//            }
-//
-//            uint8_t grantPrio;
-//            if (oldGrantOffset <= roundTripBytes) {
-//                // For the last 1 RTT remaining bytes of a scheduled message
-//                // with size (1+a)RTT, use the same priority as an unscheduled
-//                // message that has size min{1, a}*RTT.
-//                grantPrio = getUnschedTrafficPrio(std::min(roundTripBytes,
-//                        m->accumulator->totalLength - roundTripBytes));
-//            } else {
-//                grantPrio = downCast<uint8_t>(highestGrantedPrio - rank);
-//            }
-//
-//            timeTrace(fmt, downCast<uint32_t>(m->rpcId.sequence),
-//                    m->grantOffset, grantPrio);
-//            GrantHeader grant(m->rpcId, m->grantOffset, flags, grantPrio);
-//            driver->sendPacket(senderAddress, &grant, NULL,
-//                    controlPacketPriority);
-//            break;
-//        }
-//        rank++;
-//    }
-}
+        // Find the best interactive message to promote without violating the
+        // constraint that active messages must come from distinct senders.
+        IncomingMessage* messageToPromote = NULL;
+        for (IncomingMessage& candidate : interativeMessages) {
+            if (messageToPromote != NULL && !(candidate < *messageToPromote)) {
+                continue;
+            }
 
-/**
- * Insert a message to the active message list while maintaining the correct
- * ordering within the list.
- *
- * \param message
- *      A message that is scheduled to receive grants regularly from now on.
- */
-void
-HomaTransport::scheduleNewMessage(IncomingMessage *message)
-{
-    for (IncomingMessage& m : activeMessages) {
-        if (*message < m) {
-            insertBefore(activeMessages, *message, m);
-            return;
+            for (IncomingMessage& m : activeMessages) {
+                if (m.senderId == candidate.senderId) {
+                    goto endOfLoop;
+                }
+            }
+
+            messageToPromote = &candidate;
+            endOfLoop:
+            ;
+        }
+        if (messageToPromote) {
+            activateMessage(messageToPromote, false);
         }
     }
-    activeMessages.push_back(*message);
 }
 
 }  // namespace RAMCloud
