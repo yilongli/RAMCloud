@@ -191,14 +191,6 @@ class HomaTransport : public Transport {
         /// Total # bytes in the message.
         const uint32_t totalLength;
 
-        // Used to detect lost packets faster than using timeouts. When a new
-        // packet arrives but cannot be added to buffer because some preceding
-        // packets are missing, the indicator is incremented. The larger this
-        // number becomes, the more likely that the preceding packets are lost.
-        // The indicator is reset when a retransmission is initiated or a new
-        // packet arrives that can be added into the buffer.
-        uint32_t packetLossIndicator;
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
@@ -605,11 +597,17 @@ class HomaTransport : public Transport {
         uint32_t length;             // Number of bytes of data to retransmit;
                                      // this could specify a range longer than
                                      // the total message size.
+        uint8_t priority;            // Packet priority to use; the sender
+                                     // should transmit all lost data using
+                                     // this priority.
 
         ResendHeader(RpcId rpcId, uint32_t offset, uint32_t length,
-                uint8_t flags)
-            : common(PacketOpcode::RESEND, rpcId, flags), offset(offset),
-              length(length) {}
+                uint8_t flags, uint8_t priority)
+            : common(PacketOpcode::RESEND, rpcId, flags)
+            , offset(offset)
+            , length(length)
+            , priority(priority)
+        {}
     } __attribute__((packed));
 
     /**
@@ -666,11 +664,9 @@ class HomaTransport : public Transport {
             uint8_t flags, uint8_t priority, bool partialOK = false);
     bool tryToTransmitData();
     bool tryToSchedule(IncomingMessage* message, bool newMessage = true);
-    bool insert(IncomingMessage* message);
+    void insertOrAdjust(IncomingMessage* message, bool alreadyInList = false);
     void replaceActiveMessage(IncomingMessage* oldMessage,
-            IncomingMessage* replacement/*, bool purgeOldMessage, bool isNewMsg*/);
-    void activateMessage(IncomingMessage* message, bool newMessage);
-    void deactivateMessage(IncomingMessage *message, bool purge = false);
+            IncomingMessage* newMessage, bool purgeOK = false);
     void scheduledMessageReceiveData(IncomingMessage* message);
 
     /// Shared RAMCloud information.

@@ -824,21 +824,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                     }
                     clientRpc->notifier->completed();
                     deleteClientRpc(clientRpc);
-                } else {
-                    // See if we need to request retransmission.
-                    if (clientRpc->accumulator->packetLossIndicator > 2) {
-                        clientRpc->resendLimit =
-                                clientRpc->accumulator->requestRetransmission(
-                                this, clientRpc->session->serverAddress,
-                                RpcId(clientId, clientRpc->sequence),
-                                clientRpc->grantOffset, FROM_CLIENT);
-                    }
-
-                    // See if we need to adjust our scheduling decision.
-                    if (!clientRpc->isUnscheduled()) {
-                        scheduledMessageReceiveData(clientRpc);
-                        // TODO: why would the sender put NEED_GRANT into the data packet? couldn't the receiver figure it out?
-                    }
+                } else if (!clientRpc->isUnscheduled()) {
+                    scheduledMessageReceiveData(clientRpc);
                 }
 
                 if (retainPacket) {
@@ -895,6 +882,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
+                        // TODO: do I need to do anything about `ScheduledMessage`?
                     }
                     return;
                 }
@@ -927,12 +915,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                // TODO: Use the higest priority for retransmission?
+                // TODO: document why pass bytes directly to NIC
                 sendBytes(clientRpc->session->serverAddress,
                         header->common.rpcId, clientRpc->request,
                         header->offset, header->length,
                         FROM_CLIENT|RETRANSMISSION|clientRpc->needGrantFlag,
-                        highestAvailPriority, true);
+                        header->priority, true);
                 clientRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
@@ -1056,19 +1044,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                     erase(serverTimerList, *serverRpc);
                     serverRpc->requestComplete = true;
                     context->workerManager->handleRpc(serverRpc);
-                } else {
-                    // See if we need to request retransmission.
-                    if (serverRpc->accumulator->packetLossIndicator > 2) {
-                        serverRpc->resendLimit = serverRpc->accumulator->
-                                requestRetransmission(this,
-                                serverRpc->clientAddress, serverRpc->rpcId,
-                                serverRpc->grantOffset, FROM_SERVER);
-                    }
-
-                    // See if we need to adjust our scheduling decision.
-                    if (!serverRpc->isUnscheduled()) {
-                        scheduledMessageReceiveData(serverRpc);
-                    }
+                } else if (!serverRpc->isUnscheduled()) {
+                    scheduledMessageReceiveData(serverRpc);
                 }
                 serverDataDone:
                 if (retainPacket) {
@@ -1132,7 +1109,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                     timeTrace("server requesting restart, sequence %u",
                             downCast<uint32_t>(common->rpcId.sequence));
                     ResendHeader resend(header->common.rpcId, 0,
-                            roundTripBytes, FROM_SERVER|RESTART);
+                            roundTripBytes, FROM_SERVER|RESTART,
+                            getUnschedTrafficPrio());
                     driver->sendPacket(received->sender, &resend, NULL,
                             controlPacketPriority);
                     return;
@@ -1167,12 +1145,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                // TODO: Use the higest priority for retransmission?
+                // TODO: document why pass the bytes directly to NIC
                 sendBytes(serverRpc->clientAddress,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
                         RETRANSMISSION|FROM_SERVER|serverRpc->needGrantFlag,
-                        highestAvailPriority, true);
+                        header->priority, true);
                 serverRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
@@ -1255,7 +1233,6 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     , estimatedReceivedBytes(0)
     , fragments()
     , totalLength(totalLength)
-    , packetLossIndicator(0)
 { }
 
 /**
@@ -1302,7 +1279,6 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
-        packetLossIndicator++;
         if (fragments.find(header->offset) == fragments.end()) {
             fragments[header->offset] = MessageFragment(header, length);
             return true;
@@ -1314,7 +1290,6 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
-    uint32_t oldSize = buffer->size();
     bool result = appendFragment(header, length);
     while (true) {
         FragmentMap::iterator it = fragments.begin();
@@ -1330,9 +1305,6 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
             t->driver->release(fragment.header);
         };
         fragments.erase(it);
-    }
-    if (buffer->size() > oldSize) {
-        packetLossIndicator = 0;
     }
     return result;
 }
@@ -1409,7 +1381,6 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
     if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
         DIE("Bad fragment pointer: %p", &fragments);
     }
-    packetLossIndicator = 0;
     uint32_t endOffset;
     FragmentMap::iterator it = fragments.begin();
 
@@ -1625,39 +1596,107 @@ HomaTransport::checkTimeouts()
 }
 
 /**
- * Insert a message into the right place of the active message list that
- * reflects its precedence among the active messages.
+ * Insert/adjust a new/existing message to the right place of the active
+ * message list that reflects its precedence among the active messages.
  *
  * \param message
- *      A soon-to-be active message.
+ *      A message that needs to be put at the right place in the active message
+ *      list.
+ * \param alreadyInList
+ *      True means the message is an existing message already in the list;
+ *      false, otherwise.
  */
-bool
-HomaTransport::insert(IncomingMessage* message)
+void
+HomaTransport::insertOrAdjust(IncomingMessage* message, bool alreadyInList)
 {
-    assert(activeMessages.size() < maxGrantedMessages);
-    bool preemptTopMessage = true;
     for (IncomingMessage& m : activeMessages) {
-        if (*message < m) {
-            insertBefore(activeMessages, *message, m);
-            return preemptTopMessage;
+        if (alreadyInList && (&m == message)) {
+            // This existing message is still in the right place: all preceding
+            // messages are smaller.
+            return;
         }
-        preemptTopMessage = false;
+
+        if (*message < m) {
+            // Find the first message that is
+            if (alreadyInList) {
+                erase(activeMessages, message);
+            }
+            insertBefore(activeMessages, *message, m);
+            return;
+        }
     }
     activeMessages.push_back(*message);
-    return preemptTopMessage;
 }
 
+/**
+ * Replace an active message by an inactive one because our scheduling policy
+ * says it's a better choice.
+ *
+ * @param oldMessage
+ *      A currently active message that is about to be deactivated.
+ * @param newMessage
+ *      A currently inactive message that should be activated. NULL means we
+ *      it's the responsibility of this method to pick this message from the
+ *      inactive ones.
+ * @param purgeOK
+ *      True if the message about to be deactivated has been fully granted and
+ *      we can purge it from the scheduler. False if this message should be put
+ *      back to the inactive message list.
+ */
 void
 HomaTransport::replaceActiveMessage(IncomingMessage *oldMessage,
-                                    IncomingMessage *replacement
-//                                    bool purgeOldMessage,
-//                                    bool isNewMsg
-)
+        IncomingMessage *newMessage, bool purgeOK)
 {
-    bool topMessageErased = (oldMessage == &activeMessages.front());
-    erase(activeMessages, *oldMessage);
-    bool preemptTopMessage = insert(replacement);
+    if (oldMessage == &activeMessages.front()) {
+        // The top message is removed. Reclaim the highest granted priority.
+        highestGrantedPrio--;
+    }
 
+    erase(activeMessages, *oldMessage);
+    if (!purgeOK) {
+        interativeMessages.push_back(*oldMessage);
+    }
+
+    if (newMessage == NULL) {
+        // No designated message to promote. Pick one from the inactive
+        // messages.
+        for (IncomingMessage& candidate : interativeMessages) {
+            if (newMessage != NULL && !(candidate < *newMessage)) {
+                continue;
+            }
+
+            for (IncomingMessage& m : activeMessages) {
+                if (m.senderId == candidate.senderId) {
+                    // Active messages must come from distinct senders. Move on
+                    // to check the next inactive message.
+                    goto tryNextCandidate;
+                }
+            }
+
+            newMessage = &candidate;
+            tryNextCandidate:
+            ;
+        }
+    }
+
+    if (newMessage) {
+        insertOrAdjust(newMessage);
+        if (newMessage == &activeMessages.front()
+                && highestGrantedPrio + 1 < lowestUnschedPrio) {
+            // This message is promoted to the top. Bump the highest granted
+            // priority if we haven't used up all the priorities for scheduled
+            // traffic.
+            highestGrantedPrio++;
+        } else if (highestGrantedPrio + 1 < activeMessages.size()) {
+            // The priorites we are granting for scheduled traffic is not
+            // enough to accomodate all the active messages.
+            highestGrantedPrio++;
+        }
+    } else if (activeMessages.size() < maxGrantedMessages) {
+        // We don't have enough messages to buffer. Pack the priorities we are
+        // granting for scheduled traffic to start from priority 0.
+        highestGrantedPrio = downCast<int>(activeMessages.size() - 1);
+    }
 }
 
 /**
@@ -1667,8 +1706,10 @@ HomaTransport::replaceActiveMessage(IncomingMessage *oldMessage,
  *      A message that cannot be completely sent as unscheduled bytes.
  * \param newMessage
  *      True means the scheduler has no prior knowledge about this message.
- *      False means this is an interactive message the scheduler knows about.
+ *      False means this is an inactive message the scheduler knows about.
  * \return
+ *      True if the message will start to receive grants regularly after this
+ *      this method returns; false, otherwise.
  */
 bool
 HomaTransport::tryToSchedule(IncomingMessage* message, bool newMessage)
@@ -1688,6 +1729,7 @@ HomaTransport::tryToSchedule(IncomingMessage* message, bool newMessage)
             replaceActiveMessage(&m, message);
             success = true;
         }
+        // TODO: rename label
         goto label;
     }
 
@@ -1698,7 +1740,7 @@ HomaTransport::tryToSchedule(IncomingMessage* message, bool newMessage)
         // used up our priority levels for scheduled packets. Bump the highest
         // granted priority.
         assert(newMessage);
-        insert(message);
+        insertOrAdjust(message);
         highestGrantedPrio++;
         success = true;
     } else if (*message < activeMessages.back()) {
@@ -1714,68 +1756,6 @@ HomaTransport::tryToSchedule(IncomingMessage* message, bool newMessage)
         erase(interativeMessages, *message);
     }
     return success;
-}
-
-/**
- * Insert a message into the right place of the active message list that
- * reflects its precedence among the active messages. Bump the highest
- * priority level for grants when necessary.
- *
- * \param message
- *      A soon-to-be active message.
- * \param newMessage
- *      True means the scheduler has no prior knowledge about this message.
- *      False means this is an interactive message the scheduler knows about.
- */
-void
-HomaTransport::activateMessage(IncomingMessage* message, bool newMessage)
-{
-    assert(activeMessages.size() < maxGrantedMessages);
-    if (!newMessage) {
-        erase(interativeMessages, *message);
-    }
-
-    bool topMessagePreempted = true;
-    for (IncomingMessage& m : activeMessages) {
-        if (*message < m) {
-            insertBefore(activeMessages, *message, m);
-            goto updateGrantPrio;
-        }
-        topMessagePreempted = false;
-    }
-    activeMessages.push_back(*message);
-
-    updateGrantPrio:
-    if (topMessagePreempted && highestGrantedPrio + 1 < lowestUnschedPrio
-            || highestGrantedPrio + 1 < activeMessages.size()) {
-        highestGrantedPrio++;
-    }
-}
-
-/**
- * Remove a message from the active message list and reclaim the highest
- * priority level for grants when necessary.
- *
- * @param message
- *      The message to be descheduled.
- * @param purge
- *      When the message is fully granted, this parameter is set to true and
- *      this message should be purged from the scheduler instead of being
- *      demoted to an interactive message.
- */
-void
-HomaTransport::deactivateMessage(IncomingMessage *message, bool purge)
-{
-    assert(contains(activeMessages, *message));
-    if (&message == &activeMessages.front()
-            || highestGrantedPrio + 1 ) {
-        // TODO: FIXME
-        highestGrantedPrio--;
-    }
-    erase(activeMessages, message);
-    if (!purge) {
-        interativeMessages.push_back(*message);
-    }
 }
 
 /**
@@ -1796,35 +1776,16 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
     // See if we need to adjust the scheduling precedence of this message.
     bool needGrant;
     if (contains(activeMessages, *message)) {
-        // TODO: could we take advantage of insert?
-
         needGrant = true;
-//    ActiveMessageList::iterator it = activeMessages.iterator_to(*message);
-//    if (it != activeMessages.end()) {
-        // This message is an active message. See if we need to move it
-        // forward.
-
-//        IncomingMessage* insertBeforeMe = NULL;
-//        while (it != activeMessages.begin()) {
-//            it--;
-//            if (*message < *it) {
-//                insertBeforeMe = &(*it);
-//            } else {
-//                break;
-//            }
-//        }
-//
-//        if (insertBeforeMe) {
-//            erase(activeMessages, message);
-//            insertBefore(activeMessages, *message, *insertBeforeMe);
-//        }
+        insertOrAdjust(message, true);
     } else if (*message < activeMessages.back()) {
         // This message is an interactive message which has the chance to be
         // promoted to an active message.
         needGrant = tryToSchedule(message, false);
         // TODO: document why we need to output a grant in this case; what if we doesn't?
+    } else {
+        needGrant = false;
     }
-
     if (!needGrant) {
         // No need to output a GRANT if the data packet received is not from
         // an active message.
@@ -1833,12 +1794,15 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
 
     // Pick an active message to grant.
     IncomingMessage* messageToGrant = NULL;
+    // TODO: John: could we get rid of rank and use priority alone?
     int rank = 0;
     for (IncomingMessage& m : activeMessages) {
         // TODO: DO WE WANT TO MAKE THE OUTSTANDING BYTES CONFIGURABLE?
+        // TODO: OR SHOULD WE MAKE IT EXPLICIT BY INTRODUCING A VAR NAMED `outstandingBytesWindow`?
         if (m.grantOffset <
                 m.accumulator->estimatedReceivedBytes + roundTripBytes) {
             messageToGrant = &m;
+            break;
         }
         rank++;
     }
@@ -1882,33 +1846,9 @@ HomaTransport::scheduledMessageReceiveData(IncomingMessage* message)
     messageToGrant->grantOffset += maxDataPerPacket;
     if (messageToGrant->grantOffset >=
             messageToGrant->accumulator->totalLength) {
-        // Slow path: a message has been fully granted. Purge this message,
-        // promote one of the interactive messages to grant, and reclaim
-        // priority level if possible.
+        // Slow path: a message has been fully granted.
         messageToGrant->grantOffset = messageToGrant->accumulator->totalLength;
-        deactivateMessage(messageToGrant, true);
-
-        // Find the best interactive message to promote without violating the
-        // constraint that active messages must come from distinct senders.
-        IncomingMessage* messageToPromote = NULL;
-        for (IncomingMessage& candidate : interativeMessages) {
-            if (messageToPromote != NULL && !(candidate < *messageToPromote)) {
-                continue;
-            }
-
-            for (IncomingMessage& m : activeMessages) {
-                if (m.senderId == candidate.senderId) {
-                    goto endOfLoop;
-                }
-            }
-
-            messageToPromote = &candidate;
-            endOfLoop:
-            ;
-        }
-        if (messageToPromote) {
-            activateMessage(messageToPromote, false);
-        }
+        replaceActiveMessage(messageToGrant, NULL, true);
     }
 }
 
