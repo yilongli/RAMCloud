@@ -268,6 +268,7 @@ class HomaTransport : public Transport {
         const uint64_t senderId;
 
         // TODO: move it into MsgAccumulator?
+        // TODO: doc. dynamic throttling
         uint32_t unscheduledBytes;
 
       PRIVATE:
@@ -309,29 +310,13 @@ class HomaTransport : public Transport {
         /// we receive a GRANT for them.
         uint32_t transmitLimit;
 
-        // TODO: remove states related to FIFO?
-        /// Generated from t->transmitSequenceNumber, used to prioritize
-        /// transmission of the request message.
-        uint64_t transmitSequenceNumber;
-
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the request.
         uint64_t lastTransmitTime;
 
-        // TODO: HOW IS IT ACTUALLY USED?
-        /// The sum of the offset and length fields from the most recent
-        /// RESEND we have sent, 0 if no RESEND has been sent for this
-        /// RPC. Used to detect unnecessary RESENDs (because the original
-        /// data eventually arrives).
-        uint32_t resendLimit;
-
         /// Number of times that the transport timer has fired since we
         /// received any packets from the server.
         uint32_t silentIntervals;
-
-        /// Either 0 or NEED_GRANT; used in the flags for all outgoing
-        /// data packets.
-        uint8_t needGrantFlag;
 
         /// True means that the request message is in the process of being
         /// transmitted (and this object is linked on t->outgoingRequests).
@@ -352,11 +337,8 @@ class HomaTransport : public Transport {
             , transmitOffset(0)
             , transmitPriority(0)
             , transmitLimit(0)
-            , transmitSequenceNumber(0)
             , lastTransmitTime(0)
-            , resendLimit(0)
             , silentIntervals(0)
-            , needGrantFlag(0)
             , transmitPending(false)
             , outgoingRequestLinks()
         {}
@@ -399,10 +381,6 @@ class HomaTransport : public Transport {
         /// we receive a GRANT for them.
         uint32_t transmitLimit;
 
-        /// Generated from t->transmitSequenceNumber, used to prioritize
-        /// transmission of the response message.
-        uint64_t transmitSequenceNumber;
-
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the response.
         uint64_t lastTransmitTime;
@@ -425,10 +403,6 @@ class HomaTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
-        /// Either 0 or NEED_GRANT; used in the flags for all outgoing
-        /// data packets.
-        uint8_t needGrantFlag;
-
         /// Used to link this object into t->serverTimerList.
         IntrusiveListHook timerLinks;
 
@@ -445,13 +419,11 @@ class HomaTransport : public Transport {
             , transmitOffset(0)
             , transmitPriority(0)
             , transmitLimit(0)
-            , transmitSequenceNumber(0)
             , lastTransmitTime(0)
             , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
-            , needGrantFlag(0)
             , timerLinks()
             , outgoingResponseLinks()
         {}
@@ -497,11 +469,6 @@ class HomaTransport : public Transport {
     //                           means it was sent from server to client.
     // FROM_SERVER:              Opposite of FROM_CLIENT; provided to make
     //                           code more readable.
-    // NEED_GRANT:               Used only in DATA packets. Nonzero means
-    //                           the sender is transmitting the entire
-    //                           message unilaterally; if not set, the last
-    //                           part of the message won't be sent without
-    //                           GRANTs from the recipient.
     // RETRANSMISSION:           Used only in DATA packets. Nonzero means
     //                           this packet is being sent in response to a
     //                           RESEND request (it has already been sent
@@ -512,9 +479,8 @@ class HomaTransport : public Transport {
     //                           indicate that everything needs to be resent.
     static const uint8_t FROM_CLIENT =    1;
     static const uint8_t FROM_SERVER =    0;
-    static const uint8_t NEED_GRANT =     2;
-    static const uint8_t RETRANSMISSION = 4;
-    static const uint8_t RESTART =        8;
+    static const uint8_t RETRANSMISSION = 2;
+    static const uint8_t RESTART =        4;
 
     /**
      * Describes the wire format for an ALL_DATA packet, which contains an
@@ -550,11 +516,11 @@ class HomaTransport : public Transport {
         // data starting at the given offset.
 
         DataHeader(RpcId rpcId, uint32_t totalLength, uint32_t offset,
-                uint8_t flags)
+                uint32_t unscheduledBytes, uint8_t flags)
             : common(PacketOpcode::DATA, rpcId, flags)
             , totalLength(totalLength)
             , offset(offset)
-            , unscheduledBytes(0) // TODO:
+            , unscheduledBytes(unscheduledBytes)
         {}
     } __attribute__((packed));
 
@@ -599,10 +565,14 @@ class HomaTransport : public Transport {
                                      // the total message size.
         uint8_t priority;            // Packet priority to use; the sender
                                      // should transmit all lost data using
-                                     // this priority.
+                                     // this priority unless the entire message
+                                     // needs to be resent (in such case this
+                                     // field is unused and the sender simply
+                                     // starts sending unscheduled bytes as
+                                     // normal).
 
         ResendHeader(RpcId rpcId, uint32_t offset, uint32_t length,
-                uint8_t flags, uint8_t priority)
+                uint8_t priority, uint8_t flags)
             : common(PacketOpcode::RESEND, rpcId, flags)
             , offset(offset)
             , length(length)
@@ -661,10 +631,12 @@ class HomaTransport : public Transport {
     static string opcodeSymbol(uint8_t opcode);
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
-            uint8_t flags, uint8_t priority, bool partialOK = false);
+            uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
+            bool partialOK = false);
     bool tryToTransmitData();
     bool tryToSchedule(IncomingMessage* message, bool newMessage = true);
-    void insertOrAdjust(IncomingMessage* message, bool alreadyInList = false);
+    void adjustSchedulingPrecedence(IncomingMessage* message,
+            bool alreadyInList = false);
     void replaceActiveMessage(IncomingMessage* oldMessage,
             IncomingMessage* newMessage, bool purgeOK = false);
     void scheduledMessageReceiveData(IncomingMessage* message);
@@ -702,11 +674,6 @@ class HomaTransport : public Transport {
     /// The sequence number to use for the next incoming RPC (i.e., one
     /// higher than the highest number ever used in the past).
     uint64_t nextServerSequenceNumber;
-
-    /// Assigned to a request or response when it becomes ready to transmit;
-    /// sequences requests and responses in a single timeline to implement
-    /// a FIFO priority system for large messages.
-    uint64_t transmitSequenceNumber;
 
     /// Holds incoming packets received from the driver. This is only
     /// used temporarily during the poll method, but it's allocated here
@@ -771,6 +738,7 @@ class HomaTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
+    // TODO: need to clear up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
@@ -828,7 +796,6 @@ class HomaTransport : public Transport {
     /// network. One of these messages may be chosen to become an active message
     /// when a former active message is granted completely. The list doesn't
     /// maintain any particular ordering of the messages within it.
-    // TODO: document why not sorted
     INTRUSIVE_LIST_TYPEDEF(IncomingMessage, interactiveMessageLinks)
             InteractiveMessageList;
     InteractiveMessageList interativeMessages;
