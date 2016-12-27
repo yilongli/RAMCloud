@@ -157,6 +157,7 @@ class HomaTransport : public Transport {
         /// first byte that has not yet been received.
         Buffer* buffer;
 
+        // TODO: SIMPLIFY OR REMOVE IT?
         /// Estimates the total # non-redundant payload bytes received. This
         /// value cannot be precisely computed at all time because we cannot
         /// tell how many redundant bytes a new data packet carries in its
@@ -196,90 +197,58 @@ class HomaTransport : public Transport {
     };
 
     /**
-     * This class represents the schedulable entity of the receiver-side
-     * message scheduler. It is a common interface extracted from ClientRpc
-     * and ServerRpc that is required by the scheduler.
+     * An object of this class stores the state for a scheduled message for
+     * for which at least one packet has been received. It is used both for
+     * request messages on the server and for response messages on the client.
+     * Not used for messages that can be sent unilaterally.
      */
-    class IncomingMessage {
+    class ScheduledMessage {
       public:
-        IncomingMessage(RpcId rpcId, RpcKind rpcKind,
-                const Driver::Address* senderAddress)
-            : accumulator()
-            , activeMessageLinks()
-            , interactiveMessageLinks()
-            , grantOffset(0)
-            , rpcId(rpcId)
-            , rpcKind(rpcKind)
-            , senderId(std::hash<std::string>{}(senderAddress->toString()))
-        {}
+        ScheduledMessage(HomaTransport* t, MessageAccumulator* accumulator,
+                uint32_t grantOffset, RpcId* rpcId,
+                const Driver::Address* senderAddress, uint8_t whoFrom);
+        ~ScheduledMessage() {};
+        bool lessThan(ScheduledMessage& other) const;
 
-        virtual ~IncomingMessage() {}
-
-        /**
-         * Comparison function for scheduled messages, for use in the message
-         * scheduler.
-         *
-         * \return
-         *      True means the first message should have a higher precedence
-         *      over the second message in the scheduler; false, otherwise.
-         */
-        bool operator<(IncomingMessage& other) const
-        {
-            // This function is undefined if we haven't received at least one
-            // packet from each of these two messages.
-            return accumulator->getRemainingBytes() <
-                    other.accumulator->getRemainingBytes();
-        }
-
-        /**
-         * TODO:
-         * @return
-         */
-        bool isUnscheduled() {
-            // TODO: move this method into MsgAccumulator?
-            return accumulator->totalLength <= unscheduledBytes;
-        }
-
-        /// This enum defines the `rpcKind` field values for IncomingMessage's.
-        enum RpcKind { CLIENT_RPC, SERVER_RPC };
-
-        /// Holds state of a partially-received multi-packet message.
-        Tub<MessageAccumulator> accumulator;
+        /// Holds state of partially-received multi-packet messages.
+        const MessageAccumulator* accumulator;
 
         /// Used to link this object into t->activeMessages.
         IntrusiveListHook activeMessageLinks;
 
-        /// Used to link this object into t->interactiveMessages.
-        IntrusiveListHook interactiveMessageLinks;
+        /// Used to link this object into t->inactiveMessages.
+        IntrusiveListHook inactiveMessageLinks;
 
         /// Offset from the most recent GRANT packet we have sent for
         /// this incoming message, or 0 if we haven't sent any GRANTs.
         uint32_t grantOffset;
 
-        /// Unique identifier for this RPC.
-        RpcId rpcId;
+        /// Unique identifier for the RPC this message belongs to.
+        const RpcId* rpcId;
 
-        /// The kind of RPC this message belongs to.
-        const RpcKind rpcKind;
+        /// The address of the message sender.
+        const Driver::Address* senderAddress;
 
         /// (Ideally) unique identifier for the message sender. The identifier
         /// is currently computed as a hash from `senderAddress` for the sake
         /// of simplicity, so it isn't truly unique at present.
+        // TODO: senderHash
         const uint64_t senderId;
 
-        // TODO: move it into MsgAccumulator?
-        // TODO: doc. dynamic throttling
-        uint32_t unscheduledBytes;
+        /// Must be either FROM_CLIENT, indicating that this message is the
+        /// request from a client, or FROM_SERVER, indicating that this is
+        /// the response from a server.
+        const uint8_t whoFrom;
 
       PRIVATE:
-        DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
+        DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
     };
 
     /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    class ClientRpc : public IncomingMessage {
+    class ClientRpc {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
@@ -295,6 +264,9 @@ class HomaTransport : public Transport {
 
         /// Use this object to report completion.
         RpcNotifier* notifier;
+
+        /// Unique identifier for this RPC.
+        RpcId rpcId;
 
         /// Offset within the request message of the next byte we should
         /// transmit to the server; all preceding bytes have already
@@ -322,25 +294,36 @@ class HomaTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
+        /// Holds state of partially-received multi-packet responses.
+        Tub<MessageAccumulator> accumulator;
+
+        /// Holds state of response messages that require scheduling.
+        Tub<ScheduledMessage> scheduledMessage;
+
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
+        // TODO: doc. dynamic throttling
+        uint32_t unscheduledBytes;
+
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : IncomingMessage(RpcId(session->t->clientId, sequence),
-                    CLIENT_RPC, session->serverAddress)
-            , session(session)
+            : session(session)
             , sequence(sequence)
             , request(request)
             , response(response)
             , notifier(notifier)
+            , rpcId(session->t->clientId, sequence)
             , transmitOffset(0)
             , transmitPriority(0)
             , transmitLimit(0)
             , lastTransmitTime(0)
             , silentIntervals(0)
             , transmitPending(false)
+            , accumulator()
+            , scheduledMessage()
             , outgoingRequestLinks()
+            , unscheduledBytes()
         {}
 
       PRIVATE:
@@ -350,7 +333,7 @@ class HomaTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc, public IncomingMessage {
+    class ServerRpc : public Transport::ServerRpc {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -366,6 +349,9 @@ class HomaTransport : public Transport {
 
         /// Where to send the response once the RPC has executed.
         const Driver::Address* clientAddress;
+
+        /// Unique identifier for this RPC.
+        RpcId rpcId;
 
         /// Offset within the response message of the next byte we should
         /// transmit to the client; all preceding bytes have already
@@ -403,16 +389,25 @@ class HomaTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
+        /// Holds state of partially-received multi-packet requests.
+        Tub<MessageAccumulator> accumulator;
+
+        /// Holds state of request messages that require scheduling.
+        Tub<ScheduledMessage> scheduledMessage;
+
         /// Used to link this object into t->serverTimerList.
         IntrusiveListHook timerLinks;
 
         /// Used to link this object into t->outgoingResponses.
         IntrusiveListHook outgoingResponseLinks;
 
+        // TODO: HOW TO INIT. IT
+        // TODO: doc. dynamic throttling
+        uint32_t unscheduledBytes;
+
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : IncomingMessage(rpcId, SERVER_RPC, clientAddress)
-            , t(transport)
+            : t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
@@ -424,8 +419,11 @@ class HomaTransport : public Transport {
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
+            , accumulator()
+            , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
+            , unscheduledBytes()
         {}
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
@@ -634,12 +632,12 @@ class HomaTransport : public Transport {
             uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
             bool partialOK = false);
     bool tryToTransmitData();
-    bool tryToSchedule(IncomingMessage* message, bool newMessage = true);
-    void adjustSchedulingPrecedence(IncomingMessage* message,
+    bool tryToSchedule(ScheduledMessage* message, bool newMessage = true);
+    void adjustSchedulingPrecedence(ScheduledMessage* message,
             bool alreadyInList = false);
-    void replaceActiveMessage(IncomingMessage* oldMessage,
-            IncomingMessage* newMessage, bool purgeOK = false);
-    void scheduledMessageReceiveData(IncomingMessage* message);
+    void replaceActiveMessage(ScheduledMessage* oldMessage,
+            ScheduledMessage* newMessage, bool purgeOK = false);
+    void scheduledMessageReceiveData(ScheduledMessage* message);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -785,8 +783,8 @@ class HomaTransport : public Transport {
     /// in-flight packets from each of these messages. Once a message has
     /// been granted in its entirety, it will be removed from the list.
     /// This list always maintains an ordering of the messages based on the
-    /// comparison function defined in #IncomingMessage.
-    INTRUSIVE_LIST_TYPEDEF(IncomingMessage, activeMessageLinks)
+    /// comparison function defined in #ScheduledMessage.
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
             ActiveMessageList;
     ActiveMessageList activeMessages;
 
@@ -796,9 +794,9 @@ class HomaTransport : public Transport {
     /// network. One of these messages may be chosen to become an active message
     /// when a former active message is granted completely. The list doesn't
     /// maintain any particular ordering of the messages within it.
-    INTRUSIVE_LIST_TYPEDEF(IncomingMessage, interactiveMessageLinks)
-            InteractiveMessageList;
-    InteractiveMessageList interativeMessages;
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
+            InactiveMessageList;
+    InactiveMessageList inactiveMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is
