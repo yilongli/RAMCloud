@@ -144,7 +144,6 @@ class HomaTransport : public Transport {
         ~MessageAccumulator();
         bool addPacket(DataHeader *header, uint32_t length);
         bool appendFragment(DataHeader *header, uint32_t length);
-        uint32_t getRemainingBytes() const;
         uint32_t requestRetransmission(HomaTransport *t,
                 const Driver::Address* address, RpcId rpcId,
                 uint32_t grantOffset, uint8_t whoFrom);
@@ -204,11 +203,11 @@ class HomaTransport : public Transport {
      */
     class ScheduledMessage {
       public:
-        ScheduledMessage(HomaTransport* t, MessageAccumulator* accumulator,
-                uint32_t grantOffset, RpcId* rpcId,
+        ScheduledMessage(MessageAccumulator* accumulator,
+                uint32_t unscheduledBytes,
                 const Driver::Address* senderAddress, uint8_t whoFrom);
-        ~ScheduledMessage() {};
-        bool lessThan(ScheduledMessage& other) const;
+        ~ScheduledMessage();
+        int compareTo(ScheduledMessage& other) const;
 
         /// Holds state of partially-received multi-packet messages.
         const MessageAccumulator* accumulator;
@@ -219,21 +218,17 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->inactiveMessages.
         IntrusiveListHook inactiveMessageLinks;
 
-        /// Offset from the most recent GRANT packet we have sent for
-        /// this incoming message, or 0 if we haven't sent any GRANTs.
+        /// Offset from the most recent GRANT packet we have sent for this
+        /// incoming message, or # unscheduled bytes in this message if we
+        /// haven't sent any GRANTs.
         uint32_t grantOffset;
 
-        /// Unique identifier for the RPC this message belongs to.
-        const RpcId* rpcId;
-
-        /// The address of the message sender.
+        /// Network address of the message sender.
         const Driver::Address* senderAddress;
 
-        /// (Ideally) unique identifier for the message sender. The identifier
-        /// is currently computed as a hash from `senderAddress` for the sake
-        /// of simplicity, so it isn't truly unique at present.
-        // TODO: senderHash
-        const uint64_t senderId;
+        /// Hash of `senderAddress`, used by the scheduler to quickly
+        /// distinguish message senders.
+        const uint64_t senderHash;
 
         /// Must be either FROM_CLIENT, indicating that this message is the
         /// request from a client, or FROM_SERVER, indicating that this is
@@ -401,7 +396,6 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->outgoingResponses.
         IntrusiveListHook outgoingResponseLinks;
 
-        // TODO: HOW TO INIT. IT
         // TODO: doc. dynamic throttling
         uint32_t unscheduledBytes;
 
@@ -637,7 +631,7 @@ class HomaTransport : public Transport {
             bool alreadyInList = false);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
             ScheduledMessage* newMessage, bool purgeOK = false);
-    void scheduledMessageReceiveData(ScheduledMessage* message);
+    void dataArriveForScheduledMessage(ScheduledMessage* message, RpcId rpcId);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -736,7 +730,7 @@ class HomaTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
-    // TODO: need to clear up the use of this field thoroughly
+    // TODO: need to clean up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
