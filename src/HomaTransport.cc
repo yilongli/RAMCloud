@@ -797,13 +797,15 @@ HomaTransport::handlePacket(Driver::Received* received)
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->offset, received->len, header->common.flags);
                 if (!clientRpc->accumulator) {
+                    uint32_t totalLength = header->totalLength;
+                    uint32_t unscheduledBytes = header->unscheduledBytes;
                     clientRpc->accumulator.construct(this, clientRpc->response,
-                            header->totalLength);
-                    if (header->totalLength > header->unscheduledBytes) {
+                            totalLength);
+                    if (totalLength > unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
-                                clientRpc->accumulator.get(),
-                                header->unscheduledBytes,
-                                clientRpc->session->serverAddress, FROM_SERVER);
+                                clientRpc->accumulator.get(), unscheduledBytes,
+                                clientRpc->session->serverAddress,
+                                FROM_SERVER);
                     }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
@@ -1006,15 +1008,16 @@ HomaTransport::handlePacket(Driver::Received* received)
                             header->common.rpcId);
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
+                    uint32_t totalLength = header->totalLength;
+                    uint32_t unscheduledBytes = header->unscheduledBytes;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload, header->totalLength);
-                    serverTimerList.push_back(*serverRpc);
-                    if (header->totalLength > header->unscheduledBytes) {
+                            &serverRpc->requestPayload, totalLength);
+                    if (totalLength > unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
-                                serverRpc->accumulator.get(),
-                                header->unscheduledBytes,
+                                serverRpc->accumulator.get(), unscheduledBytes,
                                 serverRpc->clientAddress, FROM_CLIENT);
                     }
+                    serverTimerList.push_back(*serverRpc);
                 } else if (serverRpc->requestComplete) {
                     // We've already received the full message, so
                     // ignore this packet.
@@ -1580,8 +1583,8 @@ HomaTransport::checkTimeouts()
                 driver->sendPacket(clientRpc->session->serverAddress,
                         &resend, NULL, controlPacketPriority);
             }
-        } else if (clientRpc->scheduledMessage
-                || contains(activeMessages, *clientRpc)) {
+        } else if (!clientRpc->scheduledMessage
+                || contains(activeMessages, *clientRpc->scheduledMessage)) {
             // We have received part of the response and the response message
             // is either a unscheduled or active message. If the server has
             // gone silent, this must mean packets were lost, grants were lost,
@@ -1633,8 +1636,8 @@ HomaTransport::checkTimeouts()
 
         // See if we need to request retransmission for part of the request
         // message.
-        if ((serverRpc->silentIntervals >= 2) && (serverRpc->scheduledMessage
-                || contains(activeMessages, *serverRpc))) {
+        if ((serverRpc->silentIntervals >= 2) && (!serverRpc->scheduledMessage
+                || contains(activeMessages, *serverRpc->scheduledMessage))) {
             serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId,
                     serverRpc->scheduledMessage->grantOffset, FROM_SERVER);
@@ -1737,7 +1740,8 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
             // priority if we haven't used up all the priorities for scheduled
             // traffic.
             highestGrantedPrio++;
-        } else if (highestGrantedPrio + 1 < activeMessages.size()) {
+        } else if (highestGrantedPrio + 1 <
+                downCast<int>(activeMessages.size())) {
             // The priorites we are granting for scheduled traffic is not
             // enough to accomodate all the active messages.
             highestGrantedPrio++;
@@ -1792,7 +1796,7 @@ HomaTransport::tryToSchedule(ScheduledMessage* message, bool newMessage)
         adjustSchedulingPrecedence(message);
         highestGrantedPrio++;
         success = true;
-    } else if (*message < activeMessages.back()) {
+    } else if (message->compareTo(activeMessages.back()) < 0) {
         // The new message should replace the "worst" active message.
         replaceActiveMessage(&activeMessages.back(), message);
         success = true;
@@ -1837,7 +1841,7 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
         // Output a GRANT if the data packet is from an active message.
         needGrant = true;
         adjustSchedulingPrecedence(message, true);
-    } else if (*message < activeMessages.back()) {
+    } else if (message->compareTo(activeMessages.back()) <  0) {
         // This message is an inactive message which has the chance to be
         // promoted to an active message. Output a GRANT if it does make it
         // to the active message list.
