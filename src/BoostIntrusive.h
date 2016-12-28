@@ -60,6 +60,15 @@ typedef boost::intrusive::set_member_hook<> IntrusiveSetHook;
                     IntrusiveListHook, \
                     &entryType::hookName> >
 
+// TODO: document
+template<typename entryType, IntrusiveListHook entryType::* hook>
+using IntrusiveList = boost::intrusive::list<
+        entryType,
+        boost::intrusive::member_hook<entryType, IntrusiveListHook, hook>>;
+
+#define INTRUSIVE_LIST(entryType, hookName) \
+    IntrusiveList<entryType, &entryType::hookName>
+
 /**
  * Create a name for the type of an intrusive set.
  * \param entryType
@@ -135,15 +144,15 @@ insertBefore(List& list, Node& newNode, const Node& nextNode) {
     list.insert(list.iterator_to(nextNode), newNode);
 }
 
-template<typename List, typename Node>
+template<typename Container, typename Node>
 void
-erase(List& list, Node& node) {
-    list.erase(list.iterator_to(node));
+erase(Container& container, Node& node) {
+    container.erase(container.iterator_to(node));
 }
 
-template<typename List, typename Node>
+template<typename entryType, IntrusiveListHook entryType::* hook>
 bool
-contains(List& list, Node& node) {
+contains(IntrusiveList<entryType, hook>& list, entryType& node) {
     return list.iterator_to(node) != list.end();
 }
 

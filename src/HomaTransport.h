@@ -778,9 +778,7 @@ class HomaTransport : public Transport {
     /// been granted in its entirety, it will be removed from the list.
     /// This list always maintains an ordering of the messages based on the
     /// comparison function defined in #ScheduledMessage.
-    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
-            ActiveMessageList;
-    ActiveMessageList activeMessages;
+    INTRUSIVE_LIST(ScheduledMessage, activeMessageLinks) activeMessages;
 
     /// Holds a list of scheduled messages that we have received at least one
     /// packet for each of them, but haven't yet fully granted them and aren't
@@ -788,9 +786,7 @@ class HomaTransport : public Transport {
     /// network. One of these messages may be chosen to become an active message
     /// when a former active message is granted completely. The list doesn't
     /// maintain any particular ordering of the messages within it.
-    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
-            InactiveMessageList;
-    InactiveMessageList inactiveMessages;
+    INTRUSIVE_LIST(ScheduledMessage, inactiveMessageLinks) inactiveMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is

@@ -797,15 +797,14 @@ HomaTransport::handlePacket(Driver::Received* received)
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->offset, received->len, header->common.flags);
                 if (!clientRpc->accumulator) {
-                    uint32_t totalLength = header->totalLength;
-                    uint32_t unscheduledBytes = header->unscheduledBytes;
                     clientRpc->accumulator.construct(this, clientRpc->response,
-                            totalLength);
-                    if (totalLength > unscheduledBytes) {
+                            uint32_t(header->totalLength));
+                    if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
-                                clientRpc->accumulator.get(), unscheduledBytes,
+                                clientRpc->accumulator.get(),
+                                uint32_t(header->unscheduledBytes),
                                 clientRpc->session->serverAddress,
-                                FROM_SERVER);
+                                static_cast<uint8_t>(FROM_SERVER));
                     }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
@@ -1008,14 +1007,15 @@ HomaTransport::handlePacket(Driver::Received* received)
                             header->common.rpcId);
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
-                    uint32_t totalLength = header->totalLength;
-                    uint32_t unscheduledBytes = header->unscheduledBytes;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload, totalLength);
-                    if (totalLength > unscheduledBytes) {
+                            &serverRpc->requestPayload,
+                            uint32_t(header->totalLength));
+                    if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
-                                serverRpc->accumulator.get(), unscheduledBytes,
-                                serverRpc->clientAddress, FROM_CLIENT);
+                                serverRpc->accumulator.get(),
+                                uint32_t(header->unscheduledBytes),
+                                serverRpc->clientAddress,
+                                static_cast<uint8_t>(FROM_CLIENT));
                     }
                     serverTimerList.push_back(*serverRpc);
                 } else if (serverRpc->requestComplete) {
@@ -1672,7 +1672,7 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message,
         if (message->compareTo(m) < 0) {
             // Find the first message that is
             if (alreadyInList) {
-                erase(activeMessages, message);
+                erase(activeMessages, *message);
             }
             insertBefore(activeMessages, *message, m);
             return;
@@ -1892,12 +1892,9 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     }
 
     // Output a GRANT for the selected message.
-    char* fmt;
-    if (messageToGrant->whoFrom == FROM_CLIENT) {
-        fmt = "client sending GRANT, sequence %u, offset %u, priority %u";
-    } else {
-        fmt = "server sending GRANT, sequence %u, offset %u, priority %u";
-    }
+    const char* fmt = (messageToGrant->whoFrom == FROM_CLIENT) ?
+            "client sending GRANT, sequence %u, offset %u, priority %u" :
+            "server sending GRANT, sequence %u, offset %u, priority %u";
     timeTrace(fmt, downCast<uint32_t>(rpcId.sequence),
             messageToGrant->grantOffset, priority);
     GrantHeader grant(rpcId, messageToGrant->grantOffset,
