@@ -315,6 +315,12 @@ class ZipfianGenerator {
     }
 };
 
+const char* getCommand(char* buffer, uint32_t size, bool remove = true);
+void sendCommand(const char* command, const char* state, int firstSlave,
+            int numSlaves = 1);
+void waitSlave(int slave, const char* state, double timeout = 1.0);
+void setSlaveState(const char* state);
+
 /**
  * Used to generate a run workloads of a specific read/write distribution.  For
  * the most part, the workloads are modeled after the YCSB workload generator.
@@ -328,32 +334,31 @@ class WorkloadGenerator {
      *      Name of the workload to be generated.
      */
     explicit WorkloadGenerator(string workloadName)
-        : recordCount(2000000)
-        , recordSizeB(objectSize)
+        : keyLength(30)
+        , keyPrefix("workload")
+        , recordCount(2000000)
+        , recordSize(downCast<uint32_t>(objectSize))
         , readPercent(100)
-        , generator()
+        , keyNumberGenerator(recordCount)
     {
         if (workloadName == "YCSB-A") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 50;
         } else if (workloadName == "YCSB-B") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 95;
         } else if (workloadName == "YCSB-C") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 100;
         } else if (workloadName == "WRITE-ONLY") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 0;
         } else {
             RAMCLOUD_LOG(WARNING,
                 "Unknown workload type %s - Using default",
                 workloadName.c_str());
         }
+<<<<<<< HEAD
 
         if (numObjects != 1) {
             recordCount = numObjects;
@@ -370,63 +375,68 @@ class WorkloadGenerator {
         RAMCLOUD_LOG(NOTICE, ">>> Migrate Percentage: %d", migratePercentage);
 
         generator.construct(recordCount);
+=======
+>>>>>>> 07f632d... started working on ClusterPerf.cc
     }
+
+    using Key = char[keyLength];
+    using Value = char[recordSize];
 
     /**
      * Setup the workload; creates tables and loads working set.
      */
     void setup()
     {
-        #define BATCH_SIZE 500
-        const uint16_t keyLength = 30;
+        // TODO: SHOULD I USE STRING INSTEAD OF NAKED CHAR ARRAY?
+#define BATCH_SIZE 500
 
-        // Initialize keys and values
-        MultiWriteObject** objects = new MultiWriteObject*[BATCH_SIZE];
-        char* keys = new char[BATCH_SIZE * keyLength];
-        memset(keys, 0, BATCH_SIZE * keyLength);
+        std::array<Tub<MultiWriteObject>, BATCH_SIZE> multiWriteObjects;
+        MultiWriteObject** multiWriteRequests =
+                new MultiWriteObject*[BATCH_SIZE];
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            multiWriteRequests[i] =
+                    reinterpret_cast<MultiWriteObject*>(&multiWriteObjects[i]);
+        }
 
-        char* charValues = new char[BATCH_SIZE * recordSizeB];
-        memset(charValues, 0, BATCH_SIZE * recordSizeB);
+        // TODO
+        Key* keys = (Key*) std::calloc(BATCH_SIZE, sizeof(Key));
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            keyPrefix.copy(keys[i], keyPrefix.length());
+        }
+        Value* values = (Value*) std::calloc(BATCH_SIZE, sizeof(Value));
 
-        uint64_t i, j;
-        for (i = 0; i < static_cast<uint64_t>(recordCount); i++) {
-            j = i % BATCH_SIZE;
+        // Populate the data table
+        for (uint64_t i = 0; i < recordCount; i++) {
+            uint32_t j = downCast<uint32_t>(i % BATCH_SIZE);
 
-            char* key = keys + j * keyLength;
-            char* value = charValues + j * recordSizeB;
-            string("workload").copy(key, 8);
-            *reinterpret_cast<uint64_t*>(key + 8) = i;
+            char* key = (char*) keys[j];
+            uint64_t* keyNumber = reinterpret_cast<uint64_t*>(
+                    key + keyPrefix.length());
+            *keyNumber = i;
 
-            Util::genRandomString(value, recordSizeB);
-            objects[j] = new MultiWriteObject(dataTable, key, keyLength, value,
-                    recordSizeB);
+            char* value = (char*) values[j];
+            Util::genRandomString(value, recordSize);
+            multiWriteObjects[j].construct(dataTable, key, keyLength, value,
+                    recordSize);
 
             // Do the write and recycle the objects
-            if (j == BATCH_SIZE - 1) {
-                cluster->multiWrite(objects, BATCH_SIZE);
-
-                // Clean up the actual MultiWriteObjects
-                for (int k = 0; k < BATCH_SIZE; k++)
-                    delete objects[k];
-
-                memset(keys, 0, BATCH_SIZE * keyLength);
-                memset(charValues, 0, BATCH_SIZE * recordSizeB);
+            if ((j == BATCH_SIZE - 1) || (i == recordCount - 1)) {
+                cluster->multiWrite(multiWriteRequests, j + 1);
             }
         }
+#undef BATCH_SIZE
 
-        // Do the last partial batch and clean up, if it exists.
-        j = i % BATCH_SIZE;
-        if (j < BATCH_SIZE - 1) {
-            cluster->multiWrite(objects, static_cast<uint32_t>(j));
+        std::free(keys);
+        std::free(values);
+        delete[] multiWriteRequests;
+    }
 
-            // Clean up the actual MultiWriteObjects
-            for (uint64_t k = 0; k < j; k++)
-                delete objects[k];
-        }
-
-        delete[] keys;
-        delete[] charValues;
-        delete[] objects;
+    void
+    randomMutate(char* str, const uint32_t length) {
+        static const char alphanum[] =
+            "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        uint32_t pos = generateRandom() % length;
+        str[pos] = alphanum[generateRandom() % (sizeof(alphanum) - 1)];
     }
 
     /**
@@ -436,12 +446,41 @@ class WorkloadGenerator {
      *      Throughput the workload should attempt to maintain; 0 means run at
      *      full throttle.
      */
-    void run(uint64_t targetOps = 0)
+    void run(uint64_t targetOps = 0, bool isSlave, bool measureRead,
+            uint64_t repeat = 0, double* maxThroughput = NULL,
+            vector<uint64_t>* results = NULL)
     {
-        const uint16_t keyLen = 30;
-        char key[keyLen];
-        Buffer readBuf;
-        char value[recordSizeB];
+        // Statistics objects used only by the master client.
+        Tub<Buffer> statsBuffer;
+        Tub<PerfStats> startStats;
+        Tub<PerfStats> finishStats;
+
+        Key key = {};
+        if (!isSlave) {
+            // TODO: ???
+            // Begin counter collection on the server side.
+            cluster->objectServerControl(dataTable, key, keyLength,
+                    WireFormat::START_PERF_COUNTERS);
+            // TODO: ???
+            // Force serialization so that writing interferes less with the read
+            // benchmark.
+            Util::serialize();
+        }
+
+        keyPrefix.copy(key, keyPrefix.length());
+        uint64_t* keyNumber = reinterpret_cast<uint64_t*>(
+                key + keyPrefix.length());
+        if (!isSlave) {
+            *keyNumber = 0;
+            statsBuffer.construct();
+            cluster->objectServerControl(dataTable, key, keyLength,
+                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                    statsBuffer.get());
+            startStats.construct(*statsBuffer->getStart<PerfStats>());
+        }
+
+        char value[recordSize];
+        Util::genRandomString(value, recordSize);
 
         uint64_t readThreshold = (~0UL / 100) * readPercent;
         uint64_t opCount = 0;
@@ -455,67 +494,104 @@ class WorkloadGenerator {
             Cycles::sleep((generateRandom() % targetNSPO) / 1000);
         }
 
-        uint64_t nextStop = 0;
         uint64_t start = Cycles::rdtsc();
-        uint64_t stop = 0;
-
+        uint64_t stop = start;
         try
         {
+            Buffer readBuf;
             while (true) {
-                // Generate random key.
-                memset(key, 0, keyLen);
-                string("workload").copy(key, 8);
-                *reinterpret_cast<uint64_t*>(key + 8) = generator->nextNumber();
+                *keyNumber = keyNumberGenerator.nextNumber();
 
                 // Perform Operation
                 if (generateRandom() <= readThreshold) {
                     // Do read
-                    cluster->read(dataTable, key, keyLen, &readBuf);
+                    cluster->read(dataTable, key, keyLength, &readBuf);
+                    if (!isSlave && measureRead) {
+                        (*results)[readCount] = Cycles::rdtsc() - start;
+                        repeat--;
+                    }
                     readCount++;
                 } else {
                     // Do write
+<<<<<<< HEAD
                     Util::genRandomString(value, recordSizeB);
                     cluster->write(dataTable, key, keyLen, value, recordSizeB,
                                    NULL, NULL, asyncReplication);
+=======
+                    randomMutate(value, recordSize);
+                    cluster->write(dataTable, key, keyLength, value,
+                            recordSize);
+                    if (!isSlave && !measureRead) {
+                        (*results)[writeCount] = Cycles::rdtsc() - start;
+                        repeat--;
+                    }
+>>>>>>> 07f632d... started working on ClusterPerf.cc
                     writeCount++;
                 }
                 opCount++;
                 stop = Cycles::rdtsc();
 
+                if (!isSlave && repeat == 0) {
+                    break;
+                }
+
                 // throttle
                 if (targetNSPO > 0) {
-                    nextStop = start +
-                               Cycles::fromNanoseconds(
-                                    (opCount * targetNSPO) +
-                                    (generateRandom() % targetNSPO) -
-                                    (targetNSPO / 2));
+                    uint64_t nextStop = start + Cycles::fromNanoseconds(
+                            (opCount * targetNSPO) +
+                            (generateRandom() % targetNSPO) -
+                            (targetNSPO / 2));
                     if (Cycles::rdtsc() > nextStop) {
                         targetMissCount++;
+                        continue;
                     }
                     while (Cycles::rdtsc() < nextStop);
                 }
             }
         } catch (TableDoesntExistException &e) {
-            LogLevel ll = NOTICE;
-            if (targetMissCount > 0) {
-                ll = WARNING;
-            }
-            RAMCLOUD_LOG(ll,
+            LogLevel logLevel = targetMissCount > 0 ? WARNING : NOTICE;
+            RAMCLOUD_LOG(logLevel,
                     "Actual OPS %.0f / Target OPS %lu",
                     static_cast<double>(opCount) /
-                    static_cast<double>(Cycles::toSeconds(stop - start)),
+                    Cycles::toSeconds(stop - start),
                     targetOps);
-            RAMCLOUD_LOG(ll,
+            RAMCLOUD_LOG(logLevel,
                     "%lu Misses / %lu Total -- %lu/%lu R/W",
                     targetMissCount, opCount, readCount, writeCount);
-            throw e;
+        }
+
+        if (!isSlave) {
+            cluster->objectServerControl(dataTable, key, keyLength,
+                    WireFormat::ControlOp::GET_PERF_STATS, NULL, 0,
+                    statsBuffer.get());
+            finishStats.construct(*statsBuffer->getStart<PerfStats>());
+            double elapsedTime = static_cast<double>(
+                    finishStats->collectionTime - startStats->collectionTime) /
+                    finishStats->cyclesPerSecond;
+            *maxThroughput = static_cast<double>(finishStats->readCount +
+                    finishStats->writeCount - startStats->readCount -
+                    startStats->writeCount) / elapsedTime;
         }
     }
-//private:
-    int recordCount;
-    int recordSizeB;
+
+    // Size of each key, in bytes.
+    const uint16_t keyLength;
+
+    // Every key starts with this string.
+    const string keyPrefix;
+
+    /// # records that will be populated in the data table.
+    uint64_t recordCount;
+
+    /// Size of each record (i.e., object), in bytes.
+    const uint32_t recordSize;
+
+    /// How many percentage of the operations are reads.
     int readPercent;
-    Tub<ZipfianGenerator> generator;
+
+    // Random key number generator, used to decide which object to read
+    // or write at each iteration.
+    ZipfianGenerator keyNumberGenerator;
 };
 
 /**
@@ -4261,33 +4337,27 @@ void
 doWorkload(OpType type)
 {
     WorkloadGenerator loadGenerator(workload);
-
     if (clientIndex > 0) {
-        // Perform slave setup.
-        while (true) {
-            char command[20];
-            getCommand(command, sizeof(command));
-            if (strcmp(command, "run") == 0) {
-                // Slaves will run the specified workload until the "data" table
-                // is dropped.
-                setSlaveState("running");
-                try
-                {
-                    loadGenerator.run(static_cast<uint64_t>(targetOps));
-                }
-                catch (TableDoesntExistException &e)
-                {}
-                setSlaveState("done");
-                return;
-            } else {
-                RAMCLOUD_LOG(ERROR, "unknown command %s", command);
-                return;
-            }
+        // This is a slave client.
+        char command[20];
+        getCommand(command, sizeof(command));
+        if (strcmp(command, "run") == 0) {
+            // Slaves will run the specified workload until the "data" table
+            // is dropped.
+            setSlaveState("running");
+            loadGenerator.run(static_cast<uint64_t>(targetOps), true);
+            setSlaveState("done");
+        } else {
+            RAMCLOUD_LOG(ERROR, "unknown command %s", command);
         }
+        return;
     }
 
+    // This is a master client.
     loadGenerator.setup();
+    sendCommand("run", "running", 1, numClients - 1);
 
+<<<<<<< HEAD
     sendCommand("run", "running", 1, numClients-1);
 
     const uint16_t keyLen = 30;
@@ -4458,6 +4528,12 @@ doWorkload(OpType type)
     RAMCLOUD_LOG(ll,
             "%lu Misses / %lu Total -- %lu/%lu R/W",
             targetMissCount, opCount, readCount, writeCount);
+=======
+    double rate;
+    vector<uint64_t> ticks(count);
+    loadGenerator.run(static_cast<uint64_t>(targetOps), false,
+            type == READ_TYPE, count, &rate, &ticks);
+>>>>>>> 07f632d... started working on ClusterPerf.cc
 
     // Stop slaves.
     cluster->dropTable("data");
@@ -6330,7 +6406,7 @@ workloadThroughput()
                 setSlaveState("running");
                 try
                 {
-                    loadGenerator.run(static_cast<uint64_t>(targetOps));
+                    loadGenerator.run(static_cast<uint64_t>(targetOps), true);
                 }
                 catch (TableDoesntExistException &e)
                 {}
