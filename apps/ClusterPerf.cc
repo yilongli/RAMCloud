@@ -348,63 +348,46 @@ class WorkloadGenerator {
     void setup()
     {
         #define BATCH_SIZE 500
-        // TODO: WHY 30? WHY NOT 8 + (64 / 8) = 16? WHY NOT
+        // TODO: WHY 30? WHY NOT 8 + (64 / 8) = 16? WHY NOT USE CONST OR MACRO CONSISTENTLY?
         const uint16_t keyLength = 30;
 
-        // Initialize keys and values
+        using Key = char[30];
+        using Object = char[recordSize];
+
         std::array<Tub<MultiWriteObject>, BATCH_SIZE> objects;
-        MultiWriteObject** requests = new MultiWriteObject*[BATCH_SIZE];
+        MultiWriteObject** multiWriteRequests =
+                new MultiWriteObject*[BATCH_SIZE];
         for (int i = 0; i < BATCH_SIZE; i++) {
-            requests[i] = objects[i].get();
+            multiWriteRequests[i] =
+                    reinterpret_cast<MultiWriteObject*>(&objects[i]);
         }
-        // TODO: I mean, there is no reason to have an array of pointers; why not just allocate a contiguous chunk of memory?
-//        MultiWriteObject** objects = new MultiWriteObject*[BATCH_SIZE];
-        char* keys = (char*) std::calloc(BATCH_SIZE, keyLength);
-        char* values = (char*) std::calloc(BATCH_SIZE, recordSize);
 
-        uint64_t i, j;
-        for (i = 0; i < recordCount; i++) {
-            j = i % BATCH_SIZE;
+        // Initialize keys and values
+        Key* keys = (Key*) std::calloc(BATCH_SIZE, sizeof(Key));
+        Object* values = (Object*) std::calloc(BATCH_SIZE, sizeof(Object));
+//        Key* keys = (Key*) std::calloc(BATCH_SIZE, keyLength);
+//        Object* values = (Object*) std::calloc(BATCH_SIZE, recordSize);
 
-            char* key = keys + j * keyLength;
+        for (uint64_t i = 0; i < recordCount; i++) {
+            uint64_t j = i % BATCH_SIZE;
+
+            char* key = (char*) keys[j];
             string("workload").copy(key, 8);
             *reinterpret_cast<uint64_t*>(key + 8) = i;
 
-            char* value = values + j * recordSize;
+            char* value = (char*) values[j];
             Util::genRandomString(value, recordSize);
             objects[j].construct(dataTable, key, keyLength, value, recordSize);
-//            objects[j] = new MultiWriteObject(dataTable, key, keyLength, value,
-//                    recordSize);
 
             // Do the write and recycle the objects
             if ((j == BATCH_SIZE - 1) || (i == recordCount - 1)) {
-                cluster->multiWrite(requests, j + 1);
-
-                // Clean up the actual MultiWriteObjects
-                // TODO: .construct() will destroy the old object first
-//                for (int k = 0; k < BATCH_SIZE; k++)
-//                    delete objects[k];
-
-                // TODO: WHY RESET 0 WHEN YOU CAN SIMPLY OVERWRITE THE OLD VALUE?
-//                memset(keys, 0, BATCH_SIZE * keyLength);
-//                memset(values, 0, BATCH_SIZE * recordSize);
+                cluster->multiWrite(multiWriteRequests, j + 1);
             }
-        }
-
-        // Do the last partial batch and clean up, if it exists.
-        j = i % BATCH_SIZE;
-        if (j < BATCH_SIZE - 1) {
-            cluster->multiWrite(requests, downCast<uint32_t>(j));
-
-            // Clean up the actual MultiWriteObjects
-//            for (uint64_t k = 0; k < j; k++)
-//                delete objects[k];
         }
 
         std::free(keys);
         std::free(values);
-        delete[] requests;
-//        delete[] objects;
+        delete[] multiWriteRequests;
     }
 
     /**
