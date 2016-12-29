@@ -352,7 +352,7 @@ class WorkloadGenerator {
         const uint16_t keyLength = 30;
 
         using Key = char[30];
-        using Object = char[recordSize];
+        using Value = char[recordSize];
 
         std::array<Tub<MultiWriteObject>, BATCH_SIZE> objects;
         MultiWriteObject** multiWriteRequests =
@@ -364,20 +364,17 @@ class WorkloadGenerator {
 
         // Initialize keys and values
         Key* keys = (Key*) std::calloc(BATCH_SIZE, sizeof(Key));
-        Object* values = (Object*) std::calloc(BATCH_SIZE, sizeof(Object));
-//        Key* keys = (Key*) std::calloc(BATCH_SIZE, keyLength);
-//        Object* values = (Object*) std::calloc(BATCH_SIZE, recordSize);
-
+        Value* values = (Value*) std::calloc(BATCH_SIZE, sizeof(Value));
         for (uint64_t i = 0; i < recordCount; i++) {
-            uint64_t j = i % BATCH_SIZE;
+            uint32_t j = downCast<uint32_t>(i % BATCH_SIZE);
 
             char* key = (char*) keys[j];
             string("workload").copy(key, 8);
             *reinterpret_cast<uint64_t*>(key + 8) = i;
 
             char* value = (char*) values[j];
-            Util::genRandomString(value, recordSize);
-            objects[j].construct(dataTable, key, keyLength, value, recordSize);
+            Util::genRandomString(value, sizeof(Value));
+            objects[j].construct(dataTable, key, keyLength, value, sizeof(Value));
 
             // Do the write and recycle the objects
             if ((j == BATCH_SIZE - 1) || (i == recordCount - 1)) {
