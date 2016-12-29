@@ -60,7 +60,8 @@ typedef boost::intrusive::set_member_hook<> IntrusiveSetHook;
                     IntrusiveListHook, \
                     &entryType::hookName> >
 
-// TODO: document
+// TODO: document; THE DOWNSIDE OF THIS NEW SYNTAX IS THAT YOU CAN NO LONGER USE `ServerTimerList::iterator`
+// however, you can always use the foreach loop syntax to workaround? what about removing elements while iterating it?
 template<typename entryType, IntrusiveListHook entryType::* hook>
 using IntrusiveList = boost::intrusive::list<
         entryType,
@@ -150,11 +151,29 @@ erase(Container& container, Node& node) {
     container.erase(container.iterator_to(node));
 }
 
+// TODO: HAD TO MAKE THE TYPE PARAMETER VERY PRECISE TO AVOID CONFLICT WITH THE `contains` method in Common.h
+// (which I think is a very bad decision that pollutes the entire codebase)
 template<typename entryType, IntrusiveListHook entryType::* hook>
 bool
 contains(IntrusiveList<entryType, hook>& list, entryType& node) {
     return list.iterator_to(node) != list.end();
 }
+
+template<typename Container, typename Node>
+bool
+boost_intrusive_contains(Container& container, Node& node) {
+    return container.iterator_to(node) != container.end();
+}
+
+namespace BoostIntrusive {
+
+template<typename Container, typename Node>
+bool
+contains(Container& container, Node& node) {
+    return container.iterator_to(node) != container.end();
+}
+
+} // end BoostIntrusive
 
 } // end RAMCloud
 

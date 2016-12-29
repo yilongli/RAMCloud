@@ -1583,8 +1583,8 @@ HomaTransport::checkTimeouts()
                 driver->sendPacket(clientRpc->session->serverAddress,
                         &resend, NULL, controlPacketPriority);
             }
-        } else if (!clientRpc->scheduledMessage
-                || contains(activeMessages, *clientRpc->scheduledMessage)) {
+        } else if (!clientRpc->scheduledMessage || BoostIntrusive::contains(
+                activeMessages, *clientRpc->scheduledMessage)) {
             // We have received part of the response and the response message
             // is either a unscheduled or active message. If the server has
             // gone silent, this must mean packets were lost, grants were lost,
@@ -1636,8 +1636,9 @@ HomaTransport::checkTimeouts()
 
         // See if we need to request retransmission for part of the request
         // message.
-        if ((serverRpc->silentIntervals >= 2) && (!serverRpc->scheduledMessage
-                || contains(activeMessages, *serverRpc->scheduledMessage))) {
+        if ((serverRpc->silentIntervals >= 2) &&
+                (!serverRpc->scheduledMessage || BoostIntrusive::contains(
+                activeMessages, *serverRpc->scheduledMessage))) {
             serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId,
                     serverRpc->scheduledMessage->grantOffset, FROM_SERVER);
@@ -1837,7 +1838,7 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     bool needGrant;
     if (messagePurged) {
         needGrant = true;
-    } else if (contains(activeMessages, *message)) {
+    } else if (BoostIntrusive::contains(activeMessages, *message)) {
         // Output a GRANT if the data packet is from an active message.
         needGrant = true;
         adjustSchedulingPrecedence(message, true);

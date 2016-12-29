@@ -317,25 +317,21 @@ class WorkloadGenerator {
      */
     explicit WorkloadGenerator(string workloadName)
         : recordCount(2000000)
-        , recordSizeB(objectSize)
+        , recordSize(downCast<uint32_t>(objectSize))
         , readPercent(100)
         , generator()
     {
         if (workloadName == "YCSB-A") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 50;
         } else if (workloadName == "YCSB-B") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 95;
         } else if (workloadName == "YCSB-C") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 100;
         } else if (workloadName == "WRITE-ONLY") {
             recordCount = 1000000;
-            recordSizeB = objectSize;
             readPercent = 0;
         } else {
             RAMCLOUD_LOG(WARNING,
@@ -352,55 +348,63 @@ class WorkloadGenerator {
     void setup()
     {
         #define BATCH_SIZE 500
+        // TODO: WHY 30? WHY NOT 8 + (64 / 8) = 16? WHY NOT
         const uint16_t keyLength = 30;
 
         // Initialize keys and values
-        MultiWriteObject** objects = new MultiWriteObject*[BATCH_SIZE];
-        char* keys = new char[BATCH_SIZE * keyLength];
-        memset(keys, 0, BATCH_SIZE * keyLength);
-
-        char* charValues = new char[BATCH_SIZE * recordSizeB];
-        memset(charValues, 0, BATCH_SIZE * recordSizeB);
+        std::array<Tub<MultiWriteObject>, BATCH_SIZE> objects;
+        MultiWriteObject** requests = new MultiWriteObject*[BATCH_SIZE];
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            requests[i] = objects[i].get();
+        }
+        // TODO: I mean, there is no reason to have an array of pointers; why not just allocate a contiguous chunk of memory?
+//        MultiWriteObject** objects = new MultiWriteObject*[BATCH_SIZE];
+        char* keys = (char*) std::calloc(BATCH_SIZE, keyLength);
+        char* values = (char*) std::calloc(BATCH_SIZE, recordSize);
 
         uint64_t i, j;
-        for (i = 0; i < static_cast<uint64_t>(recordCount); i++) {
+        for (i = 0; i < recordCount; i++) {
             j = i % BATCH_SIZE;
 
             char* key = keys + j * keyLength;
-            char* value = charValues + j * recordSizeB;
             string("workload").copy(key, 8);
             *reinterpret_cast<uint64_t*>(key + 8) = i;
 
-            Util::genRandomString(value, recordSizeB);
-            objects[j] = new MultiWriteObject(dataTable, key, keyLength, value,
-                    recordSizeB);
+            char* value = values + j * recordSize;
+            Util::genRandomString(value, recordSize);
+            objects[j].construct(dataTable, key, keyLength, value, recordSize);
+//            objects[j] = new MultiWriteObject(dataTable, key, keyLength, value,
+//                    recordSize);
 
             // Do the write and recycle the objects
-            if (j == BATCH_SIZE - 1) {
-                cluster->multiWrite(objects, BATCH_SIZE);
+            if ((j == BATCH_SIZE - 1) || (i == recordCount - 1)) {
+                cluster->multiWrite(requests, j + 1);
 
                 // Clean up the actual MultiWriteObjects
-                for (int k = 0; k < BATCH_SIZE; k++)
-                    delete objects[k];
+                // TODO: .construct() will destroy the old object first
+//                for (int k = 0; k < BATCH_SIZE; k++)
+//                    delete objects[k];
 
-                memset(keys, 0, BATCH_SIZE * keyLength);
-                memset(charValues, 0, BATCH_SIZE * recordSizeB);
+                // TODO: WHY RESET 0 WHEN YOU CAN SIMPLY OVERWRITE THE OLD VALUE?
+//                memset(keys, 0, BATCH_SIZE * keyLength);
+//                memset(values, 0, BATCH_SIZE * recordSize);
             }
         }
 
         // Do the last partial batch and clean up, if it exists.
         j = i % BATCH_SIZE;
         if (j < BATCH_SIZE - 1) {
-            cluster->multiWrite(objects, static_cast<uint32_t>(j));
+            cluster->multiWrite(requests, downCast<uint32_t>(j));
 
             // Clean up the actual MultiWriteObjects
-            for (uint64_t k = 0; k < j; k++)
-                delete objects[k];
+//            for (uint64_t k = 0; k < j; k++)
+//                delete objects[k];
         }
 
-        delete[] keys;
-        delete[] charValues;
-        delete[] objects;
+        std::free(keys);
+        std::free(values);
+        delete[] requests;
+//        delete[] objects;
     }
 
     /**
@@ -415,7 +419,7 @@ class WorkloadGenerator {
         const uint16_t keyLen = 30;
         char key[keyLen];
         Buffer readBuf;
-        char value[recordSizeB];
+        char value[recordSize];
 
         uint64_t readThreshold = (~0UL / 100) * readPercent;
         uint64_t opCount = 0;
@@ -448,8 +452,8 @@ class WorkloadGenerator {
                     readCount++;
                 } else {
                     // Do write
-                    Util::genRandomString(value, recordSizeB);
-                    cluster->write(dataTable, key, keyLen, value, recordSizeB);
+                    Util::genRandomString(value, recordSize);
+                    cluster->write(dataTable, key, keyLen, value, recordSize);
                     writeCount++;
                 }
                 opCount++;
@@ -469,25 +473,30 @@ class WorkloadGenerator {
                 }
             }
         } catch (TableDoesntExistException &e) {
-            LogLevel ll = NOTICE;
-            if (targetMissCount > 0) {
-                ll = WARNING;
-            }
-            RAMCLOUD_LOG(ll,
+            LogLevel logLevel = targetMissCount > 0 ? WARNING : NOTICE;
+            RAMCLOUD_LOG(logLevel,
                     "Actual OPS %.0f / Target OPS %lu",
                     static_cast<double>(opCount) /
-                    static_cast<double>(Cycles::toSeconds(stop - start)),
+                    Cycles::toSeconds(stop - start),
                     targetOps);
-            RAMCLOUD_LOG(ll,
+            RAMCLOUD_LOG(logLevel,
                     "%lu Misses / %lu Total -- %lu/%lu R/W",
                     targetMissCount, opCount, readCount, writeCount);
             throw e;
         }
     }
 //private:
-    int recordCount;
-    int recordSizeB;
+
+    /// # records that will be populated in the data table.
+    uint64_t recordCount;
+
+    /// Size of each record (i.e., object), in bytes.
+    const uint32_t recordSize;
+
+    /// How many percentage of the operations are reads.
     int readPercent;
+
+    // Random number generator.
     Tub<ZipfianGenerator> generator;
 };
 
@@ -4188,11 +4197,10 @@ doWorkload(OpType type)
                 catch (TableDoesntExistException &e)
                 {}
                 setSlaveState("done");
-                return;
             } else {
                 RAMCLOUD_LOG(ERROR, "unknown command %s", command);
-                return;
             }
+            return;
         }
     }
 
@@ -4203,7 +4211,7 @@ doWorkload(OpType type)
     const uint16_t keyLen = 30;
     char key[keyLen];
     Buffer readBuf;
-    char value[loadGenerator.recordSizeB];
+    char value[loadGenerator.recordSize];
 
     // Begin counter collection on the server side.
     memset(key, 0, keyLen);
@@ -4261,10 +4269,10 @@ doWorkload(OpType type)
             readCount++;
         } else {
             // Do write
-            Util::genRandomString(value, loadGenerator.recordSizeB);
+            Util::genRandomString(value, loadGenerator.recordSize);
             uint64_t start = Cycles::rdtsc();
             cluster->write(dataTable, key, keyLen, value,
-                    loadGenerator.recordSizeB);
+                    loadGenerator.recordSize);
             ticks[i] = Cycles::rdtsc() - start;
             if (type == WRITE_TYPE) {
                 i++;
