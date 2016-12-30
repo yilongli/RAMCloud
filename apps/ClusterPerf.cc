@@ -316,7 +316,9 @@ class WorkloadGenerator {
      *      Name of the workload to be generated.
      */
     explicit WorkloadGenerator(string workloadName)
-        : recordCount(2000000)
+        : keyLength(30)
+        , keyPrefix("workload")
+        , recordCount(2000000)
         , recordSize(downCast<uint32_t>(objectSize))
         , readPercent(100)
         , generator()
@@ -347,40 +349,46 @@ class WorkloadGenerator {
      */
     void setup()
     {
-        #define BATCH_SIZE 500
-        // TODO: WHY 30? WHY NOT 8 + (64 / 8) = 16? WHY NOT USE CONST OR MACRO CONSISTENTLY?
-        const uint16_t keyLength = 30;
-
-        using Key = char[30];
+        // TODO: SHOULD I USE STRING INSTEAD OF NAKED CHAR ARRAY?
+#define BATCH_SIZE 500
+        using Key = char[keyLength];
         using Value = char[recordSize];
 
-        std::array<Tub<MultiWriteObject>, BATCH_SIZE> objects;
+        std::array<Tub<MultiWriteObject>, BATCH_SIZE> multiWriteObjects;
         MultiWriteObject** multiWriteRequests =
                 new MultiWriteObject*[BATCH_SIZE];
         for (int i = 0; i < BATCH_SIZE; i++) {
             multiWriteRequests[i] =
-                    reinterpret_cast<MultiWriteObject*>(&objects[i]);
+                    reinterpret_cast<MultiWriteObject*>(&multiWriteObjects[i]);
         }
 
-        // Initialize keys and values
+        // TODO
         Key* keys = (Key*) std::calloc(BATCH_SIZE, sizeof(Key));
+        for (int i = 0; i < BATCH_SIZE; i++) {
+            keyPrefix.copy(keys[i], keyPrefix.length());
+        }
         Value* values = (Value*) std::calloc(BATCH_SIZE, sizeof(Value));
+
+        // Populate the data table
         for (uint64_t i = 0; i < recordCount; i++) {
             uint32_t j = downCast<uint32_t>(i % BATCH_SIZE);
 
             char* key = (char*) keys[j];
-            string("workload").copy(key, 8);
-            *reinterpret_cast<uint64_t*>(key + 8) = i;
+            uint64_t* keyNumber = reinterpret_cast<uint64_t*>(
+                    key + keyPrefix.length());
+            *keyNumber = i;
 
             char* value = (char*) values[j];
-            Util::genRandomString(value, sizeof(Value));
-            objects[j].construct(dataTable, key, keyLength, value, sizeof(Value));
+            Util::genRandomString(value, recordSize);
+            multiWriteObjects[j].construct(dataTable, key, keyLength, value,
+                    recordSize);
 
             // Do the write and recycle the objects
             if ((j == BATCH_SIZE - 1) || (i == recordCount - 1)) {
                 cluster->multiWrite(multiWriteRequests, j + 1);
             }
         }
+#undef BATCH_SIZE
 
         std::free(keys);
         std::free(values);
@@ -396,9 +404,11 @@ class WorkloadGenerator {
      */
     void run(uint64_t targetOps = 0)
     {
-        const uint16_t keyLen = 30;
-        char key[keyLen];
         Buffer readBuf;
+        char key[keyLength] = {0};
+        keyPrefix.copy(key, keyPrefix.length());
+        uint64_t* keyNumber = reinterpret_cast<uint64_t*>(
+                key + keyPrefix.length());
         char value[recordSize];
 
         uint64_t readThreshold = (~0UL / 100) * readPercent;
@@ -421,19 +431,18 @@ class WorkloadGenerator {
         {
             while (true) {
                 // Generate random key.
-                memset(key, 0, keyLen);
-                string("workload").copy(key, 8);
-                *reinterpret_cast<uint64_t*>(key + 8) = generator->nextNumber();
+                *keyNumber = generator->nextNumber();
 
                 // Perform Operation
                 if (generateRandom() <= readThreshold) {
                     // Do read
-                    cluster->read(dataTable, key, keyLen, &readBuf);
+                    cluster->read(dataTable, key, keyLength, &readBuf);
                     readCount++;
                 } else {
                     // Do write
                     Util::genRandomString(value, recordSize);
-                    cluster->write(dataTable, key, keyLen, value, recordSize);
+                    cluster->write(dataTable, key, keyLength, value,
+                            recordSize);
                     writeCount++;
                 }
                 opCount++;
@@ -465,7 +474,12 @@ class WorkloadGenerator {
             throw e;
         }
     }
-//private:
+
+    // Size of each key, in bytes.
+    const uint16_t keyLength;
+
+    // Every key starts with this string.
+    const string keyPrefix;
 
     /// # records that will be populated in the data table.
     uint64_t recordCount;
