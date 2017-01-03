@@ -230,6 +230,20 @@ class HomaTransport : public Transport {
         /// distinguish message senders.
         const uint64_t senderHash;
 
+        /// This enum defines the state field values for scheduled messages.
+        enum State {
+            NEW,        // The message just arrives.
+            ACTIVE,     // The message is linked on t->activeMessages.
+            INACTIVE,   // The message is linked on t->inactiveMessages.
+            PURGED      // The message is purged from the scheduler.
+        };
+
+        /// The state of a scheduled messages is initialized to NEW by the
+        /// constructor. It can change between ACTIVE and INACTIVE several
+        /// times during the lifetime of the message. Finally, when the message
+        /// is fully granted, its state will be moved from ACTIVE to PURGED.
+        State state;
+
         /// Must be either FROM_CLIENT, indicating that this message is the
         /// request from a client, or FROM_SERVER, indicating that this is
         /// the response from a server.
@@ -366,12 +380,6 @@ class HomaTransport : public Transport {
         /// data bytes of the response.
         uint64_t lastTransmitTime;
 
-        /// The sum of the offset and length fields from the most recent
-        /// RESEND we have sent, 0 if no RESEND has been sent for this
-        /// RPC. Used to detect unnecessary RESENDs (because the original
-        /// data eventually arrives).
-        uint32_t resendLimit;
-
         /// Number of times that the transport timer has fired since we
         /// received any packets from the client.
         uint32_t silentIntervals;
@@ -409,7 +417,6 @@ class HomaTransport : public Transport {
             , transmitPriority(0)
             , transmitLimit(0)
             , lastTransmitTime(0)
-            , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
@@ -532,8 +539,8 @@ class HomaTransport : public Transport {
                                      // should transmit all data up to `offset`
                                      // using this priority.
 
-        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags,
-                uint8_t priority)
+        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t priority,
+                uint8_t flags)
             : common(PacketOpcode::GRANT, rpcId, flags)
             , offset(offset)
             , priority(priority)
@@ -626,9 +633,8 @@ class HomaTransport : public Transport {
             uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
             bool partialOK = false);
     bool tryToTransmitData();
-    bool tryToSchedule(ScheduledMessage* message, bool newMessage = true);
-    void adjustSchedulingPrecedence(ScheduledMessage* message,
-            bool alreadyInList = false);
+    bool tryToSchedule(ScheduledMessage* message);
+    void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
             ScheduledMessage* newMessage, bool purgeOK = false);
     void dataArriveForScheduledMessage(ScheduledMessage* message, RpcId rpcId);
@@ -653,11 +659,14 @@ class HomaTransport : public Transport {
     /// and available to us.
     const int highestAvailPriority;
 
+    // The highest priority to use for scheduled traffic.
+    int highestSchedPriority;
+
     /// The packet priority used for sending control packets.
     const int controlPacketPriority;
 
     /// The lowest priority to use for unscheduled traffic.
-    const uint8_t lowestUnschedPrio;
+    int lowestUnschedPrio;
 
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
@@ -760,13 +769,10 @@ class HomaTransport : public Transport {
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
 
-    /// The maximum packet priority supported by HomaTransport.
-#define MAX_PACKET_PRIORITY 31
-
     /// If the number at index i is the first element that is larger than the
     /// size of a message, then the sender should use the (i+1)-th highest
     /// priority for the entire unscheduled portion of the message.
-    uint32_t unschedTrafficPrioBrackets[MAX_PACKET_PRIORITY+1];
+    vector<uint32_t> unschedTrafficPrioBrackets;
 
     /// -----------------
     /// MESSAGE SCHEDULER
@@ -778,7 +784,9 @@ class HomaTransport : public Transport {
     /// been granted in its entirety, it will be removed from the list.
     /// This list always maintains an ordering of the messages based on the
     /// comparison function defined in #ScheduledMessage.
-    INTRUSIVE_LIST(ScheduledMessage, activeMessageLinks) activeMessages;
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
+            ActiveMessageList;
+    ActiveMessageList activeMessages;
 
     /// Holds a list of scheduled messages that we have received at least one
     /// packet for each of them, but haven't yet fully granted them and aren't
@@ -786,7 +794,9 @@ class HomaTransport : public Transport {
     /// network. One of these messages may be chosen to become an active message
     /// when a former active message is granted completely. The list doesn't
     /// maintain any particular ordering of the messages within it.
-    INTRUSIVE_LIST(ScheduledMessage, inactiveMessageLinks) inactiveMessages;
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
+            InactiveMessageList;
+    InactiveMessageList inactiveMessages;
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is
@@ -796,7 +806,7 @@ class HomaTransport : public Transport {
 
     /// Maximum # incoming messages that can be actively granted by the
     /// transport at any time.
-    const uint32_t maxGrantedMessages;
+    uint32_t maxGrantedMessages;
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
