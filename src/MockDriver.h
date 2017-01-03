@@ -83,9 +83,10 @@ class MockDriver : public Driver {
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
     virtual void sendPacket(const Address* addr,
-                            const void *header,
+                            const void* header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload);
+                            Buffer::Iterator* payload,
+                            int priority = 0);
     virtual string getServiceLocator();
 
     /**

@@ -58,16 +58,18 @@ class DpdkDriver : public Driver
     explicit DpdkDriver(Context* context, int port = 0);
     virtual ~DpdkDriver();
     void close();
+    virtual int getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
-    virtual int getBandwidth();
+    virtual uint32_t getBandwidth();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
     virtual void receivePackets(int maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
-    virtual void sendPacket(const Address *addr,
-                            const void *header,
+    virtual void sendPacket(const Address* addr,
+                            const void* header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload);
+                            Buffer::Iterator* payload,
+                            int priority = 0);
     virtual string getServiceLocator();
 
     typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;
@@ -106,14 +108,6 @@ class DpdkDriver : public Driver
 
     /// Hardware packet filter is provided by the NIC
     bool hasHardwareFilter;
-
-    /// Ethernet Header struct used in software packet filter
-    struct EthernetHeader {
-        uint8_t destAddress[6];
-        uint8_t sourceAddress[6];
-        uint16_t etherType; // network order
-        uint16_t length;    // host order, length of payload
-    } __attribute__((packed));
 
     // Effective network bandwidth, in Mbits/second.
     int bandwidthMbps;

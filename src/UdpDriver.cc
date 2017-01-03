@@ -221,10 +221,11 @@ UdpDriver::release(char *payload)
 
 // See docs in Driver class.
 void
-UdpDriver::sendPacket(const Address *addr,
-                      const void *header,
+UdpDriver::sendPacket(const Address* addr,
+                      const void* header,
                       uint32_t headerLen,
-                      Buffer::Iterator *payload)
+                      Buffer::Iterator* payload,
+                      int priority)
 {
     if (socketFd == -1)
         return;

@@ -56,8 +56,9 @@ class SolarFlareDriver : public Driver {
     virtual void release(char* payload);
     virtual void sendPacket(const Driver::Address* recipient,
                             const void* header,
-                            const uint32_t headerLen,
-                            Buffer::Iterator *payload);
+                            uint32_t headerLen,
+                            Buffer::Iterator* payload,
+                            int priority = 0);
     virtual string getServiceLocator();
     virtual Driver::Address* newAddress(const ServiceLocator& serviceLocator);
 

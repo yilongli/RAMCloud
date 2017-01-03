@@ -60,7 +60,7 @@ SHARED_SRCFILES := \
 		   src/BackupFailureMonitor.cc \
 		   src/BackupSelector.cc \
 		   src/Buffer.cc \
-                   src/CleanableSegmentManager.cc \
+		   src/CleanableSegmentManager.cc \
 		   src/ClientException.cc \
 		   src/ClusterMetrics.cc \
 		   src/CodeLocation.cc \
@@ -78,6 +78,7 @@ SHARED_SRCFILES := \
 		   src/FailSession.cc \
 		   src/FileLogger.cc \
 		   src/HashTable.cc \
+		   src/HomaTransport.cc \
 		   src/IndexKey.cc \
 		   src/IndexletManager.cc \
 		   src/IndexLookup.cc \

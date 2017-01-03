@@ -78,10 +78,11 @@ MockDriver::release(char *payload)
  * See Driver::release().
  */
 void
-MockDriver::sendPacket(const Address *addr,
-                       const void *header,
+MockDriver::sendPacket(const Address* addr,
+                       const void* header,
                        uint32_t headerLen,
-                       Buffer::Iterator *payload)
+                       Buffer::Iterator* payload,
+                       int priority)
 {
     sendPacketCount++;
     uint32_t bytesSent = headerLen;
