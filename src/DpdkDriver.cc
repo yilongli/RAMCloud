@@ -146,7 +146,10 @@ DpdkDriver::DpdkDriver(Context* context, int port)
     // Fix-up the locator string to reflect the real MAC address.
     rte_eth_macaddr_get(portId, &mac);
     localMac.construct(mac.addr_bytes);
-    locatorString = format("basic+dpdk:mac=%s",
+//    locatorString = format("basic+dpdk:mac=%s",
+//            localMac->toString().c_str());
+    // TODO(YilongL): I don't understand the code here
+    locatorString = format("homa+dpdk:mac=%s",
             localMac->toString().c_str());
 
     // configure some default NIC port parameters
@@ -249,16 +252,32 @@ DpdkDriver::~DpdkDriver()
         LOG(ERROR, "DpdkDriver deleted with %d packets still in use",
             packetBufsUtilized);
 
-    // Currently DPDK does not provide methods for freeing the various
-    // allocated resources (e.g. ring, mempool) and releasing the NIC.
-    // All we can do at this point is stop the packet reception
-    // by disabling the activated NIC port.
+    // Free the various allocated resources (e.g. ring, mempool) and release
+    // the NIC.
     rte_eth_dev_stop(portId);
+    rte_eth_dev_close(portId);
+    char devname[RTE_ETH_NAME_MAX_LEN+1];
+    if (rte_eth_dev_detach(portId, devname) != 0) {
+        LOG(ERROR, "DpdkDriver failed to detach Ethernet device: "
+                "portId = %u, devname = %s", portId, devname);
+    }
     rte_openlog_stream(NULL);
 }
 
 // See docs in Driver class.
+int
+DpdkDriver::getHighestPacketPriority()
+{
+#ifdef ETHERNET_DOT1P
+    // Assume we are allowed to use all 8 ethernet priorities specified
+    // in the Priority Code Point (PCP) field.
+    return 7;
+#else
+    return 0;
+#endif
+}
 
+// See docs in Driver class.
 uint32_t
 DpdkDriver::getMaxPacketSize()
 {
@@ -319,7 +338,8 @@ DpdkDriver::receivePackets(int maxPackets,
             // Perform packet filtering by software to skip irrelevant
             // packets such as ipmi or kernel TCP/IP traffics.
             char *data = rte_pktmbuf_mtod(m, char *);
-            auto& eth_header = *reinterpret_cast<EthernetHeader*>(data);
+            auto& eth_header =
+                    *reinterpret_cast<NetUtil::EthernetHeader*>(data);
             if (eth_header.etherType !=
                     HTONS(NetUtil::EthPayloadType::RAMCLOUD)) {
                 packetBufPool.destroy(buffer);
@@ -359,10 +379,11 @@ DpdkDriver::release(char *payload)
 
 // See docs in Driver class.
 void
-DpdkDriver::sendPacket(const Address *addr,
-                       const void *header,
+DpdkDriver::sendPacket(const Address* addr,
+                       const void* header,
                        uint32_t headerLen,
-                       Buffer::Iterator *payload)
+                       Buffer::Iterator* payload,
+                       int priority)
 {
     struct rte_mbuf *mbuf = NULL;
     char *data = NULL;
@@ -392,12 +413,27 @@ DpdkDriver::sendPacket(const Address *addr,
         return;
     }
 
-    NetUtil::EthernetHeader* ethHdr = reinterpret_cast<
-            NetUtil::EthernetHeader*>(p);
+    NetUtil::EthernetHeader* ethHdr =
+            reinterpret_cast<NetUtil::EthernetHeader*>(p);
 
     rte_memcpy(&ethHdr->destAddress,
             static_cast<const MacAddress*>(addr)->address, 6);
     rte_memcpy(&ethHdr->srcAddress, localMac->address, 6);
+#ifdef ETHERNET_DOT1P
+    ethHdr->tpid = HTONS(NetUtil::EthPayloadType::VLAN_TAGGED);
+    uint8_t pcp;
+    if (priority == 0) {
+        // PCP = 1 is the lowest priority: Background (BK)
+        pcp = 1;
+    } else if (priority == 1) {
+        // PCP = 0 is the 2nd lowest priority: Best Effort (BE)
+        pcp = 0;
+    } else {
+        pcp = priority;
+    }
+    ethHdr->tci[0] = downCast<uint8_t>(pcp << 5);
+    ethHdr->tci[1] = 0;
+#endif
     ethHdr->etherType = HTONS(NetUtil::EthPayloadType::RAMCLOUD);
     p += sizeof(*ethHdr);
     rte_memcpy(p, header, headerLen);
@@ -433,7 +469,7 @@ DpdkDriver::getServiceLocator()
 }
 
 // See docs in Driver class.
-int
+uint32_t
 DpdkDriver::getBandwidth()
 {
     return bandwidthMbps;

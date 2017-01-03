@@ -211,6 +211,19 @@ class Driver {
     virtual void dumpStats() {}
 
     /**
+     * Returns the highest packet priority level this Driver supports (0 is
+     * the lowest priority level). The larger the number, the more priority
+     * levels are available. For example, if the highest priority level is 7
+     * then the Driver has 8 priority levels, ranging from 0 (lowest priority)
+     * to 7 (highest priority).
+     */
+    virtual int getHighestPacketPriority()
+    {
+        // Default: support only one priority level.
+        return 0;
+    }
+
+    /**
      * The maximum number of bytes this Driver can transmit in a single
      * packet, including both header and payload.
      */
@@ -220,7 +233,7 @@ class Driver {
      * Returns the bandwidth of the network in Mbits/second. If the
      * driver cannot determine the network bandwidth, then it returns 0. 
      */
-    virtual int getBandwidth()
+    virtual uint32_t getBandwidth()
     {
         return 0;
     }
@@ -339,11 +352,14 @@ class Driver {
      *      indicate "no payload". Note: caller must preserve the buffer
      *      data (but not the actual iterator) even after the method returns,
      *      since the data may not yet have been transmitted.
+     * \param priority
+     *      The priority level of this packet. 0 is the lowest priority.
      */
-    virtual void sendPacket(const Address* recipient,
-                            const void* header,
+    virtual void sendPacket(const Address *recipient,
+                            const void *header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload) = 0;
+                            Buffer::Iterator *payload,
+                            int priority = 0) = 0;
 
     /**
      * Alternate form of sendPacket.
@@ -361,13 +377,16 @@ class Driver {
      *      indicate "no payload". Note: caller must preserve the buffer
      *      data (but not the actual iterator) even after the method returns,
      *      since the data may not yet have been transmitted.
+     * \param priority
+     *      The priority level of this packet. 0 is the lowest priority.
      */
     template<typename T>
     void sendPacket(const Address* recipient,
                     const T* header,
-                    Buffer::Iterator *payload)
+                    Buffer::Iterator* payload,
+                    int priority = 0)
     {
-        sendPacket(recipient, header, sizeof(T), payload);
+        sendPacket(recipient, header, sizeof(T), payload, priority);
     }
 
     /**

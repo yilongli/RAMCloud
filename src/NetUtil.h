@@ -34,9 +34,11 @@ namespace NetUtil {
 // This enum define various ethernet payload types as it must be specified
 // in EthernetHeader field `etherType'.
 enum EthPayloadType {
-    IP_V4 = 0x0800, // Standard ethernet type when the payload is an ip packet.
+    IP_V4       = 0x0800,   // Standard ethernet type when the payload is an
+                            // ip packet.
+    VLAN_TAGGED = 0x8100,   // VLAN-tagged frame (IEEE 802.1Q)
 #ifdef DPDK
-    RAMCLOUD = 0x88b5  // Used by RAMCloud raw-Ethernet drivers.
+    RAMCLOUD    = 0x88b5    // Used by RAMCloud raw-Ethernet drivers.
 #endif
 };
 
@@ -55,6 +57,11 @@ typedef uint8_t MacAddress[MAC_ADDR_LEN];
 struct EthernetHeader {
     MacAddress destAddress; // Destination MAC address.
     MacAddress srcAddress;  // Source MAC address.
+#ifdef ETHERNET_DOT1P
+    uint16_t tpid;          // Tag protocol identifier.
+    uint8_t tci[2];         // Tag control information including PCP (3 bits),
+                            // DEI (1 bit) and VID (12 bits).
+#endif
     uint16_t etherType;     // The payload type of the ethernet frame which
                             // follows right after this header.
 }__attribute__((packed));
