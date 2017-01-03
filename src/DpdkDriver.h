@@ -57,7 +57,6 @@ class DpdkDriver : public Driver
 
     explicit DpdkDriver(Context* context, int port = 0);
     virtual ~DpdkDriver();
-    void close();
     virtual int getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();

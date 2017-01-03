@@ -63,6 +63,18 @@ static struct BasicUdpTransportFactory : public TransportFactory {
     }
 } basicUdpTransportFactory;
 
+// TODO: homa + infud, etc.
+static struct HomaUdpTransportFactory : public TransportFactory {
+    HomaUdpTransportFactory()
+        : TransportFactory("homa+kernelUdp", "homa+udp") {}
+    Transport* createTransport(Context* context,
+            const ServiceLocator* localServiceLocator) {
+        return new HomaTransport(context, localServiceLocator,
+                new UdpDriver(context, localServiceLocator),
+                generateRandom());
+    }
+} homaUdpTransportFactory;
+
 #ifdef ONLOAD
 static struct BasicSolarFlareTransportFactory : public TransportFactory {
     BasicSolarFlareTransportFactory()
@@ -165,6 +177,7 @@ TransportManager::TransportManager(Context* context)
 {
     transportFactories.push_back(&tcpTransportFactory);
     transportFactories.push_back(&basicUdpTransportFactory);
+    transportFactories.push_back(&homaUdpTransportFactory);
 #ifdef ONLOAD
     transportFactories.push_back(&basicSolarFlareTransportFactory);
 #endif
