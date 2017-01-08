@@ -167,7 +167,8 @@ HomaTransport::~HomaTransport()
 string
 HomaTransport::getServiceLocator()
 {
-    return driver->getServiceLocator();
+    // TODO: cache it in locatorString
+    return "homa" + driver->getServiceLocator();
 }
 
 /**

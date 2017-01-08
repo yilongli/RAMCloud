@@ -132,7 +132,8 @@ BasicTransport::~BasicTransport()
 string
 BasicTransport::getServiceLocator()
 {
-    return driver->getServiceLocator();
+    // TODO: cache it in locatorString
+    return "basic" + driver->getServiceLocator();
 }
 
 /*
