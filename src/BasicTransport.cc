@@ -125,14 +125,14 @@ BasicTransport::~BasicTransport()
         ClientRpc* clientRpc = it->second;
         deleteClientRpc(clientRpc);
     }
-    delete driver;
 }
 
 // See Transport::getServiceLocator().
 string
 BasicTransport::getServiceLocator()
 {
-    return driver->getServiceLocator();
+    // TODO: cache it in locatorString
+    return "basic+" + driver->getServiceLocator();
 }
 
 /*

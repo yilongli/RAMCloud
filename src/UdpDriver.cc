@@ -174,7 +174,7 @@ UdpDriver::getTransmitQueueSpace(uint64_t currentTime)
 
 // See docs in Driver class.
 void
-UdpDriver::receivePackets(int maxPackets,
+UdpDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
     PacketBatch* batch = &packetBatches[currentBatch];

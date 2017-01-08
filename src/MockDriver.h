@@ -79,7 +79,7 @@ class MockDriver : public Driver {
     virtual int getTransmitQueueSpace(uint64_t currentTime) {
         return transmitQueueSpace;
     }
-    virtual void receivePackets(int maxPackets,
+    virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
     virtual void sendPacket(const Address* addr,

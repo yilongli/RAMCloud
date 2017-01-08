@@ -45,7 +45,7 @@ class UdpDriver : public Driver {
     void close();
     virtual uint32_t getMaxPacketSize();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
-    virtual void receivePackets(int maxPackets,
+    virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
     virtual void sendPacket(const Address* addr,

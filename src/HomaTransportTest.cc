@@ -122,10 +122,10 @@ TEST_F(HomaTransportTest, sanityCheck) {
     // Then try a second request with bigger chunks of data.
 
     ServiceLocator serverLocator("homa+udp: host=localhost, port=11101");
-    UdpDriver* serverDriver = new UdpDriver(&context, &serverLocator);
-    HomaTransport server(&context, &serverLocator, serverDriver, 1);
-    UdpDriver* clientDriver = new UdpDriver(&context);
-    HomaTransport client(&context, NULL, clientDriver, 2);
+    UdpDriver serverDriver(&context, &serverLocator);
+    HomaTransport server(&context, &serverLocator, &serverDriver, 1);
+    UdpDriver clientDriver(&context);
+    HomaTransport client(&context, NULL, &clientDriver, 2);
     Transport::SessionRef session = client.getSession(&serverLocator);
 
     MockWrapper rpc1("abcdefg");
@@ -407,8 +407,8 @@ TEST_F(HomaTransportTest, tryToTransmitData_negativeTransmitQueueSpace) {
 
 TEST_F(HomaTransportTest, Session_constructor) {
     ServiceLocator locator("homa+udp: host=localhost, port=11101");
-    UdpDriver* driver2 = new UdpDriver(&context, &locator);
-    HomaTransport transport2(&context, &locator, driver2, 1);
+    UdpDriver driver2(&context, &locator);
+    HomaTransport transport2(&context, &locator, &driver2, 1);
     string exceptionMessage("no exception");
     try {
         ServiceLocator bogusLocator("bogus:foo=bar");

@@ -160,14 +160,14 @@ HomaTransport::~HomaTransport()
         ClientRpc* clientRpc = it->second;
         deleteClientRpc(clientRpc);
     }
-    delete driver;
 }
 
 // See Transport::getServiceLocator().
 string
 HomaTransport::getServiceLocator()
 {
-    return driver->getServiceLocator();
+    // TODO: cache it in locatorString
+    return "homa+" + driver->getServiceLocator();
 }
 
 /**

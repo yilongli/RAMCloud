@@ -453,7 +453,7 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
  * See docs in the ``Driver'' class.
  */
 void
-InfUdDriver::receivePackets(int maxPackets,
+InfUdDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
     static const int MAX_COMPLETIONS = 50;

@@ -227,7 +227,7 @@ DPDK_VERTIO_UIO := $(shell test -e $(DPDK_LIB_DIR)/librte_pmd_virtio_uio.so \
 	&& echo '-lrte_pmd_virtio_uio')
 DPDK_VERTIO := $(shell test -e $(DPDK_LIB_DIR)/librte_pmd_virtio.so \
 	&& echo '-lrte_pmd_virtio')
-DPDK_SHLIBS := -lethdev -lrte_mbuf -lrte_mempool -lrte_ring \
+DPDK_SHLIBS := -lrte_ethdev -lrte_net -lrte_mbuf -lrte_mempool -lrte_ring \
 	-lrte_kvargs -lrte_eal -lrte_pmd_e1000 -lrte_pmd_ixgbe \
 	-lrte_pmd_ring $(DPDK_MALLOC) $(DPDK_VIRTIO) $(DPDK_VERTIO_UIO)
 DPDK_RPATH := -Wl,-rpath,$(abspath $(DPDK_LIB_DIR))
@@ -239,10 +239,6 @@ else
 DPDK_AR_LIBS := $(DPDK_LIB_DIR)/libdpdk.a
 ## --whole-archive is required to link the pmd objects.
 LIBS := -Wl,--whole-archive $(DPDK_AR_LIBS) -Wl,--no-whole-archive -ldl $(LIBS)
-endif
-
-ifeq ($(ETHERNET_DOT1P),yes)
-COMFLAGS += -DETHERNET_DOT1P
 endif
 
 # End of DPDK definitions
