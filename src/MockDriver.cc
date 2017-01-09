@@ -140,7 +140,7 @@ MockDriver::getServiceLocator()
 
 // See documentation in Driver.h.
 void
-MockDriver::receivePackets(int maxPackets,
+MockDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
     int count = 0;

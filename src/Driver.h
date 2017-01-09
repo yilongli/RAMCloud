@@ -309,7 +309,7 @@ class Driver {
      *      Returned packets are appended to this vector, one Received
      *      object per packet, in order of packet arrival.
      */
-    virtual void receivePackets(int maxPackets,
+    virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets) = 0;
 
     /**

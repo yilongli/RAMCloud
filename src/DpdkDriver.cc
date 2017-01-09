@@ -266,13 +266,10 @@ DpdkDriver::~DpdkDriver()
 int
 DpdkDriver::getHighestPacketPriority()
 {
-#ifdef ETHERNET_DOT1P
     // Assume we are allowed to use all 8 ethernet priorities specified
     // in the Priority Code Point (PCP) field.
+    // TODO: IN PRACTICE, WE NEED TO BE CONFIGURE THE DPDK DRIVER TO ONLY USE A SUBSET
     return 7;
-#else
-    return 0;
-#endif
 }
 
 // See docs in Driver class.
@@ -291,7 +288,7 @@ DpdkDriver::getTransmitQueueSpace(uint64_t currentTime)
 
 // See docs in Driver class.
 void
-DpdkDriver::receivePackets(int maxPackets,
+DpdkDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
 #define MAX_PACKETS_AT_ONCE 32
@@ -303,7 +300,7 @@ DpdkDriver::receivePackets(int maxPackets,
     // attempt to dequeue a batch of received packets from the NIC
     // as well as from the loopback ring.
     uint32_t incomingPkts = rte_eth_rx_burst(portId, 0, mPkts,
-            maxPackets/2);
+            downCast<uint16_t>(maxPackets/2));
     if (incomingPkts > 0) {
         timeTrace("DpdkDriver received %u packets", incomingPkts);
     }
@@ -333,7 +330,7 @@ DpdkDriver::receivePackets(int maxPackets,
         struct ether_hdr* ethHdr = rte_pktmbuf_mtod(m, struct ether_hdr*);
         uint16_t ether_type = ethHdr->ether_type;
         uint32_t headerLength = ETHER_HDR_LEN;
-        void* payload = ethHdr + 1;
+        char* payload = reinterpret_cast<char *>(ethHdr + 1);
         if (ether_type == rte_cpu_to_be_16(ETHER_TYPE_VLAN)) {
             struct vlan_hdr* vlanHdr =
                     reinterpret_cast<struct vlan_hdr*>(payload);
@@ -433,7 +430,8 @@ DpdkDriver::sendPacket(const Address* addr,
         default:
             pcp = downCast<uint16_t>(priority);
     }
-    vlanHdr->vlan_tci = rte_cpu_to_be_16(pcp << 13);
+    uint16_t vlan_tci = downCast<uint16_t>(pcp << 13);
+    vlanHdr->vlan_tci = rte_cpu_to_be_16(vlan_tci);
     vlanHdr->eth_proto = rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD);
     p += VLAN_TAG_LEN;
 

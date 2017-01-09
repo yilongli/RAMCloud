@@ -49,7 +49,7 @@ class InfUdDriver : public Driver {
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
-    virtual void receivePackets(int maxPackets,
+    virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void registerMemory(void* base, size_t bytes);
     virtual void release(char *payload);

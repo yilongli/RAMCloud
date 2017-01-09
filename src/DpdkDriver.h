@@ -54,7 +54,7 @@ class DpdkDriver : public Driver
   public:
     // TODO: WHY? WHY NOT 1500?
 //    static const uint32_t MAX_PAYLOAD_SIZE = 1400;
-    static const uint32_t MAX_PAYLOAD_SIZE = ETHER_MTU;
+    static const uint32_t MAX_PAYLOAD_SIZE = 1500;
     static const uint32_t VLAN_TAG_LEN = 4;
 
     explicit DpdkDriver(Context* context, int port = 0);
@@ -63,7 +63,7 @@ class DpdkDriver : public Driver
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
-    virtual void receivePackets(int maxPackets,
+    virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
     virtual void sendPacket(const Address* addr,

@@ -402,7 +402,7 @@ SolarFlareDriver::getTransmitQueueSpace(uint64_t currentTime)
 
 // See docs in Driver class.
 void
-SolarFlareDriver::receivePackets(int maxPackets,
+SolarFlareDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
     assert(driver->context->dispatch->isDispatchThread());

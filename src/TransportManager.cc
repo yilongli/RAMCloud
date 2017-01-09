@@ -119,7 +119,7 @@ static struct HomaInfUdTransportFactory : public TransportFactory {
                 new InfUdDriver(context, localServiceLocator, false),
                 generateRandom());
     }
-} basicInfUdTransportFactory;
+} homaInfUdTransportFactory;
 
 static struct InfRcTransportFactory : public TransportFactory {
     InfRcTransportFactory()
