@@ -143,7 +143,7 @@ void
 MockDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
-    int count = 0;
+    uint32_t count = 0;
     while ((count < maxPackets) && !incomingPackets.empty()) {
         PacketBuf* source = incomingPackets[0];
         receivedPackets->emplace_back(&source->address, this, source->length,
