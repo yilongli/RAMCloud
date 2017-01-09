@@ -279,7 +279,7 @@ DpdkDriver::getHighestPacketPriority()
 uint32_t
 DpdkDriver::getMaxPacketSize()
 {
-    return ETHER_MTU;
+    return MAX_PAYLOAD_SIZE;
 }
 
 // See docs in Driver class.
@@ -355,6 +355,7 @@ DpdkDriver::receivePackets(int maxPackets,
         packetBufsUtilized++;
         buffer->sender.construct(ethHdr->s_addr.addr_bytes);
         uint32_t length = rte_pktmbuf_pkt_len(m) - headerLength;
+        assert(length <= MAX_PAYLOAD_SIZE);
         rte_memcpy(buffer->payload, payload, length);
         receivedPackets->emplace_back(buffer->sender.get(), this,
                 length, buffer->payload);

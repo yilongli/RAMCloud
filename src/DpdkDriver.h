@@ -19,7 +19,6 @@
 #define RAMCLOUD_DPDKDRIVER_H
 
 #include <vector>
-//#include <rte_ether.h>
 
 #include "Dispatch.h"
 #include "Driver.h"
@@ -55,6 +54,7 @@ class DpdkDriver : public Driver
   public:
     // TODO: WHY? WHY NOT 1500?
 //    static const uint32_t MAX_PAYLOAD_SIZE = 1400;
+    static const uint32_t MAX_PAYLOAD_SIZE = ETHER_MTU;
     static const uint32_t VLAN_TAG_LEN = 4;
 
     explicit DpdkDriver(Context* context, int port = 0);

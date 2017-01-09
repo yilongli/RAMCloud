@@ -160,7 +160,6 @@ HomaTransport::~HomaTransport()
         ClientRpc* clientRpc = it->second;
         deleteClientRpc(clientRpc);
     }
-    delete driver;
 }
 
 // See Transport::getServiceLocator().
