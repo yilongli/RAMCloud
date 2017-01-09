@@ -68,7 +68,8 @@ class LoggerTest : public ::testing::Test {
         string result = TestUtil::readFile(fileName);
         if (sanitizeLineNumber) {
             std::regex exp("\\.cc:[[:digit:]]{1,4} ");
-            result = std::regex_replace(result, exp, ".cc:xxx ");
+            string fmt(".cc:xxx ");
+            result = std::regex_replace(result, exp, fmt);
         }
         return result;
     }

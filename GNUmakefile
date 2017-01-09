@@ -9,7 +9,7 @@
 # variables in the file private/MakefragPrivateTop.
 include $(wildcard private/MakefragPrivateTop)
 
-DEBUG ?= yes
+DEBUG ?= no
 YIELD ?= no
 SSE ?= sse4.2
 ARCH ?= core2
@@ -179,7 +179,7 @@ endif
 #   "n" to build without shared libraries, in which case you will need to
 #   modify other variables below here).
 # * Then recompile: "make clean; make"
-# DPDK ?= yes
+DPDK ?= yes
 ifeq ($(DPDK),yes)
 
 # Uncomment the line below and modify its value (or set the value in
@@ -187,11 +187,11 @@ ifeq ($(DPDK),yes)
 # (the parent of the "x86_64-native-linuxapp-gcc" directory). Or, leave
 # this variable undefined if DPDK is installed in the standard system
 # locations.
-# DPDK_DIR ?= dpdk
+DPDK_DIR ?= dpdk
 
 # Change the definition below if you compiled DPDK without shared libraries.
 # Note: this configuration is not well tested and may not work.
-DPDK_SHARED ?= yes
+DPDK_SHARED ?= no
 
 DPDK_TARGET  ?= x86_64-native-linuxapp-gcc
 COMFLAGS    += -DDPDK

@@ -35,9 +35,9 @@ import time
 from optparse import OptionParser
 
 # Locations of various RAMCloud executables.
-coordinator_binary = '%s/coordinator' % config.hooks.get_remote_obj_path()
-server_binary = '%s/server' % config.hooks.get_remote_obj_path()
-ensure_servers_bin = '%s/apps/ensureServers' % config.hooks.get_remote_obj_path()
+coordinator_binary = 'sudo %s/coordinator --dpdkPort 1' % config.hooks.get_remote_obj_path()
+server_binary = 'sudo %s/server --dpdkPort 1' % config.hooks.get_remote_obj_path()
+ensure_servers_bin = 'sudo %s/apps/ensureServers' % config.hooks.get_remote_obj_path()
 
 # valgrind
 valgrind_command = ''
@@ -356,20 +356,8 @@ class Cluster(object):
         # Adding redirection for stdout and stderr.
         stdout = open(log_prefix + '.out', 'w')
         stderr = open(log_prefix + '.err', 'w')
-        if not kill_on_exit:
-            server = self.sandbox.rsh(host[0], command, is_server=True,
-                                      locator=server_locator(self.transport,
-                                                             host, port),
-                                      kill_on_exit=False, bg=True,
-                                      stdout=stdout,
-                                      stderr=stderr)
-        else:
-            server = self.sandbox.rsh(host[0], command, is_server=True,
-                                      locator=server_locator(self.transport,
-                                                             host, port),
-                                      bg=True,
-                                      stdout=stdout,
-                                      stderr=stderr)
+        #server = 0
+        server = self.sandbox.rsh(host[0], command, is_server=True, locator=server_locator(self.transport, host, port), kill_on_exit=kill_on_exit, bg=True, stdout=stdout, stderr=stderr)
 
         if self.verbose:
             print('Server started on %s at %s: %s' %
@@ -453,11 +441,11 @@ class Cluster(object):
         """
         num_clients = len(hosts)
         args = client.split(' ')
-        client_bin = args[0]
+        client_bin = args[0] + ' --dpdkPort 1'
         client_args = ' '.join(args[1:])
         clients = []
         for i, client_host in enumerate(hosts):
-            command = ('%s %s -C %s --numClients %d --clientIndex %d '
+            command = ('sudo %s %s -C %s --numClients %d --clientIndex %d '
                        '--logFile %s/client%d.%s.log %s' %
                        (valgrind_command,
                         client_bin, self.coordinator_locator, num_clients,
@@ -587,7 +575,7 @@ def run(
     """
     Start a coordinator and servers, as indicated by the arguments.  If a
     client is specified, then start one or more client processes and wait for
-    them to complete. Otherwise leave the cluster running.  
+    them to complete. Otherwise leave the cluster running.
     @return: string indicating the path to the log files for this run.
     """
 #    client_hosts = [('rc52', '192.168.1.152', 52)]
@@ -659,6 +647,7 @@ def run(
                 args += ' %s' % backup_args
                 backups_started += 1
                 disk_args = disk1 if backup_disks_per_server == 1 else disk2
+            args += ' --debugOnSegfault '
             cluster.start_server(host, args, backup=backup, disk=disk_args)
             masters_started += 1
 
@@ -666,7 +655,7 @@ def run(
             cluster.hosts = cluster.hosts[num_servers:]
 
         if masters_started > 0 or backups_started > 0:
-            cluster.ensure_servers()
+            cluster.ensure_servers(timeout = 3000)
             if verbose:
                 print('All servers running')
 

@@ -102,7 +102,7 @@ class Sandbox(object):
             else:
                 # Assumes scripts are at same path on remote machine
                 sh_command = ['ssh', host,
-                              '%s/regexec' % config.hooks.get_remote_scripts_path(),
+                              'sudo %s/regexec' % config.hooks.get_remote_scripts_path(),
                               sonce,
                               config.hooks.get_remote_wd(),
                               "'%s'" % command]
@@ -128,7 +128,7 @@ class Sandbox(object):
                         was created with rsh().
         """
         killer = subprocess.Popen(['ssh', process.host,
-                                   '%s/killpid' % config.hooks.get_remote_scripts_path(),
+                                   'sudo %s/killpid' % config.hooks.get_remote_scripts_path(),
                                     process.sonce])
         killer.wait()
         try:
@@ -156,7 +156,7 @@ class Sandbox(object):
                 if not self.cleanup:
                     to_kill = '0'
                     killers.append(subprocess.Popen(['ssh', p.host,
-                                        '%s/killserver' % config.hooks.get_remote_scripts_path(),
+                                        'sudo %s/killserver' % config.hooks.get_remote_scripts_path(),
                                         to_kill, os.getcwd(), p.host]))
                 # invoke killpid only for processes that are not servers.
                 # server processes will be killed by killserver outside this
@@ -165,13 +165,13 @@ class Sandbox(object):
                     # Assumes scripts are at same path on remote machine
                     killers.append(
                         subprocess.Popen(['ssh', p.host,
-                                          '%s/killpid' % config.hooks.get_remote_scripts_path(),
+                                          'sudo %s/killpid' % config.hooks.get_remote_scripts_path(),
                                           p.sonce]))
 
             if self.cleanup:
                 chost = getHosts()[-1] # coordinator
                 killers.append(subprocess.Popen(['ssh', chost[0],
-                                    '%s/killcoord' % config.hooks.get_remote_scripts_path()]))
+                                    'sudo %s/killcoord' % config.hooks.get_remote_scripts_path()]))
 
                 path = '%s/logs/shm' % os.getcwd()
                 files = ""
@@ -186,7 +186,7 @@ class Sandbox(object):
                     if mhost != 'README' and not mhost.startswith("cluster"):
                         to_kill = '1'
                         killers.append(subprocess.Popen(['ssh', mhost.split('_')[0],
-                                            '%s/killserver' % config.hooks.get_remote_scripts_path(),
+                                            'sudo %s/killserver' % config.hooks.get_remote_scripts_path(),
                                             to_kill,
                                             config.hooks.get_remote_wd(),
                                             mhost]))
