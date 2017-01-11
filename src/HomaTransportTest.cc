@@ -579,6 +579,23 @@ TEST_F(HomaTransportTest, handlePacket_dataFromServer_incompleteHeader) {
     EXPECT_EQ("handlePacket: packet of type DATA from mock:server=1 too "
             "short (18 bytes)", TestLog::get());
 }
+TEST_F(HomaTransportTest, handlePacket_dataFromServer_tryToSchedule) {
+    MockWrapper wrapper1("message1");
+    MockWrapper wrapper2("message2");
+    transport.roundTripBytes = 1000;
+    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
+    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
+    driver->outputLog.clear();
+    transport.grantIncrement = 500;
+
+    handlePacket("mock:server=1",
+            HomaTransport::DataHeader(HomaTransport::RpcId(666, 1), 100, 0, 5,
+            HomaTransport::FROM_SERVER), "abcde");
+    handlePacket("mock:server=2",
+            HomaTransport::DataHeader(HomaTransport::RpcId(666, 2), 95, 0, 5,
+            HomaTransport::FROM_SERVER), "abcde");
+
+}
 TEST_F(HomaTransportTest, handlePacket_dataFromServer_basics) {
     MockWrapper wrapper("message1");
     transport.roundTripBytes = 1000;

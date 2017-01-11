@@ -242,9 +242,11 @@ TransportManager::~TransportManager()
         delete transport;
     }
 
+#ifdef DPDK
     if (dpdkDriver) {
         delete dpdkDriver;
     }
+#endif
 }
 
 /**
