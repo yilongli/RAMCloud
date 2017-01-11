@@ -1676,10 +1676,10 @@ HomaTransport::checkTimeouts()
 }
 
 /**
- * A new message needs to be inserted to the active message list or an existing
- * active message needs to moved forward in the list. Either case, put this
- * message to the right place in the list that reflects its precedence among
- * the active messages.
+ * A non-active (new or inactive) message needs to be inserted to the active
+ * message list or an existing active message needs to moved forward in the
+ * list. Either case, put this message to the right place in the list that
+ * reflects its precedence among the active messages.
  *
  * \param message
  *      A message that needs to be put at the right place in the active message
@@ -1709,43 +1709,43 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
             return;
         }
     }
+    if (message->state == ScheduledMessage::INACTIVE) {
+        erase(inactiveMessages, *message);
+    }
     message->state = ScheduledMessage::ACTIVE;
     activeMessages.push_back(*message);
 }
 
 /**
- * Replace an active message by an inactive one because our scheduling policy
- * says it's a better choice.
+ * Replace an active message by an non-active (new or inactive) one because
+ * 1) our scheduling policy says it's a better choice or 2) the active message
+ * has been fully granted and must be purged from the scheduler.
  *
  * @param oldMessage
  *      A currently active message that is about to be deactivated.
  * @param newMessage
- *      A currently inactive message that should be activated. NULL means it
- *      is the responsibility of this method to pick this message from the
- *      inactive ones.
- * @param purgeOK
- *      True if the message about to be deactivated has been fully granted and
- *      we can purge it from the scheduler. False if this message should be put
- *      back to the inactive message list.
+ *      A non-active message that should be activated. NULL means this method
+ *      is invoked because \p oldMessage must be purged and it is the duty
+ *      of this method to pick a replacement from the inactive message list.
+ *      Otherwise, this method is invoked because \p newMessage is a better
+ *      choice compared to \p oldMessage.
  */
 void
 HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
-        ScheduledMessage *newMessage, bool purgeOK)
+        ScheduledMessage *newMessage)
 {
     if (oldMessage == &activeMessages.front()) {
         // The top message is removed. Reclaim the highest granted priority.
         highestGrantedPrio--;
     }
 
+    bool purgeOK = (oldMessage->grantOffset ==
+            oldMessage->accumulator->totalLength);
     erase(activeMessages, *oldMessage);
-    if (purgeOK) {
-        oldMessage->state = ScheduledMessage::PURGED;
-    } else {
-        oldMessage->state = ScheduledMessage::INACTIVE;
-        inactiveMessages.push_back(*oldMessage);
-    }
-
     if (newMessage == NULL) {
+        assert(purgeOK);
+        oldMessage->state = ScheduledMessage::PURGED;
+
         // No designated message to promote. Pick one from the inactive
         // messages.
         for (ScheduledMessage& candidate : inactiveMessages) {
@@ -1765,6 +1765,10 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
             tryNextCandidate:
             ;
         }
+    } else {
+        assert(!purgeOK);
+        oldMessage->state = ScheduledMessage::INACTIVE;
+        inactiveMessages.push_back(*oldMessage);
     }
 
     if (newMessage) {
@@ -1939,7 +1943,7 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
         // Slow path: a message has been fully granted. Purge it from the
         // scheduler.
         messageToGrant->grantOffset = messageToGrant->accumulator->totalLength;
-        replaceActiveMessage(messageToGrant, NULL, true);
+        replaceActiveMessage(messageToGrant, NULL);
     }
 
     // Output a GRANT for the selected message.

@@ -636,7 +636,7 @@ class HomaTransport : public Transport {
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
-            ScheduledMessage* newMessage, bool purgeOK = false);
+            ScheduledMessage* newMessage);
     void dataArriveForScheduledMessage(ScheduledMessage* message, RpcId rpcId);
 
     /// Shared RAMCloud information.
