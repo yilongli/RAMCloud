@@ -115,12 +115,11 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // TODO: better name for brackets; and better name for unschedTrafficPrioBrackets...
     string brackets = "[0";
     int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
-    unschedTrafficPrioBrackets.push_back(driver->getMaxPacketSize() + 1);
-    for (int i = 1; i < numUnschedPrio - 1; i++) {
-        unschedTrafficPrioBrackets.push_back(
-                unschedTrafficPrioBrackets.back() << 1);
-        brackets += format(", %u) [%u", unschedTrafficPrioBrackets.back(),
-                unschedTrafficPrioBrackets.back());
+    uint32_t nextCutoff = driver->getMaxPacketSize();
+    for (int i = 0; i < numUnschedPrio - 1; i++) {
+        unschedTrafficPrioBrackets.push_back(nextCutoff + 1);
+        brackets += format(", %u] [%u", nextCutoff, nextCutoff + 1);
+        nextCutoff <<= 1;
     }
     unschedTrafficPrioBrackets.push_back(~0u);
     brackets += format(", %u]", ~0u);
@@ -1721,8 +1720,8 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
  * @param oldMessage
  *      A currently active message that is about to be deactivated.
  * @param newMessage
- *      A currently inactive message that should be activated. NULL means we
- *      it's the responsibility of this method to pick this message from the
+ *      A currently inactive message that should be activated. NULL means it
+ *      is the responsibility of this method to pick this message from the
  *      inactive ones.
  * @param purgeOK
  *      True if the message about to be deactivated has been fully granted and
@@ -1750,7 +1749,7 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
         // No designated message to promote. Pick one from the inactive
         // messages.
         for (ScheduledMessage& candidate : inactiveMessages) {
-            if (newMessage != NULL && candidate.compareTo(*newMessage) >= 0) {
+            if (newMessage != NULL && newMessage->compareTo(candidate) <= 0) {
                 continue;
             }
 
@@ -1778,8 +1777,8 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
             highestGrantedPrio++;
         } else if (highestGrantedPrio + 1 <
                 downCast<int>(activeMessages.size())) {
-            // The priorites we are granting for scheduled traffic is not
-            // enough to accomodate all the active messages.
+            // The priorities we are granting for scheduled traffic is not
+            // enough to accommodate all the active messages.
             highestGrantedPrio++;
         }
     } else if (activeMessages.size() < maxGrantedMessages) {
@@ -1806,7 +1805,6 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
     // The following loop handles the special case where some active message
     // comes from the same sender as the new message to avoid violating the
     // constraint that active messages must come from distinct senders.
-    bool success = false;
     for (ScheduledMessage &m : activeMessages) {
         if (m.senderHash != message->senderHash) {
             continue;
@@ -1816,7 +1814,9 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
             // The new message should replace an active message that is from
             // the same sender.
             replaceActiveMessage(&m, message);
-            success = true;
+            // TODO: REMOVE ASSERTION
+            assert(message->state == ScheduledMessage::ACTIVE);
+            assert(m.state == ScheduledMessage::INACTIVE);
         }
         goto updateInactiveList;
     }
@@ -1830,21 +1830,31 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
         assert(newMessage);
         adjustSchedulingPrecedence(message);
         highestGrantedPrio++;
-        success = true;
+        assert(message->state == ScheduledMessage::ACTIVE);
     } else if (message->compareTo(activeMessages.back()) < 0) {
         // The new message should replace the "worst" active message.
+        ScheduledMessage* worst = &activeMessages.back();
         replaceActiveMessage(&activeMessages.back(), message);
-        success = true;
+        assert(message->state == ScheduledMessage::ACTIVE);
+        assert(worst->state == ScheduledMessage::INACTIVE);
     }
 
+    // TODO: THE RESPONSIBILITY OF THIS METHOD IS TO CORRECTLY SET THE STATE OF
+    // `message` AND PUT IT IN THE RIGHT LIST; THE RESP. OF MAINTAINING THE MESSAGE
+    // BEING REPLACED BY IT IS DELEGATED TO replaceActiveMessage & adjustSchedulingPrecedence
     updateInactiveList:
-    if (newMessage && !success) {
-        message->state = ScheduledMessage::INACTIVE;
-        inactiveMessages.push_back(*message);
-    } else if (!newMessage && success) {
-        erase(inactiveMessages, *message);
+    bool activated = (message->state == ScheduledMessage::ACTIVE);
+    if (newMessage) {
+        if (!activated) {
+            message->state = ScheduledMessage::INACTIVE;
+            inactiveMessages.push_back(*message);
+        }
+    } else {
+        if (activated) {
+            erase(inactiveMessages, *message);
+        }
     }
-    return success;
+    return activated;
 }
 
 /**
