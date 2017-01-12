@@ -1662,12 +1662,18 @@ HomaTransport::checkTimeouts()
         // See if we need to request retransmission for part of the request
         // message.
         ScheduledMessage* scheduledMessage = serverRpc->scheduledMessage.get();
-        if ((serverRpc->silentIntervals >= 2) &&
+        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete &&
                 (!scheduledMessage ||
                 (scheduledMessage->state == ScheduledMessage::ACTIVE) ||
                 (scheduledMessage->state == ScheduledMessage::PURGED))) {
             uint32_t grantOffset = scheduledMessage ?
                     scheduledMessage->grantOffset : 0;
+            if (grantOffset == serverRpc->accumulator->buffer->size()) {
+                // TODO: NOT SURE WHY THIS COULD HAPPEN?
+                LOG(WARNING, "grantOffset == buffer->size(), sequence %lu",
+                        serverRpc->sequence);
+                continue;
+            }
             serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId, grantOffset,
                     FROM_SERVER);

@@ -51,7 +51,7 @@ namespace RAMCloud
 {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
-// this transport.
+// this driver.
 #define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
@@ -381,6 +381,7 @@ DpdkDriver::sendPacket(const Address* addr,
                        Buffer::Iterator* payload,
                        int priority)
 {
+    assert(priority <= getHighestPacketPriority());
     struct rte_mbuf *mbuf = NULL;
     char *data = NULL;
 
