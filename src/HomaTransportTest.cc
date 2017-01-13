@@ -582,18 +582,20 @@ TEST_F(HomaTransportTest, handlePacket_dataFromServer_incompleteHeader) {
 TEST_F(HomaTransportTest, handlePacket_dataFromServer_tryToSchedule) {
     MockWrapper wrapper1("message1");
     MockWrapper wrapper2("message2");
-    transport.roundTripBytes = 1000;
+    transport.roundTripBytes = 10;
+    transport.grantIncrement = 0;
+    transport.highestSchedPriority = 4;
+    transport.maxGrantedMessages = 3;
     session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
     session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
     driver->outputLog.clear();
-    transport.grantIncrement = 500;
 
     handlePacket("mock:server=1",
             HomaTransport::DataHeader(HomaTransport::RpcId(666, 1), 100, 0, 5,
-            HomaTransport::FROM_SERVER), "abcde");
+            HomaTransport::FROM_SERVER), "11111");
     handlePacket("mock:server=2",
             HomaTransport::DataHeader(HomaTransport::RpcId(666, 2), 95, 0, 5,
-            HomaTransport::FROM_SERVER), "abcde");
+            HomaTransport::FROM_SERVER), "22222");
 
 }
 TEST_F(HomaTransportTest, handlePacket_dataFromServer_basics) {

@@ -381,7 +381,8 @@ DpdkDriver::sendPacket(const Address* addr,
                        Buffer::Iterator* payload,
                        int priority)
 {
-    assert(priority <= getHighestPacketPriority());
+    // TODO: MAKE PRIORITY UINT32_T?
+    assert(priority <= getHighestPacketPriority() && priority >= 0);
     struct rte_mbuf *mbuf = NULL;
     char *data = NULL;
 
