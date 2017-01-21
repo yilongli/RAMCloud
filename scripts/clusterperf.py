@@ -283,6 +283,8 @@ def run_test(
         client_args['--warmup'] = options.warmup
     if options.workload != None:
         client_args['--workload'] = options.workload
+    if options.messageSizeCdfFile != None:
+        client_args['--messageSizeCdfFile'] = options.messageSizeCdfFile
     if options.targetOps != None:
         client_args['--targetOps'] = options.targetOps
     if options.txSpan != None:
@@ -798,6 +800,7 @@ simple_tests = [
     Test("broadcast", broadcast),
     Test("echo_basic", echo),
     Test("echo_incast", echo),
+    Test("echo_workload", echo), # TODO: MOVE TO GRAPH TEST?
     Test("multiRead_colocation", default),
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),
@@ -905,6 +908,8 @@ if __name__ == '__main__':
     parser.add_option('--workload', default='YCSB-A',
             choices=['YCSB-A', 'YCSB-B', 'YCSB-C', 'WRITE-ONLY'],
             help='Name of workload to run on extra clients to generate load')
+    parser.add_option('--messageSizeCdfFile', default='',
+            help='Path to the CDF file of message size')
     parser.add_option('--targetOps', type=int,
             help='Operations per second that each load generating client '
             'will try to achieve')

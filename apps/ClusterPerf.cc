@@ -42,6 +42,7 @@
 #include <boost/program_options.hpp>
 #include <boost/version.hpp>
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <unordered_set>
 namespace po = boost::program_options;
@@ -108,6 +109,9 @@ static int warmupCount;
 // to specify the name of the workload the additional clients should
 // run to provide load on the system.
 static string workload;     // NOLINT
+
+// TODO
+static string messageSizeCdfFilePath;
 
 // Value of the "--targetOps" command-line option: used by some tests
 // to specify the operations per second each load generating client
@@ -1135,6 +1139,178 @@ echoMessages(const vector<string>& receivers, uint32_t length,
     double totalRxBytes = echoLength * static_cast<double>(count);
     result.bandwidth = totalRxBytes/Cycles::toSeconds(totalCycles);
     return result;
+}
+
+// TODO: templatize it
+struct EchoRpcContainer {
+    uint messageId;
+    uint64_t startTime;
+    EchoRpc rpc;
+    IntrusiveListHook rpcContainerLinks;
+
+    EchoRpcContainer(uint messageId, RamCloud* ramcloud,
+            const char* serviceLocator, const void* message, uint32_t length,
+            uint32_t echoLength, Buffer* echo)
+        : messageId(messageId)
+        , startTime(Cycles::rdtsc())
+        , rpc(ramcloud, serviceLocator, message, length, echoLength,
+                echo)
+        , rpcContainerLinks()
+    {}
+};
+
+/**
+ * Send and receive messages of given sizes, return information about the
+ * distribution of message round-trip times and network bandwidth.
+ *
+ * \param receivers
+ *      Service locators of master servers that are receivers of the messages.
+ * \param outgoingMessageSize
+ *      Cumulative distribution function of the size of the outgoing messages.
+ * \param incomingMessageSize
+ *      Cumulative distribution function of the size of the incoming messages.
+ * \param echoLength
+ *      Size of the message to be echoed, in bytes.
+ * \param iteration
+ *      Send this many messages.
+ * \param timeLimit
+ *      Maximum time (in seconds) to spend on this test: if this much
+ *      time elapses, then less iterations will be run.
+ *
+ * \return
+ *      Information about how long the echos took.
+ */
+vector<TimeDist>
+echoMessages2(const vector<string>& receivers, double averageMessageSize,
+        vector<uint32_t>& messageSizes, vector<double>& cumulativeProbabilities,
+        uint64_t iteration, double timeLimit)
+{
+    // Collect at most MAX_NUM_SAMPLE samples for each type of message.
+    // Any more samples will simply overwrite old ones by wrapping around.
+    using Samples = vector<uint64_t>;
+    const uint32_t MAX_NUM_SAMPLE = 1000000;
+    vector<Samples> roundTripTimes(messageSizes.size());
+    vector<uint32_t> numSamples(messageSizes.size());
+    for (Samples& samples : roundTripTimes) {
+        samples.assign(MAX_NUM_SAMPLE, 0);
+    }
+
+    const uint32_t largestMessageSize = messageSizes.back();
+    static const string message(largestMessageSize, 'x');
+
+    // TODO: construct message randomizer
+    vector<double> discreteProbabilities;
+    double p = 0.0;
+    for (double x : cumulativeProbabilities) {
+        discreteProbabilities.push_back(x - p);
+        p = x;
+    }
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::discrete_distribution<uint> messageSizeDist(
+            discreteProbabilities.begin(), discreteProbabilities.end());
+
+#if 1
+    // Test distribution of generated messages.
+    uint64_t totalMessageSize = 0;
+    uint64_t numGeneratedMsgs = 10000000;
+    for (uint i = 0; i < numGeneratedMsgs; i++) {
+        totalMessageSize += messageSizes[messageSizeDist(gen)];
+    }
+    LOG(ERROR, "theoretical average message size %.1f, "
+            "generated average message size %lu", averageMessageSize,
+            totalMessageSize / numGeneratedMsgs);
+#endif
+
+    // Work out average message interval cycles.
+    double networkLoadFactor = 0.5;
+    double linkBandwidth = 10 << 27; // 10Gbps
+    double inputBytesPerSecond = linkBandwidth * networkLoadFactor;
+    uint64_t averageIntervalCycles = Cycles::fromSeconds(
+            averageMessageSize / inputBytesPerSecond);
+    std::poisson_distribution<uint64_t> messageIntervalDist(
+            static_cast<double>(averageIntervalCycles));
+
+    uint64_t totalCycles = 0;
+    Buffer buffer;
+    size_t numReceivers = receivers.size();
+
+    // TODO: POLLING LOOP FOR MULTIPLE OUTGOING RPCS
+    ObjectPool<EchoRpcContainer> echoRpcPool;
+    INTRUSIVE_LIST_TYPEDEF(EchoRpcContainer, rpcContainerLinks)
+            EchoRpcList;
+    EchoRpcList echoRpcs;
+    uint64_t startTime = Cycles::rdtsc();
+    uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
+    uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
+    bool nextMessageReady = false;
+    const char* receiver = NULL;
+    uint messageId = 0;
+    uint64_t totalTxMessageBytes = 0;
+    for (uint64_t count = 0; count < iteration; count++) {
+        // Prepare the next message if it's not ready yet.
+        if (!nextMessageReady) {
+            receiver = receivers[generateRandom() % numReceivers].c_str();
+            messageId = messageSizeDist(gen);
+            nextMessageReady = true;
+        }
+
+        uint64_t now = Cycles::rdtsc();
+        if (now >= stopTime) {
+            LOG(NOTICE, "time expired after %lu iterations", count);
+            LOG(ERROR, "load factor %.3f",
+                    static_cast<double>(totalTxMessageBytes) /
+                    (timeLimit * linkBandwidth));
+            break;
+        }
+
+        // See if we need to send another message.
+        if (now > nextMessageArrival) {
+            uint32_t length = messageSizes[messageId];
+            EchoRpcContainer* echo = echoRpcPool.construct(messageId,
+                    cluster, receiver, message.c_str(), length, length,
+                    &buffer);
+            echoRpcs.push_back(*echo);
+            nextMessageReady = false;
+            nextMessageArrival += messageIntervalDist(gen);
+        }
+
+        // Check for RPC completion.
+        context->dispatch->poll();
+        for (EchoRpcList::iterator it = echoRpcs.begin();
+                it != echoRpcs.end();) {
+            EchoRpcContainer* echo = &(*it);
+
+            // Advance the iterator now, so it won't get invalidated if we
+            // delete the EchoRpcContainer below.
+            it++;
+
+            if (echo->rpc.isReady()) {
+                uint64_t roundTripTime = Cycles::rdtsc() - echo->startTime;
+                totalTxMessageBytes += messageSizes[echo->messageId];
+                numSamples[echo->messageId]++;
+                roundTripTimes[echo->messageId]
+                        [numSamples[echo->messageId] % MAX_NUM_SAMPLE] =
+                        roundTripTime;
+                erase(echoRpcs, *echo);
+                echoRpcPool.destroy(echo);
+            }
+        }
+    }
+
+    //
+    vector<TimeDist> results(messageSizes.size());
+    for (uint i = 0; i < messageSizes.size(); i++) {
+        if (numSamples[i] <= MAX_NUM_SAMPLE) {
+            roundTripTimes[i].resize(numSamples[i]);
+        }
+
+        getDist(roundTripTimes[i], &results[i]);
+        double totalRxBytes = messageSizes[i] *
+                static_cast<double>(numSamples[i]);
+        results[i].bandwidth = totalRxBytes/Cycles::toSeconds(totalCycles);
+    }
+    return results;
 }
 
 /**
@@ -2578,16 +2754,18 @@ void
 echo_incast()
 {
     // Define parameters that control the experiment.
-    const uint32_t echoSize = 30;
+#define LONG_MESSAGE_SIZE 9000
+#define SHORT_MESSAGE_SIZE 30
+    const uint32_t echoSize = 1;
     const double masterRunningSecs = seconds;
     const double slaveWarmupSecs = 1.0;
     const double slaveRunningSecs = masterRunningSecs + 2.0;
-    uint32_t messageSize;
+    const uint32_t messageSize = (clientIndex == 0) ?
+            SHORT_MESSAGE_SIZE : LONG_MESSAGE_SIZE;
+    double echoRatio = 1.0 * echoSize / messageSize;
 
-    char name[50], description[50];
-    TimeDist dist[1];
-    Buffer statsBefore, statsAfter;
     string receiverLocator;
+    TimeDist dist[1];
     if (clientIndex == 0) {
         // Master client chooses the first master server in the server list as
         // the receiver.
@@ -2614,9 +2792,9 @@ echo_incast()
         sendCommand(receiverLocator.c_str(), "running", 1, numClients-1);
 
         // Run experiment and collect server performance statistics.
-        messageSize = 30;
         LOG(NOTICE, "Send %uB messages, receive %uB messages", messageSize,
                 echoSize);
+        Buffer statsBefore, statsAfter;
         cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsBefore);
@@ -2636,6 +2814,8 @@ echo_incast()
 
         // Print echo completion time distribution.
         Logger::get().sync();
+        char name[50], description[50];
+        printf("===client 0===\n");
         snprintf(description, sizeof(description),
                 "send %uB message, receive %uB message", messageSize, echoSize);
         snprintf(name, sizeof(name), "echo");
@@ -2657,12 +2837,59 @@ echo_incast()
             printf("%-20s %s     %s 99.9%%\n", name,
                     formatTime(dist->p999).c_str(), description);
         }
+        snprintf(description, sizeof(description),
+                 "bandwidth sending %uB messages", SHORT_MESSAGE_SIZE);
+        printBandwidth("sendBw", dist->bandwidth / echoRatio, description);
+        snprintf(description, sizeof(description),
+                 "bandwidth receiving %uB messages", echoSize);
+        printBandwidth("recvBw", dist->bandwidth, description);
+
+        // Print slave clients throughput information.
+        ClientMetrics clientMetrics;
+        sendMetrics(0, 0);
+        getMetrics(clientMetrics, numClients);
+        for (int slave = 1; slave < numClients; slave++) {
+            printf("===client %d===\n", slave);
+            snprintf(description, sizeof(description),
+                     "bandwidth sending %uB messages", LONG_MESSAGE_SIZE);
+            printBandwidth("sendBw", clientMetrics[0][slave], description);
+            snprintf(description, sizeof(description),
+                     "bandwidth receiving %uB messages", echoSize);
+            printBandwidth("recvBw", clientMetrics[1][slave], description);
+        }
+
+        // Print server network bandwidth information.
+        PerfStats::Diff diff;
+        PerfStats::clusterDiff(&statsBefore, &statsAfter, &diff);
+//        for (uint32_t i = 0; i < diff["serverId"].size(); i++) {
+        double elapsedTime = diff["collectionTime"][0] /
+                diff["cyclesPerSecond"][0];
+        double sendBw = diff["networkOutputBytes"][0] / elapsedTime;
+        double recvBw = diff["networkInputBytes"][0] / elapsedTime;
+
+        printf("===server %.0f===\n", diff["serverId"][0]);
+        printf("%-20s  %.1f s\n", "elapsedTime", elapsedTime);
+        snprintf(description, sizeof(description),
+                 "bandwidth sending bytes");
+        printBandwidth("sendBw", sendBw, description);
+        snprintf(description, sizeof(description),
+                 "bandwidth receiving bytes");
+        printBandwidth("recvBw", recvBw, description);
+//        }
+
+        // TODO: EXTRA STUFF
+        printf("!!! %s, %d, %.2f, %.2f, %.2f, %.0f\n",
+               receiverLocator.find("homa") != string::npos ? "Homa" : "Basic",
+               numClients-1,
+               dist->min * 1e6,
+               dist->p50 * 1e6,
+               dist->p99 * 1e6,
+               recvBw);
     } else {
         // Slave client obtains the receiver's service locator from the master
         // client.
         char command[50];
         receiverLocator = getCommand(command, sizeof(command));
-        messageSize = 1000000;
         LOG(NOTICE, "Send %uB messages to server at %s, receive %uB messages",
                 messageSize, receiverLocator.c_str(), echoSize);
 
@@ -2673,22 +2900,97 @@ echo_incast()
         dist[0] = echoMessages({receiverLocator}, messageSize, echoSize, ~0u,
                slaveRunningSecs);
         setSlaveState("done");
+
+        // Send metrics `sendBw` and `recvBw` to the master client.
+        sendMetrics(dist->bandwidth / echoRatio, dist->bandwidth);
+    }
+}
+
+void
+echo_workload()
+{
+    // Get all servers available in the cluster.
+    vector<string> serverLocators;
+    using ServerMap = std::map<uint64_t, std::pair<string, ServiceMask>>;
+    ServerMap servers;
+    getServerList(&servers);
+    ServerMap::iterator it;
+    for (it = servers.begin(); it != servers.end(); it++) {
+        if (it->second.second.has(WireFormat::MASTER_SERVICE)) {
+            serverLocators.push_back(it->second.first);
+        }
+    }
+    LOG(NOTICE, "%lu servers available", servers.size());
+
+    // Read in the cumulative distribution function of the message size.
+    double averageMessageSize;
+    vector<uint32_t> messageSizes;
+    vector<double> cumulativeProbabilities;
+    if (!messageSizeCdfFilePath.empty()) {
+        std::ifstream inFile(messageSizeCdfFilePath);
+        inFile >> averageMessageSize;
+
+        uint32_t size;
+        double probability;
+        while (inFile >> size >> probability) {
+            messageSizes.push_back(size);
+            cumulativeProbabilities.push_back(probability);
+        }
+        LOG(ERROR, "avg %.1f, size %u, prob %.1f", averageMessageSize, size, probability);
+    } else {
+        LOG(ERROR, "No message size CDF file found");
+        return;
     }
 
-    // Print client bandwidth information.
-    Logger::get().sync();
-    double echoRatio = 1.0 * echoSize / messageSize;
-    snprintf(description, sizeof(description),
-             "bandwidth sending %uB messages", messageSize);
-    printBandwidth("sendBw", dist->bandwidth / echoRatio, description);
-    snprintf(description, sizeof(description),
-             "bandwidth receiving %uB messages", echoSize);
-    printBandwidth("recvBw", dist->bandwidth, description);
+    //
+//    Buffer statsBefore, statsAfter;
+//    if (clientIndex == 0) {
+//        cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
+//        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+//                &statsBefore);
+//    }
 
-    // Print server network bandwidth information.
+    vector<TimeDist> results = echoMessages2(serverLocators,
+            averageMessageSize, messageSizes, cumulativeProbabilities, -1, 10);
+
     if (clientIndex == 0) {
-        printf("========\n%s",
-            PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
+        Logger::get().sync();
+        char name[50], description[50];
+        for (uint i = 0; i < results.size(); i++) {
+            TimeDist* dist = &results[i];
+            snprintf(description, sizeof(description),
+                    "send %uB message, receive %uB message",
+                     messageSizes[i], messageSizes[i]);
+            snprintf(name, sizeof(name), "echo");
+            printf("%-20s %s     %s median\n", name, formatTime(dist->p50).c_str(),
+                    description);
+            snprintf(name, sizeof(name), "echo.min");
+            printf("%-20s %s     %s minimum\n", name, formatTime(dist->min).c_str(),
+                    description);
+            snprintf(name, sizeof(name), "echo.9");
+            printf("%-20s %s     %s 90%%\n", name, formatTime(dist->p90).c_str(),
+                    description);
+            if (dist->p99 != 0) {
+                snprintf(name, sizeof(name), "echo.99");
+                printf("%-20s %s     %s 99%%\n", name,
+                        formatTime(dist->p99).c_str(), description);
+            }
+            if (dist->p999 != 0) {
+                snprintf(name, sizeof(name), "echo.999");
+                printf("%-20s %s     %s 99.9%%\n", name,
+                        formatTime(dist->p999).c_str(), description);
+            }
+            snprintf(description, sizeof(description),
+                     "bandwidth sending %uB messages", messageSizes[i]);
+            printBandwidth("sendBw", dist->bandwidth, description);
+            snprintf(description, sizeof(description),
+                     "bandwidth receiving %uB messages", messageSizes[i]);
+            printBandwidth("recvBw", dist->bandwidth, description);
+        }
+
+//        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+//                &statsAfter);
+//        PerfStats::printClusterStats(&statsBefore, &statsAfter);
     }
 }
 
@@ -6850,6 +7152,7 @@ TestInfo tests[] = {
     {"broadcast", broadcast},
     {"echo_basic", echo_basic},
     {"echo_incast", echo_incast},
+    {"echo_workload", echo_workload},
     {"indexBasic", indexBasic},
     {"indexRange", indexRange},
     {"indexMultiple", indexMultiple},
@@ -6908,7 +7211,7 @@ try
         ("numClients", po::value<int>(&numClients)->default_value(1),
                 "Total number of clients running")
         ("numVClients", po::value<int>(&numVClients)->default_value(1),
-                "Total number of virtual clients to simulate pre client")
+                "Total number of virtual clients to simulate per client")
         ("size,s", po::value<int>(&objectSize)->default_value(100),
                 "Size of objects (in bytes) to use for test")
         ("numObjects", po::value<int>(&numObjects)->default_value(1),
@@ -6923,6 +7226,10 @@ try
         ("workload", po::value<string>(&workload)->default_value("YCSB-A"),
                 "Workload of additional load generating clients"
                 "(YCSB-A, YCSB-B, YCSB-C)")
+        ("messageSizeCdfFile", po::value<string>(&messageSizeCdfFilePath)->
+                default_value(""),
+         // TODO: BETTER DESC.
+                "File to read message size distribution in CDF format. ")
         ("targetOps", po::value<int>(&targetOps)->default_value(0),
                 "Operations per second that each load generating client"
                 "will try to achieve (0 means run as fast as possible)")

@@ -233,4 +233,16 @@ Cycles::sleep(uint64_t us)
     uint64_t stop = Cycles::rdtsc() + Cycles::fromNanoseconds(1000*us);
     while (Cycles::rdtsc() < stop);
 }
+
+// TODO
+uint64_t
+Cycles::sleepUntil(uint64_t cycles)
+{
+    while (true) {
+        uint64_t now = Cycles::rdtsc();
+        if (now >= cycles) {
+            return now;
+        }
+    }
+}
 } // end RAMCloud
