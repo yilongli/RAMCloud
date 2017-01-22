@@ -155,8 +155,12 @@ HomaTransport::~HomaTransport()
         deleteServerRpc(serverRpc);
     }
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
-            it != outgoingRpcs.end(); it++) {
+            it != outgoingRpcs.end(); ) {
         ClientRpc* clientRpc = it->second;
+
+        // Advance iterator; otherwise it will get invalidated by
+        // deleteClientRpc.
+        it++;
         deleteClientRpc(clientRpc);
     }
 }
@@ -818,7 +822,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                             uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
-                                clientRpc->accumulator.get(),
+                                clientRpc->rpcId, clientRpc->accumulator.get(),
                                 uint32_t(header->unscheduledBytes),
                                 clientRpc->session->serverAddress,
                                 static_cast<uint8_t>(FROM_SERVER));
@@ -827,9 +831,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
                 if (clientRpc->scheduledMessage) {
+                    bool scheduledPacket = (header->offset + received->len >
+                            header->unscheduledBytes);
                     dataArriveForScheduledMessage(
                             clientRpc->scheduledMessage.get(),
-                            clientRpc->rpcId);
+                            scheduledPacket);
                 }
                 if (clientRpc->response->size() >= header->totalLength) {
                     // Response complete.
@@ -1029,7 +1035,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                             uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
-                                serverRpc->accumulator.get(),
+                                serverRpc->rpcId, serverRpc->accumulator.get(),
                                 uint32_t(header->unscheduledBytes),
                                 serverRpc->clientAddress,
                                 static_cast<uint8_t>(FROM_CLIENT));
@@ -1050,9 +1056,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                             header->totalLength);
                 }
                 if (serverRpc->scheduledMessage) {
+                    bool scheduledPacket = (header->offset + received->len >
+                            header->unscheduledBytes);
                     dataArriveForScheduledMessage(
                             serverRpc->scheduledMessage.get(),
-                            serverRpc->rpcId);
+                            scheduledPacket);
                 }
                 if (serverRpc->requestPayload.size() >= header->totalLength) {
                     // Message complete; start servicing the RPC.
@@ -1251,7 +1259,9 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     , estimatedReceivedBytes(0)
     , fragments()
     , totalLength(totalLength)
-{ }
+{
+    assert(buffer->size() == 0);
+}
 
 /**
  * Destructor for MessageAccumulators.
@@ -1272,6 +1282,8 @@ HomaTransport::MessageAccumulator::~MessageAccumulator()
  * Construct a ScheduledMessage and notifies the scheduler the arrival of
  * this new scheduled message.
  *
+ * @param rpcId
+ *      Unique identifier for the RPC this message belongs to.
  * @param accumulator
  *      Overall information about this multi-packet message.
  * @param unscheduledBytes
@@ -1282,13 +1294,14 @@ HomaTransport::MessageAccumulator::~MessageAccumulator()
  *      Must be either FROM_CLIENT, indicating that this is a request, or
  *      FROM_SERVER, indicating that this is a response.
  */
-HomaTransport::ScheduledMessage::ScheduledMessage(
+HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
         MessageAccumulator* accumulator, uint32_t unscheduledBytes,
         const Driver::Address* senderAddress, uint8_t whoFrom)
     : accumulator(accumulator)
     , activeMessageLinks()
     , inactiveMessageLinks()
     , grantOffset(unscheduledBytes)
+    , rpcId(rpcId)
     , senderAddress(senderAddress)
     , senderHash(std::hash<std::string>{}(senderAddress->toString()))
     , state(NEW)
@@ -1362,6 +1375,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         // data is missing. Save the packet for later.
         if (fragments.find(header->offset) == fragments.end()) {
             fragments[header->offset] = MessageFragment(header, length);
+            assert(buffer->size() < fragments.begin()->first);
             return true;
         } else {
             estimatedReceivedBytes -= length;
@@ -1386,6 +1400,9 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
             t->driver->release(fragment.header);
         };
         fragments.erase(it);
+    }
+    if (!fragments.empty()) {
+        assert(buffer->size() < fragments.begin()->first);
     }
     return result;
 }
@@ -1617,6 +1634,13 @@ HomaTransport::checkTimeouts()
             if (clientRpc->silentIntervals >= 2) {
                 uint32_t grantOffset = scheduledMessage ?
                         scheduledMessage->grantOffset : 0;
+                if (grantOffset == clientRpc->accumulator->buffer->size()) {
+                    // TODO: NOT SURE WHY THIS COULD HAPPEN?
+                    LOG(WARNING, "client rpc starved of grant, sequence %lu, "
+                            "grantOffset %u",
+                            clientRpc->sequence, grantOffset);
+                    continue;
+                }
                 clientRpc->accumulator->requestRetransmission(this,
                         clientRpc->session->serverAddress,
                         RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
@@ -1670,8 +1694,8 @@ HomaTransport::checkTimeouts()
                     scheduledMessage->grantOffset : 0;
             if (grantOffset == serverRpc->accumulator->buffer->size()) {
                 // TODO: NOT SURE WHY THIS COULD HAPPEN?
-                LOG(WARNING, "grantOffset == buffer->size(), sequence %lu",
-                        serverRpc->sequence);
+                LOG(WARNING, "server rpc starved of grant, sequence %lu, "
+                        "grantOffset %u", serverRpc->sequence, grantOffset);
                 continue;
             }
             serverRpc->accumulator->requestRetransmission(this,
@@ -1698,8 +1722,9 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 
     // The following loop iterates over the active message list to find the
     // right place to insert the given message.
+    ScheduledMessage* insertHere = NULL;
     for (ScheduledMessage& m : activeMessages) {
-        if (alreadyActive && (&m == message)) {
+        if (&m == message) {
             // This existing message is still in the right place: all preceding
             // messages are smaller.
             return;
@@ -1708,18 +1733,22 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
         if (message->compareTo(m) < 0) {
             if (alreadyActive) {
                 erase(activeMessages, *message);
-            } else {
-                message->state = ScheduledMessage::ACTIVE;
             }
-            insertBefore(activeMessages, *message, m);
-            return;
+            insertHere = &m;
+            break;
         }
     }
+
+    // TODO
     if (message->state == ScheduledMessage::INACTIVE) {
         erase(inactiveMessages, *message);
     }
     message->state = ScheduledMessage::ACTIVE;
-    activeMessages.push_back(*message);
+    if (insertHere) {
+        insertBefore(activeMessages, *message, *insertHere);
+    } else {
+        activeMessages.push_back(*message);
+    }
 }
 
 /**
@@ -1740,6 +1769,7 @@ void
 HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
         ScheduledMessage *newMessage)
 {
+    assert(oldMessage->state == ScheduledMessage::ACTIVE);
     if (oldMessage == &activeMessages.front()) {
         // The top message is removed. Reclaim the highest granted priority.
         highestGrantedPrio--;
@@ -1810,6 +1840,7 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
 bool
 HomaTransport::tryToSchedule(ScheduledMessage* message)
 {
+    assert(message->state != ScheduledMessage::ACTIVE);
     bool newMessage = (message->state == ScheduledMessage::NEW);
 
     // The following loop handles the special case where some active message
@@ -1820,6 +1851,7 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
             continue;
         }
 
+        assert(&m != message);
         if (message->compareTo(m) < 0) {
             // The new message should replace an active message that is from
             // the same sender.
@@ -1828,7 +1860,7 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
             assert(message->state == ScheduledMessage::ACTIVE);
             assert(m.state == ScheduledMessage::INACTIVE);
         }
-        goto updateInactiveList;
+        goto schedulingDone;
     }
 
     // From now on, we can assume that the new message has a different sender
@@ -1849,22 +1881,16 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
         assert(worst->state == ScheduledMessage::INACTIVE);
     }
 
-    // TODO: THE RESPONSIBILITY OF THIS METHOD IS TO CORRECTLY SET THE STATE OF
-    // `message` AND PUT IT IN THE RIGHT LIST; THE RESP. OF MAINTAINING THE MESSAGE
-    // BEING REPLACED BY IT IS DELEGATED TO replaceActiveMessage & adjustSchedulingPrecedence
-    updateInactiveList:
-    bool activated = (message->state == ScheduledMessage::ACTIVE);
-    if (newMessage) {
-        if (!activated) {
+    schedulingDone:
+    if (message->state == ScheduledMessage::ACTIVE) {
+        return true;
+    } else {
+        if (newMessage) {
             message->state = ScheduledMessage::INACTIVE;
             inactiveMessages.push_back(*message);
         }
-    } else {
-        if (activated) {
-            erase(inactiveMessages, *message);
-        }
+        return false;
     }
-    return activated;
 }
 
 /**
@@ -1875,38 +1901,38 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
  *
  * \param message
  *      The message that receives new data.
- * \param rpcId
- *      Unique identifier for the RPC the message belongs to.
+ * \param scheduledPacket
+ *      True if the data packet contains scheduled bytes of the message; false,
+ *      otherwise.
  */
 void
 HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
-        RpcId rpcId)
+        bool scheduledPacket)
 {
-    // A scheduled message will be purged from the scheduler as soon as it was
-    // fully granted. However, we will continue to receive data packets from it
-    // for a while.
-    bool messagePurged =
-            (message->grantOffset == message->accumulator->totalLength);
-
-    // See if we need to 1) adjust the scheduling precedence of this message
-    // and 2) output a GRANT.
-    bool needGrant;
-    if (messagePurged) {
-        needGrant = true;
-    } else if (message->state == ScheduledMessage::ACTIVE) {
-        // Output a GRANT if the data packet is from an active message.
-        needGrant = true;
-        adjustSchedulingPrecedence(message);
-    } else if (message->compareTo(activeMessages.back()) <  0) {
-        // This message is an inactive message which has the chance to be
-        // promoted to an active message. Output a GRANT if it does make it
-        // to the active message list.
-        needGrant = tryToSchedule(message);
-    } else {
-        // No need to output a GRANT if the data packet is from an inactive
-        // message.
-        needGrant = false;
+    // See if we need to adjust the scheduling precedence of this message.
+    switch (message->state) {
+        case ScheduledMessage::ACTIVE:
+            adjustSchedulingPrecedence(message);
+            break;
+        case ScheduledMessage::INACTIVE:
+            tryToSchedule(message);
+            break;
+        case ScheduledMessage::PURGED:
+            // A scheduled message will be purged from the scheduler as soon
+            // as it was fully granted. However, we will continue to receive
+            // data packets from it for a while.
+            break;
+        default:
+            LOG(ERROR, "unexpected message state %u", message->state);
+            return;
     }
+
+    // Output a GRANT if this packet is scheduled (i.e., it corresponds to a
+    // GRANT sent in the past) or it belongs to a message is now active or
+    // purged.
+    bool needGrant = scheduledPacket ||
+            (message->state == ScheduledMessage::ACTIVE) ||
+            (message->state == ScheduledMessage::PURGED);
     if (!needGrant) {
         return;
     }
@@ -1958,9 +1984,10 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
             "server sending GRANT, sequence %u, offset %u, priority %u";
     uint8_t whoFrom = (messageToGrant->whoFrom == FROM_CLIENT) ?
             FROM_SERVER : FROM_CLIENT;
-    timeTrace(fmt, downCast<uint32_t>(rpcId.sequence),
+    timeTrace(fmt, downCast<uint32_t>(messageToGrant->rpcId.sequence),
             messageToGrant->grantOffset, priority);
-    GrantHeader grant(rpcId, messageToGrant->grantOffset, priority, whoFrom);
+    GrantHeader grant(messageToGrant->rpcId, messageToGrant->grantOffset,
+            priority, whoFrom);
     driver->sendPacket(messageToGrant->senderAddress, &grant, NULL,
             controlPacketPriority);
 }

@@ -1143,6 +1143,7 @@ echoMessages(const vector<string>& receivers, uint32_t length,
 
 // TODO: templatize it
 struct EchoRpcContainer {
+    Buffer response;
     uint messageId;
     uint64_t startTime;
     EchoRpc rpc;
@@ -1150,11 +1151,12 @@ struct EchoRpcContainer {
 
     EchoRpcContainer(uint messageId, RamCloud* ramcloud,
             const char* serviceLocator, const void* message, uint32_t length,
-            uint32_t echoLength, Buffer* echo)
-        : messageId(messageId)
+            uint32_t echoLength)
+        : response()
+        , messageId(messageId)
         , startTime(Cycles::rdtsc())
         , rpc(ramcloud, serviceLocator, message, length, echoLength,
-                echo)
+                &response)
         , rpcContainerLinks()
     {}
 };
@@ -1232,7 +1234,6 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             static_cast<double>(averageIntervalCycles));
 
     uint64_t totalCycles = 0;
-    Buffer buffer;
     size_t numReceivers = receivers.size();
 
     // TODO: POLLING LOOP FOR MULTIPLE OUTGOING RPCS
@@ -1268,8 +1269,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         if (now > nextMessageArrival) {
             uint32_t length = messageSizes[messageId];
             EchoRpcContainer* echo = echoRpcPool.construct(messageId,
-                    cluster, receiver, message.c_str(), length, length,
-                    &buffer);
+                    cluster, receiver, message.c_str(), length, length);
             echoRpcs.push_back(*echo);
             nextMessageReady = false;
             nextMessageArrival += messageIntervalDist(gen);
@@ -1286,6 +1286,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             it++;
 
             if (echo->rpc.isReady()) {
+                // TODO: SEE IF THE RPC ACTUALLY SUCCEEDS; READY IS NOT ENOUGH
                 uint64_t roundTripTime = Cycles::rdtsc() - echo->startTime;
                 totalTxMessageBytes += messageSizes[echo->messageId];
                 numSamples[echo->messageId]++;

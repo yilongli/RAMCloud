@@ -203,14 +203,14 @@ class HomaTransport : public Transport {
      */
     class ScheduledMessage {
       public:
-        ScheduledMessage(MessageAccumulator* accumulator,
+        ScheduledMessage(RpcId rpcId, MessageAccumulator* accumulator,
                 uint32_t unscheduledBytes,
                 const Driver::Address* senderAddress, uint8_t whoFrom);
         ~ScheduledMessage();
         int compareTo(ScheduledMessage& other) const;
 
         /// Holds state of partially-received multi-packet messages.
-        const MessageAccumulator* accumulator;
+        const MessageAccumulator* const accumulator;
 
         /// Used to link this object into t->activeMessages.
         IntrusiveListHook activeMessageLinks;
@@ -222,6 +222,9 @@ class HomaTransport : public Transport {
         /// incoming message, or # unscheduled bytes in this message if we
         /// haven't sent any GRANTs.
         uint32_t grantOffset;
+
+        /// Unique identifier for the RPC this message belongs to.
+        RpcId rpcId;
 
         /// Network address of the message sender.
         const Driver::Address* senderAddress;
@@ -637,7 +640,8 @@ class HomaTransport : public Transport {
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
             ScheduledMessage* newMessage);
-    void dataArriveForScheduledMessage(ScheduledMessage* message, RpcId rpcId);
+    void dataArriveForScheduledMessage(ScheduledMessage* message,
+            bool scheduledPacket);
 
     /// Shared RAMCloud information.
     Context* context;
