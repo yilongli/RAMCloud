@@ -1956,6 +1956,8 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     if (highestGrantedPrio >= 0) {
         priority = downCast<uint8_t>(highestGrantedPrio);
     }  else {
+        // No scheduled message.
+        assert(activeMessages.size() + inactiveMessages.size() == 0);
         return;
     }
     for (ScheduledMessage& m : activeMessages) {
@@ -1968,7 +1970,6 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
         }
         priority--;
     }
-
 
     if (messageToGrant == NULL) {
         return;

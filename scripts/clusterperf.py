@@ -285,6 +285,8 @@ def run_test(
         client_args['--workload'] = options.workload
     if options.messageSizeCdfFile != None:
         client_args['--messageSizeCdfFile'] = options.messageSizeCdfFile
+    if options.loadFactor != None:
+        client_args['--loadFactor'] = options.loadFactor
     if options.targetOps != None:
         client_args['--targetOps'] = options.targetOps
     if options.txSpan != None:
@@ -910,6 +912,8 @@ if __name__ == '__main__':
             help='Name of workload to run on extra clients to generate load')
     parser.add_option('--messageSizeCdfFile', default='',
             help='Path to the CDF file of message size')
+    parser.add_option('--loadFactor', default='0.1',
+            help='Network load factor')
     parser.add_option('--targetOps', type=int,
             help='Operations per second that each load generating client '
             'will try to achieve')
