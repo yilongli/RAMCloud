@@ -1282,13 +1282,13 @@ HomaTransport::MessageAccumulator::~MessageAccumulator()
  * Construct a ScheduledMessage and notifies the scheduler the arrival of
  * this new scheduled message.
  *
- * @param rpcId
+ * \param rpcId
  *      Unique identifier for the RPC this message belongs to.
- * @param accumulator
+ * \param accumulator
  *      Overall information about this multi-packet message.
- * @param unscheduledBytes
+ * \param unscheduledBytes
  *      # bytes sent unilaterally.
- * @param senderAddress
+ * \param senderAddress
  *      Network address of the message sender.
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that this is a request, or
@@ -1317,7 +1317,7 @@ HomaTransport::ScheduledMessage::~ScheduledMessage()
 {
     // TODO: LOG A WARNING HERE?
     if (state == ACTIVE) {
-        erase(accumulator->t->activeMessages, *this);
+        accumulator->t->replaceActiveMessage(this, NULL, true);
     } else if (state == INACTIVE) {
         erase(accumulator->t->inactiveMessages, *this);
     }
@@ -1707,7 +1707,7 @@ HomaTransport::checkTimeouts()
 
 /**
  * A non-active (new or inactive) message needs to be inserted to the active
- * message list or an existing active message needs to moved forward in the
+ * message list or an existing active message needs to move forward in the
  * list. Either case, put this message to the right place in the list that
  * reflects its precedence among the active messages.
  *
@@ -1718,6 +1718,7 @@ HomaTransport::checkTimeouts()
 void
 HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 {
+    assert(message->state != ScheduledMessage::PURGED);
     bool alreadyActive = (message->state == ScheduledMessage::ACTIVE);
 
     // The following loop iterates over the active message list to find the
@@ -1739,7 +1740,7 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
         }
     }
 
-    // TODO
+    // Insert the message.
     if (message->state == ScheduledMessage::INACTIVE) {
         erase(inactiveMessages, *message);
     }
@@ -1753,33 +1754,42 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 
 /**
  * Replace an active message by an non-active (new or inactive) one because
- * 1) our scheduling policy says it's a better choice or 2) the active message
- * has been fully granted and must be purged from the scheduler.
+ * 1) our scheduling policy says it's a better choice, 2) the active message
+ * has been fully granted or 3) the active message needs to be destroyed
+ * (e.g. the RPC is cancelled).
  *
- * @param oldMessage
+ * \param oldMessage
  *      A currently active message that is about to be deactivated.
- * @param newMessage
+ * \param newMessage
  *      A non-active message that should be activated. NULL means this method
  *      is invoked because \p oldMessage must be purged and it is the duty
  *      of this method to pick a replacement from the inactive message list.
  *      Otherwise, this method is invoked because \p newMessage is a better
  *      choice compared to \p oldMessage.
+ * \param cancelled
+ *      True means we are not interested in receiving \p oldMessage anymore;
+ *      false, otherwise.
  */
 void
 HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
-        ScheduledMessage *newMessage)
+        ScheduledMessage *newMessage, bool cancelled)
 {
+    assert(oldMessage != newMessage);
     assert(oldMessage->state == ScheduledMessage::ACTIVE);
+    assert(newMessage == NULL ||
+            newMessage->state == ScheduledMessage::NEW ||
+            newMessage->state == ScheduledMessage::INACTIVE);
+
+    bool purgeOK = (oldMessage->grantOffset ==
+            oldMessage->accumulator->totalLength);
+
     if (oldMessage == &activeMessages.front()) {
         // The top message is removed. Reclaim the highest granted priority.
         highestGrantedPrio--;
     }
-
-    bool purgeOK = (oldMessage->grantOffset ==
-            oldMessage->accumulator->totalLength);
     erase(activeMessages, *oldMessage);
     if (newMessage == NULL) {
-        assert(purgeOK);
+        assert(purgeOK || cancelled);
         oldMessage->state = ScheduledMessage::PURGED;
 
         // No designated message to promote. Pick one from the inactive
@@ -1815,21 +1825,29 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
             // priority if we haven't used up all the priorities for scheduled
             // traffic.
             highestGrantedPrio++;
-        } else if (highestGrantedPrio + 1 <
-                downCast<int>(activeMessages.size())) {
+        } else if (highestGrantedPrio + 1 < int(activeMessages.size())) {
             // The priorities we are granting for scheduled traffic is not
             // enough to accommodate all the active messages.
             highestGrantedPrio++;
+            assert(highestGrantedPrio + 1 == int(activeMessages.size()));
         }
-    } else if (activeMessages.size() < maxGrantedMessages) {
-        // We don't have enough messages to buffer. Pack the priorities we are
-        // granting for scheduled traffic to start from priority 0.
-        highestGrantedPrio = downCast<int>(activeMessages.size() - 1);
     }
+
+    // Packet the priorities for scheduled packets when there is no enough
+    // message to buffer.
+    if (activeMessages.size() < maxGrantedMessages) {
+        highestGrantedPrio = int(activeMessages.size()) - 1;
+    }
+
+    assert(oldMessage->state == ScheduledMessage::INACTIVE ||
+            oldMessage->state == ScheduledMessage::PURGED);
+    assert(newMessage == NULL || newMessage->state == ScheduledMessage::ACTIVE);
 }
 
 /**
  * Attempts to schedule a message by placing it in the active message list.
+ * This function is invoked when a new scheduled message arrives or an existing
+ * inactive message tries to step up to the active message list.
  *
  * \param message
  *      A message that cannot be completely sent as unscheduled bytes.
@@ -1840,8 +1858,9 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
 bool
 HomaTransport::tryToSchedule(ScheduledMessage* message)
 {
-    assert(message->state != ScheduledMessage::ACTIVE);
-    bool newMessage = (message->state == ScheduledMessage::NEW);
+    assert(message->state == ScheduledMessage::NEW ||
+            message->state == ScheduledMessage::INACTIVE);
+    bool newMessageArrives = (message->state == ScheduledMessage::NEW);
 
     // The following loop handles the special case where some active message
     // comes from the same sender as the new message to avoid violating the
@@ -1851,14 +1870,10 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
             continue;
         }
 
-        assert(&m != message);
         if (message->compareTo(m) < 0) {
             // The new message should replace an active message that is from
             // the same sender.
             replaceActiveMessage(&m, message);
-            // TODO: REMOVE ASSERTION
-            assert(message->state == ScheduledMessage::ACTIVE);
-            assert(m.state == ScheduledMessage::INACTIVE);
         }
         goto schedulingDone;
     }
@@ -1869,23 +1884,21 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
         // We have not buffered enough messages. This also implies we have not
         // used up our priority levels for scheduled packets. Bump the highest
         // granted priority.
-        assert(newMessage);
+        assert(newMessageArrives); // TODO: EXPLAIN THE ASSERTION
         adjustSchedulingPrecedence(message);
         highestGrantedPrio++;
-        assert(message->state == ScheduledMessage::ACTIVE);
+        assert(highestGrantedPrio <= highestSchedPriority);
+        assert(highestGrantedPrio + 1 == int(activeMessages.size()));
     } else if (message->compareTo(activeMessages.back()) < 0) {
         // The new message should replace the "worst" active message.
-        ScheduledMessage* worst = &activeMessages.back();
         replaceActiveMessage(&activeMessages.back(), message);
-        assert(message->state == ScheduledMessage::ACTIVE);
-        assert(worst->state == ScheduledMessage::INACTIVE);
     }
 
     schedulingDone:
     if (message->state == ScheduledMessage::ACTIVE) {
         return true;
     } else {
-        if (newMessage) {
+        if (newMessageArrives) {
             message->state = ScheduledMessage::INACTIVE;
             inactiveMessages.push_back(*message);
         }

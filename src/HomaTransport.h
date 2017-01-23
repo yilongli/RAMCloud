@@ -639,7 +639,7 @@ class HomaTransport : public Transport {
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
-            ScheduledMessage* newMessage);
+            ScheduledMessage* newMessage, bool cancelled = false);
     void dataArriveForScheduledMessage(ScheduledMessage* message,
             bool scheduledPacket);
 
