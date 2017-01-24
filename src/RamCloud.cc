@@ -472,6 +472,43 @@ RamCloud::echo(const char* serviceLocator, const void* message,
     rpc.wait();
 }
 
+vector<EchoRpcContainer*> __finishedRpcs = {};
+
+EchoRpcContainer::EchoRpcContainer(uint messageId, RamCloud* ramcloud,
+        const char* serviceLocator, const void* message, uint32_t length,
+        uint32_t echoLength)
+    : ramcloud(ramcloud)
+    , serviceLocator(serviceLocator)
+    , message(message)
+    , length(length)
+    , echoLength(echoLength)
+    , response()
+    , messageId(messageId)
+    , startTime()
+    , roundTripTime(~0u)
+    , rpc()
+    , rpcContainerLinks()
+{}
+
+void
+EchoRpcContainer::invokeRpc() {
+    startTime = Cycles::rdtsc();
+    rpc.construct(ramcloud, serviceLocator, message, length, echoLength,
+            &response, this);
+}
+
+void
+EchoRpcContainer::callback() {
+    try {
+        rpc->wait();
+        roundTripTime = Cycles::rdtsc() - startTime;
+    } catch (...) {
+    }
+
+    // Remove itself from the EchoRpcList
+    __finishedRpcs.push_back(this);
+}
+
 /**
  * Constructor for EchoRpc: initiates an RPC in the same way as
  * #RamCloud::echo, but returns once the RPC has been initiated, without
@@ -496,9 +533,10 @@ RamCloud::echo(const char* serviceLocator, const void* message,
  */
 EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
         const void* message, uint32_t length, uint32_t echoLength,
-        Buffer* echo)
+        Buffer* echo, EchoRpcContainer* container)
     : RpcWrapper(sizeof(WireFormat::Echo::Response), echo)
     , ramcloud(ramcloud)
+    , container(container)
 {
     echo->reset();
     try {
@@ -512,6 +550,24 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     reqHdr->echoLength = echoLength;
     request.append(message, length);
     send();
+}
+
+void
+EchoRpc::completed()
+{
+    RpcWrapper::completed();
+    if (container) {
+        container->callback();
+    }
+}
+
+void
+EchoRpc::failed()
+{
+    RpcWrapper::failed();
+    if (container) {
+        container->callback();
+    }
 }
 
 /**

@@ -279,6 +279,8 @@ class DropIndexRpc : public CoordinatorRpcWrapper {
     DISALLOW_COPY_AND_ASSIGN(DropIndexRpc);
 };
 
+struct EchoRpcContainer;
+
 /**
  * Encapsulates the state of a RamCloud::echo operation,
  * allowing it to execute asynchronously.
@@ -287,15 +289,45 @@ class EchoRpc : public RpcWrapper {
   public:
     EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
             const void* message, uint32_t length, uint32_t echoLength,
-            Buffer* echo);
+            Buffer* echo, EchoRpcContainer* container = NULL);
     ~EchoRpc() {}
+    virtual void completed();
+    virtual void failed();
     /// \copydoc RpcWrapper::docForWait
     void wait();
 
   PRIVATE:
     RamCloud* ramcloud;
+    EchoRpcContainer* container;
     DISALLOW_COPY_AND_ASSIGN(EchoRpc);
 };
+
+// TODO: templatize it
+struct EchoRpcContainer {
+    RamCloud* ramcloud;
+    const char* serviceLocator;
+    const void* message;
+    uint32_t length;
+    uint32_t echoLength;
+
+    Buffer response;
+    uint messageId;
+    uint64_t startTime;
+    uint64_t roundTripTime;
+    Tub<EchoRpc> rpc;
+    IntrusiveListHook rpcContainerLinks;
+
+
+    EchoRpcContainer(uint messageId, RamCloud* ramcloud,
+            const char* serviceLocator, const void* message, uint32_t length,
+            uint32_t echoLength);
+    void invokeRpc();
+    void callback();
+
+    DISALLOW_COPY_AND_ASSIGN(EchoRpcContainer);
+};
+
+extern vector<EchoRpcContainer*> __finishedRpcs;
 
 /**
  * Encapsulates the state of a RamCloud::enumerateTable

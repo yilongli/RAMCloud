@@ -67,6 +67,7 @@ class Dispatch {
     int poll();
     void run() __attribute__ ((noreturn));
 
+    // TODO: volatile is not correct
     /// The return value from rdtsc at the beginning of the last call to
     /// #poll.  May be read from multiple threads, so must be volatile.
     /// This value is relatively accurate for any code running in a Dispatch

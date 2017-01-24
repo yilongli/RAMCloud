@@ -1145,25 +1145,7 @@ echoMessages(const vector<string>& receivers, uint32_t length,
     return result;
 }
 
-// TODO: templatize it
-struct EchoRpcContainer {
-    Buffer response;
-    uint messageId;
-    uint64_t startTime;
-    EchoRpc rpc;
-    IntrusiveListHook rpcContainerLinks;
-
-    EchoRpcContainer(uint messageId, RamCloud* ramcloud,
-            const char* serviceLocator, const void* message, uint32_t length,
-            uint32_t echoLength)
-        : response()
-        , messageId(messageId)
-        , startTime(Cycles::rdtsc())
-        , rpc(ramcloud, serviceLocator, message, length, echoLength,
-                &response)
-        , rpcContainerLinks()
-    {}
-};
+using Samples = vector<uint64_t>;
 
 /**
  * Send and receive messages of given sizes, return information about the
@@ -1189,13 +1171,13 @@ struct EchoRpcContainer {
 vector<TimeDist>
 echoMessages2(const vector<string>& receivers, double averageMessageSize,
         vector<uint32_t>& messageSizes, vector<double>& cumulativeProbabilities,
-        uint64_t iteration, double timeLimit)
+        uint64_t iteration, double timeLimit, vector<Samples>& roundTripTimes)
 {
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
     // Any more samples will simply overwrite old ones by wrapping around.
-    using Samples = vector<uint64_t>;
     const uint32_t MAX_NUM_SAMPLE = 1000000;
-    vector<Samples> roundTripTimes(messageSizes.size());
+//    vector<Samples> roundTripTimes(messageSizes.size());
+    roundTripTimes.assign(messageSizes.size(), {});
     vector<uint32_t> numSamples(messageSizes.size());
     for (Samples& samples : roundTripTimes) {
         samples.assign(MAX_NUM_SAMPLE, 0);
@@ -1243,20 +1225,22 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     ObjectPool<EchoRpcContainer> echoRpcPool;
     INTRUSIVE_LIST_TYPEDEF(EchoRpcContainer, rpcContainerLinks)
             EchoRpcList;
-    EchoRpcList echoRpcs;
+    EchoRpcList outstandingRpcs;
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
-    bool nextMessageReady = false;
     const char* receiver = NULL;
     uint messageId = 0;
     uint64_t totalTxMessageBytes = 0;
+    EchoRpcContainer* nextRpc = NULL;
     for (uint64_t count = 0; count < iteration; count++) {
         // Prepare the next message if it's not ready yet.
-        if (!nextMessageReady) {
+        if (nextRpc == NULL) {
             receiver = receivers[generateRandom() % numReceivers].c_str();
             messageId = messageSizeDist(gen);
-            nextMessageReady = true;
+            uint32_t length = messageSizes[messageId];
+            nextRpc = echoRpcPool.construct(messageId, cluster, receiver,
+                    message.c_str(), length, length);
         }
 
         uint64_t now = Cycles::rdtsc();
@@ -1270,45 +1254,55 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
         // See if we need to send another message.
         if (now > nextMessageArrival) {
-            uint32_t length = messageSizes[messageId];
-            EchoRpcContainer* echo = echoRpcPool.construct(messageId,
-                    cluster, receiver, message.c_str(), length, length);
-            echoRpcs.push_back(*echo);
-            nextMessageReady = false;
+            nextRpc->invokeRpc();
+            outstandingRpcs.push_back(*nextRpc);
+            nextRpc = NULL;
             nextMessageArrival += messageIntervalDist(gen);
         }
 
         // Check for RPC completion.
         context->dispatch->poll();
-        for (EchoRpcList::iterator it = echoRpcs.begin();
-                it != echoRpcs.end();) {
-            EchoRpcContainer* echo = &(*it);
-
-            // Advance the iterator now, so it won't get invalidated if we
-            // delete the EchoRpcContainer below.
-            it++;
-
-            if (echo->rpc.isReady()) {
-                uint64_t roundTripTime;
-                try {
-                    echo->rpc.wait();
-                    roundTripTime = Cycles::rdtsc() - echo->startTime;
-                    totalTxMessageBytes += messageSizes[echo->messageId];
-                } catch (...) {
-                    // TODO: RPC TIMEOUT, etc.
-                    roundTripTime = ~0u;
-                }
-                roundTripTimes[echo->messageId]
-                        [numSamples[echo->messageId] % MAX_NUM_SAMPLE] =
-                        roundTripTime;
-                numSamples[echo->messageId]++;
-                erase(echoRpcs, *echo);
-                echoRpcPool.destroy(echo);
-            }
+        for (EchoRpcContainer* echo : __finishedRpcs) {
+            totalTxMessageBytes += messageSizes[echo->messageId];
+            roundTripTimes[echo->messageId]
+                    [numSamples[echo->messageId] % MAX_NUM_SAMPLE] =
+                    echo->roundTripTime;
+            numSamples[echo->messageId]++;
+            erase(outstandingRpcs, *echo);
+            echoRpcPool.destroy(echo);
         }
+        __finishedRpcs.clear();
+
+        // TODO: NOW DEPRECATED CODE; TOO EXPENSIVE AND INACCURATE RTT MEASUREMENT
+//        for (EchoRpcList::iterator it = echoRpcs.begin();
+//                it != echoRpcs.end();) {
+//            EchoRpcContainer* echo = &(*it);
+//
+//            // Advance the iterator now, so it won't get invalidated if we
+//            // delete the EchoRpcContainer below.
+//            it++;
+//
+//            if (echo->rpc.isReady()) {
+//                uint64_t roundTripTime;
+//                try {
+//                    echo->rpc.wait();
+//                    roundTripTime = Cycles::rdtsc() - echo->startTime;
+//                    totalTxMessageBytes += messageSizes[echo->messageId];
+//                } catch (...) {
+//                    // TODO: RPC TIMEOUT, etc.
+//                    roundTripTime = ~0u;
+//                }
+//                roundTripTimes[echo->messageId]
+//                        [numSamples[echo->messageId] % MAX_NUM_SAMPLE] =
+//                        roundTripTime;
+//                numSamples[echo->messageId]++;
+//                erase(echoRpcs, *echo);
+//                echoRpcPool.destroy(echo);
+//            }
+//        }
     }
     totalCycles = Cycles::rdtsc() - startTime;
-    printf("Workload running time %.1f secs", Cycles::toSeconds(totalCycles));
+    printf("Workload running time %.1f secs\n", Cycles::toSeconds(totalCycles));
 
     //
     vector<TimeDist> results(messageSizes.size());
@@ -2741,8 +2735,8 @@ echo_basic()
         cluster->logMessageAll(NOTICE,
                 "Starting echo test for %d-byte reply messages",
                 incomingSizes[i]);
-        echoDists[i] = echoMessages({receiverLocator}, outgoingSizes[i],
-                incomingSizes[i], 1000, 2.0);
+        echoDists.push_back(echoMessages({receiverLocator}, outgoingSizes[i],
+                incomingSizes[i], 1000, 2.0));
     }
     Logger::get().sync();
 
@@ -2981,9 +2975,10 @@ echo_workload()
                 &statsBefore);
     }
 
+    vector<Samples> roundTripTrimes;
     vector<TimeDist> results = echoMessages2(serverLocators,
             averageMessageSize, messageSizes, cumulativeProbabilities, ~0u,
-            seconds);
+            seconds, roundTripTrimes);
 
     if (clientIndex == 0) {
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
@@ -3025,6 +3020,13 @@ echo_workload()
         }
 
         printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
+    }
+
+    for (uint i = 0; i < roundTripTrimes.size(); i++) {
+        Samples samples = roundTripTrimes[i];
+        for (uint64_t cycles : samples) {
+            printf("@ %u %.1f\n", messageSizes[i], Cycles::toSeconds(cycles)*1e6);
+        }
     }
 }
 
