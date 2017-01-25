@@ -27,6 +27,7 @@
 #include "RawMetrics.h"
 #include "PerfStats.h"
 #include "Unlock.h"
+#include "TimeTrace.h"
 
 // Uncomment to print out a human readable name for any poller that takes longer
 // than slowPollerCycles to complete. Useful for determining which poller is
@@ -78,7 +79,8 @@ Dispatch::Dispatch(bool hasDedicatedThread)
     , lockNeeded(0)
     , locked(0)
     , hasDedicatedThread(hasDedicatedThread)
-    , slowPollerCycles(Cycles::fromSeconds(.05))
+    , slowPollerCycles(Cycles::fromSeconds(100 * 1e-6)) // 100 us
+//    , slowPollerCycles(Cycles::fromSeconds(.05))
     , profilerFlag(false)
     , totalElements(0)
     , pollingTimes(NULL)
@@ -177,6 +179,7 @@ Dispatch::poll()
         currentTime = newCurrent;
     }
     for (uint32_t i = 0; i < pollers.size(); i++) {
+#define DEBUG_SLOW_POLLERS 0
 #if DEBUG_SLOW_POLLERS
         uint64_t ticks = 0;
         CycleCounter<> counter(&ticks);
@@ -186,8 +189,10 @@ Dispatch::poll()
         counter.stop();
         if (ticks > slowPollerCycles) {
             double ms = Cycles::toSeconds(ticks) * 1000;
-            LOG(NOTICE, "Poller %s (%u) took awhile: %.1f ms",
-                pollers[i]->pollerName.c_str(), i, ms);
+            uint32_t us = uint32_t(Cycles::toSeconds(ticks) * 1000000);
+            TimeTrace::record("Poller (%u) took awhile: %u us", i, us);
+//            LOG(NOTICE, "Poller %s (%u) took awhile: %.1f ms",
+//                pollers[i]->pollerName.c_str(), i, ms);
         }
 #endif
     }

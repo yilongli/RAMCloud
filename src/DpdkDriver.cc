@@ -52,7 +52,7 @@ namespace RAMCloud
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this driver.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -296,7 +296,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     // attempt to dequeue a batch of received packets from the NIC
     // as well as from the loopback ring.
     uint32_t incomingPkts = rte_eth_rx_burst(portId, 0, mPkts,
-            downCast<uint16_t>(maxPackets/2));
+            downCast<uint16_t>(maxPackets));
     if (incomingPkts > 0) {
         timeTrace("DpdkDriver received %u packets", incomingPkts);
     }
@@ -363,6 +363,10 @@ DpdkDriver::release(char *payload)
 {
     // Must sync with the dispatch thread, since this method could potentially
     // be invoked in a worker.
+    // TODO: NEED A PRIORITY SYSTEM HERE? DISPATCH THREAD HAS HIGHER PRIO ON LOCK
+    // OR, BETTER, A BULK RELEASE API FOR DISPATCH THREAD? OR AN API THAT TAKES
+    // A LOCK, SO DISPATCH THREAD CAN ACQUIRE THE LOCK ONLY ONCE BEFORE ENTERING?
+    // TODO: IS THIS WHY PKT_MBUF ZERO-COPY MAKES THE PERF WORSE IN SOME CASES?
     Dispatch::Lock _(context->dispatch);
 
     // Note: the payload is actually contained in a PacketBuf structure,

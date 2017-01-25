@@ -21,6 +21,7 @@
 #include "ObjectPool.h"
 #include "Transport.h"
 #include "LogProtector.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 

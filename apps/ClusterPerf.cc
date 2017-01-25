@@ -1223,9 +1223,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
     // TODO: POLLING LOOP FOR MULTIPLE OUTGOING RPCS
     ObjectPool<EchoRpcContainer> echoRpcPool;
-    INTRUSIVE_LIST_TYPEDEF(EchoRpcContainer, rpcContainerLinks)
-            EchoRpcList;
-    EchoRpcList outstandingRpcs;
+    uint32_t outstandingRpcs = 0;
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
@@ -1254,52 +1252,29 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
         // See if we need to send another message.
         if (now > nextMessageArrival) {
+            outstandingRpcs++;
             nextRpc->invokeRpc();
-            outstandingRpcs.push_back(*nextRpc);
             nextRpc = NULL;
             nextMessageArrival += messageIntervalDist(gen);
         }
 
         // Check for RPC completion.
-        context->dispatch->poll();
+        if (now - context->dispatch->currentTime > Cycles::fromMicroseconds(100)) {
+            TimeTrace::record("ClusterPerf: long polling iteration");
+        }
+//        TimeTrace::record("ClusterPerf: JUST BEFORE POLL, oustandingRpcs %u", outstandingRpcs);
+        uint32_t result = context->dispatch->poll();
+//        TimeTrace::record("ClusterPerf: RIGHT AFTER POLL, poll %u", result);
         for (EchoRpcContainer* echo : __finishedRpcs) {
+            outstandingRpcs--;
             totalTxMessageBytes += messageSizes[echo->messageId];
             roundTripTimes[echo->messageId]
                     [numSamples[echo->messageId] % MAX_NUM_SAMPLE] =
                     echo->roundTripTime;
             numSamples[echo->messageId]++;
-            erase(outstandingRpcs, *echo);
             echoRpcPool.destroy(echo);
         }
         __finishedRpcs.clear();
-
-        // TODO: NOW DEPRECATED CODE; TOO EXPENSIVE AND INACCURATE RTT MEASUREMENT
-//        for (EchoRpcList::iterator it = echoRpcs.begin();
-//                it != echoRpcs.end();) {
-//            EchoRpcContainer* echo = &(*it);
-//
-//            // Advance the iterator now, so it won't get invalidated if we
-//            // delete the EchoRpcContainer below.
-//            it++;
-//
-//            if (echo->rpc.isReady()) {
-//                uint64_t roundTripTime;
-//                try {
-//                    echo->rpc.wait();
-//                    roundTripTime = Cycles::rdtsc() - echo->startTime;
-//                    totalTxMessageBytes += messageSizes[echo->messageId];
-//                } catch (...) {
-//                    // TODO: RPC TIMEOUT, etc.
-//                    roundTripTime = ~0u;
-//                }
-//                roundTripTimes[echo->messageId]
-//                        [numSamples[echo->messageId] % MAX_NUM_SAMPLE] =
-//                        roundTripTime;
-//                numSamples[echo->messageId]++;
-//                erase(echoRpcs, *echo);
-//                echoRpcPool.destroy(echo);
-//            }
-//        }
     }
     totalCycles = Cycles::rdtsc() - startTime;
     printf("Workload running time %.1f secs\n", Cycles::toSeconds(totalCycles));

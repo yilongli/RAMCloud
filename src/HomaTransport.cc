@@ -18,12 +18,13 @@
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
+#include "Util.h"
 
 namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -209,6 +210,7 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             serverRpc->rpcId.sequence);
+    uint64_t sequenceNumber = serverRpc->rpcId.sequence;
     timeTrace("deleting server RPC, sequence %u",
             downCast<uint32_t>(serverRpc->rpcId.sequence));
     incomingRpcs.erase(serverRpc->rpcId);
@@ -219,6 +221,8 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
         erase(serverTimerList, *serverRpc);
     }
     serverRpcPool.destroy(serverRpc);
+    timeTrace("deleted server RPC, sequence %u",
+            downCast<uint32_t>(sequenceNumber));
 }
 
 /**
@@ -1516,15 +1520,33 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
 int
 HomaTransport::Poller::poll()
 {
+    static uint32_t pollIteration = 0;
+    pollIteration++;
+    static bool firstPoll = true;
+    if (firstPoll) {
+        firstPoll = false;
+        // TODO
+        Util::pinThreadToCore(2);
+        LOG(NOTICE, "cpu affinity %s", Util::getCpuAffinityString().c_str());
+    }
+
     int result = 0;
 
     // Process any available incoming packets.
-#define MAX_PACKETS 8
-    t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
-    int numPackets = downCast<int>(t->receivedPackets.size());
-    for (int i = 0; i < numPackets; i++) {
-        result = 1;
-        t->handlePacket(&t->receivedPackets[i]);
+#define MAX_PACKETS 4
+    uint numPackets;
+    do {
+        // TODO: SHOULD I FETCH AS MANY AS POSSIBLE BEFORE HANDLING THEM?
+        t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
+        numPackets = downCast<uint>(t->receivedPackets.size());
+        for (uint i = 0; i < numPackets; i++) {
+            result = 1;
+            t->handlePacket(&t->receivedPackets[i]);
+        }
+        t->receivedPackets.clear();
+    } while (numPackets == MAX_PACKETS);
+    if (result == 1) {
+        timeTrace("polling iteration %u", pollIteration);
     }
 
     // See if we should check for timeouts. Ideally, we'd like to do this
@@ -1561,7 +1583,7 @@ HomaTransport::Poller::poll()
     // Transmit data packets if possible.
     result |= t->tryToTransmitData();
 
-    t->receivedPackets.clear();
+//    t->receivedPackets.clear();
     return result;
 }
 

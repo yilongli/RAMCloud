@@ -487,12 +487,16 @@ EchoRpcContainer::EchoRpcContainer(uint messageId, RamCloud* ramcloud,
     , startTime()
     , roundTripTime(~0u)
     , rpc()
-    , rpcContainerLinks()
 {}
 
 void
 EchoRpcContainer::invokeRpc() {
     startTime = Cycles::rdtsc();
+    if (length < 1400) {
+        uint32_t p1 = uint32_t(startTime >> 32);
+        uint32_t p2 = uint32_t(startTime);
+        TimeTrace::record(startTime, "SHORT MSG START TIME %u.%u", p1, p2);
+    }
     rpc.construct(ramcloud, serviceLocator, message, length, echoLength,
             &response, this);
 }
@@ -501,7 +505,17 @@ void
 EchoRpcContainer::callback() {
     try {
         rpc->wait();
-        roundTripTime = Cycles::rdtsc() - startTime;
+        uint64_t endTime = Cycles::rdtsc();
+        roundTripTime = endTime - startTime;
+        static uint64_t threshold = Cycles::fromMicroseconds(100);
+        if (length < 1400 && roundTripTime > threshold) {
+            double us = Cycles::toSeconds(roundTripTime) * 1e6;
+            uint32_t x = uint32_t(us);
+            uint32_t y = uint32_t((us - x) * 100);
+            uint32_t p1 = uint32_t(startTime >> 32);
+            uint32_t p2 = uint32_t(startTime);
+            TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us, START TIME %u.%u", x, y, p1, p2);
+        }
     } catch (...) {
     }
 

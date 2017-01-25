@@ -315,8 +315,6 @@ struct EchoRpcContainer {
     uint64_t startTime;
     uint64_t roundTripTime;
     Tub<EchoRpc> rpc;
-    IntrusiveListHook rpcContainerLinks;
-
 
     EchoRpcContainer(uint messageId, RamCloud* ramcloud,
             const char* serviceLocator, const void* message, uint32_t length,
