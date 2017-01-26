@@ -179,7 +179,7 @@ Dispatch::poll()
         currentTime = newCurrent;
     }
     for (uint32_t i = 0; i < pollers.size(); i++) {
-#define DEBUG_SLOW_POLLERS 0
+#define DEBUG_SLOW_POLLERS 1
 #if DEBUG_SLOW_POLLERS
         uint64_t ticks = 0;
         CycleCounter<> counter(&ticks);
@@ -189,10 +189,10 @@ Dispatch::poll()
         counter.stop();
         if (ticks > slowPollerCycles) {
             double ms = Cycles::toSeconds(ticks) * 1000;
-            uint32_t us = uint32_t(Cycles::toSeconds(ticks) * 1000000);
+            uint32_t us = uint32_t(Cycles::toSeconds(ticks) * 1e6);
             TimeTrace::record("Poller (%u) took awhile: %u us", i, us);
-//            LOG(NOTICE, "Poller %s (%u) took awhile: %.1f ms",
-//                pollers[i]->pollerName.c_str(), i, ms);
+            LOG(NOTICE, "Poller %s (%u) took awhile: %.1f ms",
+                pollers[i]->pollerName.c_str(), i, ms);
         }
 #endif
     }

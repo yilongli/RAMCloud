@@ -507,7 +507,7 @@ EchoRpcContainer::callback() {
         rpc->wait();
         uint64_t endTime = Cycles::rdtsc();
         roundTripTime = endTime - startTime;
-        static uint64_t threshold = Cycles::fromMicroseconds(100);
+        static uint64_t threshold = Cycles::fromMicroseconds(50);
         if (length < 1400 && roundTripTime > threshold) {
             double us = Cycles::toSeconds(roundTripTime) * 1e6;
             uint32_t x = uint32_t(us);

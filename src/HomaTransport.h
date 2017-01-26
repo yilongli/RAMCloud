@@ -16,6 +16,8 @@
 #ifndef RAMCLOUD_HOMATRANSPORT_H
 #define RAMCLOUD_HOMATRANSPORT_H
 
+#include <deque>
+
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -150,6 +152,11 @@ class HomaTransport : public Transport {
 
         /// Transport that is managing this object.
         HomaTransport* t;
+
+        // TODO: NOT USING VECTOR BECAUSE EXPANSION COULD CAUSE SIGNIFICANT JITTER
+        // DEQUE SUPPORTS O(1) RANDOM ACCESS (BACKED BY FIXED-SIZE ARRAYS), CHEAPER
+        // EXPANSION AND BETTER CACHE LOCALITY THAN LINKED LIST.
+        std::deque<char*> assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -686,6 +693,9 @@ class HomaTransport : public Transport {
     /// want to reallocate space in every call to poll). Always empty,
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
+
+    // TODO:
+    std::vector<char*> retainedPayloads;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;

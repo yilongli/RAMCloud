@@ -1263,7 +1263,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             TimeTrace::record("ClusterPerf: long polling iteration");
         }
 //        TimeTrace::record("ClusterPerf: JUST BEFORE POLL, oustandingRpcs %u", outstandingRpcs);
-        uint32_t result = context->dispatch->poll();
+        context->dispatch->poll();
+//        uint32_t result = context->dispatch->poll();
 //        TimeTrace::record("ClusterPerf: RIGHT AFTER POLL, poll %u", result);
         for (EchoRpcContainer* echo : __finishedRpcs) {
             outstandingRpcs--;

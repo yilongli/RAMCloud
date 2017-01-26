@@ -395,26 +395,18 @@ MasterService::echo(const WireFormat::Echo::Request* reqHdr,
         WireFormat::Echo::Response* respHdr,
         Rpc* rpc)
 {
-    respHdr->length = reqHdr->echoLength;
-    uint32_t messageOffset = sizeof32(*reqHdr);
-    if (reqHdr->echoLength <= reqHdr->length) {
-        rpc->replyPayload->appendExternal(rpc->requestPayload, messageOffset,
-                reqHdr->echoLength);
-    } else {
-        // Declare the dummy data as static to avoid repeated allocations.
-        const uint32_t dummyBlockSize = 1 << 20;
-        static const char dummyBlock[dummyBlockSize] = {0};
+    // Declare the dummy data as static to avoid repeated allocations.
+    const uint32_t dummyBlockSize = 1 << 20;
+    static const char dummyBlock[dummyBlockSize] = {0};
 
-        // Fill in the reply buffer with the original message plus dummy data.
-        rpc->replyPayload->appendExternal(rpc->requestPayload, messageOffset,
-                reqHdr->length);
-        uint32_t bytesLeft = reqHdr->echoLength - reqHdr->length;
-        while (bytesLeft > dummyBlockSize) {
-            bytesLeft -= dummyBlockSize;
-            rpc->replyPayload->appendExternal(dummyBlock, dummyBlockSize);
-        }
-        rpc->replyPayload->appendExternal(dummyBlock, bytesLeft);
+    respHdr->length = reqHdr->echoLength;
+    // Fill in the reply buffer with the dummy data.
+    uint32_t bytesLeft = reqHdr->echoLength;
+    while (bytesLeft > dummyBlockSize) {
+        bytesLeft -= dummyBlockSize;
+        rpc->replyPayload->appendExternal(dummyBlock, dummyBlockSize);
     }
+    rpc->replyPayload->appendExternal(dummyBlock, bytesLeft);
 }
 
 /**

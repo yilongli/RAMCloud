@@ -207,17 +207,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     if (((header->opcode == WireFormat::ECHO) ||
             (header->opcode == WireFormat::READ)) &&
             (header->service == WireFormat::MASTER_SERVICE)) {
-        uint32_t size = rpc->requestPayload.size();
-#define ROUND_TRIP_BYTES 8820
-        if (size > 2 * ROUND_TRIP_BYTES) {
-            // TODO: WHY 2? TWO FACTORS: 1) DOES THREAD HANDOFF COST MATTER
-            // FOR THIS MESSAGE? IF IT IS LONG, THEN IT DOESN'T CARE; 2)
-            // NEED TO LOOK AT HOW FAST PACKETS CAN BE RELEASED, PREFER
-            // THE LARGEST #PACKETS THAT WON'T INTRODUCE JITTER
-
-        }
-
-        Service::Rpc serviceRpc(NULL, &rpc->requestPayload, &rpc->replyPayload);
+        Service::Rpc serviceRpc(NULL, &rpc->requestPayload,
+                &rpc->replyPayload);
         Service::handleRpc(context, &serviceRpc);
         rpc->sendReply();
         return;

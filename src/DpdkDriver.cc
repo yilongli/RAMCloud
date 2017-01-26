@@ -52,7 +52,7 @@ namespace RAMCloud
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this driver.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -363,10 +363,13 @@ DpdkDriver::release(char *payload)
 {
     // Must sync with the dispatch thread, since this method could potentially
     // be invoked in a worker.
+    // TODO: HOW CAN IT BE INVOKED IN A WORKER?
+
     // TODO: NEED A PRIORITY SYSTEM HERE? DISPATCH THREAD HAS HIGHER PRIO ON LOCK
     // OR, BETTER, A BULK RELEASE API FOR DISPATCH THREAD? OR AN API THAT TAKES
     // A LOCK, SO DISPATCH THREAD CAN ACQUIRE THE LOCK ONLY ONCE BEFORE ENTERING?
     // TODO: IS THIS WHY PKT_MBUF ZERO-COPY MAKES THE PERF WORSE IN SOME CASES?
+    // BECAUSE FREEING PKT_MBUF IS MORE EXPENSIVE THAN FREEING PacketBuf?
     Dispatch::Lock _(context->dispatch);
 
     // Note: the payload is actually contained in a PacketBuf structure,
@@ -455,8 +458,10 @@ DpdkDriver::sendPacket(const Address* addr,
     } else {
         uint32_t ret = rte_eth_tx_burst(portId, 0, &mbuf, 1);
         if (ret != 1) {
+            queueEstimator.setQueueSize(maxTransmitQueueSize, Cycles::rdtsc());
             LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?",
                     ret);
+            return;
         }
     }
     timeTrace("outgoing packet enqueued");

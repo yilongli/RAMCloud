@@ -70,6 +70,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
+    , retainedPayloads()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
@@ -164,6 +165,11 @@ HomaTransport::~HomaTransport()
         it++;
         deleteClientRpc(clientRpc);
     }
+
+    // Release all retained payloads after reclaiming all RPC objects.
+    for (char* payload : retainedPayloads) {
+        driver->release(payload);
+    }
 }
 
 // See Transport::getServiceLocator().
@@ -186,14 +192,16 @@ HomaTransport::getServiceLocator()
 void
 HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
-    TEST_LOG("RpcId %lu", clientRpc->sequence);
-    timeTrace("deleting client RPC, sequence %u",
-            downCast<uint32_t>(clientRpc->sequence));
-    outgoingRpcs.erase(clientRpc->sequence);
+    uint64_t sequence = clientRpc->sequence;
+    TEST_LOG("RpcId %lu", sequence);
+    outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
         erase(outgoingRequests, *clientRpc);
     }
+    // TODO: THIS COULD ALSO BE SUPER EXPENSIVE ON THE CLIENT SIDE!!!!
     clientRpcPool.destroy(clientRpc);
+    timeTrace("deleted client RPC, sequence %u",
+            downCast<uint32_t>(sequence));
 }
 
 /**
@@ -208,11 +216,13 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 void
 HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
+    uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
-            serverRpc->rpcId.sequence);
-    uint64_t sequenceNumber = serverRpc->rpcId.sequence;
-    timeTrace("deleting server RPC, sequence %u",
-            downCast<uint32_t>(serverRpc->rpcId.sequence));
+            sequence);
+    // TODO: REMOVE THIS FOLLOWING
+    timeTrace("deleting server RPC, sequence %u, request chunks %u",
+            downCast<uint32_t>(sequence),
+            serverRpc->requestPayload.getNumberChunks());
     incomingRpcs.erase(serverRpc->rpcId);
     if (serverRpc->sendingResponse) {
         erase(outgoingResponses, *serverRpc);
@@ -222,7 +232,7 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
     }
     serverRpcPool.destroy(serverRpc);
     timeTrace("deleted server RPC, sequence %u",
-            downCast<uint32_t>(sequenceNumber));
+            downCast<uint32_t>(sequence));
 }
 
 /**
@@ -1028,6 +1038,21 @@ HomaTransport::handlePacket(Driver::Received* received)
                         "length %u, flags %u",
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->offset, received->len, header->common.flags);
+                if ((header->offset > header->unscheduledBytes) &&
+                        ((serverRpc == NULL) || (header->offset >
+                        serverRpc->scheduledMessage->grantOffset))) {
+                    uint32_t grantOffset = (serverRpc == NULL) ?
+                            header->unscheduledBytes :
+                            serverRpc->scheduledMessage->grantOffset;
+                    // TODO: MAYBE JUST A WARNING
+                    LOG(ERROR, "unexpected DATA from client %s, "
+                            "id (%lu,%lu), offset %u, grantOffset %u",
+                            received->sender->toString().c_str(),
+                            header->common.rpcId.clientId,
+                            header->common.rpcId.sequence, header->offset,
+                            grantOffset);
+                    goto serverDataDone;
+                }
                 if (serverRpc == NULL) {
                     serverRpc = serverRpcPool.construct(this,
                             nextServerSequenceNumber, received->sender,
@@ -1060,6 +1085,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                             header->totalLength);
                 }
                 if (serverRpc->scheduledMessage) {
+                    if (header->offset > serverRpc->scheduledMessage->grantOffset) {
+                        LOG(ERROR, "DATA offset %u larger than grant offset %u",
+                                header->offset,
+                                serverRpc->scheduledMessage->grantOffset);
+                    }
                     bool scheduledPacket = (header->offset + received->len >
                             header->unscheduledBytes);
                     dataArriveForScheduledMessage(
@@ -1259,6 +1289,7 @@ HomaTransport::ServerRpc::sendReply()
 HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
         Buffer* buffer, uint32_t totalLength)
     : t(t)
+    , assembledPayloads()
     , buffer(buffer)
     , estimatedReceivedBytes(0)
     , fragments()
@@ -1280,6 +1311,186 @@ HomaTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->release(fragment.header);
     }
     fragments.clear();
+
+    // TODO: STILL TOO EXPENSIVE?
+    // TODO: AVOID RELEASING THE PAYLOADS ALL AT ONCE TO THE DRIVER
+    for (char* payload : assembledPayloads) {
+        t->retainedPayloads.push_back(payload);
+    }
+}
+
+/**
+ * This method is invoked whenever a new DATA packet arrives for a partially
+ * complete message. It saves information about the new fragment and
+ * (eventually) combines all of the fragments into a complete message.
+ *
+ * \param header
+ *      Pointer to the first byte of the packet, which must be a valid
+ *      DATA packet.
+ * \param length
+ *      Total number of bytes in the packet.
+ * \return
+ *      The return value is true if we have retained a pointer to the
+ *      packet (meaning that the caller should "steal" the Received, if
+ *      it hasn't already). False means that the data in this packet
+ *      was all redundant; we didn't save anything, so the caller need
+ *      not steal the Received.
+ */
+bool
+HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
+        uint32_t length)
+{
+    // Assume the payload contains no redundant bytes for now. The redundant
+    // portion will be deducted when this packet is discarded/assembled.
+    length -= sizeof32(DataHeader);
+    estimatedReceivedBytes += length;
+
+    if (header->offset > buffer->size()) {
+        // Can't append this packet into the buffer because some prior
+        // data is missing. Save the packet for later.
+        if (fragments.find(header->offset) == fragments.end()) {
+            fragments[header->offset] = MessageFragment(header, length);
+            assert(buffer->size() < fragments.begin()->first);
+            return true;
+        } else {
+            estimatedReceivedBytes -= length;
+            return false;
+        }
+    }
+
+    // Append this fragment to the assembled message buffer, then see
+    // if some of the unappended fragments can now be appended as well.
+    bool result = appendFragment(header, length);
+    while (true) {
+        FragmentMap::iterator it = fragments.begin();
+        if (it == fragments.end()) {
+            break;
+        }
+        uint32_t offset = it->first;
+        if (offset > buffer->size()) {
+            break;
+        }
+        MessageFragment fragment = it->second;
+        if (!appendFragment(fragment.header, fragment.length)) {
+            t->driver->release(fragment.header);
+        };
+        fragments.erase(it);
+    }
+    if (!fragments.empty()) {
+        assert(buffer->size() < fragments.begin()->first);
+    }
+    return result;
+}
+
+/**
+ * This method is invoked to append a fragment to a partially-assembled
+ * message. It handles the special cases where part or all of the
+ * fragment is already in the assembled message.
+ *
+ * \param header
+ *      Address of the first byte of a DATA packet.
+ * \param length
+ *      Size of the payload, in bytes.
+ * \return
+ *      True means that (some of) the data in this fragment was
+ *      incorporated into the message buffer. False means that
+ *      the data in this fragment is entirely redundant, so we
+ *      didn't save any pointers to it (the caller may want to
+ *      free this packet).
+ */
+bool
+HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
+        uint32_t length)
+{
+    uint32_t bytesToSkip = buffer->size() - header->offset;
+    estimatedReceivedBytes -= std::min(bytesToSkip, length);
+    if (bytesToSkip >= length) {
+        // This entire fragment is redundant.
+        return false;
+    }
+
+    char* payload = reinterpret_cast<char*>(header);
+    buffer->appendExternal(payload + sizeof32(DataHeader) + bytesToSkip,
+            length - bytesToSkip);
+    assembledPayloads.push_back(payload);
+//    Driver::PayloadChunk::appendToBuffer(buffer,
+//            reinterpret_cast<char*>(header) + sizeof32(DataHeader)
+//            + bytesToSkip, length - bytesToSkip, t->driver,
+//            reinterpret_cast<char*>(header));
+    return true;
+}
+
+/**
+ * This method is invoked to issue a RESEND packet when it appears that
+ * packets have been lost. It is used by both servers and clients.
+ *
+ * \param t
+ *      Overall information about the transport.
+ * \param address
+ *      Network address to which the RESEND should be sent.
+ * \param rpcId
+ *      Unique identifier for the RPC in question.
+ * \param grantOffset
+ *      Largest grantOffset that we have sent for this message (i.e.
+ *      this is how many total bytes we should have received already).
+ *      May be 0 if the client never requested a grant (meaning that it
+ *      planned to transmit the entire message unilaterally).
+ * \param whoFrom
+ *      Must be either FROM_CLIENT, indicating that we are the client, or
+ *      FROM_SERVER, indicating that we are the server.
+ *
+ * \return
+ *      The offset of the byte just after the last one whose retransmission
+ *      was requested.
+ */
+uint32_t
+HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
+        const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
+        uint8_t whoFrom)
+{
+    if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
+        DIE("Bad fragment pointer: %p", &fragments);
+    }
+    uint32_t endOffset;
+    FragmentMap::iterator it = fragments.begin();
+
+    // Compute the end of the retransmission range.
+    if (it != fragments.end()) {
+        // Retransmit the entire gap up to the first fragment.
+        endOffset = it->first;
+    } else if (grantOffset > 0) {
+        // Retransmit everything that we've asked the sender to send:
+        // we don't seem to have received any of it.
+        endOffset = grantOffset;
+    } else {
+        // We haven't issued a GRANT for this message; just request
+        // the first round-trip's worth of data. Once this data arrives,
+        // the normal grant mechanism should kick in if it's still needed.
+        endOffset = t->roundTripBytes;
+    }
+    assert(endOffset > buffer->size());
+    if (whoFrom == FROM_SERVER) {
+        timeTrace("server requesting retransmission of bytes %u-%u, "
+                "sequence %u", buffer->size(), endOffset,
+                downCast<uint32_t>(rpcId.sequence));
+    } else {
+        timeTrace("client requesting retransmission of bytes %u-%u, "
+                "sequence %u", buffer->size(), endOffset,
+                downCast<uint32_t>(rpcId.sequence));
+    }
+    uint32_t length = endOffset - buffer->size();
+    if (length > t->roundTripBytes) {
+        // TODO: This is not only suspicious but could also cause significant queueing on
+        // the other side's NIC since retransmission bytes are passed to the driver directly
+        LOG(WARNING, "%s requesting retransmission of a large range %u-%u, "
+                "sequence %u", whoFrom == FROM_SERVER ? "server" : "client",
+                buffer->size(), endOffset, downCast<uint32_t>(rpcId.sequence));
+    }
+    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
+    ResendHeader resend(rpcId, buffer->size(), length,
+            t->getUnschedTrafficPrio(length), whoFrom);
+    t->driver->sendPacket(address, &resend, NULL, t->controlPacketPriority);
+    return endOffset;
 }
 
 /**
@@ -1349,168 +1560,6 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
 }
 
 /**
- * This method is invoked whenever a new DATA packet arrives for a partially
- * complete message. It saves information about the new fragment and
- * (eventually) combines all of the fragments into a complete message.
- * 
- * \param header
- *      Pointer to the first byte of the packet, which must be a valid
- *      DATA packet.
- * \param length
- *      Total number of bytes in the packet.
- * \return
- *      The return value is true if we have retained a pointer to the
- *      packet (meaning that the caller should "steal" the Received, if
- *      it hasn't already). False means that the data in this packet
- *      was all redundant; we didn't save anything, so the caller need
- *      not steal the Received.
- */
-bool
-HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
-        uint32_t length)
-{
-    // Assume the payload contains no redundant bytes for now. The redundant
-    // portion will be deducted when this packet is discarded/assembled.
-    length -= sizeof32(DataHeader);
-    estimatedReceivedBytes += length;
-
-    if (header->offset > buffer->size()) {
-        // Can't append this packet into the buffer because some prior
-        // data is missing. Save the packet for later.
-        if (fragments.find(header->offset) == fragments.end()) {
-            fragments[header->offset] = MessageFragment(header, length);
-            assert(buffer->size() < fragments.begin()->first);
-            return true;
-        } else {
-            estimatedReceivedBytes -= length;
-            return false;
-        }
-    }
-
-    // Append this fragment to the assembled message buffer, then see
-    // if some of the unappended fragments can now be appended as well.
-    bool result = appendFragment(header, length);
-    while (true) {
-        FragmentMap::iterator it = fragments.begin();
-        if (it == fragments.end()) {
-            break;
-        }
-        uint32_t offset = it->first;
-        if (offset > buffer->size()) {
-            break;
-        }
-        MessageFragment fragment = it->second;
-        if (!appendFragment(fragment.header, fragment.length)) {
-            t->driver->release(fragment.header);
-        };
-        fragments.erase(it);
-    }
-    if (!fragments.empty()) {
-        assert(buffer->size() < fragments.begin()->first);
-    }
-    return result;
-}
-
-/**
- * This method is invoked to append a fragment to a partially-assembled
- * message. It handles the special cases where part or all of the
- * fragment is already in the assembled message.
- * 
- * \param header
- *      Address of the first byte of a DATA packet.
- * \param length
- *      Size of the payload, in bytes.
- * \return
- *      True means that (some of) the data in this fragment was
- *      incorporated into the message buffer. False means that
- *      the data in this fragment is entirely redundant, so we
- *      didn't save any pointers to it (the caller may want to
- *      free this packet).
- */
-bool
-HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
-        uint32_t length)
-{
-    uint32_t bytesToSkip = buffer->size() - header->offset;
-    estimatedReceivedBytes -= std::min(bytesToSkip, length);
-    if (bytesToSkip >= length) {
-        // This entire fragment is redundant.
-        return false;
-    }
-    Driver::PayloadChunk::appendToBuffer(buffer,
-            reinterpret_cast<char*>(header) + sizeof32(DataHeader)
-            + bytesToSkip, length - bytesToSkip, t->driver,
-            reinterpret_cast<char*>(header));
-    return true;
-}
-
-/**
- * This method is invoked to issue a RESEND packet when it appears that
- * packets have been lost. It is used by both servers and clients.
- * 
- * \param t
- *      Overall information about the transport.
- * \param address
- *      Network address to which the RESEND should be sent.
- * \param rpcId
- *      Unique identifier for the RPC in question.
- * \param grantOffset
- *      Largest grantOffset that we have sent for this message (i.e.
- *      this is how many total bytes we should have received already).
- *      May be 0 if the client never requested a grant (meaning that it
- *      planned to transmit the entire message unilaterally).
- * \param whoFrom
- *      Must be either FROM_CLIENT, indicating that we are the client, or
- *      FROM_SERVER, indicating that we are the server.
- *
- * \return
- *      The offset of the byte just after the last one whose retransmission
- *      was requested.
- */
-uint32_t
-HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
-        const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
-        uint8_t whoFrom)
-{
-    if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
-        DIE("Bad fragment pointer: %p", &fragments);
-    }
-    uint32_t endOffset;
-    FragmentMap::iterator it = fragments.begin();
-
-    // Compute the end of the retransmission range.
-    if (it != fragments.end()) {
-        // Retransmit the entire gap up to the first fragment.
-        endOffset = it->first;
-    } else if (grantOffset > 0) {
-        // Retransmit everything that we've asked the sender to send:
-        // we don't seem to have received any of it.
-        endOffset = grantOffset;
-    } else {
-        // We haven't issued a GRANT for this message; just request
-        // the first round-trip's worth of data. Once this data arrives,
-        // the normal grant mechanism should kick in if it's still needed.
-        endOffset = t->roundTripBytes;
-    }
-    assert(endOffset > buffer->size());
-    if (whoFrom == FROM_SERVER) {
-        timeTrace("server requesting retransmission of bytes %u-%u, "
-                "sequence %u", buffer->size(), endOffset,
-                downCast<uint32_t>(rpcId.sequence));
-    } else {
-        timeTrace("client requesting retransmission of bytes %u-%u, "
-                "sequence %u", buffer->size(), endOffset,
-                downCast<uint32_t>(rpcId.sequence));
-    }
-    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
-    uint32_t length = endOffset - buffer->size();
-    ResendHeader resend(rpcId, buffer->size(), length,
-            t->getUnschedTrafficPrio(length), whoFrom);
-    t->driver->sendPacket(address, &resend, NULL, t->controlPacketPriority);
-    return endOffset;
-}
-
-/**
  * This method is invoked in the inner polling loop of the dispatcher;
  * it drives the operation of the transport.
  * \return
@@ -1545,9 +1594,6 @@ HomaTransport::Poller::poll()
         }
         t->receivedPackets.clear();
     } while (numPackets == MAX_PACKETS);
-    if (result == 1) {
-        timeTrace("polling iteration %u", pollIteration);
-    }
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -1582,6 +1628,17 @@ HomaTransport::Poller::poll()
 
     // Transmit data packets if possible.
     result |= t->tryToTransmitData();
+
+    // TODO: Release a few retained payloads to the driver. Assuming that
+    // each release takes ~65ns.
+#define MAX_RELEASE 10
+    int releaseCount = 0;
+    while (!t->retainedPayloads.empty() && (releaseCount < MAX_RELEASE)) {
+        char* payload = t->retainedPayloads.back();
+        t->retainedPayloads.pop_back();
+        t->driver->release(payload);
+        releaseCount++;
+    }
 
 //    t->receivedPackets.clear();
     return result;
