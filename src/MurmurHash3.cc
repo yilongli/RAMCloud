@@ -51,6 +51,8 @@ static inline uint64_t rotl64 ( uint64_t x, int8_t r )
 
 #endif // !defined(_MSC_VER)
 
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+
 namespace RAMCloud {
 
 //-----------------------------------------------------------------------------
@@ -337,5 +339,5 @@ void MurmurHash3_x64_128 ( const void * key, const int len,
 }
 
 //-----------------------------------------------------------------------------
-
+#pragma GCC diagnostic warning "-Wimplicit-fallthrough"
 } // namespace RAMCloud

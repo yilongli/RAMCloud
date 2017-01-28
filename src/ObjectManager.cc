@@ -108,11 +108,13 @@ ObjectManager::ObjectManager(Context* context, ServerId* serverId,
  */
 ObjectManager::~ObjectManager()
 {
+#pragma GCC diagnostic ignored "-Wterminate"
     if (tombstoneProtectorCount > 0) {
         LOG(ERROR, "Can't destroy ObjectManager with active "
                 "TombstoneProtectors.");
         std::terminate();
     }
+#pragma GCC diagnostic warning "-Wterminate"
     replicaManager.haltFailureMonitor();
 }
 
