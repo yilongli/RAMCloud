@@ -138,7 +138,7 @@ ClientTransactionTask::performTask()
                         decision = WireFormat::TxDecision::COMMIT;
                         TEST_LOG("Set decision to COMMIT.");
                         // NO break; fall through to continue with commit.
-                        FALLTHROUGH
+                        FALLS_THROUGH_TO
                     case WireFormat::TxDecision::ABORT:
                         // If not READ-ONLY, move to decision phase.
                         if (!readOnly) {
@@ -149,7 +149,7 @@ ClientTransactionTask::performTask()
                         }
                         // else NO break; fall through to declare the
                         // transaction DONE.
-                        FALLTHROUGH
+                        FALLS_THROUGH_TO
                     case WireFormat::TxDecision::COMMIT:
                         // Prepare must have returned COMMITTED or was READ-ONLY
                         // so the transaction is now done.

@@ -85,8 +85,12 @@ string vformat(const char* format, va_list ap)
 #endif
 
 // A macro to annotate intentional fallthrough in switch statement.
-#ifndef FALLTHROUGH
-#define FALLTHROUGH gcc_fallthrough();
+#ifndef FALLS_THROUGH_TO
+#if __GNUC__ >= 7
+#define FALLS_THROUGH_TO gcc_fallthrough();
+#elif __GNUC__ < 7
+#define FALLS_THROUGH_TO
+#endif
 #endif
 
 /*
