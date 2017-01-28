@@ -338,7 +338,7 @@ ClientTransactionTask::processPrepareRpcResults()
                                 detectionTime * 1e06);
                     }
                     // NO break; fall through to perform actual ABORT work.
-                    FALLTHROUGH
+                    FALLS_THROUGH_TO
                 case TxPrepare::ABORT:
                     // Decide the transaction should ABORT (as long as the
                     // transaction has not already committed).
