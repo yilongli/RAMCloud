@@ -107,11 +107,11 @@ ObjectManager::ObjectManager(Context* context, ServerId* serverId,
  */
 ObjectManager::~ObjectManager()
 {
-#pragma GCC diagnostic ignored "-Wterminate"
+#pragma GCC diagnostic ignored "-Wall"
     if (tombstoneProtectorCount > 0) {
         DIE("Can't destroy ObjectManager with active TombstoneProtectors.");
     }
-#pragma GCC diagnostic warning "-Wterminate"
+#pragma GCC diagnostic warning "-Wall"
     replicaManager.haltFailureMonitor();
 }
 
