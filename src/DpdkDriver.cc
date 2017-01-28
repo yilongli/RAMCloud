@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
 #include <rte_config.h>
 #include <rte_common.h>
 #include <rte_errno.h>
@@ -36,6 +37,7 @@
 #include <rte_ring.h>
 #include <rte_version.h>
 #pragma GCC diagnostic warning "-Wconversion"
+#pragma GCC diagnostic warning "-Wimplicit-fallthrough"
 
 #include "Common.h"
 #include "Cycles.h"

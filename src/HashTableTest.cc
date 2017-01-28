@@ -323,7 +323,9 @@ class HashTableTest : public ::testing::Test {
         // fill in the "log" entries
         for (uint64_t i = 0; i < numEnt; i++) {
             string stringKey = format("%lu", i);
+#pragma GCC diagnostic ignored "-Waligned-new=all"
             values.push_back(new TestObject(tableId, stringKey));
+#pragma GCC diagnostic warning "-Waligned-new=all"
             Key key(values[i]->tableId,
                     values[i]->stringKeyPtr,
                     values[i]->stringKeyLength);
@@ -660,18 +662,16 @@ TEST_F(HashTableTest, lookupEntry_hashCollision) {
 
 TEST_F(HashTableTest, lookup) {
     HashTable ht(1);
-    TestObject *v = new TestObject(0, "0");
-    Key vKey(v->tableId, v->stringKeyPtr, v->stringKeyLength);
+    TestObject v(0, "0");
+    Key vKey(v.tableId, v.stringKeyPtr, v.stringKeyLength);
 
     uint64_t outRef;
     EXPECT_FALSE(lookup(&ht, vKey, outRef));
 
-    uint64_t vRef = v->u64Address();
+    uint64_t vRef = v.u64Address();
     replace(&ht, vKey, vRef);
     EXPECT_TRUE(lookup(&ht, vKey, outRef));
     EXPECT_EQ(outRef, vRef);
-
-    delete v;
 }
 
 #if 0
@@ -803,7 +803,7 @@ test_forEach_callback(uint64_t ref, void *cookie)
 TEST_F(HashTableTest, forEach) {
     HashTable ht(2);
     uint32_t arrayLen = 256;
-    TestObject* checkoff = new TestObject[arrayLen];
+    TestObject checkoff[arrayLen] = {};
 
     for (uint32_t i = 0; i < arrayLen; i++) {
         string stringKey = format("%u", i);

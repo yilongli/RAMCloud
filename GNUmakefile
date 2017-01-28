@@ -12,8 +12,10 @@ include $(wildcard private/MakefragPrivateTop)
 DEBUG ?= yes
 YIELD ?= no
 SSE ?= sse4.2
+# TODO: why core2?
 ARCH ?= core2
 COMPILER ?= gnu
+GLIBCXX_USE_CXX11_ABI ?= no
 SANITIZER ?= none
 VALGRIND ?= no
 ONLOAD_DIR ?= /usr/local/openonload-201405
@@ -58,6 +60,12 @@ BASECFLAGS := -g
 OPTFLAG := -O3
 DEBUGFLAGS := -DNDEBUG -Wno-unused-variable
 endif
+
+ifeq ($(GLIBCXX_USE_CXX11_ABI),yes)
+BASECFLAGS += -D_GLIBCXX_USE_CXX11_ABI=1
+else
+BASECFLAGS += -D_GLIBCXX_USE_CXX11_ABI=0
+end
 
 COMFLAGS := $(BASECFLAGS) $(OPTFLAG) -fno-strict-aliasing \
 	        -MD -m$(SSE) \

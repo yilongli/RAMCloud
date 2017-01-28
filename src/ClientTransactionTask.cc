@@ -132,6 +132,7 @@ ClientTransactionTask::performTask()
             sendPrepareRpc();
             processPrepareRpcResults();
             if (prepareRpcs.empty() && nextCacheEntry == commitCache.end()) {
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
                 switch (decision) {
                     case WireFormat::TxDecision::UNDECIDED:
                         // Decide to commit.
@@ -164,6 +165,7 @@ ClientTransactionTask::performTask()
                         break;
                 }
             }
+#pragma GCC diagnostic warning "-Wimplicit-fallthrough"
         }
         if (state == DECISION) {
             sendDecisionRpc();
@@ -200,6 +202,7 @@ ClientTransactionTask::performTask()
                 RAMCLOUD_LOG(NOTICE, "Unexpected exception '%s' after "
                         "committing transaction %lu.%lu.",
                         statusToString(e.status), lease.leaseId, txId);
+                break;
             default:
                 // This case should be unreachable.
                 RAMCLOUD_LOG(ERROR, "Unexpected exception '%s' while "
@@ -302,6 +305,7 @@ ClientTransactionTask::processPrepareRpcResults()
             using WireFormat::TxDecision;
 
             TxPrepare::Vote newVote = rpc->wait();
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
             switch (newVote) {
                 case TxPrepare::PREPARED:
                     // Wait for other prepare requests to complete;
@@ -359,6 +363,7 @@ ClientTransactionTask::processPrepareRpcResults()
                     ClientException::throwException(HERE,
                                                     STATUS_INTERNAL_ERROR);
             }
+#pragma GCC diagnostic warning "-Wimplicit-fallthrough"
         } catch (UnknownTabletException& e) {
             // Target server did not contain the requested tablet; the
             // operations should have been already marked for retry. Nothing
