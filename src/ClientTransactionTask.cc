@@ -132,13 +132,13 @@ ClientTransactionTask::performTask()
             sendPrepareRpc();
             processPrepareRpcResults();
             if (prepareRpcs.empty() && nextCacheEntry == commitCache.end()) {
-#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
                 switch (decision) {
                     case WireFormat::TxDecision::UNDECIDED:
                         // Decide to commit.
                         decision = WireFormat::TxDecision::COMMIT;
                         TEST_LOG("Set decision to COMMIT.");
                         // NO break; fall through to continue with commit.
+                        FALLTHROUGH
                     case WireFormat::TxDecision::ABORT:
                         // If not READ-ONLY, move to decision phase.
                         if (!readOnly) {
@@ -149,6 +149,7 @@ ClientTransactionTask::performTask()
                         }
                         // else NO break; fall through to declare the
                         // transaction DONE.
+                        FALLTHROUGH
                     case WireFormat::TxDecision::COMMIT:
                         // Prepare must have returned COMMITTED or was READ-ONLY
                         // so the transaction is now done.
@@ -162,10 +163,8 @@ ClientTransactionTask::performTask()
                                      lease.leaseId, txId);
                         ClientException::throwException(HERE,
                                                         STATUS_INTERNAL_ERROR);
-                        break;
                 }
             }
-#pragma GCC diagnostic warning "-Wimplicit-fallthrough"
         }
         if (state == DECISION) {
             sendDecisionRpc();
@@ -305,7 +304,6 @@ ClientTransactionTask::processPrepareRpcResults()
             using WireFormat::TxDecision;
 
             TxPrepare::Vote newVote = rpc->wait();
-#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
             switch (newVote) {
                 case TxPrepare::PREPARED:
                     // Wait for other prepare requests to complete;
@@ -340,6 +338,7 @@ ClientTransactionTask::processPrepareRpcResults()
                                 detectionTime * 1e06);
                     }
                     // NO break; fall through to perform actual ABORT work.
+                    FALLTHROUGH
                 case TxPrepare::ABORT:
                     // Decide the transaction should ABORT (as long as the
                     // transaction has not already committed).
@@ -363,7 +362,6 @@ ClientTransactionTask::processPrepareRpcResults()
                     ClientException::throwException(HERE,
                                                     STATUS_INTERNAL_ERROR);
             }
-#pragma GCC diagnostic warning "-Wimplicit-fallthrough"
         } catch (UnknownTabletException& e) {
             // Target server did not contain the requested tablet; the
             // operations should have been already marked for retry. Nothing

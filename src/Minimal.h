@@ -84,6 +84,11 @@ string vformat(const char* format, va_list ap)
     TypeName& operator=(const TypeName&) = delete;
 #endif
 
+// A macro to annotate intentional fallthrough in switch statement.
+#ifndef FALLTHROUGH
+#define FALLTHROUGH gcc_fallthrough();
+#endif
+
 /*
  * The following two macros are used in highly optimized code paths to hint
  * to the compiler what the expected truth value of a given expression is.
