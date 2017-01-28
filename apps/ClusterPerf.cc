@@ -54,8 +54,6 @@ namespace po = boost::program_options;
 #include "Transaction.h"
 #include "Util.h"
 
-#pragma GCC diagnostic ignored "-Wformat-truncation"
-
 using namespace RAMCloud;
 
 // Shared state for client library.
@@ -7002,4 +7000,3 @@ catch (std::exception& e) {
     RAMCLOUD_LOG(ERROR, "%s", e.what());
     exit(1);
 }
-#pragma GCC diagnostic warning "-Wformat-truncation"
