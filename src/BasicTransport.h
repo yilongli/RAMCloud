@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2016 Stanford University
+/* Copyright (c) 2015-2017 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -569,8 +569,12 @@ class BasicTransport : public Transport {
     /// Shared RAMCloud information.
     Context* context;
 
-    /// The Driver used to send and receive packets.
+    /// The Driver used to send and receive packets, owned by the
+    /// TransportManager.
     Driver* driver;
+
+    /// Service locator string of this transport.
+    string locatorString;
 
     /// Allows us to get invoked during the dispatch polling loop.
     Poller poller;

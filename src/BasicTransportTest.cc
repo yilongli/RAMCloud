@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2016 Stanford University
+/* Copyright (c) 2015-2017 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -122,10 +122,10 @@ TEST_F(BasicTransportTest, sanityCheck) {
     // Then try a second request with bigger chunks of data.
 
     ServiceLocator serverLocator("basic+udp: host=localhost, port=11101");
-    UdpDriver* serverDriver = new UdpDriver(&context, &serverLocator);
-    BasicTransport server(&context, &serverLocator, serverDriver, 1);
-    UdpDriver* clientDriver = new UdpDriver(&context);
-    BasicTransport client(&context, NULL, clientDriver, 2);
+    UdpDriver serverDriver(&context, &serverLocator);
+    BasicTransport server(&context, &serverLocator, &serverDriver, 1);
+    UdpDriver clientDriver(&context);
+    BasicTransport client(&context, NULL, &clientDriver, 2);
     Transport::SessionRef session = client.getSession(&serverLocator);
 
     MockWrapper rpc1("abcdefg");
@@ -406,8 +406,8 @@ TEST_F(BasicTransportTest, tryToTransmitData_negativeTransmitQueueSpace) {
 
 TEST_F(BasicTransportTest, Session_constructor) {
     ServiceLocator locator("basic+udp: host=localhost, port=11101");
-    UdpDriver* driver2 = new UdpDriver(&context, &locator);
-    BasicTransport transport2(&context, &locator, driver2, 1);
+    UdpDriver driver2(&context, &locator);
+    BasicTransport transport2(&context, &locator, &driver2, 1);
     string exceptionMessage("no exception");
     try {
         ServiceLocator bogusLocator("bogus:foo=bar");
