@@ -254,6 +254,7 @@ def run_test(
         'replicas':    options.replicas,
         'timeout':     options.timeout,
         'share_hosts': True,
+        'dpdkPort':    options.dpdkPort,
         'transport':   options.transport,
         'disjunct':    options.disjunct,
         'verbose':     options.verbose
@@ -897,6 +898,8 @@ if __name__ == '__main__':
             dest='master_args',
             help='Additional command-line arguments to pass to '
                  'each master')
+    parser.add_option('--dpdkPort', type=int, default=-1,
+            help='Ethernet port that the DPDK driver should use')
     parser.add_option('-T', '--transport', default='basic+infud',
             help='Transport to use for communication with servers')
     parser.add_option('-v', '--verbose', action='store_true', default=False,

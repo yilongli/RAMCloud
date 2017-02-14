@@ -570,6 +570,7 @@ def run(
         old_master_args='',        # Additional arguments to run on the
                                    # old master (e.g. total RAM).
         enable_logcabin=False,     # Do not enable logcabin.
+        dpdkPort=None,             # Do not enable DpdkDriver.
         valgrind=False,            # Do not run under valgrind
         valgrind_args='',          # Additional arguments for valgrind
         disjunct=False,            # Disjunct entities on a server
@@ -625,6 +626,10 @@ def run(
         cluster.enable_logcabin = enable_logcabin
         cluster.disjunct = disjunct
         cluster.hosts = getHosts()
+        if dpdkPort is not None:
+            coordinator_args += ' --dpdkPort %d' % dpdkPort
+            master_args += ' --dpdkPort %d' % dpdkPort
+            client += ' --dpdkPort %d' % dpdkPort
 
         if not coordinator_host:
             coordinator_host = cluster.hosts[len(cluster.hosts)-1]
@@ -747,6 +752,8 @@ if __name__ == '__main__':
             metavar='SECS',
             help="Abort if the client application doesn't finish within "
             'SECS seconds')
+    parser.add_option('--dpdkPort', type=int, default=-1,
+            help='Ethernet port that the DPDK driver should use')
     parser.add_option('-T', '--transport', default='basic+infud',
             help='Transport to use for communication with servers')
     parser.add_option('-v', '--verbose', action='store_true', default=False,
