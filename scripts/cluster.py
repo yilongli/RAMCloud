@@ -34,6 +34,7 @@ import sys
 import time
 from optparse import OptionParser
 
+# Path to the directory containing RAMCloud object files on remote machines.
 remote_obj_path = config.hooks.get_remote_obj_path()
 
 # Locations of various RAMCloud executables.
@@ -156,7 +157,8 @@ class Cluster(object):
     """
 
     def __init__(self, log_dir='logs', log_exists=False,
-                    cluster_name_exists=False):
+                 cluster_name_exists=False,
+                 superuser=False):
         """
         @param log_dir: Top-level directory in which to write log files.
                         A separate subdirectory will be created in this
@@ -174,6 +176,9 @@ class Cluster(object):
                         part of this test. Backups that are started/restarted
                         using the same cluster name will read data from the
                         replicas
+                        (default: False)
+        @param superuser:
+                        Indicates whether to start the cluster as superuser.
                         (default: False)
         """
         self.log_level = 'NOTICE'
@@ -208,9 +213,9 @@ class Cluster(object):
         # Create a perfcounters directory under the log directory.
         os.mkdir(self.log_subdir + '/perfcounters')
         if not log_exists:
-            self.sandbox = Sandbox()
+            self.sandbox = Sandbox(superuser=superuser)
         else:
-            self.sandbox = Sandbox(cleanup=False)
+            self.sandbox = Sandbox(cleanup=False, superuser=superuser)
         # create the shm directory to store shared files
         try:
             os.mkdir('%s/logs/shm' % os.getcwd())
@@ -571,6 +576,7 @@ def run(
                                    # old master (e.g. total RAM).
         enable_logcabin=False,     # Do not enable logcabin.
         dpdkPort=None,             # Do not enable DpdkDriver.
+        superuser=False,           # Do not start cluster as superuser by default.
         valgrind=False,            # Do not run under valgrind
         valgrind_args='',          # Additional arguments for valgrind
         disjunct=False,            # Disjunct entities on a server
@@ -616,7 +622,7 @@ def run(
     if valgrind:
         prefix_command += (' valgrind %s' % valgrind_args)
 
-    with Cluster(log_dir) as cluster:
+    with Cluster(log_dir, superuser=superuser) as cluster:
         cluster.log_level = log_level
         cluster.verbose = verbose
         cluster.transport = transport
@@ -765,6 +771,8 @@ if __name__ == '__main__':
             help='Arguments to pass to valgrind')
     parser.add_option('--disjunct', action='store_true', default=False,
             help='Disjunct entities (disable collocation) on each server')
+    parser.add_option('--superuser', action='store_true', default=False,
+            help='Start the cluster and clients as superuser')
 
     (options, args) = parser.parse_args()
 

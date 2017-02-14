@@ -69,12 +69,13 @@ class Sandbox(object):
         def __repr__(self):
             return repr(self.__dict__)
 
-    def __init__(self, cleanup=True):
+    def __init__(self, cleanup=True, superuser=False):
         # cleanup indicates whether this this Sandbox needs to clean up
         # processes that are currently running as part of this run of
         # clusterperf or not.
         self.processes = []
         self.cleanup = cleanup
+        self.sudo = 'sudo' if superuser else ''
 
     def rsh(self, host, command, locator=None, ignoreFailures=False,
             is_server=False, kill_on_exit=True, bg=False, **kwargs):
@@ -95,6 +96,7 @@ class Sandbox(object):
             if is_server:
                 # Assumes scripts are at same path on remote machine
                 sh_command = ['ssh', host,
+                              self.sudo,
                               '%s/serverexec' % remote_scripts_path,
                               host,
                               config.hooks.get_remote_wd(),
@@ -103,6 +105,7 @@ class Sandbox(object):
             else:
                 # Assumes scripts are at same path on remote machine
                 sh_command = ['ssh', host,
+                              self.sudo,
                               '%s/regexec' % remote_scripts_path,
                               sonce,
                               config.hooks.get_remote_wd(),
@@ -117,6 +120,7 @@ class Sandbox(object):
             return process
         else:
             sh_command = ['ssh', host,
+                          self.sudo,
                           '%s/remoteexec.py' % remote_scripts_path,
                           "'%s'" % command, config.hooks.get_remote_wd()]
             subprocess.check_call(sh_command, **kwargs)
@@ -129,8 +133,9 @@ class Sandbox(object):
                         was created with rsh().
         """
         killer = subprocess.Popen(['ssh', process.host,
+                                   self.sudo,
                                    '%s/killpid' % config.hooks.get_remote_scripts_path(),
-                                    process.sonce])
+                                   process.sonce])
         killer.wait()
         try:
             process.proc.kill()
@@ -158,6 +163,7 @@ class Sandbox(object):
                 if not self.cleanup:
                     to_kill = '0'
                     killers.append(subprocess.Popen(['ssh', p.host,
+                            self.sudo,
                             '%s/killserver' % remote_scripts_path,
                             to_kill, os.getcwd(), p.host]))
                 # invoke killpid only for processes that are not servers.
@@ -166,12 +172,14 @@ class Sandbox(object):
                 elif not p.server_process:
                     # Assumes scripts are at same path on remote machine
                     killers.append(subprocess.Popen(['ssh', p.host,
+                            self.sudo,
                             '%s/killpid' % remote_scripts_path,
                             p.sonce]))
 
             if self.cleanup:
                 chost = getHosts()[-1] # coordinator
                 killers.append(subprocess.Popen(['ssh', chost[0],
+                        self.sudo,
                         '%s/killcoord' % remote_scripts_path]))
 
                 path = '%s/logs/shm' % os.getcwd()
@@ -186,12 +194,11 @@ class Sandbox(object):
                 for mhost_file in files:
                     if mhost_file != 'README' and not mhost_file.startswith("cluster"):
                         to_kill = '1'
-                        mhost = mhost.split('_')[0]
+                        mhost = mhost_file.split('_')[0]
                         killers.append(subprocess.Popen(['ssh', mhost,
+                                self.sudo,
                                 '%s/killserver' % remote_scripts_path,
-                                to_kill,
-                                config.hooks.get_remote_wd(),
-                                mhost_file]))
+                                to_kill, config.hooks.get_remote_wd(), mhost_file]))
                 try:
                     os.remove('%s/logs/shm/README' % os.getcwd())
                     # remove the file that represents the name of the cluster.

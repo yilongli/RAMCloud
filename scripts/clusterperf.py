@@ -953,6 +953,8 @@ if __name__ == '__main__':
             action='store_true', default=False, dest='fullSamples',
             help='Run with alternate sample format that includes sample '
                  'timestamps along with their durations.')
+    parser.add_option('--superuser', action='store_true', default=False,
+            help='Start the cluster and clients as superuser')
     (options, args) = parser.parse_args()
 
     if options.parse:
