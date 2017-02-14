@@ -34,13 +34,17 @@ import sys
 import time
 from optparse import OptionParser
 
-# Locations of various RAMCloud executables.
-coordinator_binary = '%s/coordinator' % config.hooks.get_remote_obj_path()
-server_binary = '%s/server' % config.hooks.get_remote_obj_path()
-ensure_servers_bin = '%s/apps/ensureServers' % config.hooks.get_remote_obj_path()
+remote_obj_path = config.hooks.get_remote_obj_path()
 
-# valgrind
-valgrind_command = ''
+# Locations of various RAMCloud executables.
+coordinator_binary = '%s/coordinator' % remote_obj_path
+server_binary = '%s/server' % remote_obj_path
+ensure_servers_bin = '%s/apps/ensureServers' % remote_obj_path
+
+# Used to prepend sudo and/or debugging tool commands (e.g., valgrind) before
+# the various RAMCloud executables.
+if prefix_command is None:
+    prefix_command = ''
 
 # Info used to construct service locators for each of the transports
 # supported by RAMCloud.  In some cases the locator for the coordinator
@@ -246,7 +250,7 @@ class Cluster(object):
         if not self.enable_logcabin:
             command = (
                 '%s %s -C %s -l %s --logFile %s/coordinator.%s.log %s' %
-                (valgrind_command,
+                (prefix_command,
                  coordinator_binary, self.coordinator_locator,
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
@@ -259,7 +263,7 @@ class Cluster(object):
             command = (
                 '%s %s -C %s -z logcabin21:61023 -l %s '
                 '--logFile %s/coordinator.%s.log %s' %
-                (valgrind_command,
+                (prefix_command,
                  coordinator_binary, self.coordinator_locator,
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
@@ -284,8 +288,7 @@ class Cluster(object):
         if self.verbose:
             print('Coordinator started on %s at %s' %
                    (self.coordinator_host[0], self.coordinator_locator))
-            print('Coordinator command line arguments %s' %
-                   (command))
+            print('Coordinator command line arguments %s' % command)
         return self.coordinator
 
     def start_server(self,
@@ -322,7 +325,7 @@ class Cluster(object):
 
         command = ('%s %s -C %s -L %s -r %d -l %s --clusterName __unnamed__ '
                    '--logFile %s.log --preferredIndex %d %s' %
-                   (valgrind_command,
+                   (prefix_command,
                     server_binary, self.coordinator_locator,
                     server_locator(self.transport, host, port),
                     self.replicas,
@@ -354,20 +357,10 @@ class Cluster(object):
         # Adding redirection for stdout and stderr.
         stdout = open(log_prefix + '.out', 'w')
         stderr = open(log_prefix + '.err', 'w')
-        if not kill_on_exit:
-            server = self.sandbox.rsh(host[0], command, is_server=True,
-                                      locator=server_locator(self.transport,
-                                                             host, port),
-                                      kill_on_exit=False, bg=True,
-                                      stdout=stdout,
-                                      stderr=stderr)
-        else:
-            server = self.sandbox.rsh(host[0], command, is_server=True,
-                                      locator=server_locator(self.transport,
-                                                             host, port),
-                                      bg=True,
-                                      stdout=stdout,
-                                      stderr=stderr)
+        server = self.sandbox.rsh(host[0], command, is_server=True,
+                locator=server_locator(self.transport, host, port),
+                kill_on_exit=kill_on_exit, bg=True, stdout=stdout,
+                stderr=stderr)
 
         if self.verbose:
             print('Server started on %s at %s: %s' %
@@ -426,11 +419,11 @@ class Cluster(object):
             numBackups = self.backups_started
         self.sandbox.checkFailures()
         try:
-            ensureCommand = ('%s -C %s -m %d -b %d -l 1 --wait %d '
+            ensureCommand = ('%s %s -C %s -m %d -b %d -l 1 --wait %d '
                              '--logFile %s/ensureServers.log' %
-                             (ensure_servers_bin, self.coordinator_locator,
-                             numMasters, numBackups, timeout,
-                             self.log_subdir))
+                             (prefix_command, ensure_servers_bin,
+                             self.coordinator_locator, numMasters, numBackups,
+                             timeout, self.log_subdir))
             if self.verbose:
                 print("ensureServers command: %s" % ensureCommand)
             self.sandbox.rsh(self.coordinator_host[0], ensureCommand)
@@ -457,7 +450,7 @@ class Cluster(object):
         for i, client_host in enumerate(hosts):
             command = ('%s %s -C %s --numClients %d --clientIndex %d '
                        '--logFile %s/client%d.%s.log %s' %
-                       (valgrind_command,
+                       (prefix_command,
                         client_bin, self.coordinator_locator, num_clients,
                         i, self.log_subdir, self.next_client_id,
                         client_host[0], client_args))
@@ -577,15 +570,15 @@ def run(
         old_master_args='',        # Additional arguments to run on the
                                    # old master (e.g. total RAM).
         enable_logcabin=False,     # Do not enable logcabin.
-        valgrind=False,		   # Do not run under valgrind
-        valgrind_args='',	   # Additional arguments for valgrind
+        valgrind=False,            # Do not run under valgrind
+        valgrind_args='',          # Additional arguments for valgrind
         disjunct=False,            # Disjunct entities on a server
         coordinator_host=None
         ):
     """
     Start a coordinator and servers, as indicated by the arguments.  If a
     client is specified, then start one or more client processes and wait for
-    them to complete. Otherwise leave the cluster running.  
+    them to complete. Otherwise leave the cluster running.
     @return: string indicating the path to the log files for this run.
     """
 #    client_hosts = [('rc52', '192.168.1.152', 52)]
@@ -618,9 +611,9 @@ def run(
     masters_started = 0
     backups_started = 0
 
-    global valgrind_command
+    global prefix_command
     if valgrind:
-        valgrind_command = ('valgrind %s' % valgrind_args)
+        prefix_command += (' valgrind %s' % valgrind_args)
 
     with Cluster(log_dir) as cluster:
         cluster.log_level = log_level
@@ -635,8 +628,7 @@ def run(
 
         if not coordinator_host:
             coordinator_host = cluster.hosts[len(cluster.hosts)-1]
-        coordinator = cluster.start_coordinator(coordinator_host,
-                                                coordinator_args)
+        cluster.start_coordinator(coordinator_host, coordinator_args)
         if disjunct:
             cluster.hosts.pop(0)
 

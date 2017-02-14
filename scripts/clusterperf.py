@@ -258,7 +258,6 @@ def run_test(
         'disjunct':    options.disjunct,
         'verbose':     options.verbose
     }
-    client_args = {}
     # Provide a default value for num_servers here.  This is better
     # than defaulting it in the OptionParser below, because tests can
     # see whether or not an actual value was specified and provide a
@@ -270,6 +269,8 @@ def run_test(
         cluster_args['num_clients'] = options.num_clients
     if options.master_args != None:
         cluster_args['master_args'] = options.master_args
+
+    client_args = {}
     if options.count != None:
         client_args['--count'] = options.count
     if options.size != None:
