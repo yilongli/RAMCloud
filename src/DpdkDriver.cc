@@ -183,7 +183,7 @@ DpdkDriver::DpdkDriver(Context* context, int port)
                 portId, numPorts));
     }
 
-    // Reading the MAC address from the NIC via DPDK.
+    // Read the MAC address from the NIC via DPDK.
     rte_eth_macaddr_get(portId, &mac);
     localMac.construct(mac.addr_bytes);
     locatorString = format("dpdk:mac=%s", localMac->toString().c_str());
@@ -459,8 +459,7 @@ DpdkDriver::sendPacket(const Address* addr,
     // Fill out the PCP field and the Ethernet frame type of the encapsulated
     // frame (DEI and VLAN ID are not relevant and trivially set to 0).
     struct vlan_hdr* vlanHdr = reinterpret_cast<struct vlan_hdr*>(p);
-    uint16_t vlan_tci = downCast<uint16_t>(PRIORITY_TO_PCP[priority] << 13);
-    vlanHdr->vlan_tci = rte_cpu_to_be_16(vlan_tci);
+    vlanHdr->vlan_tci = rte_cpu_to_be_16(PRIORITY_TO_PCP[priority]);
     vlanHdr->eth_proto = rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD);
     p += VLAN_TAG_LEN;
 

@@ -90,7 +90,9 @@ class DpdkDriver : public Driver
     /// Map from priority levels to values of the PCP (Priority Code Point)
     /// field defined in the Ethernet VLAN header. Note that PCP = 1 is
     /// actually the lowest priority, while PCP = 0 is the second lowest.
-    static constexpr uint16_t PRIORITY_TO_PCP[8] = {1, 0, 2, 3, 4, 5, 6, 7};
+    static constexpr uint16_t PRIORITY_TO_PCP[8] =
+            {1 << 13, 0 << 13, 2 << 13, 3 << 13, 4 << 13, 5 << 13, 6 << 13,
+             7 << 13};
 
     typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;
 
