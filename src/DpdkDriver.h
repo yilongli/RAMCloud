@@ -81,15 +81,15 @@ class DpdkDriver : public Driver
   PRIVATE:
     static const uint32_t MAX_PAYLOAD_SIZE = 1500;
 
-    /// Size of VLAN tag, in bytes.
+    /// Size of VLAN tag, in bytes. We are using the PCP (Priority Code Point)
+    /// field defined in the VLAN tag to specify the packet priority.
     static const uint32_t VLAN_TAG_LEN = 4;
 
     /// Size of Ethernet header including VLAN tag, in bytes.
     static const uint32_t ETHER_VLAN_HDR_LEN = 14 + VLAN_TAG_LEN;
 
-    /// Map from priority levels to values of the PCP (Priority Code Point)
-    /// field defined in the Ethernet VLAN header. Note that PCP = 1 is
-    /// actually the lowest priority, while PCP = 0 is the second lowest.
+    /// Map from priority levels to values of the PCP field. Note that PCP = 1
+    /// is actually the lowest priority, while PCP = 0 is the second lowest.
     static constexpr uint16_t PRIORITY_TO_PCP[8] =
             {1 << 13, 0 << 13, 2 << 13, 3 << 13, 4 << 13, 5 << 13, 6 << 13,
              7 << 13};

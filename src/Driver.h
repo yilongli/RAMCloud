@@ -355,10 +355,10 @@ class Driver {
      * \param priority
      *      The priority level of this packet. 0 is the lowest priority.
      */
-    virtual void sendPacket(const Address *recipient,
-                            const void *header,
+    virtual void sendPacket(const Address* recipient,
+                            const void* header,
                             uint32_t headerLen,
-                            Buffer::Iterator *payload,
+                            Buffer::Iterator* payload,
                             int priority = 0) = 0;
 
     /**
