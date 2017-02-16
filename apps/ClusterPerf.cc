@@ -49,6 +49,7 @@ namespace po = boost::program_options;
 #include "BasicTransport.h"
 #include "btreeRamCloud/Btree.h"
 #include "ClientLeaseAgent.h"
+#include "Ftrace.h"
 #include "IndexLookup.h"
 #include "TimeTrace.h"
 #include "Transaction.h"
@@ -5752,6 +5753,12 @@ readDistRandom()
     // if we haven't read count keys by then.
     uint64_t stop = Cycles::rdtsc() + Cycles::fromSeconds(10.0);
 
+    Ftrace::controlSet("set_ftrace_pid", std::to_string(getpid()).c_str());
+    Ftrace::controlSet("tracing_on", "0");
+    Ftrace::controlSet("current_tracer", "nop");
+    Ftrace::controlSet("current_tracer", "function_graph");
+    Ftrace::controlSet("tracing_on", "1");
+
     // Issue the reads back-to-back, and save the times.
     std::vector<uint64_t> ticks(count);
     for (int i = 0; i < count; i++) {
@@ -5764,6 +5771,13 @@ readDistRandom()
         cluster->read(dataTable, key, keyLength, &value);
         uint64_t now = Cycles::rdtsc();
         uint64_t interval = now - start;
+
+        if (interval > Cycles::fromSeconds(0.0001)) {
+            Ftrace::controlSet("trace_marker", "Bad tail latency in userland!!!");
+            Ftrace::controlSet("tracing_on", "0");
+            LOG(ERROR, "Bad tail latency detected");
+        }
+
         ticks.at(i) = interval;
         int index = downCast<int>(interval/bucketTicks);
         if (index < NUM_BUCKETS) {
@@ -7000,6 +7014,7 @@ try
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();
+    Ftrace::printToLog();
 }
 catch (std::exception& e) {
     RAMCLOUD_LOG(ERROR, "%s", e.what());
