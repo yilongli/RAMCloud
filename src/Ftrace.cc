@@ -14,7 +14,6 @@
  */
 
 #include <fstream>
-#include <sstream>
 
 #include "Ftrace.h"
 #include "Syscall.h"
@@ -78,10 +77,11 @@ Ftrace::printToLog()
 {
 #if FTRACE
     std::ifstream ifstream((tracingFs + "trace").c_str());
-    std::stringstream buffer;
-    buffer << ifstream.rdbuf();
-    RAMCLOUD_LOG(NOTICE, "Logging collected ftrace:\n%s",
-            buffer.str().c_str());
+    RAMCLOUD_LOG(NOTICE, "Logging collected ftrace:\n%s");
+    string line;
+    while (getline(ifstream, line)) {
+        syscall.write(Logger::get().getLogFile(), line.c_str(), line.length());
+    }
 #endif
 }
 
