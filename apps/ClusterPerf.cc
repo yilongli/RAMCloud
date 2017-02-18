@@ -5771,6 +5771,7 @@ readDistRandom()
 
         if (interval > Cycles::fromSeconds(0.0001)) {
             Ftrace::controlSet("trace_marker", "Bad tail latency in userland!!!");
+            cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
 //            Ftrace::controlSet("tracing_on", "0");
             LOG(ERROR, "Bad tail latency detected");
         }

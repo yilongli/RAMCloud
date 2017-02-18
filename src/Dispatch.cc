@@ -23,6 +23,7 @@
 #include "Cycles.h"
 #include "Dispatch.h"
 #include "Fence.h"
+#include "Ftrace.h"
 #include "NoOp.h"
 #include "RawMetrics.h"
 #include "PerfStats.h"
@@ -85,6 +86,7 @@ Dispatch::Dispatch(bool hasDedicatedThread)
     , nextInd(0)
 {
     exitPipeFds[0] = exitPipeFds[1] = -1;
+    Ftrace::setup();
 }
 
 /**
