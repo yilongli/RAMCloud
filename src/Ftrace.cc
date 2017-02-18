@@ -32,6 +32,10 @@ static Syscall syscall;
 // This directory only presents after the `debugfs` file system is mounted.
 static string tracingFs = "/sys/kernel/debug/tracing/";
 
+/// Map from ftrace files to file descriptors.
+using FileDescriptors = std::map<string, int>;
+static FileDescriptors fds = {};
+
 /**
  * Control the behavior of ftrace by writing to the control files.
  *

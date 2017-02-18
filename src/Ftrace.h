@@ -30,7 +30,7 @@ class Ftrace {
     static void printToLog();
     static void setup();
 
-  private:
+//  private:
 //    /// Simple wrapper around the opened control file descriptors that closes
 //    /// managing
 //    class FileDescriptors {
@@ -39,9 +39,6 @@ class Ftrace {
 //
 //    };
 
-    /// Map from ftrace files to file descriptors.
-    using FileDescriptors = std::map<string, int>;
-    static FileDescriptors fds;
 };
 
 } // namespace RAMCloud
