@@ -48,6 +48,7 @@ namespace po = boost::program_options;
 
 #include "BasicTransport.h"
 #include "btreeRamCloud/Btree.h"
+#include "CacheTrace.h"
 #include "ClientLeaseAgent.h"
 #include "Ftrace.h"
 #include "IndexLookup.h"
@@ -5753,11 +5754,7 @@ readDistRandom()
     // if we haven't read count keys by then.
     uint64_t stop = Cycles::rdtsc() + Cycles::fromSeconds(10.0);
 
-    Ftrace::controlSet("set_ftrace_pid", std::to_string(getpid()).c_str());
-    Ftrace::controlSet("tracing_on", "0");
-    Ftrace::controlSet("current_tracer", "nop");
-    Ftrace::controlSet("current_tracer", "function_graph");
-    Ftrace::controlSet("tracing_on", "1");
+    Ftrace::setup();
 
     // Issue the reads back-to-back, and save the times.
     std::vector<uint64_t> ticks(count);
@@ -5774,7 +5771,7 @@ readDistRandom()
 
         if (interval > Cycles::fromSeconds(0.0001)) {
             Ftrace::controlSet("trace_marker", "Bad tail latency in userland!!!");
-            Ftrace::controlSet("tracing_on", "0");
+//            Ftrace::controlSet("tracing_on", "0");
             LOG(ERROR, "Bad tail latency detected");
         }
 
@@ -7014,6 +7011,7 @@ try
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();
+    context->cacheTrace->printToLog();
     Ftrace::printToLog();
 }
 catch (std::exception& e) {

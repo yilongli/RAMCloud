@@ -109,6 +109,10 @@ class Syscall {
         return ::listen(sockfd, backlog);
     }
     VIRTUAL_FOR_TESTING
+    int open(const char* file, int oflag) {
+        return ::open(file, oflag);
+    }
+    VIRTUAL_FOR_TESTING
     int pipe(int fds[2]) {
         return ::pipe(fds);
     }

@@ -13,7 +13,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include<fstream>
+#include <fstream>
 #include "Common.h"
 #include "BackupService.h"
 #include "CycleCounter.h"
@@ -27,6 +27,7 @@
 #include "ServerList.h"
 #include "TimeTrace.h"
 #include "CacheTrace.h"
+#include "Ftrace.h"
 
 namespace RAMCloud {
 
@@ -349,6 +350,8 @@ AdminService::serverControl(const WireFormat::ServerControl::Request* reqHdr,
         case WireFormat::LOG_TIME_TRACE:
         {
             TimeTrace::printToLog();
+            // TODO: TEMPORARY HACK
+            Ftrace::printToLog();
             break;
         }
         case WireFormat::GET_CACHE_TRACE:
