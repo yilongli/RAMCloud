@@ -350,7 +350,12 @@ AdminService::serverControl(const WireFormat::ServerControl::Request* reqHdr,
         case WireFormat::LOG_TIME_TRACE:
         {
             TimeTrace::printToLog();
+            break;
+        }
+        case WireFormat::LOG_KERNEL_FTRACE:
+        {
             // TODO: TEMPORARY HACK
+            // TODO: RECEIVE THE MARKER FROM THE SENDER
             Ftrace::controlSet("trace_marker", "BAD TAIL LATENCY BECAUSE OF SERVER?");
             Ftrace::printToLog();
             break;

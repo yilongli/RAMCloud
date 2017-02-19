@@ -86,7 +86,7 @@ Dispatch::Dispatch(bool hasDedicatedThread)
     , nextInd(0)
 {
     exitPipeFds[0] = exitPipeFds[1] = -1;
-    Ftrace::setup();
+    Ftrace::start();
 }
 
 /**
@@ -132,6 +132,7 @@ Dispatch::~Dispatch()
         }
     }
     cleanProfiler();
+    Ftrace::stopAll();
 }
 
 /**

@@ -18,6 +18,7 @@
 #include "Cycles.h"
 #include "CycleCounter.h"
 #include "Fence.h"
+#include "Ftrace.h"
 #include "Initialize.h"
 #include "LogProtector.h"
 #include "PerfStats.h"
@@ -382,6 +383,7 @@ WorkerManager::workerMain(Worker* worker)
 {
     worker->threadId = ThreadId::get();
     PerfStats::registerStats(&PerfStats::threadStats);
+    Ftrace::start();
 
     // Cycles::rdtsc time that's updated continuously when this thread is idle.
     // Used to keep track of how much time this thread spends doing useful

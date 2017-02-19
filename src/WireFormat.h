@@ -152,6 +152,7 @@ enum ControlOp {
     LOG_MESSAGE                 = 1010,
     RESET_METRICS               = 1011,
     QUIESCE                     = 1012,
+    LOG_KERNEL_FTRACE           = 1013,
 };
 
 /**

@@ -5754,8 +5754,6 @@ readDistRandom()
     // if we haven't read count keys by then.
     uint64_t stop = Cycles::rdtsc() + Cycles::fromSeconds(10.0);
 
-    Ftrace::setup();
-
     // Issue the reads back-to-back, and save the times.
     std::vector<uint64_t> ticks(count);
     for (int i = 0; i < count; i++) {

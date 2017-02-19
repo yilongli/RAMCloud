@@ -28,7 +28,9 @@ class Ftrace {
   public:
     static void controlSet(const char* option, const char* value);
     static void printToLog();
-    static void setup();
+    static void snapshot();
+    static void start();
+    static void stopAll();
 
 //  private:
 //    /// Simple wrapper around the opened control file descriptors that closes
