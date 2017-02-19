@@ -30,6 +30,7 @@
 
 namespace RAMCloud {
 
+class DpdkDriver;
 class TransportFactory;
 
 /**
@@ -109,6 +110,12 @@ class TransportManager {
      * Shared RAMCloud information.
      */
     Context* context;
+
+    // TODO: IS IT SAFE TO SHARE IT? DOCUMENT WHY SHARING.
+    /**
+     * Shared DPDK driver instance.
+     */
+    DpdkDriver* dpdkDriver;
 
     /**
      * True means this is a server application, false means this is a client only.

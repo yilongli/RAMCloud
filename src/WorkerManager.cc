@@ -213,11 +213,12 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     }
 
     // Temporary code to test how much faster things would be without threads.
-#if 0
+#if 1
     if (((header->opcode == WireFormat::ECHO) ||
             (header->opcode == WireFormat::READ)) &&
             (header->service == WireFormat::MASTER_SERVICE)) {
-        Service::Rpc serviceRpc(NULL, &rpc->requestPayload, &rpc->replyPayload);
+        Service::Rpc serviceRpc(NULL, &rpc->requestPayload,
+                &rpc->replyPayload);
         Service::handleRpc(context, &serviceRpc);
         rpc->sendReply();
         return;

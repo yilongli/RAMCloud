@@ -286,6 +286,10 @@ def run_test(
         client_args['--warmup'] = options.warmup
     if options.workload != None:
         client_args['--workload'] = options.workload
+    if options.messageSizeCdfFile != None:
+        client_args['--messageSizeCdfFile'] = options.messageSizeCdfFile
+    if options.loadFactor != None:
+        client_args['--loadFactor'] = options.loadFactor
     if options.targetOps != None:
         client_args['--targetOps'] = options.targetOps
     if options.txSpan != None:
@@ -357,6 +361,10 @@ def echo(name, options, cluster_args, client_args):
     if options.num_servers == None:
         cluster_args['num_servers'] = 1
     default(name, options, cluster_args, client_args)
+
+def echoWorkload(name, options, cluster_args, client_args):
+    echo(name, options, cluster_args, client_args)
+    print_cdf_from_log()
 
 def indexBasic(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
@@ -810,6 +818,7 @@ simple_tests = [
 ]
 
 graph_tests = [
+    Test("echo_workload", echo),
     Test("indexBasic", indexBasic),
     Test("indexRange", indexRange),
     Test("indexMultiple", indexMultiple),
@@ -909,9 +918,13 @@ if __name__ == '__main__':
     parser.add_option('-w', '--warmup', type=int,
             help='Number of times to execute operating before '
             'starting measurements')
-    parser.add_option('--workload', default='YCSB-A',
+    parser.add_option('--workload', default=None,
             choices=['YCSB-A', 'YCSB-B', 'YCSB-C', 'WRITE-ONLY'],
             help='Name of workload to run on extra clients to generate load')
+    parser.add_option('--messageSizeCdfFile', default=None,
+            help='Path to the CDF file of message size')
+    parser.add_option('--loadFactor', default=None,
+            help='Network load factor')
     parser.add_option('--targetOps', type=int,
             help='Operations per second that each load generating client '
             'will try to achieve')
