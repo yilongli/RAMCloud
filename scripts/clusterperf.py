@@ -37,6 +37,7 @@ benchmark.
 from __future__ import division, print_function
 from common import *
 import cluster
+import collections
 import config
 import log
 import glob
@@ -91,6 +92,47 @@ def get_client_log(
         if not re.match('([0-9]+\.[0-9]+) ', line):
             result += line
     return result
+
+def printXXX():
+
+    # Read the log file into an array of numbers.
+    messages = collections.OrderedDict()
+    globResult = glob.glob('%s/latest/client*.log')
+    if len(globResult) == 0:
+        raise Exception("couldn't find log files for clients")
+    result = "";
+    leader = '>>> '
+    for logfile in globResult:
+        for line in open(logfile, 'r'):
+            if re.match(leader, line):
+                continue
+            if not re.match('([0-9]+\.[0-9]+) ', line):
+                numbers = None
+                for value in line.split(","):
+                    try:
+                        if numbers is None:
+                            size = int(value)
+                            if size not in messages:
+                                messages[size] = []
+                            numbers = messages[size]
+                        else:
+                            numbers.append(float(value))
+                    except ValueError, e:
+                        # print("Skipping, couldn't parse %s" % line)
+                        skip
+
+    # TODO
+    for size, numbers in messages.iteritems():
+        numbers.sort()
+        numSamples = len(numbers)
+        print("%8d    %8.2f    %8.3f    %8.3f    %8.3f    %8.3f" % (
+            size,
+            numbers[0],
+            numbers[numSamples * .5],
+            numbers[numSamples * .9] if numSamples >= 10 else .0,
+            numbers[numSamples * .99] if numSamples >= 100 else .0,
+            numbers[numSamples * .999] if numSamples >= 1000 else .0,
+            numbers[-1]))
 
 def print_cdf_from_log(
         index = 1                 # Client index (0 for first client,
@@ -373,7 +415,7 @@ def echoWorkload(name, options, cluster_args, client_args):
     cluster.run(client='%s/apps/ClusterPerf %s %s' %
                        (config.hooks.get_remote_obj_path(),
                         flatten_args(client_args), name), **cluster_args)
-    print_cdf_from_log()
+    printXXX()
 
 def indexBasic(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:

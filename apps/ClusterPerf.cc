@@ -3007,38 +3007,21 @@ echo_workload()
 //        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
 //    }
 
+    // TODO: KEEP THE FOLLOWING OUTPUT ONLY; MODIFY IT TO BE:
+    // MSG_SIZE,TIME0,TIME1,TIME2, ...
+
     // Output the times (several comma-separated values on each line) for
     // single-packet messages.
     Logger::get().sync();
-    int valuesInLine = 0;
-
     for (uint i = 0; i < roundTripTrimes.size(); i++) {
-        if (messageSizes[i] > 1400) break;
-
-        Samples samples = roundTripTrimes[i];
-        for (uint64_t cycles : samples) {
-            if (valuesInLine >= 10) {
-                valuesInLine = 0;
-                printf("\n");
-            }
-            if (valuesInLine != 0) {
-                printf(",");
-            }
-            double micros = Cycles::toSeconds(cycles)*1.0e06;
-            printf("%.2f", micros);
-            valuesInLine++;
+        printf("%d", messageSizes[i]);
+        for (uint64_t cycles : roundTripTrimes[i]) {
+            printf(",%.2f", Cycles::toSeconds(cycles) * 1.0e06);
         }
+        printf("\n");
     }
-    printf("\n");
     fflush(stdout);
 
-    // TODO: ENABLE IT?
-//    for (uint i = 0; i < roundTripTrimes.size(); i++) {
-//        Samples samples = roundTripTrimes[i];
-//        for (uint64_t cycles : samples) {
-//            printf("@ %u %.1f\n", messageSizes[i], Cycles::toSeconds(cycles)*1e6);
-//        }
-//    }
 }
 
 /**
