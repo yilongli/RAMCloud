@@ -363,7 +363,16 @@ def echo(name, options, cluster_args, client_args):
     default(name, options, cluster_args, client_args)
 
 def echoWorkload(name, options, cluster_args, client_args):
-    echo(name, options, cluster_args, client_args)
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '-t 4000'
+    if cluster_args['timeout'] < 250:
+        cluster_args['timeout'] = 250
+    cluster_args['replicas'] = 0
+    if options.num_servers == None:
+        cluster_args['num_servers'] = 1
+    cluster.run(client='%s/apps/ClusterPerf %s %s' %
+                       (config.hooks.get_remote_obj_path(),
+                        flatten_args(client_args), name), **cluster_args)
     print_cdf_from_log()
 
 def indexBasic(name, options, cluster_args, client_args):
@@ -416,11 +425,7 @@ def indexMultiple(name, options, cluster_args, client_args):
         client_args['--numIndexes'] = len(getHosts()) - 1
     else:
         client_args['--numIndexes'] = 10
-
-    cluster.run(client='%s/apps/ClusterPerf %s %s' %
-               (config.hooks.get_remote_obj_path(),
-                flatten_args(client_args), name), **cluster_args)
-    print(get_client_log(), end='')
+    default(name, options, cluster_args, client_args)
 
 def indexScalability(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
@@ -557,11 +562,7 @@ def multiOp(name, options, cluster_args, client_args):
     if options.num_servers == None:
         cluster_args['num_servers'] = len(getHosts())
     client_args['--numTables'] = cluster_args['num_servers'];
-    cluster.run(client='%s/apps/ClusterPerf %s %s' %
-            (config.hooks.get_remote_obj_path(),
-             flatten_args(client_args), name),
-            **cluster_args)
-    print(get_client_log(), end='')
+    default(name, options, cluster_args, client_args)
 
 def netBandwidth(name, options, cluster_args, client_args):
     if 'num_clients' not in cluster_args:
@@ -818,7 +819,7 @@ simple_tests = [
 ]
 
 graph_tests = [
-    Test("echo_workload", echo),
+    Test("echo_workload", echoWorkload),
     Test("indexBasic", indexBasic),
     Test("indexRange", indexRange),
     Test("indexMultiple", indexMultiple),

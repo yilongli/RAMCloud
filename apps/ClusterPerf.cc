@@ -2964,47 +2964,48 @@ echo_workload()
             averageMessageSize, messageSizes, cumulativeProbabilities, ~0u,
             seconds, roundTripTrimes);
 
-    if (clientIndex == 0) {
-        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
-                &statsAfter);
-
-        Logger::get().sync();
-        char name[50], description[50];
-        for (uint i = 0; i < results.size(); i++) {
-            TimeDist* dist = &results[i];
-            snprintf(description, sizeof(description),
-                    "send %uB message, receive %uB message",
-                     messageSizes[i], messageSizes[i]);
-            printf("%-20s %lu\n", "#samples", dist->numSamples);
-            snprintf(name, sizeof(name), "echo");
-            printf("%-20s %s     %s median\n", name, formatTime(dist->p50).c_str(),
-                    description);
-            snprintf(name, sizeof(name), "echo.min");
-            printf("%-20s %s     %s minimum\n", name, formatTime(dist->min).c_str(),
-                    description);
-            snprintf(name, sizeof(name), "echo.9");
-            printf("%-20s %s     %s 90%%\n", name, formatTime(dist->p90).c_str(),
-                    description);
-            if (dist->p99 != 0) {
-                snprintf(name, sizeof(name), "echo.99");
-                printf("%-20s %s     %s 99%%\n", name,
-                        formatTime(dist->p99).c_str(), description);
-            }
-            if (dist->p999 != 0) {
-                snprintf(name, sizeof(name), "echo.999");
-                printf("%-20s %s     %s 99.9%%\n", name,
-                        formatTime(dist->p999).c_str(), description);
-            }
-            snprintf(description, sizeof(description),
-                     "bandwidth sending %uB messages", messageSizes[i]);
-            printBandwidth("sendBw", dist->bandwidth, description);
-            snprintf(description, sizeof(description),
-                     "bandwidth receiving %uB messages", messageSizes[i]);
-            printBandwidth("recvBw", dist->bandwidth, description);
-        }
-
-        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
-    }
+// TODO: DON'T NEED IT FOR NOW SINCE I AM DEBUGGING SINGLE PACKET MSG
+//    if (clientIndex == 0) {
+//        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+//                &statsAfter);
+//
+//        Logger::get().sync();
+//        char name[50], description[50];
+//        for (uint i = 0; i < results.size(); i++) {
+//            TimeDist* dist = &results[i];
+//            snprintf(description, sizeof(description),
+//                    "send %uB message, receive %uB message",
+//                     messageSizes[i], messageSizes[i]);
+//            printf("%-20s %lu\n", "#samples", dist->numSamples);
+//            snprintf(name, sizeof(name), "echo");
+//            printf("%-20s %s     %s median\n", name, formatTime(dist->p50).c_str(),
+//                    description);
+//            snprintf(name, sizeof(name), "echo.min");
+//            printf("%-20s %s     %s minimum\n", name, formatTime(dist->min).c_str(),
+//                    description);
+//            snprintf(name, sizeof(name), "echo.9");
+//            printf("%-20s %s     %s 90%%\n", name, formatTime(dist->p90).c_str(),
+//                    description);
+//            if (dist->p99 != 0) {
+//                snprintf(name, sizeof(name), "echo.99");
+//                printf("%-20s %s     %s 99%%\n", name,
+//                        formatTime(dist->p99).c_str(), description);
+//            }
+//            if (dist->p999 != 0) {
+//                snprintf(name, sizeof(name), "echo.999");
+//                printf("%-20s %s     %s 99.9%%\n", name,
+//                        formatTime(dist->p999).c_str(), description);
+//            }
+//            snprintf(description, sizeof(description),
+//                     "bandwidth sending %uB messages", messageSizes[i]);
+//            printBandwidth("sendBw", dist->bandwidth, description);
+//            snprintf(description, sizeof(description),
+//                     "bandwidth receiving %uB messages", messageSizes[i]);
+//            printBandwidth("recvBw", dist->bandwidth, description);
+//        }
+//
+//        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
+//    }
 
     // Output the times (several comma-separated values on each line) for
     // single-packet messages.
