@@ -1227,7 +1227,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
     // TODO: POLLING LOOP FOR MULTIPLE OUTGOING RPCS
     ObjectPool<EchoRpc> echoRpcPool;
-    std::list<std::pair<uint32_t, EchoRpc*>> outstandingRpcs = {};
+    using OutstandingRpcs = std::list<std::pair<uint32_t, EchoRpc*>>;
+    OutstandingRpcs outstandingRpcs = {};
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
@@ -1244,9 +1245,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         uint64_t now = Cycles::rdtsc();
         if (now >= stopTime) {
             LOG(NOTICE, "time expired after %lu iterations", count);
-            LOG(ERROR, "load factor %.3f",
-                    static_cast<double>(totalTxMessageBytes) /
-                    (timeLimit * linkBandwidth));
+            double actualLoadFactor = static_cast<double>(totalTxMessageBytes)
+                    / (timeLimit * linkBandwidth);
+            if (std::abs(actualLoadFactor - loadFactor) / loadFactor > 0.05) {
+                LOG(ERROR, "The experiment is unstable! Actual load factor %.3f,"
+                        " expected %.3f", actualLoadFactor, loadFactor);
+            } else {
+                LOG(NOTICE, "Generated load factor %.3f", actualLoadFactor);
+            }
             break;
         }
 
@@ -1267,7 +1273,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 //        TimeTrace::record("ClusterPerf: JUST BEFORE POLL, oustandingRpcs %u", outstandingRpcs);
         context->dispatch->poll();
 //        TimeTrace::record("ClusterPerf: RIGHT AFTER POLL, poll %u", result);
-        for (auto it = outstandingRpcs.begin(); it != outstandingRpcs.end();) {
+        for (OutstandingRpcs::iterator it = outstandingRpcs.begin();
+                it != outstandingRpcs.end();) {
             EchoRpc* echo = it->second;
             if (echo->isReady()) {
                 uint id = it->first;
@@ -1287,6 +1294,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     }
     totalCycles = Cycles::rdtsc() - startTime;
     printf("Workload running time %.1f secs\n", Cycles::toSeconds(totalCycles));
+
+    // Cancel outstanding RPCs
+    for (OutstandingRpcs::value_type p : outstandingRpcs) {
+        echoRpcPool.destroy(p.second);
+    }
 
     //
     vector<TimeDist> results(messageSizes.size());
