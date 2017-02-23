@@ -58,6 +58,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         Driver* driver, uint64_t clientId)
     : context(context)
     , driver(driver)
+    , locatorString("homa+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
     , clientId(clientId)
@@ -70,7 +71,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
-    , retainedPayloads()
+    , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
@@ -167,8 +168,10 @@ HomaTransport::~HomaTransport()
     }
 
     // Release all retained payloads after reclaiming all RPC objects.
-    for (char* payload : retainedPayloads) {
-        driver->release(payload);
+    for (MessageAccumulator::MessageBuffer* messageBuffer : messageBuffers) {
+        for (char* payload : *messageBuffer) {
+            driver->release(payload);
+        }
     }
 }
 
@@ -176,8 +179,7 @@ HomaTransport::~HomaTransport()
 string
 HomaTransport::getServiceLocator()
 {
-    // TODO: cache it in locatorString
-    return "homa+" + driver->getServiceLocator();
+    return locatorString;
 }
 
 /**
@@ -1292,7 +1294,7 @@ HomaTransport::ServerRpc::sendReply()
 HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
         Buffer* buffer, uint32_t totalLength)
     : t(t)
-    , assembledPayloads()
+    , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , estimatedReceivedBytes(0)
     , fragments()
@@ -1314,12 +1316,7 @@ HomaTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->release(fragment.header);
     }
     fragments.clear();
-
-    // TODO: STILL TOO EXPENSIVE?
-    // TODO: AVOID RELEASING THE PAYLOADS ALL AT ONCE TO THE DRIVER
-    for (char* payload : assembledPayloads) {
-        t->retainedPayloads.push_back(payload);
-    }
+    t->messageBuffers.push_back(assembledPayloads);
 }
 
 /**
@@ -1415,11 +1412,7 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
     char* payload = reinterpret_cast<char*>(header);
     buffer->appendExternal(payload + sizeof32(DataHeader) + bytesToSkip,
             length - bytesToSkip);
-    assembledPayloads.push_back(payload);
-//    Driver::PayloadChunk::appendToBuffer(buffer,
-//            reinterpret_cast<char*>(header) + sizeof32(DataHeader)
-//            + bytesToSkip, length - bytesToSkip, t->driver,
-//            reinterpret_cast<char*>(header));
+    assembledPayloads->push_back(payload);
     return true;
 }
 
@@ -1632,15 +1625,28 @@ HomaTransport::Poller::poll()
     // Transmit data packets if possible.
     result |= t->tryToTransmitData();
 
-    // TODO: Release a few retained payloads to the driver. Assuming that
-    // each release takes ~65ns.
-#define MAX_RELEASE 10
+    // Release a few retained payloads to the driver. As of 02/2017, releasing
+    // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
+    // useful to do in this method uptill now, try to release more payloads.
+    const int maxRelease = result ? 10 : 50;
     int releaseCount = 0;
-    while (!t->retainedPayloads.empty() && (releaseCount < MAX_RELEASE)) {
-        char* payload = t->retainedPayloads.back();
-        t->retainedPayloads.pop_back();
-        t->driver->release(payload);
-        releaseCount++;
+    while (!t->messageBuffers.empty()) {
+        MessageAccumulator::MessageBuffer* messageBuffer =
+                t->messageBuffers.back();
+        while (!messageBuffer->empty() && (releaseCount < maxRelease)) {
+            char* payload = messageBuffer->back();
+            messageBuffer->pop_back();
+            t->driver->release(payload);
+            releaseCount++;
+            result = 1;
+        }
+
+        if (messageBuffer->empty()) {
+            t->messageBuffers.pop_back();
+            delete messageBuffer;
+        } else {
+            break;
+        }
     }
 
     return result;

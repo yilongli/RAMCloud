@@ -156,7 +156,8 @@ class HomaTransport : public Transport {
         // TODO: NOT USING VECTOR BECAUSE EXPANSION COULD CAUSE SIGNIFICANT JITTER
         // DEQUE SUPPORTS O(1) RANDOM ACCESS (BACKED BY FIXED-SIZE ARRAYS), CHEAPER
         // EXPANSION AND BETTER CACHE LOCALITY THAN LINKED LIST.
-        std::deque<char*> assembledPayloads;
+        using MessageBuffer = std::deque<char*>;
+        MessageBuffer* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -657,6 +658,9 @@ class HomaTransport : public Transport {
     /// The Driver used to send and receive packets.
     Driver* driver;
 
+    /// Service locator string of this transport.
+    string locatorString;
+
     /// Allows us to get invoked during the dispatch polling loop.
     Poller poller;
 
@@ -695,8 +699,12 @@ class HomaTransport : public Transport {
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
 
-    // TODO:
-    std::vector<char*> retainedPayloads;
+    /// Holds message buffers that are consist of payloads that are retained
+    /// and assembled by the MessageAccumulator. These retained payloads are
+    /// gradually released in the poll method so that the MessageAccumulator
+    /// doesn't have to release all its payloads at one shot in the destructor
+    /// and cause significant jitter.
+    std::vector<MessageAccumulator::MessageBuffer*> messageBuffers;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
