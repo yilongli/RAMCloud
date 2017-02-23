@@ -582,7 +582,7 @@ EchoRpc::completed() {
     endTime = Cycles::rdtsc();
 #if DEBUG_BAD_TAIL
     uint64_t roundTripTime = endTime - startTime;
-    static uint64_t threshold = Cycles::fromMicroseconds(50);
+    static uint64_t threshold = Cycles::fromMicroseconds(45);
     const WireFormat::Echo::Request* reqHdr = getRequestHeader<WireFormat::Echo>();
     assert(reqHdr->length == length);
     if (reqHdr->length < 1400 && roundTripTime > threshold) {

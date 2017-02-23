@@ -200,7 +200,6 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
     if (clientRpc->transmitPending) {
         erase(outgoingRequests, *clientRpc);
     }
-    // TODO: THIS COULD ALSO BE SUPER EXPENSIVE ON THE CLIENT SIDE!!!!
     clientRpcPool.destroy(clientRpc);
     timeTrace("deleted client RPC, sequence %u",
             downCast<uint32_t>(sequence));
@@ -221,10 +220,6 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
-    // TODO: REMOVE THIS FOLLOWING
-    timeTrace("deleting server RPC, sequence %u, request chunks %u",
-            downCast<uint32_t>(sequence),
-            serverRpc->requestPayload.getNumberChunks());
     incomingRpcs.erase(serverRpc->rpcId);
     if (serverRpc->sendingResponse) {
         erase(outgoingResponses, *serverRpc);
@@ -1526,7 +1521,6 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
  */
 HomaTransport::ScheduledMessage::~ScheduledMessage()
 {
-    // TODO: LOG A WARNING HERE?
     if (state == ACTIVE) {
         accumulator->t->replaceActiveMessage(this, NULL, true);
     } else if (state == INACTIVE) {
