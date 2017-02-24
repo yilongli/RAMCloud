@@ -569,7 +569,7 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     if (length < 1400) {
         uint32_t p1 = uint32_t(startTime >> 32);
         uint32_t p2 = uint32_t(startTime);
-        TimeTrace::record(startTime, "SHORT MSG START TIME %u.%u", p1, p2);
+//        TimeTrace::record(startTime, "SHORT MSG START TIME %u.%u", p1, p2);
     }
 #endif
     send();
@@ -582,7 +582,7 @@ EchoRpc::completed() {
     endTime = Cycles::rdtsc();
 #if DEBUG_BAD_TAIL
     uint64_t roundTripTime = endTime - startTime;
-    static uint64_t threshold = Cycles::fromMicroseconds(45);
+    static uint64_t threshold = Cycles::fromMicroseconds(15);
     const WireFormat::Echo::Request* reqHdr = getRequestHeader<WireFormat::Echo>();
     assert(reqHdr->length == length);
     if (reqHdr->length < 1400 && roundTripTime > threshold) {

@@ -1180,11 +1180,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 {
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
     // Any more samples will simply overwrite old ones by wrapping around.
-    const uint32_t MAX_NUM_SAMPLE = 1000000;
+    const uint32_t MAX_SAMPLES = 1000000;
     roundTripTimes.assign(messageSizes.size(), {});
     vector<uint32_t> numSamples(messageSizes.size());
     for (Samples& samples : roundTripTimes) {
-        samples.assign(MAX_NUM_SAMPLE, 0);
+        samples.assign(MAX_SAMPLES, 0);
     }
 
     const uint32_t largestMessageSize = messageSizes.back();
@@ -1221,6 +1221,9 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             averageMessageSize / inputBytesPerSecond);
     std::poisson_distribution<uint64_t> messageIntervalDist(
             static_cast<double>(averageIntervalCycles));
+    LOG(NOTICE, "Average message size %.2f, average message interval %.2f us",
+            averageMessageSize,
+            Cycles::toSeconds(averageIntervalCycles) * 1e6);
 
     uint64_t totalCycles = 0;
     size_t numReceivers = receivers.size();
@@ -1228,14 +1231,16 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     ObjectPool<EchoRpc> echoRpcPool;
     using OutstandingRpcs = std::list<std::pair<uint32_t, EchoRpc*>>;
     OutstandingRpcs outstandingRpcs = {};
-    uint64_t maxOutstandingRpcs = 0;
+    uint64_t count = 0;
+    uint64_t accOutstandingRpcs = 0;
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
     const char* receiver = NULL;
     uint messageId = 0;
     uint64_t totalTxMessageBytes = 0;
-    for (uint64_t count = 0; count < iteration; count++) {
+    uint64_t warmupCount = 1000;
+    for (count = 0; count < iteration;) {
         // Prepare the next message if it's not ready yet.
         if (receiver == NULL) {
             receiver = receivers[generateRandom() % numReceivers].c_str();
@@ -1258,15 +1263,29 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
         // See if we need to send another message.
         if (now > nextMessageArrival) {
+            if (warmupCount > 0) {
+                warmupCount--;
+            } else {
+                count++;
+            }
             uint32_t length = messageSizes[messageId];
             EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
                     message.c_str(), length, length);
             outstandingRpcs.emplace_back(messageId, echo);
-            if (outstandingRpcs.size() > maxOutstandingRpcs) {
-                maxOutstandingRpcs = outstandingRpcs.size();
-            }
             receiver = NULL;
             nextMessageArrival += messageIntervalDist(gen);
+
+            // Update debugging statistics
+            if (count > 0) {
+                accOutstandingRpcs += outstandingRpcs.size();
+                uint64_t averageQueueSize = accOutstandingRpcs / count;
+                if (outstandingRpcs.size() > averageQueueSize * 10) {
+                    TimeTrace::record(
+                            "%u outstanding RPCs queued up, %u RPCs in total",
+                            downCast<uint32_t>(outstandingRpcs.size()),
+                            downCast<uint32_t>(count));
+                }
+            }
         }
 
         // Check for RPC completion.
@@ -1275,13 +1294,18 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 it != outstandingRpcs.end();) {
             EchoRpc* echo = it->second;
             if (echo->isReady()) {
-                uint id = it->first;
-                uint64_t completionTime = echo->getCompletionTime();
-                if (completionTime != ~0u) {
+                if (count > 0) {
+                    uint id = it->first;
+                    uint64_t completionTime = echo->getCompletionTime();
                     totalTxMessageBytes += messageSizes[id];
-                    roundTripTimes[id][numSamples[id] % MAX_NUM_SAMPLE] =
+                    roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
                             completionTime;
                     numSamples[id]++;
+
+                    // TODO: REMOVE THIS DEBUGGING CODE
+                    if (completionTime > Cycles::fromMicroseconds(15)) {
+
+                    }
                 }
                 echoRpcPool.destroy(echo);
                 it = outstandingRpcs.erase(it);
@@ -1291,11 +1315,12 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         }
     }
     totalCycles = Cycles::rdtsc() - startTime;
-    LOG(NOTICE, "Experiment runs for %.2f secs\n", Cycles::toSeconds(totalCycles));
+    LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));
+    LOG(NOTICE, "Average outstanding RPC queue size %.1f",
+            static_cast<double>(accOutstandingRpcs) / static_cast<double>(count));
 
     // Cancel outstanding RPCs
-    LOG(NOTICE, "Destroying %lu outstanding RPCs, maxOutstandingRpcs %lu",
-            outstandingRpcs.size(), maxOutstandingRpcs);
+    LOG(NOTICE, "Destroying %lu outstanding RPCs", outstandingRpcs.size());
     for (OutstandingRpcs::value_type p : outstandingRpcs) {
         echoRpcPool.destroy(p.second);
     }
@@ -1303,7 +1328,9 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     // Aggregate the results into TimeDist format.
     vector<TimeDist> results(messageSizes.size());
     for (uint i = 0; i < messageSizes.size(); i++) {
-        if (numSamples[i] <= MAX_NUM_SAMPLE) {
+        // TODO: REMOVE THE FOLLOWING
+        LOG(ERROR, "message %u, numSamples %u", i, numSamples[i]);
+        if (numSamples[i] <= MAX_SAMPLES) {
             roundTripTimes[i].resize(numSamples[i]);
         }
 
@@ -2957,7 +2984,6 @@ echo_workload()
             messageSizes.push_back(size);
             cumulativeProbabilities.push_back(probability);
         }
-        LOG(NOTICE, "avg %.1f, size %u, prob %.1f", averageMessageSize, size, probability);
     } else {
         LOG(ERROR, "No message size CDF file found");
         return;

@@ -24,7 +24,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -626,9 +626,9 @@ HomaTransport::tryToTransmitData()
         }
     }
 
-    if (totalBytesSent > 0) {
-        timeTrace("tryToTransmit sent %u bytes in total", totalBytesSent);
-    }
+//    if (totalBytesSent > 0) {
+//        timeTrace("tryToTransmit sent %u bytes in total", totalBytesSent);
+//    }
     return totalBytesSent > 0;
 }
 
@@ -1574,6 +1574,7 @@ HomaTransport::Poller::poll()
     // Process any available incoming packets.
 #define MAX_PACKETS 4
     uint32_t numPackets;
+    uint32_t totalPackets = 0;
     do {
         // TODO: SHOULD I FETCH AS MANY AS POSSIBLE BEFORE HANDLING THEM?
         t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
@@ -1583,7 +1584,12 @@ HomaTransport::Poller::poll()
             t->handlePacket(&t->receivedPackets[i]);
         }
         t->receivedPackets.clear();
+        totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
+
+    if (totalPackets > 0) {
+        timeTrace("received %u packets in last poll", totalPackets);
+    }
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
