@@ -1225,10 +1225,10 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     uint64_t totalCycles = 0;
     size_t numReceivers = receivers.size();
 
-    // TODO: POLLING LOOP FOR MULTIPLE OUTGOING RPCS
     ObjectPool<EchoRpc> echoRpcPool;
     using OutstandingRpcs = std::list<std::pair<uint32_t, EchoRpc*>>;
     OutstandingRpcs outstandingRpcs = {};
+    uint64_t maxOutstandingRpcs = 0;
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
@@ -1262,17 +1262,15 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
                     message.c_str(), length, length);
             outstandingRpcs.emplace_back(messageId, echo);
+            if (outstandingRpcs.size() > maxOutstandingRpcs) {
+                maxOutstandingRpcs = outstandingRpcs.size();
+            }
             receiver = NULL;
             nextMessageArrival += messageIntervalDist(gen);
         }
 
         // Check for RPC completion.
-        if (now - context->dispatch->currentTime > Cycles::fromMicroseconds(100)) {
-            TimeTrace::record("ClusterPerf: long polling iteration");
-        }
-//        TimeTrace::record("ClusterPerf: JUST BEFORE POLL, oustandingRpcs %u", outstandingRpcs);
         context->dispatch->poll();
-//        TimeTrace::record("ClusterPerf: RIGHT AFTER POLL, poll %u", result);
         for (OutstandingRpcs::iterator it = outstandingRpcs.begin();
                 it != outstandingRpcs.end();) {
             EchoRpc* echo = it->second;
@@ -1293,14 +1291,16 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         }
     }
     totalCycles = Cycles::rdtsc() - startTime;
-    printf("Workload running time %.1f secs\n", Cycles::toSeconds(totalCycles));
+    LOG(NOTICE, "Experiment runs for %.2f secs\n", Cycles::toSeconds(totalCycles));
 
     // Cancel outstanding RPCs
+    LOG(NOTICE, "Destroying %lu outstanding RPCs, maxOutstandingRpcs %lu",
+            outstandingRpcs.size(), maxOutstandingRpcs);
     for (OutstandingRpcs::value_type p : outstandingRpcs) {
         echoRpcPool.destroy(p.second);
     }
 
-    //
+    // Aggregate the results into TimeDist format.
     vector<TimeDist> results(messageSizes.size());
     for (uint i = 0; i < messageSizes.size(); i++) {
         if (numSamples[i] <= MAX_NUM_SAMPLE) {
