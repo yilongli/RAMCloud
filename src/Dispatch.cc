@@ -64,6 +64,7 @@ Syscall* Dispatch::sys = &defaultSyscall;
  */
 Dispatch::Dispatch(bool hasDedicatedThread)
     : currentTime(0)
+    , iteration(0)
     , pollers()
     , files()
     , epollFd(-1)
@@ -285,6 +286,7 @@ Dispatch::poll()
             }
         }
     }
+    iteration++;
     return result;
 }
 

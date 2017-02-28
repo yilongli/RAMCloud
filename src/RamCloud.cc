@@ -565,13 +565,6 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     reqHdr->echoLength = echoLength;
     request.append(message, length);
     startTime = Cycles::rdtsc();
-#if DEBUG_BAD_TAIL
-    if (length < 1400) {
-        uint32_t p1 = uint32_t(startTime >> 32);
-        uint32_t p2 = uint32_t(startTime);
-//        TimeTrace::record(startTime, "SHORT MSG START TIME %u.%u", p1, p2);
-    }
-#endif
     send();
 }
 
@@ -587,11 +580,9 @@ EchoRpc::completed() {
     assert(reqHdr->length == length);
     if (reqHdr->length < 1400 && roundTripTime > threshold) {
         double us = Cycles::toSeconds(roundTripTime) * 1e6;
-        uint32_t x = uint32_t(us);
-        uint32_t y = uint32_t((us - x) * 100);
-        uint32_t p1 = uint32_t(startTime >> 32);
-        uint32_t p2 = uint32_t(startTime);
-        TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us, START TIME %u.%u", x, y, p1, p2);
+        uint32_t integral = uint32_t(us);
+        uint32_t frac = uint32_t((us - integral) * 100);
+        TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us", integral, frac);
     }
 #endif
 }

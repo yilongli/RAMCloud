@@ -77,6 +77,10 @@ class Dispatch {
     /// waiting for RPCs to complete.
     volatile uint64_t currentTime;
 
+    /// How many times the poll method has been invoked. Should only be read
+    /// from the dispatch thread.
+    uint64_t iteration;
+
     void startProfiler(const uint64_t totalElements);
 
     void stopProfiler();

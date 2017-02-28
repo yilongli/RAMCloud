@@ -584,6 +584,7 @@ HomaTransport::tryToTransmitData()
             // if appropriate.
             maxBytes = std::min(transmitQueueSpace,
                     clientRpc->transmitLimit - clientRpc->transmitOffset);
+            timeTrace("transmitQueueSpace %u, maxBytes %u", transmitQueueSpace, maxBytes); // TODO: REMOVE ME
             int bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -604,6 +605,7 @@ HomaTransport::tryToTransmitData()
             // if appropriate.
             maxBytes = std::min(transmitQueueSpace,
                     serverRpc->transmitLimit - serverRpc->transmitOffset);
+            timeTrace("transmitQueueSpace %u, maxBytes %u", transmitQueueSpace, maxBytes); // TODO: REMOVE ME
             int bytesSent = sendBytes(serverRpc->clientAddress,
                     serverRpc->rpcId, &serverRpc->replyPayload,
                     serverRpc->transmitOffset, maxBytes,
@@ -1561,16 +1563,6 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
 int
 HomaTransport::Poller::poll()
 {
-    static uint32_t pollIteration = 0;
-    pollIteration++;
-    static bool firstPoll = true;
-    if (firstPoll) {
-        firstPoll = false;
-        // TODO
-        Util::pinThreadToCore(2);
-        LOG(NOTICE, "cpu affinity %s", Util::getCpuAffinityString().c_str());
-    }
-
     int result = 0;
 
     // Process any available incoming packets.
@@ -1590,7 +1582,8 @@ HomaTransport::Poller::poll()
     } while (numPackets == MAX_PACKETS);
 
     if (totalPackets > 0) {
-        timeTrace("received %u packets in last poll", totalPackets);
+        timeTrace("received %u packets at polling iteration %u", totalPackets,
+                downCast<uint32_t>(owner->iteration));
     }
 
     // See if we should check for timeouts. Ideally, we'd like to do this
