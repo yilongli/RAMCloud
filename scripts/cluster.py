@@ -57,6 +57,7 @@ server_locator_templates = {
     'unreliable+udp': 'unreliable+udp:host=%(host)s,port=%(port)d',
     'infrc': 'infrc:host=%(host)s,port=%(port)d',
     'basic+infud': 'basic+infud:host=%(host1g)s',
+    'homa+infud': 'homa+infud:host=%(host1g)s',
     'unreliable+infud': 'unreliable+infud:host=%(host1g)s',
     'unreliable+infeth': 'unreliable+infeth:mac=00:11:22:33:44:%(id)02x',
     'basic+dpdk': 'basic+dpdk:',
@@ -72,6 +73,7 @@ coord_locator_templates = {
     # Coordinator uses udp even when rest of cluster uses infud
     # or dpdk.
     'basic+infud': 'basic+udp:host=%(host)s,port=%(port)d',
+    'homa+infud': 'homa+udp:host=%(host)s,port=%(port)d',
     'basic+dpdk': 'basic+udp:host=%(host)s,port=%(port)d',
     'homa+dpdk': 'homa+udp:host=%(host)s,port=%(port)d',
 }

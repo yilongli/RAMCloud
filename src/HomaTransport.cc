@@ -407,8 +407,8 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         curOffset += bytesThisPacket;
     }
 
-    timeTrace("sent data, sequence %u, offset %u, length %u",
-            downCast<uint32_t>(rpcId.sequence), offset, bytesSent);
+    timeTrace("sent data, sequence %u, offset %u, length %u, priority %u",
+            downCast<uint32_t>(rpcId.sequence), offset, bytesSent, priority);
     return bytesSent;
 }
 
@@ -535,6 +535,8 @@ HomaTransport::tryToTransmitData()
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
+    // TODO: IF WE JUST WANT TO SEND A SMALL MESSAGE, IT DOESN'T MAKE SENSE TO
+    // WAIT FOR A SPACE OF `maxDataPerPacket`.
     while (transmitQueueSpace >= maxDataPerPacket) {
         // Find an outgoing request or response that is ready to transmit.
         // The policy here is "shortest remaining processing time" (SRPT).
