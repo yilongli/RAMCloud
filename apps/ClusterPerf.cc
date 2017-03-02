@@ -1267,6 +1267,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 warmupCount--;
             } else {
                 count++;
+                // TODO: MEASURE NOW-NEXTMESSAGEARRIVAL
             }
             uint32_t length = messageSizes[messageId];
             EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
