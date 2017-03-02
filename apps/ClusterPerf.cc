@@ -1215,7 +1215,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 #endif
 
     // Work out average message interval cycles.
-    double linkBandwidth = 10 << 27; // 10Gbps
+    double linkBandwidth = 10 << 27ul; // 10Gbps
     double inputBytesPerSecond = linkBandwidth * loadFactor;
     uint64_t averageIntervalCycles = Cycles::fromSeconds(
             averageMessageSize / inputBytesPerSecond);
