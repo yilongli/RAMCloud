@@ -1575,13 +1575,7 @@ HomaTransport::Poller::poll()
         numPackets = downCast<uint>(t->receivedPackets.size());
         for (uint i = 0; i < numPackets; i++) {
             result = 1;
-            // TODO: TEMPORARY DEBUG CODE THAT MUST BE REMOVED
-            static int _count = 0;
-            uint64_t _cycles = Cycles::rdtsc();
             t->handlePacket(&t->receivedPackets[i]);
-            if (Cycles::rdtsc() - _cycles > Cycles::fromMicroseconds(15) && ++_count > 100) {
-                RAMCLOUD_DIE("CAUGHT MYSTERIOUS JITTER, cycles %lu", _cycles);
-            }
         }
         t->receivedPackets.clear();
         totalPackets += numPackets;

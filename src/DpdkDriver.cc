@@ -383,7 +383,20 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         }
 
         PerfStats::threadStats.networkInputBytes += rte_pktmbuf_pkt_len(m);
+
+        static int _count = 0;
+        uint64_t _cycles = Cycles::rdtsc();
+        uint32_t _poolSize = static_cast<uint32_t>(packetBufPool.pool.size());
         PacketBuf* buffer = packetBufPool.construct();
+        if (Cycles::rdtsc() - _cycles > Cycles::fromMicroseconds(15)) {
+            TimeTrace::record("CAUGHT MYSTERIOUS JITTER2, pool size %lu",
+                    _poolSize);
+            if (_count > 100) {
+                TimeTrace::printToLog();
+                RAMCLOUD_DIE("I am done...");
+            }
+        }
+
         packetBufsUtilized++;
         buffer->sender.construct(ethHdr->s_addr.addr_bytes);
         uint32_t length = rte_pktmbuf_pkt_len(m) - headerLength;
