@@ -101,7 +101,7 @@ void
 FailureDetector::detectorThreadEntry(FailureDetector* detector,
                                      Context* context)
 {
-    LOG(NOTICE, "Failure detector thread started");
+    LOG(NOTICE, "Failure detector thread started, thread id %ld", gettid());
 
     // Wait a while before sending the first probe, so that the coordinator
     // has had a chance to let the other servers know of our existence.

@@ -296,7 +296,7 @@ TESTS_ONLY_OBJFILES := $(filter-out %TestRunner.o, $(TESTS_ONLY_OBJFILES))
 
 $(OBJDIR)/libramcloudtest.so: $(TESTS_ONLY_OBJFILES)
 	@mkdir -p $(@D)
-	$(CXX) $(LDFLAGS) -shared -lpthread -o $@ $^ $(TESTS_LIB)
+	$(CXX) $(LDFLAGS) -shared -o $@ $^ $(TESTS_LIB)
 
 # Do not remove.
 tests-clean:

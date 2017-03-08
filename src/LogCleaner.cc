@@ -196,7 +196,7 @@ static volatile uint32_t threadCnt;
 void
 LogCleaner::cleanerThreadEntry(LogCleaner* logCleaner, Context* context)
 {
-    LOG(NOTICE, "LogCleaner thread started");
+    LOG(NOTICE, "LogCleaner thread started, thread id %ld", gettid());
     PerfStats::registerStats(&PerfStats::threadStats);
 
     CleanerThreadState state;

@@ -728,6 +728,9 @@ Logger::printThreadMain(Logger* logger)
     Lock lock(logger->mutex);
     int bytesToPrint;
     ssize_t bytesPrinted;
+    // TODO: FIGURE OUT HOW TO LOG THIS MESSAGE WITHOUT CAUSING PROBLEMS
+//    LOG(NOTICE, "Logger background printer thread started, thread id %ld",
+//            gettid());
     while (true) {
         if (logger-> printThreadExit) {
             TEST_LOG("print thread exiting");

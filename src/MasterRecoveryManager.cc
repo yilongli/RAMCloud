@@ -659,6 +659,8 @@ MasterRecoveryManager::recoveryMasterFinished(
 void
 MasterRecoveryManager::main()
 try {
+    LOG(NOTICE, "MasterRecoveryManager thread started, thread id %ld",
+            gettid());
     taskQueue.performTasksUntilHalt();
 } catch (const std::exception& e) {
     LOG(ERROR, "Fatal error in MasterRecoveryManager: %s", e.what());

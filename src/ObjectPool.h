@@ -106,16 +106,12 @@ class ObjectPool
     T*
     construct(Args&&... args)
     {
-        uint64_t _cycles = Cycles::rdtsc();
         void* backing = NULL;
         if (pool.size() == 0) {
             backing = Memory::xmalloc(HERE, sizeof(T));
         } else {
             backing = pool.back();
             pool.pop_back();
-        }
-        if (Cycles::rdtsc() - _cycles > Cycles::fromMicroseconds(15)) {
-            TimeTrace::record("CAUGHT MYSTERIOUS JITTER");
         }
 
         T* object = NULL;
@@ -142,7 +138,7 @@ class ObjectPool
         outstandingObjects--;
     }
 
-//  PRIVATE:
+  PRIVATE:
     /// Count of the number of objects for which construct() was called, but
     /// destroy() was not.
     uint64_t outstandingObjects;

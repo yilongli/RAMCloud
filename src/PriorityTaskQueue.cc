@@ -206,6 +206,8 @@ PriorityTaskQueue::performTasksUntilHalt()
 void
 PriorityTaskQueue::main()
 try {
+    LOG(NOTICE, "PriorityTaskQueue thread started, thread id %ld",
+            gettid());
     PerfStats::registerStats(&PerfStats::threadStats);
     performTasksUntilHalt();
 } catch (const std::exception& e) {
