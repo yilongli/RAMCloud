@@ -1575,7 +1575,15 @@ HomaTransport::Poller::poll()
         numPackets = downCast<uint>(t->receivedPackets.size());
         for (uint i = 0; i < numPackets; i++) {
             result = 1;
+
+            uint64_t _cycles = Cycles::rdtsc();
+
             t->handlePacket(&t->receivedPackets[i]);
+
+            if (Cycles::rdtsc() - _cycles > Cycles::fromMicroseconds(15)) {
+                TimeTrace::record(_cycles, "START HANDLING PACKETS");
+                TimeTrace::record("CAUGHT MYSTERIOUS JITTER WHEN HANDLING PACKETS");
+            }
         }
         t->receivedPackets.clear();
         totalPackets += numPackets;
