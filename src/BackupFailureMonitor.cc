@@ -66,6 +66,10 @@ BackupFailureMonitor::~BackupFailureMonitor()
 void
 BackupFailureMonitor::main()
 try {
+#if !TESTING
+    LOG(NOTICE, "BackupFailureMonitor thread started, thread id %u",
+            gettid());
+#endif
     ServerDetails server;
     ServerChangeEvent event;
     while (running) {

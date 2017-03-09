@@ -25,6 +25,7 @@
 #include <stdarg.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <syscall.h>
 
 #include "Common.h"
 #include "Buffer.h"
@@ -150,6 +151,16 @@ pinToCpu(uint32_t cpu)
         return false;
     }
     return true;
+}
+
+/**
+ * Return the caller's thread ID (TID).
+ *
+ * As of 03/2017, there is no glibc wrapper for this system call.
+ */
+uint32_t gettid()
+{
+    return downCast<uint32_t>(syscall(SYS_gettid));
 }
 
 /**

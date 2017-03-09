@@ -391,6 +391,10 @@ void
 WorkerManager::workerMain(Worker* worker)
 {
     worker->threadId = ThreadId::get();
+#if !TESTING
+    LOG(NOTICE, "Worker thread %d started, thread id %u", worker->threadId,
+            gettid());
+#endif
     PerfStats::registerStats(&PerfStats::threadStats);
 
     // Cycles::rdtsc time that's updated continuously when this thread is idle.

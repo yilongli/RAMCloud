@@ -13,7 +13,6 @@
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
-
 #if ENABLE_LOGCABIN
 
 #include "Common.h"
@@ -516,6 +515,9 @@ void
 LogCabinStorage::leaseRenewerMain(TimePoint start)
 {
     std::unique_lock<std::mutex> lockGuard(exitingMutex);
+    RAMCLOUD_LOG(NOTICE, "LogCabin LeaseRenewer thread started, "
+            "thread id %u", gettid());
+
     using std::chrono::milliseconds;
     while (!isExiting) {
         TimePoint renewAt = start + milliseconds(renewLeaseIntervalMs);
