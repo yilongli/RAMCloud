@@ -1288,6 +1288,35 @@ double sfence()
     return Cycles::toSeconds(stop - start)/count;
 }
 
+// Measure the kernel jitter at a certain percentile.
+double spinAndCheckGaps(double percentile)
+{
+    const int count = 1000000;
+    static uint64_t cycles[count+1] = {};
+    if (cycles[0] == 0) {
+        for (int i = 0; i < count + 1; i++) {
+            cycles[i] = Cycles::rdtsc();
+        }
+        for (int i = 0; i < count; i++) {
+            cycles[i] = cycles[i + 1] - cycles[i];
+        }
+        std::sort(std::begin(cycles), std::end(cycles) - 1);
+    }
+    return Cycles::toSeconds(cycles[int(count * percentile)]);
+}
+
+double spinAndCheckGaps99() {
+    return spinAndCheckGaps(0.99);
+}
+
+double spinAndCheckGaps999() {
+    return spinAndCheckGaps(0.999);
+}
+
+double spinAndCheckGaps9999() {
+    return spinAndCheckGaps(0.9999);
+}
+
 // Measure the cost of acquiring and releasing a SpinLock (assuming the
 // lock is initially free).
 double spinLock()
@@ -1611,6 +1640,13 @@ TestInfo tests[] = {
      "Key lookup in a 1GB HashTable"},
     {"hashTableLookupPf", hashTableLookup<20>,
      "Key lookup in a 1GB HashTable with prefetching"},
+     // TODO: REVISE DOCS. AND ALL
+    {"spinAndCheckGaps99", spinAndCheckGaps99,
+     "Running rdtsc in a tight loop and check the gaps 99%"},
+    {"spinAndCheckGaps999", spinAndCheckGaps999,
+     "Running rdtsc in a tight loop and check the gaps 99.9%"},
+    {"spinAndCheckGaps9999", spinAndCheckGaps9999,
+     "Running rdtsc in a tight loop and check the gaps 99.99%"},
     {"lfence", lfence,
      "Lfence instruction"},
     {"lockInDispThrd", lockInDispThrd,
@@ -1716,6 +1752,7 @@ void runTest(TestInfo& info)
 int
 main(int argc, char *argv[])
 {
+    // TODO: CONFIGURE THE CPU TO BIND TO
     bindThreadToCpu(3);
     if (argc == 1) {
         // No test names specified; run all tests.

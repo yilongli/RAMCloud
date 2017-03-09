@@ -31,7 +31,6 @@ void clearCpuAffinity(void);
 void genRandomString(char* str, const int length);
 string getCpuAffinityString(void);
 string hexDump(const void *buffer, uint64_t bytes);
-void spinAndCheckGaps(int count);
 bool timespecLess(const struct timespec& t1, const struct timespec& t2);
 bool timespecLessEqual(const struct timespec& t1, const struct timespec& t2);
 struct timespec timespecAdd(const struct timespec& t1,
