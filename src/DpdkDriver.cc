@@ -392,6 +392,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         receivedPackets->emplace_back(buffer->sender.get(), this,
                 length, buffer->payload);
         rte_pktmbuf_free(m);
+        timeTrace("received packet processed, payload size %u", length);
     }
 }
 
@@ -424,6 +425,7 @@ DpdkDriver::sendPacket(const Address* addr,
     priority += lowestPriorityAvail;
 
     uint32_t etherPayloadLength = headerLen + (payload ? payload->size() : 0);
+    timeTrace("sendPacket invoked, payload size %u", etherPayloadLength);
     uint32_t frameLength = etherPayloadLength + ETHER_VLAN_HDR_LEN;
     assert(etherPayloadLength <= MAX_PAYLOAD_SIZE);
 
