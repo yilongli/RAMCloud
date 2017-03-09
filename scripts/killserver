@@ -11,9 +11,16 @@ if [[ "$1" == "1" ]]; then
     pid=${file#*_}
     rm -rf logs/shm/$file
 
-    kill $pid 2>/dev/null || exit 0
+    command=`ps -o comm $pid | tail -n +2`
     while true; do
+        if [ "$command" = "server" ]; then
+            kill $pid 2>/dev/null || exit 0
+        else
+            # When we are starting the server using tools like time and perf,
+            # only kill the children processes to allow the parent tool process
+            # exit normally and produce its output.
+            pkill -P $pid 2>/dev/null || exit 0
+        fi
         sleep .01
-        kill $pid 2>/dev/null || exit 0
     done
 fi
