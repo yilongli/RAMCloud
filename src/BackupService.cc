@@ -659,6 +659,8 @@ BackupService::writeSegment(const WireFormat::BackupWrite::Request* reqHdr,
 void
 BackupService::gcMain()
 try {
+    LOG(NOTICE, "BackupService replica garbage collector thread started, "
+            "thread id %u", gettid());
     taskQueue.performTasksUntilHalt();
 } catch (const std::exception& e) {
     LOG(ERROR, "Fatal error in BackupService::gcThread: %s", e.what());
@@ -682,7 +684,6 @@ BackupService::trackerChangesEnqueued()
     if (!initCalled)
         return;
     if (!gcThread && !testingDoNotStartGcThread) {
-        LOG(NOTICE, "Starting backup replica garbage collector thread");
         gcThread.construct(&BackupService::gcMain, this);
     }
     ServerDetails server;

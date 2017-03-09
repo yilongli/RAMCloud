@@ -1090,6 +1090,8 @@ void
 CoordinatorServerList::updateLoop()
 {
     try {
+        LOG(NOTICE, "CoordinatorServerList updater thread started, "
+                "thread id %u", gettid());
         while (!stopUpdater) {
             checkUpdates();
             if (activeRpcs.empty()) {

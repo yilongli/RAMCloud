@@ -303,6 +303,8 @@ UdpDriver::getServiceLocator()
 void
 UdpDriver::readerThreadMain(UdpDriver* driver)
 {
+    LOG(NOTICE, "UdpDriver reader thread started, thread id %u", gettid());
+
     // Index within driver->packetBatches where we will read the next
     // batch of packets.
     int currentBatch = 0;

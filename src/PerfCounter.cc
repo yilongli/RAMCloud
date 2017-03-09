@@ -15,7 +15,6 @@
 
 #include "PerfCounter.h"
 
-#include <pthread.h>
 #include <signal.h>
 #include <mutex>
 #include <sstream>
@@ -83,6 +82,8 @@ const char* EnabledCounter::PATH_PREFIX = "perfcounters/";
  * SIGTERM is used to terminate.
  */
 void terminatePerfCounters() {
+    LOG(NOTICE, "PerfCounter terminateHandler thread started, thread id %u",
+            gettid());
     // We make a copy instead of directly using the global structure because we
     // will deadlock if we try to hold the lock while terminating threads.
     vector<EnabledCounter*> enabledCounters;
@@ -135,6 +136,8 @@ void EnabledCounter::writeCyclesPerSecond(FILE* handle) {
  * disk. It is functionally a Consumer in the Producer-Consumer model.
  */
 void EnabledCounter::backgroundWriter() {
+    LOG(NOTICE, "PerfCounter background writer thread started, thread id %u",
+            gettid());
     FILE* handle = NULL;
     for (;;) {
         {
