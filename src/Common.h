@@ -141,6 +141,7 @@ string demangle(const char* name);
 namespace RAMCloud {
 
 bool pinToCpu(uint32_t cpu);
+uint32_t gettid();
 uint64_t getTotalSystemMemory();
 
 // conveniences for dealing with maps

@@ -102,6 +102,8 @@ CoordinatorService::init(CoordinatorService* service,
     // This is the top-level method in a thread, so it must catch all
     // exceptions.
     try {
+        LOG(NOTICE, "CoordinatorService thread started, thread id %u",
+                gettid());
         // Recover state (and incomplete operations) from external storage.
         service->leaseAuthority.recover();
         uint64_t lastCompletedUpdate = service->updateManager.init();

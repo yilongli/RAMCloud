@@ -356,6 +356,8 @@ void WorkerTimer::Manager::checkTimers(Lock& lock)
  */
 void WorkerTimer::Manager::workerThreadMain(Manager* manager)
 try {
+    LOG(NOTICE, "WorkerTimer worker thread started, thread id %u",
+            gettid());
     Lock lock(mutex);
 
     while (true) {

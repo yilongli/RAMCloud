@@ -291,6 +291,7 @@ Dispatch::poll()
 void
 Dispatch::run()
 {
+    LOG(NOTICE, "Dispatch thread started polling, thread id %u", gettid());
     PerfStats::registerStats(&PerfStats::threadStats);
     uint64_t prev;
     while (true) {
@@ -579,6 +580,7 @@ Dispatch::File::setEvents(int events)
 void
 Dispatch::epollThreadMain(Dispatch* owner)
 try {
+    LOG(NOTICE, "Dispatch epoll thread started, thread id %u", gettid());
 #define MAX_EVENTS 10
     struct epoll_event events[MAX_EVENTS];
     while (true) {
