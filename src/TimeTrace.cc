@@ -16,6 +16,11 @@
 #include "TimeTrace.h"
 
 namespace RAMCloud {
+
+// Change 0 -> 1 in the following line to use the raw RDTSC timestamps in the
+// timetraces instead of converting them to nanoseconds first.
+#define RAW_TIMESTAMP 0
+
 __thread TimeTrace::Buffer* TimeTrace::threadBuffer = NULL;
 std::vector<TimeTrace::Buffer*> TimeTrace::threadBuffers;
 TimeTrace::TraceLogger* TimeTrace::backgroundLogger = NULL;
@@ -119,7 +124,11 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
 
     // Each iteration through this loop processes one event (the one with
     // the earliest timestamp).
+#if RAW_TIMESTAMP
+    uint64_t prevTimestamp = 0;
+#else
     double prevTime = 0.0;
+#endif
     int eventsSinceCongestionCheck = 0;
     while (1) {
         TimeTrace::Buffer* buffer;
@@ -148,13 +157,22 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
                 % Buffer::BUFFER_SIZE;
 
         char message[1000];
+#if RAW_TIMESTAMP
+        uint64_t ts = event->timestamp;
+#else
         double ns = Cycles::toSeconds(event->timestamp - startTime) * 1e09;
+#endif
         if (s != NULL) {
             if (s->length() != 0) {
                 s->append("\n");
             }
+#if RAW_TIMESTAMP
+            snprintf(message, sizeof(message), "%lu cycles (+%lu cycles): ",
+                    ts, ts - prevTimestamp);
+#else
             snprintf(message, sizeof(message), "%8.1f ns (+%6.1f ns): ",
                     ns, ns - prevTime);
+#endif
             s->append(message);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
@@ -168,8 +186,13 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
             snprintf(message, sizeof(message), event->format, event->arg0,
                      event->arg1, event->arg2, event->arg3);
 #pragma GCC diagnostic pop
+#if RAW_TIMESTAMP
+            RAMCLOUD_LOG(NOTICE, "%lu cycles (+%lu cycles): %s",
+                    ts, ts - prevTimestamp, message);
+#else
             RAMCLOUD_LOG(NOTICE, "%8.1f ns (+%6.1f ns): %s", ns, ns - prevTime,
                     message);
+#endif
 
             // Make sure we're not monopolizing all of the buffer space
             // in the logger.
@@ -179,7 +202,11 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
                 eventsSinceCongestionCheck = 0;
             }
         }
+#if RAW_TIMESTAMP
+        prevTimestamp = ts;
+#else
         prevTime = ns;
+#endif
     }
 
     if (!printedAnything) {
