@@ -1187,7 +1187,15 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         samples.assign(MAX_SAMPLES, 0);
     }
 
+#define DECOUPLE_SHORT_LONG_MSGS 1
+#if DECOUPLE_SHORT_LONG_MSGS
     const uint32_t largestMessageSize = messageSizes.back();
+    messageSizes.pop_back();
+    cumulativeProbabilities.pop_back();
+    roundTripTimes.pop_back();
+#else
+    const uint32_t largestMessageSize = messageSizes.back();
+#endif
     static const string message(largestMessageSize, 'x');
 
     // TODO: construct message randomizer
@@ -1240,6 +1248,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     uint messageId = 0;
     uint64_t totalTxMessageBytes = 0;
     uint64_t warmupCount = 1000;
+
     for (count = 0; count < iteration;) {
         // Prepare the next message if it's not ready yet.
         if (receiver == NULL) {
@@ -1289,6 +1298,18 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             }
         }
 
+#if DECOUPLE_SHORT_LONG_MSGS
+        static bool longMessageOngoing = false;
+        static const uint32_t longMessageSize = largestMessageSize;
+        if (!longMessageOngoing && messageSizes.size() == 1 && count > 0) {
+            uint32_t length = longMessageSize;
+            EchoRpc* echo = echoRpcPool.construct(cluster, receivers[0].c_str(),
+                    message.c_str(), length, length);
+            outstandingRpcs.emplace_back(~0u, echo);
+            longMessageOngoing = true;
+        }
+#endif
+
         // Check for RPC completion.
         context->dispatch->poll();
         for (OutstandingRpcs::iterator it = outstandingRpcs.begin();
@@ -1297,16 +1318,20 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             if (echo->isReady()) {
                 if (count > 0) {
                     uint id = it->first;
+#if DECOUPLE_SHORT_LONG_MSGS
+                    if (id > 10000U) {
+                        totalTxMessageBytes += longMessageSize;
+                        longMessageOngoing = false;
+                    } else {
+#endif
                     uint64_t completionTime = echo->getCompletionTime();
                     totalTxMessageBytes += messageSizes[id];
                     roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
                             completionTime;
                     numSamples[id]++;
-
-                    // TODO: REMOVE THIS DEBUGGING CODE
-                    if (completionTime > Cycles::fromMicroseconds(15)) {
-
+#if DECOUPLE_SHORT_LONG_MSGS
                     }
+#endif
                 }
                 echoRpcPool.destroy(echo);
                 it = outstandingRpcs.erase(it);
