@@ -67,8 +67,9 @@ class ObjectPool
      * allocations. For simplicity, no bulk allocations are performed.
      */
     ObjectPool()
-        : outstandingObjects(0),
-          pool()
+        : outstandingObjects(0)
+        , pool()
+        , t0(), t1(), t2(), t3(), t4()
     {
     }
 
@@ -106,19 +107,26 @@ class ObjectPool
     T*
     construct(Args&&... args)
     {
+        t0 = Cycles::rdtsc();
         void* backing = NULL;
         if (pool.size() == 0) {
             backing = Memory::xmalloc(HERE, sizeof(T));
+            t1 = t2 = Cycles::rdtsc();
         } else {
+            t1 = t0;
             backing = pool.back();
             pool.pop_back();
+            t2 = Cycles::rdtsc();
         }
 
         T* object = NULL;
         try {
             object = new(backing) T(static_cast<Args&&>(args)...);
+            t3 = t4 = Cycles::rdtsc();
         } catch (...) {
+            t3 = Cycles::rdtsc();
             pool.push_back(backing);
+            t4 = Cycles::rdtsc();
             throw;
         }
 
@@ -145,6 +153,9 @@ class ObjectPool
 
     /// Pool of backing memory from previously destroyed objects.
     vector<void*> pool;
+
+  public:
+    uint64_t t0, t1, t2, t3, t4;
 };
 
 } // end RAMCloud

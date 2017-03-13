@@ -383,7 +383,19 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         }
 
         PerfStats::threadStats.networkInputBytes += rte_pktmbuf_pkt_len(m);
+        uint64_t prev = Cycles::rdtsc();
         PacketBuf* buffer = packetBufPool.construct();
+        uint64_t now = Cycles::rdtsc();
+        if (now - prev > Cycles::fromMicroseconds(15)) {
+            TimeTrace::record(prev, "about to call ObjectPool::construct");
+            TimeTrace::record(packetBufPool.t0, "construct invoked");
+            TimeTrace::record(packetBufPool.t1, "Memory::xmalloc finished");
+            TimeTrace::record(packetBufPool.t2, "pop an object out of the pool");
+            TimeTrace::record(packetBufPool.t3, "PacketBuf ctor finished");
+            TimeTrace::record(packetBufPool.t4, "catching ctor exception");
+            TimeTrace::record(now, "ObjectPool::construct returned");
+        }
+
         packetBufsUtilized++;
         buffer->sender.construct(ethHdr->s_addr.addr_bytes);
         uint32_t length = rte_pktmbuf_pkt_len(m) - headerLength;
