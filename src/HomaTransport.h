@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2017 Stanford University
+/* Copyright (c) 2015-2016 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -13,8 +13,10 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef RAMCLOUD_BASICTRANSPORT_H
-#define RAMCLOUD_BASICTRANSPORT_H
+#ifndef RAMCLOUD_HOMATRANSPORT_H
+#define RAMCLOUD_HOMATRANSPORT_H
+
+#include <deque>
 
 #include "BoostIntrusive.h"
 #include "Buffer.h"
@@ -31,14 +33,14 @@ namespace RAMCloud {
  * This class implements a simple transport that uses the Driver mechanism
  * for datagram-based packet delivery.
  */
-class BasicTransport : public Transport {
+class HomaTransport : public Transport {
   PRIVATE:
     struct DataHeader;
 
   public:
-    explicit BasicTransport(Context* context, const ServiceLocator* locator,
+    explicit HomaTransport(Context* context, const ServiceLocator* locator,
             Driver* driver, uint64_t clientId);
-    ~BasicTransport();
+    ~HomaTransport();
 
     string getServiceLocator();
     Transport::SessionRef getSession(const ServiceLocator* serviceLocator,
@@ -114,7 +116,7 @@ class BasicTransport : public Transport {
 
       PRIVATE:
         // Transport associated with this session.
-        BasicTransport* t;
+        HomaTransport* t;
 
         // Address of the target server to which RPCs will be sent. This is
         // dynamically allocated and must be freed by the session.
@@ -124,10 +126,10 @@ class BasicTransport : public Transport {
         // is no longer usable.
         bool aborted;
 
-        Session(BasicTransport* t, const ServiceLocator* locator,
+        Session(HomaTransport* t, const ServiceLocator* locator,
                 uint32_t timeoutMs);
 
-        friend class BasicTransport;
+        friend class HomaTransport;
         DISALLOW_COPY_AND_ASSIGN(Session);
     };
 
@@ -139,21 +141,35 @@ class BasicTransport : public Transport {
      */
     class MessageAccumulator {
       public:
-        MessageAccumulator(BasicTransport* t, Buffer* buffer);
+        MessageAccumulator(HomaTransport* t, Buffer* buffer,
+                uint32_t totalLength);
         ~MessageAccumulator();
         bool addPacket(DataHeader *header, uint32_t length);
         bool appendFragment(DataHeader *header, uint32_t length);
-        uint32_t requestRetransmission(BasicTransport *t,
-                const Driver::Address* address, RpcId grantOffset,
-                uint32_t limit, uint32_t roundTripBytes, uint8_t whoFrom);
+        uint32_t requestRetransmission(HomaTransport *t,
+                const Driver::Address* address, RpcId rpcId,
+                uint32_t grantOffset, uint8_t whoFrom);
 
         /// Transport that is managing this object.
-        BasicTransport* t;
+        HomaTransport* t;
+
+        // TODO: NOT USING VECTOR BECAUSE EXPANSION COULD CAUSE SIGNIFICANT JITTER
+        // DEQUE SUPPORTS O(1) RANDOM ACCESS (BACKED BY FIXED-SIZE ARRAYS), CHEAPER
+        // EXPANSION AND BETTER CACHE LOCALITY THAN LINKED LIST.
+        using MessageBuffer = std::deque<char*>;
+        MessageBuffer* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
         /// first byte that has not yet been received.
         Buffer* buffer;
+
+        // TODO: SIMPLIFY OR REMOVE IT?
+        /// Estimates the total # non-redundant payload bytes received. This
+        /// value cannot be precisely computed at all time because we cannot
+        /// tell how many redundant bytes a new data packet carries in its
+        /// payload before we actually manage to assemble it in the buffer.
+        uint32_t estimatedReceivedBytes;
 
         /// Describes a portion of an incoming message.
         struct MessageFragment {
@@ -180,20 +196,80 @@ class BasicTransport : public Transport {
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
 
-        /// Offset into the message of the most recent GRANT packet
-        /// we have sent (i.e., we've already authorized the sender to
-        /// transmit bytes up to this point in the message).
-        uint32_t grantOffset;
+        /// Total # bytes in the message.
+        const uint32_t totalLength;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
 
     /**
+     * An object of this class stores the state for a scheduled message for
+     * for which at least one packet has been received. It is used both for
+     * request messages on the server and for response messages on the client.
+     * Not used for messages that can be sent unilaterally.
+     */
+    class ScheduledMessage {
+      public:
+        ScheduledMessage(RpcId rpcId, MessageAccumulator* accumulator,
+                uint32_t unscheduledBytes,
+                const Driver::Address* senderAddress, uint8_t whoFrom);
+        ~ScheduledMessage();
+        int compareTo(ScheduledMessage& other) const;
+
+        /// Holds state of partially-received multi-packet messages.
+        const MessageAccumulator* const accumulator;
+
+        /// Used to link this object into t->activeMessages.
+        IntrusiveListHook activeMessageLinks;
+
+        /// Used to link this object into t->inactiveMessages.
+        IntrusiveListHook inactiveMessageLinks;
+
+        /// Offset from the most recent GRANT packet we have sent for this
+        /// incoming message, or # unscheduled bytes in this message if we
+        /// haven't sent any GRANTs.
+        uint32_t grantOffset;
+
+        /// Unique identifier for the RPC this message belongs to.
+        RpcId rpcId;
+
+        /// Network address of the message sender.
+        const Driver::Address* senderAddress;
+
+        /// Hash of `senderAddress`, used by the scheduler to quickly
+        /// distinguish message senders.
+        const uint64_t senderHash;
+
+        /// This enum defines the state field values for scheduled messages.
+        enum State {
+            NEW,        // The message just arrives.
+            ACTIVE,     // The message is linked on t->activeMessages.
+            INACTIVE,   // The message is linked on t->inactiveMessages.
+            PURGED      // The message is purged from the scheduler.
+        };
+
+        /// The state of a scheduled messages is initialized to NEW by the
+        /// constructor. It can change between ACTIVE and INACTIVE several
+        /// times during the lifetime of the message. Finally, when the message
+        /// is fully granted, its state will be moved from ACTIVE to PURGED.
+        State state;
+
+        /// Must be either FROM_CLIENT, indicating that this message is the
+        /// request from a client, or FROM_SERVER, indicating that this is
+        /// the response from a server.
+        const uint8_t whoFrom;
+
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
+    };
+
+    /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    struct ClientRpc {
+    class ClientRpc {
+      public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
 
@@ -209,41 +285,30 @@ class BasicTransport : public Transport {
         /// Use this object to report completion.
         RpcNotifier* notifier;
 
+        /// Unique identifier for this RPC.
+        RpcId rpcId;
+
         /// Offset within the request message of the next byte we should
         /// transmit to the server; all preceding bytes have already
         /// been sent.
         uint32_t transmitOffset;
+
+        /// Packet priority to use for transmitting the rest of the request
+        /// message up to `transmitLimit`.
+        uint8_t transmitPriority;
 
         /// The number of bytes in the request message that it's OK for
         /// us to transmit. Bytes after this cannot be transmitted until
         /// we receive a GRANT for them.
         uint32_t transmitLimit;
 
-        /// Generated from t->transmitSequenceNumber, used to prioritize
-        /// transmission of the request message.
-        uint64_t transmitSequenceNumber;
-
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the request.
         uint64_t lastTransmitTime;
 
-        /// Offset from the most recent GRANT packet we have sent for
-        /// the response for this RPC, or 0 if we haven't sent any GRANTs.
-        uint32_t grantOffset;
-
-        /// The sum of the offset and length fields from the most recent
-        /// RESEND we have sent, 0 if no RESEND has been sent for this
-        /// RPC. Used to detect unnecessary RESENDs (because the original
-        /// data eventually arrives).
-        uint32_t resendLimit;
-
         /// Number of times that the transport timer has fired since we
         /// received any packets from the server.
         uint32_t silentIntervals;
-
-        /// Either 0 or NEED_GRANT; used in the flags for all outgoing
-        /// data packets.
-        uint8_t needGrantFlag;
 
         /// True means that the request message is in the process of being
         /// transmitted (and this object is linked on t->outgoingRequests).
@@ -252,8 +317,14 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
 
+        /// Holds state of response messages that require scheduling.
+        Tub<ScheduledMessage> scheduledMessage;
+
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
+
+        // TODO: doc. dynamic throttling
+        uint32_t unscheduledBytes;
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
@@ -262,17 +333,17 @@ class BasicTransport : public Transport {
             , request(request)
             , response(response)
             , notifier(notifier)
+            , rpcId(session->t->clientId, sequence)
             , transmitOffset(0)
+            , transmitPriority(0)
             , transmitLimit(0)
-            , transmitSequenceNumber(0)
             , lastTransmitTime(0)
-            , grantOffset(0)
-            , resendLimit(0)
             , silentIntervals(0)
-            , needGrantFlag(0)
             , transmitPending(false)
             , accumulator()
+            , scheduledMessage()
             , outgoingRequestLinks()
+            , unscheduledBytes()
         {}
 
       PRIVATE:
@@ -289,7 +360,7 @@ class BasicTransport : public Transport {
 
         /// The transport that will be used to deliver the response when
         /// the RPC completes.
-        BasicTransport* t;
+        HomaTransport* t;
 
         /// Uniquely identifies this RPC among all RPCs ever received by
         /// this server. This is the *server's* sequence number; the client's
@@ -307,28 +378,18 @@ class BasicTransport : public Transport {
         /// been sent.
         uint32_t transmitOffset;
 
+        /// Packet priority to use for transmitting the rest of the response
+        /// message up to `transmitLimit`.
+        uint8_t transmitPriority;
+
         /// The number of bytes in the response message that it's OK for
         /// us to transmit. Bytes after this cannot be transmitted until
         /// we receive a GRANT for them.
         uint32_t transmitLimit;
 
-        /// Generated from t->transmitSequenceNumber, used to prioritize
-        /// transmission of the response message.
-        uint64_t transmitSequenceNumber;
-
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the response.
         uint64_t lastTransmitTime;
-
-        /// Offset from the most recent GRANT packet we have sent for
-        /// the request message, or 0 if we haven't sent any GRANTs.
-        uint32_t grantOffset;
-
-        /// The sum of the offset and length fields from the most recent
-        /// RESEND we have sent, 0 if no RESEND has been sent for this
-        /// RPC. Used to detect unnecessary RESENDs (because the original
-        /// data eventually arrives).
-        uint32_t resendLimit;
 
         /// Number of times that the transport timer has fired since we
         /// received any packets from the client.
@@ -342,12 +403,11 @@ class BasicTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
-        /// Either 0 or NEED_GRANT; used in the flags for all outgoing
-        /// data packets.
-        uint8_t needGrantFlag;
-
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
+
+        /// Holds state of request messages that require scheduling.
+        Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->serverTimerList.
         IntrusiveListHook timerLinks;
@@ -355,25 +415,27 @@ class BasicTransport : public Transport {
         /// Used to link this object into t->outgoingResponses.
         IntrusiveListHook outgoingResponseLinks;
 
-        ServerRpc(BasicTransport* transport, uint64_t sequence,
+        // TODO: doc. dynamic throttling
+        uint32_t unscheduledBytes;
+
+        ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
             : t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
             , transmitOffset(0)
+            , transmitPriority(0)
             , transmitLimit(0)
-            , transmitSequenceNumber(0)
             , lastTransmitTime(0)
-            , grantOffset(0)
-            , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
-            , needGrantFlag(0)
             , accumulator()
+            , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
+            , unscheduledBytes()
         {}
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
@@ -417,11 +479,6 @@ class BasicTransport : public Transport {
     //                           means it was sent from server to client.
     // FROM_SERVER:              Opposite of FROM_CLIENT; provided to make
     //                           code more readable.
-    // NEED_GRANT:               Used only in DATA packets. Nonzero means
-    //                           the sender is transmitting the entire
-    //                           message unilaterally; if not set, the last
-    //                           part of the message won't be sent without
-    //                           GRANTs from the recipient.
     // RETRANSMISSION:           Used only in DATA packets. Nonzero means
     //                           this packet is being sent in response to a
     //                           RESEND request (it has already been sent
@@ -432,9 +489,8 @@ class BasicTransport : public Transport {
     //                           indicate that everything needs to be resent.
     static const uint8_t FROM_CLIENT =    1;
     static const uint8_t FROM_SERVER =    0;
-    static const uint8_t NEED_GRANT =     2;
-    static const uint8_t RETRANSMISSION = 4;
-    static const uint8_t RESTART =        8;
+    static const uint8_t RETRANSMISSION = 2;
+    static const uint8_t RESTART =        4;
 
     /**
      * Describes the wire format for an ALL_DATA packet, which contains an
@@ -464,14 +520,18 @@ class BasicTransport : public Transport {
                                      // this packet!).
         uint32_t offset;             // Offset within the message of the first
                                      // byte of data in this packet.
+        uint32_t unscheduledBytes;    // # unscheduled bytes in the message.
 
         // The remaining packet bytes after the header constitute message
         // data starting at the given offset.
 
         DataHeader(RpcId rpcId, uint32_t totalLength, uint32_t offset,
-                uint8_t flags)
-            : common(PacketOpcode::DATA, rpcId, flags),
-            totalLength(totalLength), offset(offset) {}
+                uint32_t unscheduledBytes, uint8_t flags)
+            : common(PacketOpcode::DATA, rpcId, flags)
+            , totalLength(totalLength)
+            , offset(offset)
+            , unscheduledBytes(unscheduledBytes)
+        {}
     } __attribute__((packed));
 
     /**
@@ -486,9 +546,16 @@ class BasicTransport : public Transport {
                                      // sender should now transmit all data up
                                      // to (but not including) this offset, if
                                      // it hasn't already.
+        uint8_t priority;            // Packet priority to use; the sender
+                                     // should transmit all data up to `offset`
+                                     // using this priority.
 
-        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t flags)
-            : common(PacketOpcode::GRANT, rpcId, flags), offset(offset) {}
+        GrantHeader(RpcId rpcId, uint32_t offset, uint8_t priority,
+                uint8_t flags)
+            : common(PacketOpcode::GRANT, rpcId, flags)
+            , offset(offset)
+            , priority(priority)
+        {}
     } __attribute__((packed));
 
     /**
@@ -506,11 +573,21 @@ class BasicTransport : public Transport {
         uint32_t length;             // Number of bytes of data to retransmit;
                                      // this could specify a range longer than
                                      // the total message size.
+        uint8_t priority;            // Packet priority to use; the sender
+                                     // should transmit all lost data using
+                                     // this priority unless the entire message
+                                     // needs to be resent (in such case this
+                                     // field is unused and the sender simply
+                                     // starts sending unscheduled bytes as
+                                     // normal).
 
         ResendHeader(RpcId rpcId, uint32_t offset, uint32_t length,
-                uint8_t flags)
-            : common(PacketOpcode::RESEND, rpcId, flags), offset(offset),
-              length(length) {}
+                uint8_t priority, uint8_t flags)
+            : common(PacketOpcode::RESEND, rpcId, flags)
+            , offset(offset)
+            , length(length)
+            , priority(priority)
+        {}
     } __attribute__((packed));
 
     /**
@@ -538,18 +615,19 @@ class BasicTransport : public Transport {
     } __attribute__((packed));
 
     /**
-     * Causes BasicTransport to be invoked during each iteration through
+     * Causes HomaTransport to be invoked during each iteration through
      * the dispatch poller loop.
      */
     class Poller : public Dispatch::Poller {
       public:
-        explicit Poller(Context* context, BasicTransport* t)
-            : Dispatch::Poller(context->dispatch, "BasicTransport::Poller")
+        explicit Poller(Context* context, HomaTransport* t)
+            : Dispatch::Poller(context->dispatch, "HomaTransport(" +
+                    t->driver->getServiceLocator() + ")::Poller")
             , t(t) { }
         virtual int poll();
       private:
         // Transport on whose behalf this poller operates.
-        BasicTransport* t;
+        HomaTransport* t;
         DISALLOW_COPY_AND_ASSIGN(Poller);
     };
 
@@ -558,13 +636,21 @@ class BasicTransport : public Transport {
     void deleteClientRpc(ClientRpc* clientRpc);
     void deleteServerRpc(ServerRpc* serverRpc);
     uint32_t getRoundTripBytes(const ServiceLocator* locator);
+    uint8_t getUnschedTrafficPrio(uint32_t messageSize);
     void handlePacket(Driver::Received* received);
     static string headerToString(const void* header, uint32_t headerLength);
     static string opcodeSymbol(uint8_t opcode);
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
-            uint8_t flags, bool partialOK = false);
-    int tryToTransmitData();
+            uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
+            bool partialOK = false);
+    bool tryToTransmitData();
+    bool tryToSchedule(ScheduledMessage* message);
+    void adjustSchedulingPrecedence(ScheduledMessage* message);
+    void replaceActiveMessage(ScheduledMessage* oldMessage,
+            ScheduledMessage* newMessage, bool cancelled = false);
+    void dataArriveForScheduledMessage(ScheduledMessage* message,
+            bool scheduledPacket);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -585,6 +671,19 @@ class BasicTransport : public Transport {
     /// identification for RPCs).
     uint64_t clientId;
 
+    /// The highest packet priority that is supported by the underlying driver
+    /// and available to us.
+    const int highestAvailPriority;
+
+    // The highest priority to use for scheduled traffic.
+    int highestSchedPriority;
+
+    /// The packet priority used for sending control packets.
+    const int controlPacketPriority;
+
+    /// The lowest priority to use for unscheduled traffic.
+    int lowestUnschedPrio;
+
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
     uint64_t nextClientSequenceNumber;
@@ -593,17 +692,19 @@ class BasicTransport : public Transport {
     /// higher than the highest number ever used in the past).
     uint64_t nextServerSequenceNumber;
 
-    /// Assigned to a request or response when it becomes ready to transmit;
-    /// sequences requests and responses in a single timeline to implement
-    /// a FIFO priority system for large messages.
-    uint64_t transmitSequenceNumber;
-
     /// Holds incoming packets received from the driver. This is only
     /// used temporarily during the poll method, but it's allocated here
     /// so that we only pay the cost for storage allocation once (don't
     /// want to reallocate space in every call to poll). Always empty,
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
+
+    /// Holds message buffers that are consist of payloads that are retained
+    /// and assembled by the MessageAccumulator. These retained payloads are
+    /// gradually released in the poll method so that the MessageAccumulator
+    /// doesn't have to release all its payloads at one shot in the destructor
+    /// and cause significant jitter.
+    std::vector<MessageAccumulator::MessageBuffer*> messageBuffers;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
@@ -661,6 +762,7 @@ class BasicTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
+    // TODO: need to clean up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
@@ -690,9 +792,48 @@ class BasicTransport : public Transport {
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
 
-    DISALLOW_COPY_AND_ASSIGN(BasicTransport);
+    /// If the number at index i is the first element that is larger than the
+    /// size of a message, then the sender should use the (i+1)-th highest
+    /// priority for the entire unscheduled portion of the message.
+    vector<uint32_t> unschedTrafficPrioBrackets;
+
+    /// -----------------
+    /// MESSAGE SCHEDULER
+    /// -----------------
+
+    /// Holds a list of scheduled messages that are sent from distinct senders
+    /// and receive grants regularly. The scheduler attempts to keep 1 RTT
+    /// in-flight packets from each of these messages. Once a message has
+    /// been granted in its entirety, it will be removed from the list.
+    /// This list always maintains an ordering of the messages based on the
+    /// comparison function defined in #ScheduledMessage.
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
+            ActiveMessageList;
+    ActiveMessageList activeMessages;
+
+    /// Holds a list of scheduled messages that we have received at least one
+    /// packet for each of them, but haven't yet fully granted them and aren't
+    /// actively sending grants to them in order to avoid overloading the
+    /// network. One of these messages may be chosen to become an active message
+    /// when a former active message is granted completely. The list doesn't
+    /// maintain any particular ordering of the messages within it.
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
+            InactiveMessageList;
+    InactiveMessageList inactiveMessages;
+
+    /// The highest priority currently granted to the incoming messages that
+    /// are scheduled by this transport. The valid range of this value is
+    /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
+    /// by the transport.
+    int highestGrantedPrio;
+
+    /// Maximum # incoming messages that can be actively granted by the
+    /// transport at any time.
+    uint32_t maxGrantedMessages;
+
+    DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
 
 }  // namespace RAMCloud
 
-#endif // RAMCLOUD_BASICTRANSPORT_H
+#endif // RAMCLOUD_HOMATRANSPORT_H

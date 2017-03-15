@@ -1,0 +1,1 @@
+scripts/clusterperf.py --dpdkPort 1 --superuser --transport homa+dpdk --servers 1 --clients 1 --replicas 0 --disjunct --seconds 30 --messageSizeCdfFile ReadDistRandom.txt --loadFactor 0.4 --verbose echo_workload

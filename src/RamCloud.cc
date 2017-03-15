@@ -460,7 +460,8 @@ DropIndexRpc::DropIndexRpc(RamCloud* ramcloud, uint64_t tableId,
  *      Size of the message to be echoed, in bytes.
  * \param[out] echo
  *      After a successful return, this Buffer will hold the echoed message,
- *      which contains all whitespaces.
+ *      which contains all whitespaces. NULL means the client doesn't care
+ *      about the result.
  */
 void
 RamCloud::echo(const char* serviceLocator, const void* message,
@@ -469,6 +470,59 @@ RamCloud::echo(const char* serviceLocator, const void* message,
     EchoRpc rpc(this, serviceLocator, message, length, echoLength, echo);
     rpc.wait();
 }
+
+//vector<EchoRpcContainer*> __finishedRpcs = {};
+//
+//EchoRpcContainer::EchoRpcContainer(uint messageId, RamCloud* ramcloud,
+//        const char* serviceLocator, const void* message, uint32_t length,
+//        uint32_t echoLength)
+//    : ramcloud(ramcloud)
+//    , serviceLocator(serviceLocator)
+//    , message(message)
+//    , length(length)
+//    , echoLength(echoLength)
+//    , response()
+//    , messageId(messageId)
+//    , startTime()
+//    , roundTripTime(~0u)
+//    , rpc()
+//{}
+//
+//void
+//EchoRpcContainer::invokeRpc() {
+//    startTime = Cycles::rdtsc();
+//    if (length < 1400) {
+//        uint32_t p1 = uint32_t(startTime >> 32);
+//        uint32_t p2 = uint32_t(startTime);
+//        TimeTrace::record(startTime, "SHORT MSG START TIME %u.%u", p1, p2);
+//    }
+//    rpc.construct(ramcloud, serviceLocator, message, length, echoLength,
+//            &response, this);
+//}
+//
+//void
+//EchoRpcContainer::callback() {
+//    try {
+//        rpc->wait();
+//        uint64_t endTime = Cycles::rdtsc();
+//        roundTripTime = endTime - startTime;
+//        static uint64_t threshold = Cycles::fromMicroseconds(50);
+//        if (length < 1400 && roundTripTime > threshold) {
+//            double us = Cycles::toSeconds(roundTripTime) * 1e6;
+//            uint32_t x = uint32_t(us);
+//            uint32_t y = uint32_t((us - x) * 100);
+//            uint32_t p1 = uint32_t(startTime >> 32);
+//            uint32_t p2 = uint32_t(startTime);
+//            TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us, START TIME %u.%u", x, y, p1, p2);
+//        }
+//    } catch (...) {
+//    }
+//
+//    // Remove itself from the EchoRpcList
+//    __finishedRpcs.push_back(this);
+//}
+
+#define DEBUG_BAD_TAIL 1
 
 /**
  * Constructor for EchoRpc: initiates an RPC in the same way as
@@ -488,7 +542,8 @@ RamCloud::echo(const char* serviceLocator, const void* message,
  *      Size of the message to be echoed, in bytes.
  * \param[out] echo
  *      After a successful return, this Buffer will hold the echoed message,
- *      which contains all whitespaces.
+ *      which contains all whitespaces. NULL means the client doesn't care
+ *      about the result.
  */
 EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
         const void* message, uint32_t length, uint32_t echoLength,
@@ -497,8 +552,8 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     , ramcloud(ramcloud)
     , startTime(0)
     , endTime(~0u)
+    , length(length)
 {
-    echo->reset();
     try {
         session = ramcloud->clientContext->transportManager->getSession(
                 serviceLocator);
@@ -518,6 +573,18 @@ void
 EchoRpc::completed() {
     RpcWrapper::completed();
     endTime = Cycles::rdtsc();
+#if DEBUG_BAD_TAIL
+    uint64_t roundTripTime = endTime - startTime;
+    static uint64_t threshold = Cycles::fromMicroseconds(15);
+    const WireFormat::Echo::Request* reqHdr = getRequestHeader<WireFormat::Echo>();
+    assert(reqHdr->length == length);
+    if (reqHdr->length < 1400 && roundTripTime > threshold) {
+        double us = Cycles::toSeconds(roundTripTime) * 1e6;
+        uint32_t integral = uint32_t(us);
+        uint32_t frac = uint32_t((us - integral) * 100);
+        TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us", integral, frac);
+    }
+#endif
 }
 
 /**

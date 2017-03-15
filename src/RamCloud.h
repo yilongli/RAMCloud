@@ -75,7 +75,7 @@ class RamCloud {
             uint8_t numIndexlets = 1);
     void dropIndex(uint64_t tableId, uint8_t indexId);
     void echo(const char* serviceLocator, const void* message, uint32_t length,
-         uint32_t echoLength, Buffer* echo);
+         uint32_t echoLength, Buffer* echo = NULL);
     uint64_t enumerateTable(uint64_t tableId, bool keysOnly,
          uint64_t tabletFirstHash, Buffer& state, Buffer& objects);
     void getLogMetrics(const char* serviceLocator,
@@ -279,6 +279,8 @@ class DropIndexRpc : public CoordinatorRpcWrapper {
     DISALLOW_COPY_AND_ASSIGN(DropIndexRpc);
 };
 
+//struct EchoRpcContainer;
+
 /**
  * Encapsulates the state of a RamCloud::echo operation,
  * allowing it to execute asynchronously.
@@ -287,7 +289,7 @@ class EchoRpc : public RpcWrapper {
   public:
     EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
             const void* message, uint32_t length, uint32_t echoLength,
-            Buffer* echo);
+            Buffer* echo = NULL);
     ~EchoRpc() {}
     virtual void completed();
     uint64_t getCompletionTime();
@@ -300,8 +302,35 @@ class EchoRpc : public RpcWrapper {
     uint64_t startTime;
     /// TSC value when the RPC is completed.
     uint64_t endTime;
+    // TODO: ONLY USED FOR DEBUGGING; REMOVE LATEER
+    uint32_t length;
     DISALLOW_COPY_AND_ASSIGN(EchoRpc);
 };
+
+//// TODO: templatize it
+//struct EchoRpcContainer {
+//    RamCloud* ramcloud;
+//    const char* serviceLocator;
+//    const void* message;
+//    uint32_t length;
+//    uint32_t echoLength;
+//
+//    Buffer response;
+//    uint messageId;
+//    uint64_t startTime;
+//    uint64_t roundTripTime;
+//    Tub<EchoRpc> rpc;
+//
+//    EchoRpcContainer(uint messageId, RamCloud* ramcloud,
+//            const char* serviceLocator, const void* message, uint32_t length,
+//            uint32_t echoLength);
+//    void invokeRpc();
+//    void callback();
+//
+//    DISALLOW_COPY_AND_ASSIGN(EchoRpcContainer);
+//};
+//
+//extern vector<EchoRpcContainer*> __finishedRpcs;
 
 /**
  * Encapsulates the state of a RamCloud::enumerateTable

@@ -67,6 +67,7 @@ class Dispatch {
     int poll();
     void run() __attribute__ ((noreturn));
 
+    // TODO: volatile is not correct
     /// The return value from rdtsc at the beginning of the last call to
     /// #poll.  May be read from multiple threads, so must be volatile.
     /// This value is relatively accurate for any code running in a Dispatch
@@ -75,6 +76,10 @@ class Dispatch {
     /// #currentTime may be out of date, since #poll is only invoked while
     /// waiting for RPCs to complete.
     volatile uint64_t currentTime;
+
+    /// How many times the poll method has been invoked. Should only be read
+    /// from the dispatch thread.
+    uint64_t iteration;
 
     void startProfiler(const uint64_t totalElements);
 
