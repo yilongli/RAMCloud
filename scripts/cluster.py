@@ -39,9 +39,10 @@ remote_obj_path = config.hooks.get_remote_obj_path()
 
 # Locations of various RAMCloud executables.
 coordinator_binary = '%s/coordinator' % remote_obj_path
-server_binary = '%s/server' % remote_obj_path
-#server_binary = 'trace-cmd record -p function_graph -o /shome/trace.dat -C x86-tsc %s/server' % remote_obj_path
-#server_binary = 'trace-cmd record -p function_graph -o /shome/trace.dat %s/server' % remote_obj_path
+server_binary = '/shome/ftrace-server.sh %s/server' % remote_obj_path
+#server_binary = '%s/server' % remote_obj_path
+#server_binary = 'trace-cmd record -M 4 -p function_graph --max-graph-depth 1 -o /shome/ftrace/trace.dat -C x86-tsc %s/server' % remote_obj_path
+#server_binary = 'trace-cmd record -p function_graph -o /shome/ftrace/trace.dat %s/server' % remote_obj_path
 ensure_servers_bin = '%s/apps/ensureServers' % remote_obj_path
 
 # Used to prepend debugging tool commands (e.g., valgrind) before the various
