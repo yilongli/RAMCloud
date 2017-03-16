@@ -230,8 +230,8 @@ timespecAdd(const struct timespec& t1, const struct timespec& t2)
 int
 writeFtraceMarker(string marker)
 {
-    static int fd = sys.open("/sys/kernel/debug/tracing/trace_marker",
-            O_WRONLY);
+    char file[] = "/sys/kernel/debug/tracing/trace_marker";
+    static int fd = sys.open(file, O_WRONLY);
     return static_cast<int>(sys.write(fd, marker.c_str(), marker.length()));
 }
 

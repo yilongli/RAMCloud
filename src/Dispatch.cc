@@ -28,6 +28,7 @@
 #include "PerfStats.h"
 #include "Unlock.h"
 #include "TimeTrace.h"
+#include "Util.h"
 
 // Uncomment to print out a human readable name for any poller that takes longer
 // than slowPollerCycles to complete. Useful for determining which poller is
@@ -299,6 +300,7 @@ void
 Dispatch::run()
 {
     LOG(NOTICE, "Dispatch thread started polling, thread id %u", gettid());
+    Util::pinThreadToCore(2);
     PerfStats::registerStats(&PerfStats::threadStats);
     uint64_t prev;
     while (true) {

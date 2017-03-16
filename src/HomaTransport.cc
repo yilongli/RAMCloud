@@ -1584,11 +1584,11 @@ HomaTransport::Poller::poll()
                 TimeTrace::record(_cycles, "START HANDLING PACKETS");
                 TimeTrace::record("CAUGHT MYSTERIOUS JITTER WHEN HANDLING PACKETS");
                 static int count = 0;
-                int result = Util::ftraceMark("");
+                int result = Util::writeFtraceMarker(format("RC MARKER %d", count++));
                 if (result < 0) {
                     LOG(ERROR, "Ftrace marker failed %d", result);
                 }
-                if (count++ > 100) {
+                if (count > 100) {
                     //std::terminate();
                 }
             }
