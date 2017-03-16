@@ -22,11 +22,10 @@
 
 namespace RAMCloud {
 
-__attribute__((weak))
 static int perf_event_open(struct perf_event_attr *attr, pid_t pid,
                     int cpu, int group_fd, unsigned long flags)
 {
-    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+    return downCast<int>(syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags));
 }
 
 /**
@@ -43,13 +42,13 @@ CacheTrace::CacheTrace()
         events[i].message = NULL;
     }
 
-    struct perf_event_attr attr = {
-            .type = PERF_TYPE_HARDWARE,
-            .size = PERF_ATTR_SIZE_VER0,
-            .config = PERF_COUNT_HW_INSTRUCTIONS,
-            .sample_type = PERF_SAMPLE_READ,
-            .exclude_kernel = 1,
-    };
+    struct perf_event_attr attr = {};
+//            type : PERF_TYPE_HARDWARE,
+//            size : PERF_ATTR_SIZE_VER0,
+//            config : PERF_COUNT_HW_INSTRUCTIONS,
+//            sample_type : PERF_SAMPLE_READ,
+//            exclude_kernel : 1,
+//    };
     fd = perf_event_open(&attr, 0, -1, -1, 0);
     if (fd < 0) {
         RAMCLOUD_LOG(ERROR, "perf_event_open error");
@@ -124,6 +123,11 @@ void CacheTrace::record(const char* message, uint64_t lastLevelMissCount)
     nextIndex = (i + 1)%BUFFER_SIZE;
     events[i].count = lastLevelMissCount;
     events[i].message = message;
+}
+
+void CacheTrace::record(const char* message)
+{
+    record(message, rdpmc_read());
 }
 
 /**

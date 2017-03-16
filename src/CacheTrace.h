@@ -42,8 +42,8 @@ class CacheTrace {
   PUBLIC:
     CacheTrace();
     ~CacheTrace();
-    void record(const char* message,
-            uint64_t lastLevelMissCount = rdpmc_read());
+    void record(const char* message);
+    void record(const char* message, uint64_t pmc);
 
     /**
      * Simple wrapper for convenient serialized calls to readPmc, which will
@@ -88,6 +88,8 @@ class CacheTrace {
     int fd;
 
     struct perf_event_mmap_page *buf;
+
+    DISALLOW_COPY_AND_ASSIGN(CacheTrace);
 };
 
 } // namespace RAMCloud
