@@ -43,7 +43,7 @@ class CacheTrace {
     CacheTrace();
     ~CacheTrace();
     void record(const char* message,
-            uint64_t lastLevelMissCount = Util::readPmc(0));
+            uint64_t lastLevelMissCount = rdpmc_read());
 
     /**
      * Simple wrapper for convenient serialized calls to readPmc, which will
@@ -59,6 +59,7 @@ class CacheTrace {
 
   PRIVATE:
     void printInternal(string* s);
+    uint64_t rdpmc_read();
 
     /**
      * This structure holds one entry in the CacheTrace.
@@ -83,6 +84,10 @@ class CacheTrace {
     // Index within events of the slot to use for the next call to the
     // record method.
     volatile int nextIndex;
+
+    int fd;
+
+    struct perf_event_mmap_page *buf;
 };
 
 } // namespace RAMCloud

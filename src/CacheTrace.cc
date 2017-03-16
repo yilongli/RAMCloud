@@ -1,4 +1,4 @@
-/* Copyright (c) 2014-2016 Stanford University
+/* Copyright (c) 2014-2017 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -13,9 +13,21 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <linux/perf_event.h>
+#include <sys/mman.h>
+
 #include "CacheTrace.h"
 
 namespace RAMCloud {
+
+__attribute__((weak))
+static int perf_event_open(struct perf_event_attr *attr, pid_t pid,
+                    int cpu, int group_fd, unsigned long flags)
+{
+    return syscall(__NR_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
 
 /**
  * Construct a CacheTrace.
@@ -23,10 +35,39 @@ namespace RAMCloud {
 CacheTrace::CacheTrace()
     : events()
     , nextIndex(0)
+    , fd(0)
+    , buf()
 {
     // Mark all of the events invalid.
     for (int i = 0; i < BUFFER_SIZE; i++) {
         events[i].message = NULL;
+    }
+
+    struct perf_event_attr attr = {
+            .type = PERF_TYPE_HARDWARE,
+            .size = PERF_ATTR_SIZE_VER0,
+            .config = PERF_COUNT_HW_INSTRUCTIONS,
+            .sample_type = PERF_SAMPLE_READ,
+            .exclude_kernel = 1,
+    };
+    fd = perf_event_open(&attr, 0, -1, -1, 0);
+    if (fd < 0) {
+        RAMCLOUD_LOG(ERROR, "perf_event_open error");
+//        perror("perf_event_open");
+    }
+
+	buf = static_cast<perf_event_mmap_page*>(mmap(NULL, sysconf(_SC_PAGESIZE), PROT_READ, MAP_SHARED, fd, 0));
+	if (buf == MAP_FAILED) {
+		close(fd);
+        buf = NULL;
+        RAMCLOUD_LOG(ERROR, "mmap on perf fd");
+	}
+	/* Not sure why this happens? */
+	if (buf->index == 0) {
+		munmap(buf, sysconf(_SC_PAGESIZE));
+		close(fd);
+        buf = NULL;
+        RAMCLOUD_LOG(ERROR, "not sure why this could happen?");
     }
 }
 
@@ -35,8 +76,34 @@ CacheTrace::CacheTrace()
  */
 CacheTrace::~CacheTrace()
 {
+    if (buf) {
+        close(fd);
+        munmap(buf, sysconf(_SC_PAGESIZE));
+    }
 }
 
+#define rmb() asm volatile("" ::: "memory")
+
+uint64_t
+CacheTrace::rdpmc_read()
+{
+    uint64_t val;
+	unsigned seq;
+    uint64_t offset;
+	unsigned index;
+
+    do {
+		seq = buf->lock;
+		rmb();
+		index = buf->index;
+		offset = buf->offset;
+		if (index == 0) /* rdpmc not allowed */
+			return offset;
+		val = __builtin_ia32_rdpmc(index - 1);
+		rmb();
+	} while (buf->lock != seq);
+	return val + offset;
+}
 /**
  * Record an event in the trace.
  *
