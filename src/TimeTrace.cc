@@ -158,6 +158,8 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
 
         char message[1000];
 #if RAW_TIMESTAMP
+        // Use the absolute RDTSC timestamp to make the comparison against
+        // the Linux kernel tracing output simpler.
         uint64_t ts = event->timestamp;
 #else
         double ns = Cycles::toSeconds(event->timestamp - startTime) * 1e09;
@@ -167,7 +169,7 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
                 s->append("\n");
             }
 #if RAW_TIMESTAMP
-            snprintf(message, sizeof(message), "%lu cycles (+%lu cycles): ",
+            snprintf(message, sizeof(message), "%8lu cycles (+%6lu cycles): ",
                     ts, ts - prevTimestamp);
 #else
             snprintf(message, sizeof(message), "%8.1f ns (+%6.1f ns): ",
@@ -187,7 +189,7 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
                      event->arg1, event->arg2, event->arg3);
 #pragma GCC diagnostic pop
 #if RAW_TIMESTAMP
-            RAMCLOUD_LOG(NOTICE, "%lu cycles (+%lu cycles): %s",
+            RAMCLOUD_LOG(NOTICE, "%8lu cycles (+%6lu cycles): %s",
                     ts, ts - prevTimestamp, message);
 #else
             RAMCLOUD_LOG(NOTICE, "%8.1f ns (+%6.1f ns): %s", ns, ns - prevTime,

@@ -17,7 +17,7 @@
 
 #include "Util.h"
 #include "Cycles.h"
-#include "Logger.h"
+#include "Syscall.h"
 
 namespace RAMCloud {
 namespace Util {
@@ -25,6 +25,8 @@ namespace Util {
 // Memory buffer used by spinAndCheckGaps.
 #define SPIN_BUFFER_SIZE 10000
 char spinBuffer[SPIN_BUFFER_SIZE];
+
+static Syscall sys;
 
 /**
  * Sets the allowable set of cores for the current threadto include
@@ -216,7 +218,24 @@ timespecAdd(const struct timespec& t1, const struct timespec& t2)
     return result;
 }
 
-/** 
+/**
+ * Write a trace marker to the Linux ftrace buffer to synchronize ourselves
+ * with events happening in the kernel.
+ *
+ * @param marker
+ *      Message to write in the ftrace buffer.
+ * @return
+ *      The return value of the write system call.
+ */
+int
+writeFtraceMarker(string marker)
+{
+    static int fd = sys.open("/sys/kernel/debug/tracing/trace_marker",
+            O_WRONLY);
+    return static_cast<int>(sys.write(fd, marker.c_str(), marker.length()));
+}
+
+/**
  * Used for testing: if nonzero then this will be returned as the result of the
  * next call to read_pmc().
  */
