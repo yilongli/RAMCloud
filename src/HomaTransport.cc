@@ -815,7 +815,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     driver->release(payload);
                     return;
                 }
-                timeTrace("client received ALL_DATA, sequence %u, length %u",
+                timeTrace("client received ALL_DATA, clientId %u, sequence %u,"
+                        " length %u",
+                        downCast<uint32_t>(header->common.rpcId.clientId),
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         length);
                 Driver::PayloadChunk::appendToBuffer(clientRpc->response,
@@ -998,7 +1000,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                 AllDataHeader* header = received->getOffset<AllDataHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received ALL_DATA, sequence %u, length %u",
+                timeTrace("server received ALL_DATA, clientId %u, sequence %u,"
+                        " length %u",
+                        downCast<uint32_t>(header->common.rpcId.clientId),
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->messageLength);
                 if (serverRpc != NULL) {
