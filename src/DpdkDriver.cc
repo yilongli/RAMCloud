@@ -325,6 +325,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     struct rte_mbuf* mPkts[MAX_PACKETS_AT_ONCE];
 
 #if TIME_TRACE
+    static uint64_t startOfPollerLoop = 0;
     uint64_t timestamp = Cycles::rdtsc();
 #endif
     // attempt to dequeue a batch of received packets from the NIC
@@ -334,6 +335,13 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
 
     if (incomingPkts > 0) {
 #if TIME_TRACE
+        static uint64_t numPolls = 0;
+        if (context->dispatch->iteration != numPolls) {
+            numPolls = context->dispatch->iteration;
+            TimeTrace::record(context->dispatch->currentTime,
+                    "start of polling iteration %u",
+                    downCast<uint32_t>(numPolls));
+        }
         TimeTrace::record(timestamp, "DpdkDriver about to receive packets");
         TimeTrace::record("DpdkDriver received %u packets", incomingPkts);
 #endif

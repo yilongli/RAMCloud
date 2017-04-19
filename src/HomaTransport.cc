@@ -882,7 +882,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                 GrantHeader* header = received->getOffset<GrantHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("client received GRANT, sequence %u, offset %u",
+                timeTrace("client received GRANT, clientId %u, sequence %u,"
+                        " offset %u",
+                        downCast<uint32_t>(header->common.rpcId.clientId),
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->offset);
                 if (header->offset > clientRpc->transmitLimit) {
@@ -1132,7 +1134,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                 GrantHeader* header = received->getOffset<GrantHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received GRANT, sequence %u, offset %u",
+                timeTrace("server received GRANT, clientId %u, sequence %u,"
+                        " offset %u",
+                        downCast<uint32_t>(header->common.rpcId.clientId),
                         downCast<uint32_t>(header->common.rpcId.sequence),
                         header->offset);
                 if ((serverRpc == NULL) || !serverRpc->sendingResponse) {
@@ -2080,11 +2084,12 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
 
     // Output a GRANT for the selected message.
     const char* fmt = (messageToGrant->whoFrom == FROM_CLIENT) ?
-            "server sending GRANT, sequence %u, offset %u, priority %u" :
-            "client sending GRANT, sequence %u, offset %u, priority %u";
+            "server sending GRANT, clientId %u, sequence %u, offset %u, priority %u" :
+            "client sending GRANT, clientId %u, sequence %u, offset %u, priority %u";
     uint8_t whoFrom = (messageToGrant->whoFrom == FROM_CLIENT) ?
             FROM_SERVER : FROM_CLIENT;
-    timeTrace(fmt, downCast<uint32_t>(messageToGrant->rpcId.sequence),
+    timeTrace(fmt, downCast<uint32_t>(messageToGrant->rpcId.clientId),
+            downCast<uint32_t>(messageToGrant->rpcId.sequence),
             messageToGrant->grantOffset, priority);
     GrantHeader grant(messageToGrant->rpcId, messageToGrant->grantOffset,
             priority, whoFrom);

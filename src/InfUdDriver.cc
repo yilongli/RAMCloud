@@ -39,6 +39,20 @@ namespace RAMCloud {
 // this driver.
 #define TIME_TRACE 0
 
+// Provides a cleaner way of invoking TimeTrace::record, with the code
+// conditionally compiled in or out by the TIME_TRACE #ifdef.
+namespace {
+    inline void
+    timeTrace(const char* format,
+            uint32_t arg0 = 0, uint32_t arg1 = 0, uint32_t arg2 = 0,
+            uint32_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(format, arg0, arg1, arg2, arg3);
+#endif
+    }
+}
+
 /**
  * Construct an InfUdDriver.
  *
@@ -418,18 +432,14 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     if (bd->packetLength <= Infiniband::MAX_INLINE_DATA)
         workRequest.send_flags |= IBV_SEND_INLINE;
 
-#if TIME_TRACE
-    TimeTrace::record("before postSend in InfUdDriver");
-#endif
+    timeTrace("before postSend in InfUdDriver");
     ibv_send_wr *bad_txWorkRequest;
     if (ibv_post_send(qp->qp, &workRequest, &bad_txWorkRequest)) {
         LOG(WARNING, "Error posting transmit packet: %s", strerror(errno));
         txPool->freeBuffers.push_back(bd);
     }
-#if TIME_TRACE
-    TimeTrace::record("sent packet with %u bytes, %d free buffers",
+    timeTrace("sent packet with %u bytes, %d free buffers",
             totalLength, downCast<int>(txPool->freeBuffers.size()));
-#endif
     queueEstimator.packetQueued(bd->packetLength, Cycles::rdtsc());
     PerfStats::threadStats.networkOutputBytes += bd->packetLength;
 
@@ -469,10 +479,14 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         return;
     }
 #if TIME_TRACE
-    TimeTrace::record(context->dispatch->currentTime,
-            "start of poller loop");
-    TimeTrace::record("InfUdDriver received %d packets", numPackets);
+    static uint64_t numPolls = 0;
+    if (context->dispatch->iteration != numPolls) {
+        numPolls = context->dispatch->iteration;
+        TimeTrace::record(context->dispatch->currentTime,
+                "start of polling iteration %u", downCast<uint32_t>(numPolls));
+    }
 #endif
+    timeTrace("InfUdDriver received %d packets", numPackets);
 
     // First, prefetch the initial bytes of all the incoming packets. This
     // allows us to process multiple cache misses concurrently, which improves
@@ -485,9 +499,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
                 incoming->byte_len > 256 ? 256 : incoming->byte_len);
     }
     refillReceiver();
-#if TIME_TRACE
-    TimeTrace::record("receive queue refilled");
-#endif
+    timeTrace("receive queue refilled");
 
     rxBuffersInHca -= numPackets;
     if (rxBuffersInHca == 0) {
@@ -539,9 +551,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         SpinLock::Guard guard(mutex);
         rxPool->freeBuffers.push_back(bd);
     }
-#if TIME_TRACE
-    TimeTrace::record("InfUdDriver::receivePackets done");
-#endif
+    timeTrace("InfUdDriver::receivePackets done");
 }
 
 /**
