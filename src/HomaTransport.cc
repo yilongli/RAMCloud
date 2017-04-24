@@ -396,6 +396,12 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             // Entire message fits in a single packet.
             AllDataHeader header(rpcId, flags, downCast<uint16_t>(messageSize));
             Buffer::Iterator iter(message, 0, messageSize);
+            const char* fmt = flags & FROM_CLIENT ?
+                    "client sending ALL_DATA, clientId %u, sequence %u, length %u" :
+                    "server sending ALL_DATA, clientId %u, sequence %u, length %u";
+            timeTrace(fmt, downCast<uint32_t>(rpcId.clientId),
+                    downCast<uint32_t>(rpcId.sequence),
+                    messageSize);
             driver->sendPacket(address, &header, &iter, priority);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
@@ -2088,11 +2094,11 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
             "client sending GRANT, clientId %u, sequence %u, offset %u, priority %u";
     uint8_t whoFrom = (messageToGrant->whoFrom == FROM_CLIENT) ?
             FROM_SERVER : FROM_CLIENT;
+    GrantHeader grant(messageToGrant->rpcId, messageToGrant->grantOffset,
+            priority, whoFrom);
     timeTrace(fmt, downCast<uint32_t>(messageToGrant->rpcId.clientId),
             downCast<uint32_t>(messageToGrant->rpcId.sequence),
             messageToGrant->grantOffset, priority);
-    GrantHeader grant(messageToGrant->rpcId, messageToGrant->grantOffset,
-            priority, whoFrom);
     driver->sendPacket(messageToGrant->senderAddress, &grant, NULL,
             controlPacketPriority);
 }
