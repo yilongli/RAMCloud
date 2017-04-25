@@ -1405,8 +1405,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     for (count = 0; count < iteration;) {
         // Prepare the next message if it's not ready yet.
         if (receiver == NULL) {
-            receiver = receivers[generateRandom() % numReceivers].c_str();
             messageId = messageSizeDist(gen);
+//            receiver = receivers[generateRandom() % numReceivers].c_str();
+            // Hack: short message to server1; long messages to other servers
+            if ((messageSizes[messageId] < 1500) || (numReceivers == 1)) {
+                receiver = receivers[0].c_str();
+            } else {
+                receiver = receivers[1 + generateRandom() % (numReceivers- 1)].c_str();
+            }
         }
 
         uint64_t now = Cycles::rdtsc();
@@ -1432,10 +1438,12 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             }
             uint32_t length = messageSizes[messageId];
             EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
-                    message.c_str(), length, length);
+//                    message.c_str(), length, length);
+                    message.c_str(), length, 0);
             outstandingRpcs.emplace_back(messageId, echo);
             receiver = NULL;
-            nextMessageArrival += messageIntervalDist(gen);
+//            nextMessageArrival += messageIntervalDist(gen);
+            nextMessageArrival += averageIntervalCycles;
 
             // Update debugging statistics
             if (count > 0) {
@@ -1463,11 +1471,6 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
                             completionTime;
                     numSamples[id]++;
-
-                    // TODO: REMOVE THIS DEBUGGING CODE
-                    if (completionTime > Cycles::fromMicroseconds(15)) {
-
-                    }
                 }
                 echoRpcPool.destroy(echo);
                 it = outstandingRpcs.erase(it);

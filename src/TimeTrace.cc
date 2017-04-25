@@ -19,7 +19,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to use the raw TSC values in the output
 // instead of converting them to nanoseconds.
-#define RAW_TIMESTAMP 0
+#define RAW_TIMESTAMP 1
 
 __thread TimeTrace::Buffer* TimeTrace::threadBuffer = NULL;
 std::vector<TimeTrace::Buffer*> TimeTrace::threadBuffers;
