@@ -252,6 +252,9 @@ class MasterService : public Service {
     void readKeysAndValue(const WireFormat::ReadKeysAndValue::Request* reqHdr,
                 WireFormat::ReadKeysAndValue::Response* respHdr,
                 Rpc* rpc);
+    void readTsc(const WireFormat::ReadTsc::Request* reqHdr,
+                WireFormat::ReadTsc::Response* respHdr,
+                Rpc* rpc);
     void receiveMigrationData(
                 const WireFormat::ReceiveMigrationData::Request* reqHdr,
                 WireFormat::ReceiveMigrationData::Response* respHdr,

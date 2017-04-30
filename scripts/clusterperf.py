@@ -301,7 +301,7 @@ def run_test(
         'transport':   options.transport,
         'disjunct':    options.disjunct,
         'verbose':     options.verbose,
-        'superuser':   options.superuser
+        'superuser':   options.superuser,
     }
     # Provide a default value for num_servers here.  This is better
     # than defaulting it in the OptionParser below, because tests can
@@ -354,6 +354,8 @@ def run_test(
         client_args['--fullSamples'] = ''
     if options.seconds:
         client_args['--seconds'] = options.seconds
+    if options.calibrateTscFreq:
+        client_args['--calibrateTscFreq'] = ''
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -1018,6 +1020,8 @@ if __name__ == '__main__':
                  'timestamps along with their durations.')
     parser.add_option('--superuser', action='store_true', default=False,
             help='Start the cluster and clients as superuser')
+    parser.add_option('--calibrateTscFreq', action='store_true', default=False,
+            help='Calibrate TSC clock frequencies of servers against clients')
     (options, args) = parser.parse_args()
 
     if options.parse:

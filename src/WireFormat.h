@@ -130,7 +130,8 @@ enum Opcode {
     TX_REQUEST_ABORT            = 78,
     TX_HINT_FAILED              = 79,
     ECHO                        = 80,
-    ILLEGAL_RPC_TYPE            = 81, // 1 + the highest legitimate Opcode
+    READ_TSC                    = 81,
+    ILLEGAL_RPC_TYPE            = 82, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -1279,6 +1280,18 @@ struct ReadKeysAndValue {
                                       // as defined in Object.h in bytes.
                                       // The actual bytes of the object follow
                                       // immediately after this header.
+    } __attribute__((packed));
+};
+
+struct ReadTsc {
+    static const Opcode opcode = READ_TSC;
+    static const ServiceType service = MASTER_SERVICE;
+    struct Request {
+        RequestCommon common;
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+        uint64_t tsc;                 // Raw TSC value read from the server.
     } __attribute__((packed));
 };
 

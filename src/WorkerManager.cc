@@ -175,7 +175,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 
     // Handle ping requests inline so that high server load can never cause a
     // server to appear offline.
-    if ((header->opcode == WireFormat::PING)) {
+    if ((header->opcode == WireFormat::PING) ||
+            (header->opcode == WireFormat::READ_TSC)) {
         Service::Rpc serviceRpc(NULL, &rpc->requestPayload, &rpc->replyPayload);
         Service::handleRpc(context, &serviceRpc);
         rpc->sendReply();

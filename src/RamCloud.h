@@ -128,6 +128,7 @@ class RamCloud {
     void readKeysAndValue(uint64_t tableId, const void* key, uint16_t keyLength,
             ObjectBuffer* value, const RejectRules* rejectRules = NULL,
             uint64_t* version = NULL);
+    uint64_t readTsc(const char* serviceLocator);
     void remove(uint64_t tableId, const void* key, uint16_t keyLength,
             const RejectRules* rejectRules = NULL, uint64_t* version = NULL);
     void serverControlAll(WireFormat::ControlOp controlOp,
@@ -991,6 +992,22 @@ class ReadKeysAndValueRpc : public ObjectRpcWrapper {
 
   PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(ReadKeysAndValueRpc);
+};
+
+/**
+ * Encapsulates the state of a RamCloud::readTsc operation,
+ * allowing it to execute asynchronously.
+ */
+class ReadTscRpc : public RpcWrapper {
+  public:
+    ReadTscRpc(RamCloud* ramcloud, const char* serviceLocator);
+    ~ReadTscRpc() {}
+    /// \copydoc RpcWrapper::docForWait
+    uint64_t wait();
+
+  PRIVATE:
+    RamCloud* ramcloud;
+    DISALLOW_COPY_AND_ASSIGN(ReadTscRpc);
 };
 
 /**

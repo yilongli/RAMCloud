@@ -210,6 +210,10 @@ MasterService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             callHandler<WireFormat::ReadKeysAndValue, MasterService,
                         &MasterService::readKeysAndValue>(rpc);
             break;
+        case WireFormat::ReadTsc::opcode:
+            callHandler<WireFormat::ReadTsc, MasterService,
+                        &MasterService::readTsc>(rpc);
+            break;
         case WireFormat::ReceiveMigrationData::opcode:
             callHandler<WireFormat::ReceiveMigrationData, MasterService,
                         &MasterService::receiveMigrationData>(rpc);
@@ -1798,6 +1802,18 @@ MasterService::readKeysAndValue(
         return;
 
     respHdr->length = rpc->replyPayload->size() - initialLength;
+}
+
+/**
+ * Top-level server method to handle the READ_TSC request.
+ *
+ * \copydetails Service::ping
+ */
+void
+MasterService::readTsc(const WireFormat::ReadTsc::Request* reqHdr,
+        WireFormat::ReadTsc::Response* respHdr, Rpc* rpc)
+{
+    respHdr->tsc = Cycles::rdtsc();
 }
 
 /**

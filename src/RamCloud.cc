@@ -2177,6 +2177,70 @@ ReadKeysAndValueRpc::wait(uint64_t* version)
 }
 
 /**
+ * Read the TSC value of a given server.
+ *
+ * \param serviceLocator
+ *      Selects the server, whose TSC value should be read.
+ * \return
+ *      The TSC value read from the server when it starts processing this
+ *      RPC.
+ */
+uint64_t
+RamCloud::readTsc(const char* serviceLocator)
+{
+    ReadTscRpc rpc(this, serviceLocator);
+    return rpc.wait();
+}
+
+/**
+ * Constructor for ReadTscRpc: initiates an RPC in the same way as
+ * #RamCloud::readTsc, but returns once the RPC has been initiated, without
+ * waiting for it to complete.
+ *
+ * \param ramcloud
+ *      The RAMCloud object that governs this RPC.
+ * \param serviceLocator
+ *      Selects the server, whose TSC value should be read.
+ */
+ReadTscRpc::ReadTscRpc(RamCloud *ramcloud, const char *serviceLocator)
+    : RpcWrapper(sizeof(WireFormat::ReadTsc::Response))
+    , ramcloud(ramcloud)
+{
+    try {
+        session = ramcloud->clientContext->transportManager->getSession(
+                serviceLocator);
+    } catch (const TransportException& e) {
+        session = FailSession::get();
+    }
+    allocHeader<WireFormat::ReadTsc>();
+    send();
+}
+
+/**
+ * Wait for the RPC to complete, and return the same results as
+ * #RamCloud::readTsc.
+ *
+ * \throw TransportException
+ *       Thrown if an unrecoverable error occurred while communicating with
+ *       the target server.
+ */
+uint64_t
+ReadTscRpc::wait()
+{
+    waitInternal(ramcloud->clientContext->dispatch);
+    if (getState() != RpcState::FINISHED) {
+        throw TransportException(HERE);
+    }
+
+    const WireFormat::ReadTsc::Response* respHdr(
+            getResponseHeader<WireFormat::ReadTsc>());
+
+    if (respHdr->common.status != STATUS_OK)
+        ClientException::throwException(HERE, respHdr->common.status);
+    return respHdr->tsc;
+}
+
+/**
  * Delete an object from a table. If the object does not currently exist
  * then the operation succeeds without doing anything (unless rejectRules
  * causes the operation to be aborted).

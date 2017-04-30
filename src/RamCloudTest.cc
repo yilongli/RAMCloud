@@ -525,6 +525,12 @@ TEST_F(RamCloudTest, read) {
                         value.size()));
 }
 
+TEST_F(RamCloudTest, readTsc) {
+    Cycles::mockTscValue = 1000;
+    EXPECT_EQ(1000UL, ramcloud->readTsc("mock:host=master1"));
+    Cycles::mockTscValue = 0;
+}
+
 TEST_F(RamCloudTest, remove) {
     ramcloud->write(tableId1, "0", 1, "abcdef", 6);
     uint64_t version;

@@ -1967,6 +1967,12 @@ TEST_F(MasterServiceTest, read_rejectRules) {
     EXPECT_EQ(1U, version);
 }
 
+TEST_F(MasterServiceTest, readTsc) {
+    Cycles::mockTscValue = 1000;
+    EXPECT_EQ(1000UL, ramcloud->readTsc("mock:host=master"));
+    Cycles::mockTscValue = 0;
+}
+
 TEST_F(MasterServiceTest, receiveMigrationData) {
     Segment s;
 

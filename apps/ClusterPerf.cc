@@ -154,6 +154,10 @@ int seconds = 10;
 // for each sample along with its duration.
 bool fullSamples = false;
 
+// If true calibrate the frequencies of server TSC clocks against the client
+// and print results to the client log.
+bool calibrateTscFreq = false;
+
 #define MAX_METRICS 8
 
 // The following type holds metrics for all the clients.  Each inner vector
@@ -259,6 +263,32 @@ void getDist(std::vector<uint64_t>& times, TimeDist* dist)
         dist->p99999 = Cycles::toSeconds(times.at(index));
     } else {
         dist->p99999 = 0;
+    }
+}
+
+/**
+ * Obtain a list of available servers in the cluster from the coordinator.
+ *
+ * \param[out] servers
+ *      Filled in with information about available servers. Each server is
+ *      described as a (service mask, service locator) pair indexed by its
+ *      server Id.
+ */
+void
+getServerList(std::map<uint64_t, std::pair<string, ServiceMask>>* servers)
+{
+    servers->clear();
+    ProtoBuf::ServerList serverList;
+    CoordinatorClient::getServerList(cluster->clientContext, &serverList);
+    for (int i = 0; i < serverList.server_size(); i++) {
+        const ProtoBuf::ServerList_Entry* server = &serverList.server(i);
+        if (ServerStatus(server->status()) != ServerStatus::UP) {
+            continue;
+        }
+
+        (*servers)[server->server_id()] = std::make_pair(
+                server->service_locator(),
+                ServiceMask::deserialize(server->services()));
     }
 }
 
@@ -571,6 +601,138 @@ struct VirtualClient {
     ClientLeaseAgent lease;
     RpcTracker rpcTracker;
     DISALLOW_COPY_AND_ASSIGN(VirtualClient);
+};
+
+
+/**
+ * Utility class that helps calibrating TSC clock frequencies on remote servers
+ * in the cluster. This class automatically starts the calibration process on
+ * construction and automatically finishes it on destruction.
+ */
+class TscFrequencyCalibrator {
+
+    /// Holds the starting TSC and the result of a fast ReadTsc RPC, filled in
+    /// by getMinRoundTripTime().
+    struct ReadTscResult {
+        uint64_t clientTsc;
+        uint64_t serverTsc;
+        uint64_t roundTripTime;
+    };
+
+    /// Holds information about a server and intermediate data collected from
+    /// the experiment that are necessary to calibrate the server TSC clock.
+    struct ServerState {
+        /// Unique identifier of the server.
+        uint64_t serverId;
+
+        /// Service locator used to contact the server.
+        std::string serviceLocator;
+
+        /// Holds the result of the first call to getMinRoundTripTime().
+        ReadTscResult result;
+
+        explicit ServerState(uint64_t serverId, std::string serviceLocator)
+            : serverId(serverId), serviceLocator(serviceLocator), result()
+        {}
+    };
+
+  public:
+    /**
+     * Constructor for the TSC frequency calibrator.
+     */
+    explicit TscFrequencyCalibrator()
+        : serverStates()
+    {
+        // Retrieve ServerList from the coordinator and fill out the server
+        // information.
+        using ServerMap = std::map<uint64_t, std::pair<string, ServiceMask>>;
+        ServerMap servers;
+        getServerList(&servers);
+        ServerMap::iterator mapIt;
+        for (mapIt = servers.begin(); mapIt != servers.end(); mapIt++) {
+            if (mapIt->second.second.has(WireFormat::MASTER_SERVICE)) {
+                serverStates.emplace_back(mapIt->first, mapIt->second.first);
+            }
+        }
+
+        // Shift the order of the servers in the list based on the client Id;
+        // reduce the chance of multiple clients hitting the same server.
+        std::rotate(serverStates.begin(),
+                serverStates.begin() + clientIndex % serverStates.size(),
+                serverStates.end());
+
+        std::vector<ServerState>::iterator it;
+        for (it = serverStates.begin(); it != serverStates.end(); it++) {
+            ReadTscResult* result = &it->result;
+            result->roundTripTime = getMinRoundTripTime(
+                    it->serviceLocator.c_str(), &result->clientTsc,
+                    &result->serverTsc);
+        }
+    }
+
+    /**
+     * Destructor for the TSC frequency calibrator.
+     */
+    ~TscFrequencyCalibrator() {
+        std::vector<ServerState>::iterator it;
+        for (it = serverStates.begin(); it != serverStates.end(); it++) {
+            ReadTscResult r1 = it->result;
+            ReadTscResult r2 = {0, 0, 0};
+            r2.roundTripTime = getMinRoundTripTime(it->serviceLocator.c_str(),
+                    &r2.clientTsc, &r2.serverTsc);
+
+            // Compute the server TSC frequency scalar relative to the client.
+            double scalar = static_cast<double>(r2.clientTsc - r1.clientTsc)
+                    / static_cast<double>(r2.serverTsc - r1.serverTsc);
+            LOG(NOTICE, "TSC_Freq(server%lu) * %.15f = TSC_Freq(client%d), "
+                    "computed with two ReadTscRpc's that are %.2f s apart, "
+                    "1st RPC took %lu cycles, 2nd RPC took %lu cycles",
+                    it->serverId, scalar, clientIndex + 1,
+                    Cycles::toSeconds(r2.clientTsc - r1.clientTsc),
+                    r1.roundTripTime, r2.roundTripTime);
+        }
+    }
+
+  private:
+    /**
+     * Measures the minimum round-trip time between the calling client and
+     * a given server using the ReadTsc RPC.
+     *
+     * \param serviceLocator
+     *      Selects the server to communicate.
+     * \param clientTsc[out]
+     *      Records the TSC value on the client side right before invoking the
+     *      RPC.
+     * \param serverTsc[out]
+     *      Records the TSC value on the server side when it starts processing
+     *      the RPC.
+     * \param runs
+     *      The number of times the experiment must be repeated before
+     *      concluding the minimum round-trip time.
+     * \return
+     *      The minimum round-trip time, in TSC cycles, observed in all runs.
+     */
+    static uint64_t
+    getMinRoundTripTime(const char* serviceLocator, uint64_t* clientTsc,
+            uint64_t* serverTsc, uint32_t runs = 10000)
+    {
+        uint64_t minElapsedTime = ~0ul;
+        for (unsigned i = 0; i < runs; i++) {
+            uint64_t startTime = Cycles::rdtsc();
+            uint64_t tsc = cluster->readTsc(serviceLocator);
+            uint64_t elapsedTime = Cycles::rdtsc() - startTime;
+            if (elapsedTime < minElapsedTime) {
+                minElapsedTime = elapsedTime;
+                *clientTsc = startTime;
+                *serverTsc = tsc;
+            }
+        }
+        return minElapsedTime;
+    }
+
+    /// List of servers whose TSC clocks need to be calibrated against the
+    /// local clock of this client.
+    std::vector<ServerState> serverStates;
 };
 
 /**
@@ -2021,32 +2183,6 @@ getMetrics(ClientMetrics& metrics, int clientCount)
         for (int i = 0; i < MAX_METRICS; i++) {
             metrics[i][client] = clientMetrics[i];
         }
-    }
-}
-
-/**
- * Obtain a list of available servers in the cluster from the coordinator.
- *
- * @param[out] servers
- *      Filled in with information about available servers. Each server is
- *      described as a (service mask, service locator) pair indexed by its
- *      server Id.
- */
-void
-getServerList(std::map<uint64_t, std::pair<string, ServiceMask>>* servers)
-{
-    servers->clear();
-    ProtoBuf::ServerList serverList;
-    CoordinatorClient::getServerList(cluster->clientContext, &serverList);
-    for (int i = 0; i < serverList.server_size(); i++) {
-        const ProtoBuf::ServerList_Entry* server = &serverList.server(i);
-        if (ServerStatus(server->status()) != ServerStatus::UP) {
-            continue;
-        }
-
-        (*servers)[server->server_id()] = std::make_pair(
-                server->service_locator(),
-                ServiceMask::deserialize(server->services()));
     }
 }
 
@@ -7327,7 +7463,10 @@ try
                 "only applies to doWorkload based experiments.")
         ("fullSamples", po::bool_switch(&fullSamples),
                 "Print alternate format for latency samples that includes "
-                "timestamps for each of the samples.");
+                "timestamps for each of the samples.")
+        ("calibrateTscFreq", po::bool_switch(&calibrateTscFreq),
+                "For each client, compute the relative scalar of its TSC "
+                "clock frequency compared to those of the servers");
 
     po::positional_options_description pos_desc;
     pos_desc.add("testName", -1);
@@ -7347,6 +7486,10 @@ try
     // TODO: PIN MEMORY AFTER INITIALIZATION?
     pinAllMemory();
 
+    Tub<TscFrequencyCalibrator> tscFreqCalibrator;
+    if (calibrateTscFreq) {
+        tscFreqCalibrator.construct();
+    }
     if (testNames.size() == 0) {
         // No test names specified; run all tests.
         for (TestInfo& info : tests) {
@@ -7368,6 +7511,7 @@ try
             }
         }
     }
+    tscFreqCalibrator.destroy();
 
     // Flush printout of all data before timetrace gets dumped.
     fflush(stdout);
