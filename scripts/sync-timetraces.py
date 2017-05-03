@@ -1,148 +1,195 @@
 #!/usr/bin/python
 
-import itertools
 import glob
 import re
 from sys import argv
 
-class Grant(object):
+from decimal import *
 
-    def __init__(self, grant_id):
-        self.id = grant_id
-        self.sender = None
-        self.receiver = None
-        self.tx_timestamp = None
-        self.rx_timestamp = None
+class Rpc(object):
 
-#
-grants = {}
+    def __init__(self, rpcId):
+        self.rpcId = rpcId
+        self.client = None
+        self.server = None
+        self.tsc0 = None
+        self.tsc1 = None
+        self.tsc2 = None
+        self.tsc3 = None
+        self.retransmission = False
 
-#
-hosts = set()
+    def isComplete(self):
+        return self.tsc0 and self.tsc1 and self.tsc2 and self.tsc3
 
-#
-timestamp_diffs = {}
+    def getElapsedTime(self):
+        return self.tsc3 - self.tsc0
 
 LOG_FILE_REGEX = re.compile("(client|server)[0-9]*\.(.*)\.log")
 # Example: 1492031792.531004386 TimeTrace.cc:172 in printInternal NOTICE[8]: 255789.0 ns (+ 114.9 ns): server received DATA, sequence 61257, offset 13846, length 2008, flags 1
-TIMETRACE_MSG_REGEX = re.compile(".*TimeTrace.cc:.*:\s+(\d+.\d+) ns.*: (.*)")
-#GRANT_MSG_REGEX = re.compile("^.*: (.*) ns .*(client|server) (sending|received) GRANT.*clientId (\d+), sequence (\d+), offset (\d+)")
-ALLDATA_MSG_REGEX = re.compile("^.*: (.*) ns .*(client|server) (sending|received) ALL_DATA.*clientId (\d+), sequence (\d+)")
+STARTING_TSC_REGEX = re.compile(".*TimeTrace.cc:.*: Starting TSC (\d+)")
+TIMETRACE_MSG_REGEX = re.compile(".*TimeTrace.cc:.*:\s+(\d+) cyc.*: (.*)")
+CALIBR_TSC_MSG_REGEX = re.compile(".*TSC_Freq\((.*)\) \* (.*) = TSC_Freq")
+ALLDATA_MSG_REGEX = re.compile("^.*: (.*) cyc .*(client|server) (sending|received) ALL_DATA.*clientId (\d+), sequence (\d+)")
+cyclesPerMicros = 1995.379 # TODO
 
+#
+hosts = sorted(set([x.split('.')[1] for x in glob.glob('*.log')]))
+role2Host = {x.split('.')[0] : x.split('.')[1] for x in glob.glob('*.log')}
+print "hosts = %s" % hosts
+
+# TSC_Freq(x) = TSC_Freq(y) * scalars[x][y]
+scalars = {x : {y : None if x != y else 1 for y in hosts} for x in hosts}
+
+# List of rpcs indexed by (client, server)-pair.
+rpcsByCS = {}
+rpcs = {}
 for fname in glob.glob("*.log"):
-    match_result = LOG_FILE_REGEX.match(fname)
-    if not match_result:
+    matchResult = LOG_FILE_REGEX.match(fname)
+    if not matchResult:
         continue
     print "Scanning %s..." % fname
 
-    host = match_result.group(2)
-    hosts.add(host)
+    host = matchResult.group(2)
+    baseTSC = None
 
     with open(fname, 'r') as f:
+        startingTSC = 0
         for line in f.readlines():
-            #match_result = GRANT_MSG_REGEX.match(line)
-            match_result = ALLDATA_MSG_REGEX.match(line)
-            if not match_result:
+            matchResult = STARTING_TSC_REGEX.match(line)
+            if matchResult:
+                startingTSC = int(matchResult.group(1))
+                if baseTSC is None:
+                    baseTSC = startingTSC
+                    startingTSC = 0
+                else:
+                    startingTSC -= baseTSC
                 continue
-            timestamp = float(match_result.group(1))
-            who = match_result.group(2)
-            is_sender = match_result.group(3) == "sending"
-            client_id = match_result.group(4)
-            sequence_num = int(match_result.group(5))
-            #offset = int(match_result.group(6))
 
-            server2client = (who == "client") ^ is_sender
-            grant_id = (server2client, client_id, sequence_num)
-#            grant_id = (server2client, client_id, sequence_num, offset)
-            grant = grants[grant_id] if grant_id in grants else None
-            is_complete = True
-            if grant is None:
-                is_complete = False
-                grant = Grant(grant_id)
-                grants[grant_id] = grant
-            if is_sender:
-                grant.sender = host
-                grant.tx_timestamp = timestamp
+            matchResult = CALIBR_TSC_MSG_REGEX.match(line)
+            if matchResult:
+                role = matchResult.group(1)
+                scalar = float(matchResult.group(2))
+                scalars[host][role2Host[role]] = scalar
+                continue
+
+            matchResult = ALLDATA_MSG_REGEX.match(line)
+            if not matchResult:
+                continue
+            timestamp = startingTSC + int(matchResult.group(1))
+            who = matchResult.group(2)
+            isMsgSender = matchResult.group(3) == "sending"
+            clientId = int(matchResult.group(4))
+            sequenceNum = int(matchResult.group(5))
+
+            rpcId = (clientId, sequenceNum)
+            if rpcId in rpcs:
+                rpc = rpcs[rpcId]
             else:
-                grant.receiver = host
-                grant.rx_timestamp = timestamp
+                rpc = Rpc(rpcId)
+                rpcs[rpcId] = rpc
 
-            if is_complete:
-                tx_rx = (grant.sender, grant.receiver)
-                tsc_diff = grant.rx_timestamp - grant.tx_timestamp
-                if tx_rx not in timestamp_diffs:
-                    timestamp_diffs[tx_rx] = []
-                timestamp_diffs[tx_rx].append(tsc_diff)
+            setattr(rpc, who, host)
+            if isMsgSender:
+                if who == "client":
+                    rpc.retransmission = rpc.retransmission or rpc.tsc0
+                    rpc.tsc0 = timestamp
+                else:
+                    rpc.retransmission = rpc.retransmission or rpc.tsc2
+                    rpc.tsc2 = timestamp
+            else:
+                if who == "server":
+                    rpc.tsc1 = timestamp
+                else:
+                    rpc.tsc3 = timestamp
 
-                # Done processing this grant. Remove it.
-                grants.pop(grant_id)
+            if rpc.isComplete():
+                cs = (rpc.client, rpc.server)
+                if cs not in rpcsByCS:
+                    rpcsByCS[cs] = []
+                rpcsByCS[cs].append(rpc)
 
-print "hosts = %s" % hosts
-#print "timestamp_diffs = %s" % timestamp_diffs
-
-# Compute clock offsets between hosts
-hosts = sorted(hosts)
-clock_offset_table = {x : {y : None if x != y else 0 for y in hosts} for x in hosts}
-for x, y in itertools.combinations(hosts, 2):
-    if (x, y) in timestamp_diffs and (y, x) in timestamp_diffs:
-        min_tx_diff = min(timestamp_diffs[(x,y)])
-        min_rx_diff = min(timestamp_diffs[(y,x)])
-        offset = (min_rx_diff - min_tx_diff) / 2
-        clock_offset_table[x][y] = offset
-        clock_offset_table[y][x] = -offset
-
-        print min_tx_diff, min_rx_diff
-        one_way_delay = min_tx_diff + offset
-        print "synchronizing %s and %s: delta = %.2f, one-way-delay = %.2f" % (x, y, offset, one_way_delay)
-        assert one_way_delay > 0
-# TODO: HOW TO RECONCILE THE DESCREPENCIES INSIDE THE TABLE?
-for x, y in itertools.combinations(hosts, 2):
-    if clock_offset_table[x][y] is None:
-        # No enough direct communication between x and y
-        for z in set(hosts) - set([x, y]):
-            if not clock_offset_table[x][z] or not clock_offset_table[z][y]:
-                continue
-            offset = clock_offset_table[x][z] + clock_offset_table[z][y]
-            clock_offset_table[x][y] = offset
-            clock_offset_table[y][x] = -offset
-            print "synchronizing %s and %s using %s: %.2f" % (x, y, z, offset)
-
-print clock_offset_table
-
-# Rewrite the timestamps of all timetraces
-# Step 1: TODO
-reference_host = min(hosts, key=lambda x: clock_offset_table[hosts[0]][x])
-earliest_timestamps = []
-for fname in glob.glob("*.%s.log" % reference_host):
-    with open(fname, 'r') as f:
-        earliest_timetrace_record = next(l for l in f.readlines() if TIMETRACE_MSG_REGEX.match(l))
-        earliest_timestamps.append(float(TIMETRACE_MSG_REGEX.match(earliest_timetrace_record).group(1)))
-timestamp_base = min(earliest_timestamps)
-print "reference_host %s, timestamp_base %.2f" % (reference_host, timestamp_base)
-
-for fname in glob.glob("*.log"):
-    match_result = LOG_FILE_REGEX.match(fname)
-    if not match_result:
+# TSC(x) = TSC(y) * scalars[x][y] + offset[x][y]
+offsets = {x : {y : None if x != y else 0 for y in hosts} for x in hosts}
+for cs in rpcsByCS.keys():
+    scalar = scalars[cs[0]][cs[1]]
+    if scalar is None:
         continue
-    print "Rewriting timetraces in %s..." % fname
 
-    host = match_result.group(2)
+    minRequestDelay = min([x.tsc1 * scalar - x.tsc0 for x in rpcsByCS[cs]])
+    minReplyDelay = min([x.tsc3 - x.tsc2 * scalar for x in rpcsByCS[cs]])
+    minProcessingTime = min([(x.tsc2 - x.tsc1) * scalar for x in rpcsByCS[cs]])
+    minElapsedTime = minRequestDelay + minProcessingTime + minReplyDelay
 
-    prev_timestamp = None
-    with open(fname, 'r') as f:
-        with open(fname[:-3] + "trace", 'w') as out:
+    offset = (minReplyDelay - minRequestDelay) / 2
+    minOneWayDelay = minRequestDelay + offset
+    offsets[cs[0]][cs[1]] = offset
+
+    print "TSC(%s) = TSC(%s) x %.15f + %d" % (cs[0], cs[1], scalar, offset)
+    print "Estimated min. one-way delay = %d cyc" % minOneWayDelay
+    assert minOneWayDelay > 3000
+
+    # Sanity check
+    numWarnings = 0
+    for x in rpcsByCS[cs]:
+        extraTime = x.getElapsedTime() - minElapsedTime
+
+        outgoingOneWayDelay = x.tsc1 * scalar + offset - x.tsc0
+        incomingOneWayDelay = x.tsc3 - (x.tsc2  * scalar + offset)
+        processingTime = (x.tsc2 - x.tsc1) * scalar
+
+        eps = 0.001
+        if outgoingOneWayDelay + eps < minOneWayDelay:
+            numWarnings += 1
+            print "Warning: computed outgoing one-way delay %d less than %d" % (outgoingOneWayDelay, minOneWayDelay)
+        elif incomingOneWayDelay + eps < minOneWayDelay:
+            numWarnings += 1
+            print "Warning: computed incoming one-way delay %d less than %d" % (incomingOneWayDelay, minOneWayDelay)
+        elif processingTime + eps < minProcessingTime:
+            numWarnings += 1
+            print "Warning: computed processing time %d less than %d" % (processingTime, minProcessingTime)
+    if numWarnings > 0:
+        print "#Warnings = %d, warning rate = %.2f%%" % (numWarnings, 100.0 * numWarnings / len(rpcsByCS[cs]))
+
+# Convert TSC(ClientN) to TSC(Client1) via TSC(Server1)
+client1 = role2Host["client1"]
+server1 = role2Host["server1"]
+for clientN in [role2Host[c] for c in role2Host.keys() if c.startswith("client") and c != "client1"]:
+    if scalars[client1][clientN] is not None:
+        continue
+    scalar = scalars[client1][server1] / scalars[clientN][server1]
+    scalars[client1][clientN] = scalar
+    offsets[client1][clientN] = offsets[client1][server1] - scalar * offsets[clientN][server1]
+
+# Rewrite all timetraces using TSC(Client1)
+timetraceEntries = []
+for role, host in role2Host.iteritems():
+    if role == "coordinator":
+        continue
+
+    fileName = "%s.%s.log" % (role, host)
+    with open(fileName, 'r') as f:
+        with open("%s.%s.tt" % (role, host), 'w') as out:
+            prevTSC = None
             for line in f.readlines():
-                match_result = TIMETRACE_MSG_REGEX.match(line)
-                if not match_result:
+                matchResult = TIMETRACE_MSG_REGEX.match(line)
+                if not matchResult:
                     continue
+                currentTSC = int(matchResult.group(1)) * scalars[client1][host] + offsets[client1][host]
+                message = matchResult.group(2)
 
-                timestamp = float(match_result.group(1))
-                log_msg = match_result.group(2)
+                if prevTSC is None:
+                    prevTSC = currentTSC
+                deltaTSC = currentTSC - prevTSC
+                prevTSC = currentTSC
 
-                adjusted_timestamp = timestamp + clock_offset_table[reference_host][host] - timestamp_base
-                if prev_timestamp is None:
-                    prev_timestamp = adjusted_timestamp
-                delta = adjusted_timestamp - prev_timestamp
-                prev_timestamp = adjusted_timestamp
-                out.write("%7.2f us (+%7.1f ns): %s\n" % (adjusted_timestamp / 1000, delta, log_msg))
+                out.write("%7.2f us (+%7.1f ns): %s\n" % (currentTSC / cyclesPerMicros, deltaTSC * 1000 / cyclesPerMicros, message))
+                timetraceEntries.append((role, currentTSC, message))
+
+timetraceEntries = sorted(timetraceEntries, key=lambda e : e[1])
+with open("merged.tt", 'w') as out:
+    prevTSC = timetraceEntries[0][1]
+    for e in timetraceEntries:
+        deltaTSC = e[1] - prevTSC
+        prevTSC = e[1]
+        out.write(" %s | %7.2f us (+%7.1f ns): %s\n" % (e[0], e[1] / cyclesPerMicros, deltaTSC * 1000 / cyclesPerMicros, e[2]))
 
