@@ -91,6 +91,11 @@ class DpdkDriver : public Driver
     /// Size of Ethernet header including VLAN tag, in bytes.
     static const uint32_t ETHER_VLAN_HDR_LEN = 14 + VLAN_TAG_LEN;
 
+    /// Overhead of a physical layer Ethernet packet, in bytes, which includes
+    /// the preamble (7 bytes), the start of frame delimiter (1 byte), the
+    /// frame checking sequence (4 bytes) and the interpacket gap (12 bytes).
+    static const uint32_t ETHER_PACKET_OVERHEAD = 24;
+
     /// Map from priority levels to values of the PCP field. Note that PCP = 1
     /// is actually the lowest priority, while PCP = 0 is the second lowest.
     static constexpr uint16_t PRIORITY_TO_PCP[8] =

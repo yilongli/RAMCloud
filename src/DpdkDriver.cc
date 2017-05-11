@@ -234,6 +234,7 @@ DpdkDriver::DpdkDriver(Context* context, int port)
         LOG(WARNING, "Can't retrieve network bandwidth from DPDK; "
                 "using default of %d Mbps", bandwidthMbps);
     }
+    bandwidthMbps = (uint32_t) (static_cast<double>(bandwidthMbps) * 0.98);
     queueEstimator.setBandwidth(bandwidthMbps);
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthMbps)
             * MAX_DRAIN_TIME / 8000.0);
@@ -522,8 +523,9 @@ DpdkDriver::sendPacket(const Address* addr,
     }
 #endif
     timeTrace("outgoing packet enqueued");
-    queueEstimator.packetQueued(frameLength, Cycles::rdtsc());
-    PerfStats::threadStats.networkOutputBytes += frameLength;
+    uint32_t physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
+    queueEstimator.packetQueued(physPacketLength, Cycles::rdtsc());
+    PerfStats::threadStats.networkOutputBytes += physPacketLength;
 }
 
 // See docs in Driver class.
