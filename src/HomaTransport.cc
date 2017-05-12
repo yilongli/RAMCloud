@@ -551,6 +551,13 @@ HomaTransport::tryToTransmitData()
 
     int transmitQueueSpace =
             driver->getTransmitQueueSpace(context->dispatch->currentTime);
+    int transmitQueueSpace2 =
+            driver->getTransmitQueueSpace(Cycles::rdtsc());
+    uint32_t estError = abs(transmitQueueSpace2 - transmitQueueSpace);
+    if (transmitQueueSpace > transmitQueueSpace2) {
+        timeTrace("Queue space estimation error %u, %u vs %u", estError,
+                  transmitQueueSpace, transmitQueueSpace2);
+    }
     uint32_t maxBytes;
 
     // Each iteration of the following loop transmits data packets for
