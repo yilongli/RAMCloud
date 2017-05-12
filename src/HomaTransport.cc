@@ -24,8 +24,8 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
-#define TIME_TRACE2 1
+#define TIME_TRACE 1
+#define TIME_TRACE2 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -549,15 +549,15 @@ HomaTransport::tryToTransmitData()
     // control packets (and retransmitted data) are always passed to the
     // driver immediately.
 
-    uint32_t transmitQueueSpace = static_cast<uint32_t>(std::max(0,
-            driver->getTransmitQueueSpace(context->dispatch->currentTime)));
+    int transmitQueueSpace =
+            driver->getTransmitQueueSpace(context->dispatch->currentTime);
     uint32_t maxBytes;
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
     // TODO: IF WE JUST WANT TO SEND A SMALL MESSAGE, IT DOESN'T MAKE SENSE TO
     // WAIT FOR A SPACE OF `maxDataPerPacket`.
-    while (transmitQueueSpace >= maxDataPerPacket) {
+    while (transmitQueueSpace >= static_cast<int>(maxDataPerPacket)) {
         // Find an outgoing request or response that is ready to transmit.
         // The policy here is "shortest remaining processing time" (SRPT).
 
@@ -602,9 +602,9 @@ HomaTransport::tryToTransmitData()
         if (clientRpc != NULL) {
             // Transmit one or more request DATA packets from clientRpc,
             // if appropriate.
-            maxBytes = std::min(transmitQueueSpace,
+            maxBytes = std::min(static_cast<uint32_t>(transmitQueueSpace),
                     clientRpc->transmitLimit - clientRpc->transmitOffset);
-            timeTrace("transmitQueueSpace %u, maxBytes %u", transmitQueueSpace, maxBytes); // TODO: REMOVE ME
+            timeTrace("Estimated queue length %u", 3000 - transmitQueueSpace); // TODO: REMOVE ME
             int bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -623,9 +623,9 @@ HomaTransport::tryToTransmitData()
         } else if (serverRpc != NULL) {
             // Transmit one or more response DATA packets from serverRpc,
             // if appropriate.
-            maxBytes = std::min(transmitQueueSpace,
+            maxBytes = std::min(static_cast<uint32_t>(transmitQueueSpace),
                     serverRpc->transmitLimit - serverRpc->transmitOffset);
-            timeTrace("transmitQueueSpace %u, maxBytes %u", transmitQueueSpace, maxBytes); // TODO: REMOVE ME
+            timeTrace("Estimated queue length %u", 3000 - transmitQueueSpace); // TODO: REMOVE ME
             int bytesSent = sendBytes(serverRpc->clientAddress,
                     serverRpc->rpcId, &serverRpc->replyPayload,
                     serverRpc->transmitOffset, maxBytes,

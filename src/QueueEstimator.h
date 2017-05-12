@@ -91,6 +91,11 @@ class QueueEstimator {
     {
         bandwidth = (static_cast<double>(mBitsPerSecond)*1e06/8.0)
                 / Cycles::perSecond();
+        double micros  = 1542 * 8.0 / mBitsPerSecond;
+        double ticks = 1542 / bandwidth;
+        RAMCLOUD_LOG(NOTICE, "bandwidth %u Mb/s, %.2f us (or %.1f ticks) to "
+                "transmit a full Ethernet packet of 1542 bytes",
+                mBitsPerSecond, micros, ticks);
     }
 
     /**

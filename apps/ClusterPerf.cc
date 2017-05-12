@@ -1438,8 +1438,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             }
             uint32_t length = messageSizes[messageId];
             EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
-//                    message.c_str(), length, length);
-                    message.c_str(), length, 0);
+                    message.c_str(), length, length);
+//                    message.c_str(), length, 0);
             outstandingRpcs.emplace_back(messageId, echo);
             receiver = NULL;
 //            nextMessageArrival += messageIntervalDist(gen);

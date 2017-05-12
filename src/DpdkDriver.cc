@@ -229,12 +229,11 @@ DpdkDriver::DpdkDriver(Context* context, int port)
                 "Failed to detect a link on Ethernet port %u", portId));
     }
     if (link.link_speed != ETH_SPEED_NUM_NONE) {
-        bandwidthMbps = link.link_speed;
+        bandwidthMbps = (uint32_t) (link.link_speed * 0.98);
     } else {
         LOG(WARNING, "Can't retrieve network bandwidth from DPDK; "
                 "using default of %d Mbps", bandwidthMbps);
     }
-    bandwidthMbps = (uint32_t) (static_cast<double>(bandwidthMbps) * 0.98);
     queueEstimator.setBandwidth(bandwidthMbps);
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthMbps)
             * MAX_DRAIN_TIME / 8000.0);
@@ -311,7 +310,8 @@ DpdkDriver::getMaxPacketSize()
 int
 DpdkDriver::getTransmitQueueSpace(uint64_t currentTime)
 {
-    return maxTransmitQueueSize - queueEstimator.getQueueSize(currentTime);
+    return static_cast<int>(maxTransmitQueueSize) -
+            queueEstimator.getQueueSize(currentTime);
 }
 
 // See docs in Driver class.
