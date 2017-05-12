@@ -60,8 +60,9 @@ class QueueEstimator {
     void
     packetQueued(uint32_t length, uint64_t transmitTime)
     {
-        getQueueSize(transmitTime);
-        queueSize += static_cast <double>(length);
+        assert(transmitTime > currentTime);
+        queueSize = getQueueSize(transmitTime) + length;
+        currentTime = transmitTime;
     }
 
     /**
@@ -73,11 +74,9 @@ class QueueEstimator {
     uint32_t
     getQueueSize(uint64_t time)
     {
-        double newSize = queueSize
-                - static_cast<double>(time - currentTime) * bandwidth;
-        queueSize = (newSize < 0) ? 0 : newSize;
-        currentTime = time;
-        return (uint32_t) queueSize;
+        assert(time > currentTime);
+        double newSize = queueSize - (time - currentTime) * bandwidth;
+        return (newSize < 0) ? 0 : (uint32_t) newSize;
     }
 
     /**

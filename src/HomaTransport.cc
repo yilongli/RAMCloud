@@ -549,15 +549,27 @@ HomaTransport::tryToTransmitData()
     // control packets (and retransmitted data) are always passed to the
     // driver immediately.
 
+    // Yilong: using rdtsc is better than dispatch->currentTime even without
+    // considering the problem of query time going backwards in QueueEstimator
+    // because using the latter consistently overestimate the queue length,
+    // the result is 1 us worse (10.5us vs 9.6us) at 99%-tile latency.
     int transmitQueueSpace =
-            driver->getTransmitQueueSpace(context->dispatch->currentTime);
-    int transmitQueueSpace2 =
             driver->getTransmitQueueSpace(Cycles::rdtsc());
-    uint32_t estError = abs(transmitQueueSpace2 - transmitQueueSpace);
-    if (transmitQueueSpace > transmitQueueSpace2) {
-        timeTrace("Queue space estimation error %u, %u vs %u", estError,
-                  transmitQueueSpace, transmitQueueSpace2);
-    }
+//    int transmitQueueSpace =
+//            driver->getTransmitQueueSpace(context->dispatch->currentTime);
+//    int transmitQueueSpace2 =
+//            driver->getTransmitQueueSpace(Cycles::rdtsc());
+//    transmitQueueSpace = transmitQueueSpace2;
+//    if (transmitQueueSpace > transmitQueueSpace2) {
+//        uint32_t estError = abs(transmitQueueSpace2 - transmitQueueSpace);
+//        if (transmitQueueSpace2 < 0) {
+//            timeTrace("Queue space estimation error %u, %u vs -%u", estError,
+//                      transmitQueueSpace, -transmitQueueSpace2);
+//        } else {
+//            timeTrace("Queue space estimation error %u, %u vs %u", estError,
+//                      transmitQueueSpace, transmitQueueSpace2);
+//        }
+//    }
     uint32_t maxBytes;
 
     // Each iteration of the following loop transmits data packets for
@@ -611,7 +623,6 @@ HomaTransport::tryToTransmitData()
             // if appropriate.
             maxBytes = std::min(static_cast<uint32_t>(transmitQueueSpace),
                     clientRpc->transmitLimit - clientRpc->transmitOffset);
-            timeTrace("Estimated queue length %u", 3000 - transmitQueueSpace); // TODO: REMOVE ME
             int bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -620,6 +631,7 @@ HomaTransport::tryToTransmitData()
                     FROM_CLIENT);
             assert(bytesSent > 0);     // Otherwise, infinite loop.
             clientRpc->transmitOffset += bytesSent;
+            // TODO: No need to call rdtsc directly if we provide a Driver::lastTransmitTime
             clientRpc->lastTransmitTime = Cycles::rdtsc();
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
@@ -632,7 +644,6 @@ HomaTransport::tryToTransmitData()
             // if appropriate.
             maxBytes = std::min(static_cast<uint32_t>(transmitQueueSpace),
                     serverRpc->transmitLimit - serverRpc->transmitOffset);
-            timeTrace("Estimated queue length %u", 3000 - transmitQueueSpace); // TODO: REMOVE ME
             int bytesSent = sendBytes(serverRpc->clientAddress,
                     serverRpc->rpcId, &serverRpc->replyPayload,
                     serverRpc->transmitOffset, maxBytes,
@@ -997,6 +1008,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->offset, header->length,
                         clientRpc->unscheduledBytes, header->priority,
                         FROM_CLIENT|RETRANSMISSION, true);
+                // TODO: NO NEED TO CALL RDTSC DIRECTLY; GET THIS FROM DRIVER;
+                // ALSO, MOVE THIS STATEMENT INTO sendBytes?
                 clientRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
