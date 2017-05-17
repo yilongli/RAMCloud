@@ -471,57 +471,6 @@ RamCloud::echo(const char* serviceLocator, const void* message,
     rpc.wait();
 }
 
-//vector<EchoRpcContainer*> __finishedRpcs = {};
-//
-//EchoRpcContainer::EchoRpcContainer(uint messageId, RamCloud* ramcloud,
-//        const char* serviceLocator, const void* message, uint32_t length,
-//        uint32_t echoLength)
-//    : ramcloud(ramcloud)
-//    , serviceLocator(serviceLocator)
-//    , message(message)
-//    , length(length)
-//    , echoLength(echoLength)
-//    , response()
-//    , messageId(messageId)
-//    , startTime()
-//    , roundTripTime(~0u)
-//    , rpc()
-//{}
-//
-//void
-//EchoRpcContainer::invokeRpc() {
-//    startTime = Cycles::rdtsc();
-//    if (length < 1400) {
-//        uint32_t p1 = uint32_t(startTime >> 32);
-//        uint32_t p2 = uint32_t(startTime);
-//        TimeTrace::record(startTime, "SHORT MSG START TIME %u.%u", p1, p2);
-//    }
-//    rpc.construct(ramcloud, serviceLocator, message, length, echoLength,
-//            &response, this);
-//}
-//
-//void
-//EchoRpcContainer::callback() {
-//    try {
-//        rpc->wait();
-//        uint64_t endTime = Cycles::rdtsc();
-//        roundTripTime = endTime - startTime;
-//        static uint64_t threshold = Cycles::fromMicroseconds(50);
-//        if (length < 1400 && roundTripTime > threshold) {
-//            double us = Cycles::toSeconds(roundTripTime) * 1e6;
-//            uint32_t x = uint32_t(us);
-//            uint32_t y = uint32_t((us - x) * 100);
-//            uint32_t p1 = uint32_t(startTime >> 32);
-//            uint32_t p2 = uint32_t(startTime);
-//            TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us, START TIME %u.%u", x, y, p1, p2);
-//        }
-//    } catch (...) {
-//    }
-//
-//    // Remove itself from the EchoRpcList
-//    __finishedRpcs.push_back(this);
-//}
-
 #define DEBUG_BAD_TAIL 1
 
 /**
@@ -575,7 +524,7 @@ EchoRpc::completed() {
     endTime = Cycles::rdtsc();
 #if DEBUG_BAD_TAIL
     uint64_t roundTripTime = endTime - startTime;
-    static uint64_t threshold = Cycles::fromMicroseconds(15);
+    static uint64_t threshold = Cycles::fromMicroseconds(10);
     const WireFormat::Echo::Request* reqHdr = getRequestHeader<WireFormat::Echo>();
     assert(reqHdr->length == length);
     if (reqHdr->length < 1400 && roundTripTime > threshold) {

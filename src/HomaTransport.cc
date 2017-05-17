@@ -39,16 +39,6 @@ namespace {
         TimeTrace::record(format, arg0, arg1, arg2, arg3);
 #endif
     }
-
-    inline void
-    timeTrace2(const char* format,
-            uint32_t arg0 = 0, uint32_t arg1 = 0, uint32_t arg2 = 0,
-            uint32_t arg3 = 0)
-    {
-#if TIME_TRACE2
-        TimeTrace::record(format, arg0, arg1, arg2, arg3);
-#endif
-    }
 }
 
 /**
@@ -413,9 +403,6 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             timeTrace(fmt, downCast<uint32_t>(rpcId.clientId),
                     downCast<uint32_t>(rpcId.sequence),
                     messageSize);
-            timeTrace2(fmt, downCast<uint32_t>(rpcId.clientId),
-                    downCast<uint32_t>(rpcId.sequence),
-                    messageSize);
             driver->sendPacket(address, &header, &iter, priority);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
@@ -758,8 +745,6 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     }
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
-//    clientRpc->transmitLimit = t->maxDataPerPacket;
-//    clientRpc->unscheduledBytes = t->maxDataPerPacket;
     clientRpc->transmitLimit = t->roundTripBytes;
     clientRpc->unscheduledBytes = t->roundTripBytes;
     clientRpc->transmitPriority = t->getUnschedTrafficPrio(request->size());
@@ -837,11 +822,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                     return;
                 }
                 timeTrace("client received ALL_DATA, clientId %u, sequence %u,"
-                        " length %u",
-                        downCast<uint32_t>(header->common.rpcId.clientId),
-                        downCast<uint32_t>(header->common.rpcId.sequence),
-                        length);
-                timeTrace2("client received ALL_DATA, clientId %u, sequence %u,"
                         " length %u",
                         downCast<uint32_t>(header->common.rpcId.clientId),
                         downCast<uint32_t>(header->common.rpcId.sequence),
@@ -1031,11 +1011,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (header == NULL)
                     goto packetLengthError;
                 timeTrace("server received ALL_DATA, clientId %u, sequence %u,"
-                        " length %u",
-                        downCast<uint32_t>(header->common.rpcId.clientId),
-                        downCast<uint32_t>(header->common.rpcId.sequence),
-                        header->messageLength);
-                timeTrace2("server received ALL_DATA, clientId %u, sequence %u,"
                         " length %u",
                         downCast<uint32_t>(header->common.rpcId.clientId),
                         downCast<uint32_t>(header->common.rpcId.sequence),

@@ -1406,13 +1406,13 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         // Prepare the next message if it's not ready yet.
         if (receiver == NULL) {
             messageId = messageSizeDist(gen);
-//            receiver = receivers[generateRandom() % numReceivers].c_str();
+            receiver = receivers[generateRandom() % numReceivers].c_str();
             // Hack: short message to server1; long messages to other servers
-            if ((messageSizes[messageId] < 1500) || (numReceivers == 1)) {
-                receiver = receivers[0].c_str();
-            } else {
-                receiver = receivers[1 + generateRandom() % (numReceivers- 1)].c_str();
-            }
+//            if ((messageSizes[messageId] < 1500) || (numReceivers == 1)) {
+//                receiver = receivers[0].c_str();
+//            } else {
+//                receiver = receivers[1 + generateRandom() % (numReceivers- 1)].c_str();
+//            }
         }
 
         uint64_t now = Cycles::rdtsc();
@@ -1439,11 +1439,9 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             uint32_t length = messageSizes[messageId];
             EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
                     message.c_str(), length, length);
-//                    message.c_str(), length, 0);
             outstandingRpcs.emplace_back(messageId, echo);
             receiver = NULL;
-//            nextMessageArrival += messageIntervalDist(gen);
-            nextMessageArrival += averageIntervalCycles;
+            nextMessageArrival += messageIntervalDist(gen);
 
             // Update debugging statistics
             if (count > 0) {
@@ -1493,8 +1491,6 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     // Aggregate the results into TimeDist format.
     vector<TimeDist> results(messageSizes.size());
     for (uint i = 0; i < messageSizes.size(); i++) {
-        // TODO: REMOVE THE FOLLOWING
-        LOG(ERROR, "message %u, numSamples %u", i, numSamples[i]);
         if (numSamples[i] <= MAX_SAMPLES) {
             roundTripTimes[i].resize(numSamples[i]);
         }
