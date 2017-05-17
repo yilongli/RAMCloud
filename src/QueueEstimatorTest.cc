@@ -41,10 +41,12 @@ TEST_F(QueueEstimatorTest, constructor) {
 TEST_F(QueueEstimatorTest, getQueueSize) {
     QueueEstimator estimator(8000);
     EXPECT_EQ(0.5, estimator.bandwidth);
-    estimator.packetQueued(1000, 100000u);
+    Cycles::mockTscValue = 100000u;
+    estimator.packetQueued(1000);
     EXPECT_EQ(1000, estimator.queueSize);
     EXPECT_EQ(950u, estimator.getQueueSize(100100));
-    estimator.packetQueued(1000, 101000u);
+    Cycles::mockTscValue = 101000u;
+    estimator.packetQueued(1000);
     EXPECT_EQ(1500, estimator.queueSize);
     EXPECT_EQ(0u, estimator.getQueueSize(105000));
 }

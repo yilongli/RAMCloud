@@ -549,27 +549,8 @@ HomaTransport::tryToTransmitData()
     // control packets (and retransmitted data) are always passed to the
     // driver immediately.
 
-    // Yilong: using rdtsc is better than dispatch->currentTime even without
-    // considering the problem of query time going backwards in QueueEstimator
-    // because using the latter consistently overestimate the queue length,
-    // the result is 1 us worse (10.5us vs 9.6us) at 99%-tile latency.
     int transmitQueueSpace =
-            driver->getTransmitQueueSpace(Cycles::rdtsc());
-//    int transmitQueueSpace =
-//            driver->getTransmitQueueSpace(context->dispatch->currentTime);
-//    int transmitQueueSpace2 =
-//            driver->getTransmitQueueSpace(Cycles::rdtsc());
-//    transmitQueueSpace = transmitQueueSpace2;
-//    if (transmitQueueSpace > transmitQueueSpace2) {
-//        uint32_t estError = abs(transmitQueueSpace2 - transmitQueueSpace);
-//        if (transmitQueueSpace2 < 0) {
-//            timeTrace("Queue space estimation error %u, %u vs -%u", estError,
-//                      transmitQueueSpace, -transmitQueueSpace2);
-//        } else {
-//            timeTrace("Queue space estimation error %u, %u vs %u", estError,
-//                      transmitQueueSpace, transmitQueueSpace2);
-//        }
-//    }
+            driver->getTransmitQueueSpace(context->dispatch->currentTime);
     uint32_t maxBytes;
 
     // Each iteration of the following loop transmits data packets for

@@ -524,7 +524,7 @@ DpdkDriver::sendPacket(const Address* addr,
 #endif
     timeTrace("outgoing packet enqueued");
     uint32_t physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
-    queueEstimator.packetQueued(physPacketLength, Cycles::rdtsc());
+    queueEstimator.packetQueued(physPacketLength);
     // TODO: MONITORING BANDWIDTH AT SHORT PERIOD TO CHECK HOW WELL THE QUEUEESTIMATOR WORKS
     PerfStats::threadStats.networkOutputBytes += physPacketLength;
 }

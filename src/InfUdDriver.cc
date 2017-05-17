@@ -440,7 +440,7 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     }
     timeTrace("sent packet with %u bytes, %d free buffers",
             totalLength, downCast<int>(txPool->freeBuffers.size()));
-    queueEstimator.packetQueued(bd->packetLength, Cycles::rdtsc());
+    queueEstimator.packetQueued(bd->packetLength);
     PerfStats::threadStats.networkOutputBytes += bd->packetLength;
 
     // Every once in a while, see if we can reclaim used transmit buffers.

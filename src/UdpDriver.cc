@@ -263,7 +263,7 @@ UdpDriver::sendPacket(const Address* addr,
         LOG(WARNING, "UdpDriver error sending to socket: %s", strerror(errno));
         return;
     }
-    queueEstimator.packetQueued(totalLength, Cycles::rdtsc());
+    queueEstimator.packetQueued(totalLength);
     assert(static_cast<size_t>(r) == totalLength);
 }
 

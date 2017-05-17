@@ -54,15 +54,12 @@ class QueueEstimator {
      * \param length
      *      Total number of bytes in packet(s) that were just added to the
      *      NIC's queue.
-     * \param transmitTime
-     *      Time when the packet was queued in the NIC, in Cycles::rdtsc ticks.
      */
     void
-    packetQueued(uint32_t length, uint64_t transmitTime)
+    packetQueued(uint32_t length)
     {
-        assert(transmitTime > currentTime);
-        queueSize = getQueueSize(transmitTime) + length;
-        currentTime = transmitTime;
+        getQueueSize(Cycles::rdtsc());
+        queueSize += length;
     }
 
     /**
@@ -74,9 +71,13 @@ class QueueEstimator {
     uint32_t
     getQueueSize(uint64_t time)
     {
-        assert(time > currentTime);
-        double newSize = queueSize - (time - currentTime) * bandwidth;
-        return (newSize < 0) ? 0 : (uint32_t) newSize;
+        if (time > currentTime) {
+            double newSize = queueSize
+                    - static_cast<double>(time - currentTime) * bandwidth;
+            queueSize = (newSize < 0) ? 0 : (uint32_t) newSize;
+            currentTime = time;
+        }
+        return (uint32_t) queueSize;
     }
 
     /**
@@ -116,8 +117,8 @@ class QueueEstimator {
     /// Network bandwidth, measured in bytes per Cycles::rdtsc tick.
     double bandwidth;
 
-    /// A Cycles::rdtsc ticks value indicating the last time when queueSize
-    /// was calculated.
+    /// A Cycles::rdtsc ticks value indicating the latest time we have ever
+    /// seen when queueSize was calculated.
     uint64_t currentTime;
 
     /// The number of bytes in the transmit queue at currentTime.

@@ -639,7 +639,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
             LOG(WARNING, "Was not able to resolve the MAC address for the"
                 " packet destined to %s", inet_ntoa(destInAddr));
     }
-    queueEstimator.packetQueued(totalLen, Cycles::rdtsc());
+    queueEstimator.packetQueued(totalLen);
 }
 
 /**
