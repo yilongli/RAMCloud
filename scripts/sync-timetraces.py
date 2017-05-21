@@ -2,9 +2,6 @@
 
 import glob
 import re
-from sys import argv
-
-from decimal import *
 
 class Rpc(object):
 
@@ -26,16 +23,17 @@ class Rpc(object):
 
 LOG_FILE_REGEX = re.compile("(client|server)[0-9]*\.(.*)\.log")
 # Example: 1492031792.531004386 TimeTrace.cc:172 in printInternal NOTICE[8]: 255789.0 ns (+ 114.9 ns): server received DATA, sequence 61257, offset 13846, length 2008, flags 1
-STARTING_TSC_REGEX = re.compile(".*TimeTrace.cc:.*: Starting TSC (\d+)")
+STARTING_TSC_REGEX = re.compile(".*TimeTrace.cc:.*: Starting TSC (\d+), cyclesPerSec (\d+)")
 TIMETRACE_MSG_REGEX = re.compile(".*TimeTrace.cc:.*:\s+(\d+) cyc.*: (.*)")
 CALIBR_TSC_MSG_REGEX = re.compile(".*TSC_Freq\((.*)\) \* (.*) = TSC_Freq")
+#ALLDATA_MSG_REGEX = re.compile("^.*: (.*) ns .*(client|server) (sending|received) ALL_DATA.*clientId (\d+), sequence (\d+)")
 ALLDATA_MSG_REGEX = re.compile("^.*: (.*) cyc .*(client|server) (sending|received) ALL_DATA.*clientId (\d+), sequence (\d+)")
 cyclesPerMicros = 1995.379 # TODO
 
 #
 hosts = sorted(set([x.split('.')[1] for x in glob.glob('*.log')]))
 role2Host = {x.split('.')[0] : x.split('.')[1] for x in glob.glob('*.log')}
-print "hosts = %s" % hosts
+print("hosts = %s" % hosts)
 
 # TSC_Freq(x) = TSC_Freq(y) * scalars[x][y]
 scalars = {x : {y : None if x != y else 1 for y in hosts} for x in hosts}
@@ -47,7 +45,7 @@ for fname in glob.glob("*.log"):
     matchResult = LOG_FILE_REGEX.match(fname)
     if not matchResult:
         continue
-    print "Scanning %s..." % fname
+    print("Scanning %s..." % fname)
 
     host = matchResult.group(2)
     baseTSC = None
@@ -124,8 +122,8 @@ for cs in rpcsByCS.keys():
     minOneWayDelay = minRequestDelay + offset
     offsets[cs[0]][cs[1]] = offset
 
-    print "TSC(%s) = TSC(%s) x %.15f + %d" % (cs[0], cs[1], scalar, offset)
-    print "Estimated min. one-way delay = %d cyc" % minOneWayDelay
+    print("TSC(%s) = TSC(%s) x %.15f + %d" % (cs[0], cs[1], scalar, offset))
+    print("Estimated min. one-way delay = %d cyc" % minOneWayDelay)
     assert minOneWayDelay > 3000
 
     # Sanity check
@@ -140,15 +138,15 @@ for cs in rpcsByCS.keys():
         eps = 0.001
         if outgoingOneWayDelay + eps < minOneWayDelay:
             numWarnings += 1
-            print "Warning: computed outgoing one-way delay %d less than %d" % (outgoingOneWayDelay, minOneWayDelay)
+            print("Warning: computed outgoing one-way delay %d less than %d" % (outgoingOneWayDelay, minOneWayDelay))
         elif incomingOneWayDelay + eps < minOneWayDelay:
             numWarnings += 1
-            print "Warning: computed incoming one-way delay %d less than %d" % (incomingOneWayDelay, minOneWayDelay)
+            print("Warning: computed incoming one-way delay %d less than %d" % (incomingOneWayDelay, minOneWayDelay))
         elif processingTime + eps < minProcessingTime:
             numWarnings += 1
-            print "Warning: computed processing time %d less than %d" % (processingTime, minProcessingTime)
+            print("Warning: computed processing time %d less than %d" % (processingTime, minProcessingTime))
     if numWarnings > 0:
-        print "#Warnings = %d, warning rate = %.2f%%" % (numWarnings, 100.0 * numWarnings / len(rpcsByCS[cs]))
+        print("#Warnings = %d, warning rate = %.2f%%" % (numWarnings, 100.0 * numWarnings / len(rpcsByCS[cs])))
 
 # Convert TSC(ClientN) to TSC(Client1) via TSC(Server1)
 client1 = role2Host["client1"]
@@ -192,4 +190,3 @@ with open("merged.tt", 'w') as out:
         deltaTSC = e[1] - prevTSC
         prevTSC = e[1]
         out.write(" %s | %7.2f us (+%7.1f ns): %s\n" % (e[0], e[1] / cyclesPerMicros, deltaTSC * 1000 / cyclesPerMicros, e[2]))
-

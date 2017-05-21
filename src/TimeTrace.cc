@@ -111,7 +111,8 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
             startTime = event->timestamp;
         }
     }
-    RAMCLOUD_LOG(NOTICE, "Starting TSC %lu", startTime);
+    RAMCLOUD_LOG(NOTICE, "Starting TSC %lu, cyclesPerSec %.0f", startTime,
+            Cycles::perSecond());
 
     // Skip all events before the starting time.
     for (uint32_t i = 0; i < buffers->size(); i++) {
