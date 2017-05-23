@@ -535,9 +535,9 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
  * This method queues one or more data packets for transmission, if (a) the
  * NIC queue isn't too long and (b) there is data that needs to be transmitted.
  * \return
- *      True if we actually transmitted one or more packets, false otherwise.
+ *      Total number of bytes transmitted.
  */
-bool
+uint32_t
 HomaTransport::tryToTransmitData()
 {
     uint32_t totalBytesSent = 0;
@@ -649,10 +649,7 @@ HomaTransport::tryToTransmitData()
         }
     }
 
-//    if (totalBytesSent > 0) {
-//        timeTrace("tryToTransmit sent %u bytes in total", totalBytesSent);
-//    }
-    return totalBytesSent > 0;
+    return totalBytesSent;
 }
 
 /**
@@ -766,7 +763,10 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     t->outgoingRequests.push_back(*clientRpc);
     clientRpc->transmitPending = true;
     t->nextClientSequenceNumber++;
-    t->tryToTransmitData();
+    uint32_t bytesSent = t->tryToTransmitData();
+    if (bytesSent > 0) {
+        timeTrace("sendRequest trasmitted %u bytes", bytesSent);
+    }
 }
 
 /**
@@ -1610,27 +1610,30 @@ int
 HomaTransport::Poller::poll()
 {
     int result = 0;
+#if TIME_TRACE
+    uint64_t startTime = Cycles::rdtsc();
+#endif
 
     // Process any available incoming packets.
 #define MAX_PACKETS 4
     uint32_t numPackets;
     uint32_t totalPackets = 0;
     do {
-        // TODO: SHOULD I FETCH AS MANY AS POSSIBLE BEFORE HANDLING THEM?
         t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
         numPackets = downCast<uint>(t->receivedPackets.size());
+#if TIME_TRACE
+        if (totalPackets == 0 && numPackets > 0) {
+            TimeTrace::record(startTime, "start of polling iteration %u",
+                    downCast<uint32_t>(owner->iteration));
+        }
+#endif
         for (uint i = 0; i < numPackets; i++) {
-            result = 1;
             t->handlePacket(&t->receivedPackets[i]);
         }
         t->receivedPackets.clear();
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
-
-    if (totalPackets > 0) {
-        timeTrace("received %u packets at polling iteration %u", totalPackets,
-                downCast<uint32_t>(owner->iteration));
-    }
+    result |= totalPackets;
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -1645,7 +1648,7 @@ HomaTransport::Poller::poll()
     // too many of these happen, it will create noise in the logs, which will
     // make it harder to notice when a *real* problem happens. Thus, it's
     // best to eliminate spurious retransmissions as much as possible.
-    uint64_t now = Cycles::rdtsc();
+    uint64_t now = owner->currentTime;
     if (now >= t->nextTimeoutCheck) {
         if (t->timeoutCheckDeadline == 0) {
             t->timeoutCheckDeadline = now + t->timerInterval;
@@ -1664,13 +1667,17 @@ HomaTransport::Poller::poll()
     }
 
     // Transmit data packets if possible.
-    result |= t->tryToTransmitData();
+    uint32_t totalBytesSent = t->tryToTransmitData();
+    result |= totalBytesSent;
 
+    // TODO: In fact, why does the following code have to be done in the
+    // dispatch thread?
     // Release a few retained payloads to the driver. As of 02/2017, releasing
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
     // useful to do in this method uptill now, try to release more payloads.
-    const int maxRelease = result ? 10 : 50;
-    int releaseCount = 0;
+    // TODO: THIS NUMBER MIGHT BE TOO LARGE; SEE IF WE SHOULD REDUCE IT
+    const uint32_t maxRelease = result ? 10 : 50;
+    uint32_t releaseCount = 0;
     while (!t->messageBuffers.empty()) {
         MessageAccumulator::MessageBuffer* messageBuffer =
                 t->messageBuffers.back();
@@ -1690,6 +1697,12 @@ HomaTransport::Poller::poll()
         }
     }
 
+    if (result) {
+        timeTrace("end of polling iteration %u, received %u packets, "
+                "transmitted %u bytes, released %u packet buffers",
+                downCast<uint32_t>(owner->iteration),
+                totalPackets, totalBytesSent, releaseCount);
+    }
     return result;
 }
 

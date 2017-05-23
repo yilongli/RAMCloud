@@ -16,6 +16,7 @@
 #include "Buffer.h"
 #include "Memory.h"
 #include "Syscall.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 
@@ -56,7 +57,36 @@ Buffer::Buffer()
  * Deallocate the memory allocated by this Buffer.
  */
 Buffer::~Buffer() {
-    resetInternal(false);
+//    resetInternal(false);
+
+    // TODO: The virtual function call ~Chunk() is really a pain in the neck,
+    // without this function call, the entire following block of code could
+    // be removed.
+
+    // Free the chunks.
+    uint32_t numChunks = 0;
+    Chunk* current = firstChunk;
+    while (current != NULL) {
+        Chunk* next = current->next;
+        current->~Chunk();
+        current = next;
+        numChunks++;
+    }
+    if (numChunks > 100) {
+        TimeTrace::record("freed %u chunks", numChunks);
+    }
+
+    // Free any malloc-ed memory.
+    uint32_t numAllocs = 0;
+    if (allocations) {
+        numAllocs = downCast<uint32_t>(allocations->size());
+        for (uint32_t i = 0; i < allocations->size(); i++) {
+            free((*allocations)[i]);
+        }
+    }
+    if (numChunks > 100) {
+        TimeTrace::record("freed %u malloc-ed memory blocks", numAllocs);
+    }
 }
 
 /**

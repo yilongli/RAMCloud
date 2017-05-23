@@ -644,7 +644,7 @@ class HomaTransport : public Transport {
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
             bool partialOK = false);
-    bool tryToTransmitData();
+    uint32_t tryToTransmitData();
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,

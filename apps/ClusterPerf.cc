@@ -3106,18 +3106,24 @@ echo_workload()
     LOG(NOTICE, "%lu servers available", servers.size());
 
     // Read in the cumulative distribution function of the message size.
-    double averageMessageSize;
+    double averageMessageSize = 0;
     vector<uint32_t> messageSizes;
     vector<double> cumulativeProbabilities;
     if (!messageSizeCdfFilePath.empty()) {
         std::ifstream inFile(messageSizeCdfFilePath);
-        inFile >> averageMessageSize;
+//        inFile >> averageMessageSize;
+        inFile.ignore(256, '\n');
 
         uint32_t size;
-        double probability;
-        while (inFile >> size >> probability) {
+        double cp;
+        while (inFile >> size >> cp) {
+            double probability = cp;
+            if (!cumulativeProbabilities.empty()) {
+                probability -= cumulativeProbabilities.back();
+            }
             messageSizes.push_back(size);
-            cumulativeProbabilities.push_back(probability);
+            cumulativeProbabilities.push_back(cp);
+            averageMessageSize += size * probability;
         }
     } else {
         LOG(ERROR, "No message size CDF file found");

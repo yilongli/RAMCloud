@@ -326,7 +326,6 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     struct rte_mbuf* mPkts[MAX_PACKETS_AT_ONCE];
 
 #if TIME_TRACE
-    static uint64_t startOfPollerLoop = 0;
     uint64_t timestamp = Cycles::rdtsc();
 #endif
     // attempt to dequeue a batch of received packets from the NIC
