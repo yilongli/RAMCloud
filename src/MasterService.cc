@@ -43,6 +43,10 @@
 
 namespace RAMCloud {
 
+// Change 0 -> 1 in the following line to compile detailed time tracing in
+// this service.
+#define TIME_TRACE 1
+
 // struct MasterService::Replica
 
 /**
@@ -133,6 +137,9 @@ MasterService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
         return;
     }
 
+#if TIME_TRACE
+    TimeTrace::record("MasterService::dispatch invoked, opcode %u", opcode);
+#endif
     switch (opcode) {
         case WireFormat::DropTabletOwnership::opcode:
             callHandler<WireFormat::DropTabletOwnership, MasterService,
@@ -271,6 +278,9 @@ MasterService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             prepareErrorResponse(rpc->replyPayload,
                                  STATUS_UNIMPLEMENTED_REQUEST);
     }
+#if TIME_TRACE
+    TimeTrace::record("MasterService request serviced");
+#endif
 }
 
 /**

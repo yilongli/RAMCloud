@@ -1057,12 +1057,18 @@ HomaTransport::handlePacket(Driver::Received* received)
                 serverRpc = serverRpcPool.construct(this,
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
+                // TODO: REMOVE THE FOLLOWING TIMETRACES ONCE WE FIGURE OUT
+                // WHY "received ALL_DATA" => "sendReply invoked" TOOK SO LONG?
+                timeTrace("about to insert into std::unordered_map, size %u",
+                        (uint32_t) incomingRpcs.size());
                 nextServerSequenceNumber++;
                 incomingRpcs[header->common.rpcId] = serverRpc;
+                timeTrace("about to appendToBuffer");
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
+                timeTrace("about to workerManager::handleRpc");
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
@@ -1321,7 +1327,10 @@ HomaTransport::ServerRpc::sendReply()
     transmitPriority = t->getUnschedTrafficPrio(replyPayload.size());
     t->outgoingResponses.push_back(*this);
     t->serverTimerList.push_back(*this);
-    t->tryToTransmitData();
+    uint32_t bytesSent = t->tryToTransmitData();
+    if (bytesSent > 0) {
+        timeTrace("sendReply trasmitted %u bytes", bytesSent);
+    }
 }
 
 /**

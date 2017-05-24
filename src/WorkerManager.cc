@@ -176,6 +176,7 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     // Handle ping requests inline so that high server load can never cause a
     // server to appear offline.
     if ((header->opcode == WireFormat::PING) ||
+            (header->opcode == WireFormat::ECHO) ||
             (header->opcode == WireFormat::READ_TSC)) {
         Service::Rpc serviceRpc(NULL, &rpc->requestPayload, &rpc->replyPayload);
         Service::handleRpc(context, &serviceRpc);
@@ -214,9 +215,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     }
 
     // Temporary code to test how much faster things would be without threads.
-#if 1
-    if (((header->opcode == WireFormat::ECHO) ||
-            (header->opcode == WireFormat::READ)) &&
+#if 0
+    if ((header->opcode == WireFormat::READ) &&
             (header->service == WireFormat::MASTER_SERVICE)) {
         Service::Rpc serviceRpc(NULL, &rpc->requestPayload,
                 &rpc->replyPayload);
