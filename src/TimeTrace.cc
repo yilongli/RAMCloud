@@ -226,6 +226,11 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
 void
 TimeTrace::printToLog()
 {
+    // TODO: temporary hack to avoid logging the same entries multiple times?
+    if (activeReaders > 0) {
+        return;
+    }
+
     std::vector<Buffer*> buffers;
     activeReaders.add(1);
 

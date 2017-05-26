@@ -221,6 +221,7 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
+    // TODO: Profile how long it takes; might have to optimize it
     incomingRpcs.erase(serverRpc->rpcId);
     if (serverRpc->sendingResponse) {
         erase(outgoingResponses, *serverRpc);
@@ -1062,7 +1063,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                 timeTrace("about to insert into std::unordered_map, size %u",
                         (uint32_t) incomingRpcs.size());
                 nextServerSequenceNumber++;
-                incomingRpcs[header->common.rpcId] = serverRpc;
+                // TODO: Actually, I don't think the following line is even
+                // necessary; incomingRpcs is really only useful for RPC with
+                // multi-packet response
+//                incomingRpcs[header->common.rpcId] = serverRpc;
                 timeTrace("about to appendToBuffer");
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
                         payload + sizeof32(AllDataHeader),

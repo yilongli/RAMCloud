@@ -1509,6 +1509,39 @@ double vectorPushPop()
     return Cycles::toSeconds(stop - start)/(count*3);
 }
 
+// TODO: I don't think the following two micro-benchmarks are meaningful
+// they are just testing the performance of memory read/write when there
+// is no cache miss; in other words, the keyword "volatile" is completely
+// irrelevant here.
+// Measure the cost of the volatile read on a uint64_t.
+double volatileLoad()
+{
+    int count = 100000;
+    volatile uint64_t value = 11;
+    uint64_t total = 0;
+    uint64_t start = Cycles::rdtsc();
+    for (int i = 0; i < count; i++) {
+        total = value;
+    }
+    uint64_t stop = Cycles::rdtsc();
+    discard(&total);
+    return Cycles::toSeconds(stop - start)/count;
+}
+
+// Measure the cost of the volatile write on a uint64_t.
+double volatileStore()
+{
+    int count = 100000;
+    volatile uint64_t value = 0;
+    uint64_t start = Cycles::rdtsc();
+    for (int i = 0; i < count; i++) {
+        value = 11;
+    }
+    uint64_t stop = Cycles::rdtsc();
+    discard(const_cast<uint64_t*>(&value));
+    return Cycles::toSeconds(stop - start)/count;
+}
+
 // The following struct and table define each performance test in terms of
 // a string name and a function that implements the test.
 struct TestInfo {
@@ -1689,6 +1722,10 @@ TestInfo tests[] = {
      "Lookup in std::unordered_map<uint64_t, uint64_t>"},
     {"vectorPushPop", vectorPushPop,
      "Push and pop a std::vector"},
+    {"volatileLoad", volatileLoad,
+     "Read a volatile uint64_t"},
+    {"volatileStore", volatileStore,
+     "Write a volatile uint64_t"},
 };
 
 /**

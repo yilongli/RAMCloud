@@ -67,7 +67,12 @@ class Dispatch {
     int poll();
     void run() __attribute__ ((noreturn));
 
-    // TODO: volatile is not correct
+    // TODO: volatile is not correct; besides, is volatile read actually cheaper than rdtsc()?
+    // In the dispatch thread, yes, because there should be no cache miss; in worker threads,
+    // the first read is probably much more expensive than rdtsc because it has to fetch the data
+    // from memory; finally, volatile write in dispatch thread could become quite expensive as it
+    // also involves coherency protocol.
+
     /// The return value from rdtsc at the beginning of the last call to
     /// #poll.  May be read from multiple threads, so must be volatile.
     /// This value is relatively accurate for any code running in a Dispatch
