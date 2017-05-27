@@ -45,7 +45,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this service.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // struct MasterService::Replica
 
