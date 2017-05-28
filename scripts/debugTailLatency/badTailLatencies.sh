@@ -4,7 +4,7 @@ BEGIN {
     prevTime=0
     startTime=0
 }
-$3~/^[0-9]+/ {
+$3~/^(-)?[0-9]+/ {
     delta = sprintf("%.2f", $3-prevTime)
     if (startTime == 0)
         startTime = $3
@@ -14,7 +14,7 @@ $3~/^[0-9]+/ {
     print
     next
 };{
-    if (prevTime > 0)
+    if (prevTime > startTime)
         printf("Elapsed time: %.2f us\n", prevTime-startTime)
     startTime = 0
     print

@@ -550,15 +550,17 @@ HomaTransport::tryToTransmitData()
     // control packets (and retransmitted data) are always passed to the
     // driver immediately.
 
-    int transmitQueueSpace =
-            driver->getTransmitQueueSpace(context->dispatch->currentTime);
+    uint32_t transmitQueueSpace = static_cast<uint32_t>(
+            driver->getTransmitQueueSpace(context->dispatch->currentTime));
+    if (static_cast<int>(transmitQueueSpace) < 0) {
+        return 0;
+    }
     uint32_t maxBytes;
+    uint32_t grantedBytesLeft;
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
-    // TODO: IF WE JUST WANT TO SEND A SMALL MESSAGE, IT DOESN'T MAKE SENSE TO
-    // WAIT FOR A SPACE OF `maxDataPerPacket`.
-    while (transmitQueueSpace >= static_cast<int>(maxDataPerPacket)) {
+    while (true) {
         // Find an outgoing request or response that is ready to transmit.
         // The policy here is "shortest remaining processing time" (SRPT).
 
@@ -570,6 +572,7 @@ HomaTransport::tryToTransmitData()
         // need to be revisited.
         ClientRpc* clientRpc = NULL;
         ServerRpc* serverRpc = NULL;
+        // TODO: WHAT ABOUT FINDING NOT JUST THE MIN. MSG BUT ALSO THE 2ND MIN.
         uint32_t minBytesLeft = ~0u;
         for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                     it != outgoingRequests.end(); it++) {
@@ -600,18 +603,26 @@ HomaTransport::tryToTransmitData()
             }
         }
 
+        int bytesSent = 0;
         if (clientRpc != NULL) {
             // Transmit one or more request DATA packets from clientRpc,
             // if appropriate.
-            maxBytes = std::min(static_cast<uint32_t>(transmitQueueSpace),
-                    clientRpc->transmitLimit - clientRpc->transmitOffset);
-            int bytesSent = sendBytes(
+            grantedBytesLeft = std::min(clientRpc->transmitLimit,
+                    clientRpc->request->size()) - clientRpc->transmitOffset;
+            if (transmitQueueSpace < grantedBytesLeft) {
+                if (transmitQueueSpace < maxDataPerPacket) {
+                    break;
+                }
+                maxBytes = transmitQueueSpace;
+            } else {
+                maxBytes = grantedBytesLeft;
+            }
+            bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
                     clientRpc->request, clientRpc->transmitOffset, maxBytes,
                     clientRpc->unscheduledBytes, clientRpc->transmitPriority,
                     FROM_CLIENT);
-            assert(bytesSent > 0);     // Otherwise, infinite loop.
             clientRpc->transmitOffset += bytesSent;
             // TODO: No need to call rdtsc directly if we provide a Driver::lastTransmitTime
             clientRpc->lastTransmitTime = Cycles::rdtsc();
@@ -624,14 +635,21 @@ HomaTransport::tryToTransmitData()
         } else if (serverRpc != NULL) {
             // Transmit one or more response DATA packets from serverRpc,
             // if appropriate.
-            maxBytes = std::min(static_cast<uint32_t>(transmitQueueSpace),
-                    serverRpc->transmitLimit - serverRpc->transmitOffset);
-            int bytesSent = sendBytes(serverRpc->clientAddress,
+            grantedBytesLeft = std::min(serverRpc->transmitLimit,
+                    serverRpc->replyPayload.size()) - serverRpc->transmitOffset;
+            if (transmitQueueSpace < grantedBytesLeft) {
+                if (transmitQueueSpace < maxDataPerPacket) {
+                    break;
+                }
+                maxBytes = transmitQueueSpace;
+            } else {
+                maxBytes = grantedBytesLeft;
+            }
+            bytesSent = sendBytes(serverRpc->clientAddress,
                     serverRpc->rpcId, &serverRpc->replyPayload,
                     serverRpc->transmitOffset, maxBytes,
                     serverRpc->unscheduledBytes, serverRpc->transmitPriority,
                     FROM_SERVER);
-            assert(bytesSent > 0);     // Otherwise, infinite loop.
             serverRpc->transmitOffset += bytesSent;
             serverRpc->lastTransmitTime = Cycles::rdtsc();
             transmitQueueSpace -= bytesSent;
@@ -646,6 +664,13 @@ HomaTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
+            break;
+        }
+
+        // TODO: REMOVE? OR KEEP IT JUST FOR SAFE
+        if (bytesSent == 0) {
+            // THIS SHOULD NEVER HAPPEN
+            LOG(WARNING, "Infinite loop if I don't break out the loop");
             break;
         }
     }

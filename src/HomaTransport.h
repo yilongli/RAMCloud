@@ -769,6 +769,16 @@ class HomaTransport : public Transport {
     uint32_t roundTripBytes;
     // TODO: need to clean up the use of this field thoroughly
 
+//    /// Specifies the client RPC in `outgoingRequests` whose request has the
+//    /// minimum number of bytes left to be sent. NULL means `outgoingRequests`
+//    /// is empty.
+//    ClientRpc* shortestRemainingRequest;
+//
+//    /// Specifies the server RPC in `outgoingResponses` whose response has the
+//    /// minimum number of bytes left to be sent. NULL means `outgoingResponses`
+//    /// is empty.
+//    ServerRpc* shortestRemainingResponse;
+
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
     /// GRANTS, but it can result in additional buffering in the network.
