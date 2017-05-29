@@ -663,6 +663,10 @@ class HomaTransport : public Transport {
     /// The Driver used to send and receive packets.
     Driver* driver;
 
+    /// Cycles::rdtsc time of the most recent time that we polled the NIC
+    /// for incoming packets.
+    uint64_t lastPollTime;
+
     /// Service locator string of this transport.
     string locatorString;
 
@@ -676,8 +680,8 @@ class HomaTransport : public Transport {
     /// identification for RPCs).
     uint64_t clientId;
 
-    /// The highest packet priority that is supported by the underlying driver
-    /// and available to us.
+    /// The highest packet priority that is supported by the underlying
+    /// driver and available to us.
     const int highestAvailPriority;
 
     // The highest priority to use for scheduled traffic.
@@ -703,6 +707,13 @@ class HomaTransport : public Transport {
     /// want to reallocate space in every call to poll). Always empty,
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
+
+    /// Holds the recipients of `grantPackets`.
+    std::vector<const Driver::Address*> grantRecipients;
+
+    /// Holds outgoing GRANT packets about to be sent. Always empty, except
+    /// when the poll method is receiving and processing incoming packets.
+    std::vector<GrantHeader> grantPackets;
 
     /// Holds message buffers that are consist of payloads that are retained
     /// and assembled by the MessageAccumulator. These retained payloads are
@@ -768,16 +779,6 @@ class HomaTransport : public Transport {
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
     // TODO: need to clean up the use of this field thoroughly
-
-//    /// Specifies the client RPC in `outgoingRequests` whose request has the
-//    /// minimum number of bytes left to be sent. NULL means `outgoingRequests`
-//    /// is empty.
-//    ClientRpc* shortestRemainingRequest;
-//
-//    /// Specifies the server RPC in `outgoingResponses` whose response has the
-//    /// minimum number of bytes left to be sent. NULL means `outgoingResponses`
-//    /// is empty.
-//    ServerRpc* shortestRemainingResponse;
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving

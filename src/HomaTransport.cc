@@ -58,6 +58,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         Driver* driver, uint64_t clientId)
     : context(context)
     , driver(driver)
+    , lastPollTime(0)
     , locatorString("homa+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
@@ -71,6 +72,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
+    , grantRecipients()
+    , grantPackets()
     , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
@@ -1661,8 +1664,11 @@ HomaTransport::Poller::poll()
         numPackets = downCast<uint>(t->receivedPackets.size());
 #if TIME_TRACE
         if (totalPackets == 0 && numPackets > 0) {
-            TimeTrace::record(startTime, "start of polling iteration %u",
-                    downCast<uint32_t>(owner->iteration));
+            uint64_t ns = Cycles::toNanoseconds(startTime - t->lastPollTime);
+            TimeTrace::record(startTime, "start of polling iteration %u, "
+                    "last poll was %u ns ago",
+                    static_cast<uint32_t>(owner->iteration),
+                    static_cast<uint32_t>(ns));
         }
 #endif
         for (uint i = 0; i < numPackets; i++) {
@@ -1672,6 +1678,27 @@ HomaTransport::Poller::poll()
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
     result |= totalPackets;
+#if TIME_TRACE
+    t->lastPollTime = startTime;
+#endif
+
+    // Send out GRANTs that are outputted in the previous processing step.
+    for (unsigned i = 0; i < t->grantPackets.size(); i++) {
+        GrantHeader* grant = &t->grantPackets[i];
+        CommonHeader* common = &grant->common;
+        const char* fmt = (common->flags & FROM_CLIENT) ?
+                "client sending GRANT, clientId %u, sequence %u, offset %u, "
+                "priority %u" :
+                "server sending GRANT, clientId %u, sequence %u, offset %u, "
+                "priority %u";
+        timeTrace(fmt, downCast<uint32_t>(common->rpcId.clientId),
+                downCast<uint32_t>(common->rpcId.sequence),
+                grant->offset, grant->priority);
+        t->driver->sendPacket(t->grantRecipients[i], grant, NULL,
+                t->controlPacketPriority);
+    }
+    t->grantRecipients.clear();
+    t->grantPackets.clear();
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -1714,7 +1741,7 @@ HomaTransport::Poller::poll()
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
     // useful to do in this method uptill now, try to release more payloads.
     // TODO: THIS NUMBER MIGHT BE TOO LARGE; SEE IF WE SHOULD REDUCE IT
-    const uint32_t maxRelease = result ? 10 : 50;
+    const uint32_t maxRelease = result ? 5 : 10;
     uint32_t releaseCount = 0;
     while (!t->messageBuffers.empty()) {
         MessageAccumulator::MessageBuffer* messageBuffer =
@@ -2177,18 +2204,9 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     // Output a GRANT for the selected message.
     uint8_t whoFrom = (messageToGrant->whoFrom == FROM_CLIENT) ?
             FROM_SERVER : FROM_CLIENT;
-    GrantHeader grant(messageToGrant->rpcId, messageToGrant->grantOffset,
-            priority, whoFrom);
-    const char* fmt = (messageToGrant->whoFrom == FROM_CLIENT) ?
-            "server sending GRANT, clientId %u, sequence %u, offset %u, "
-            "priority %u" :
-            "client sending GRANT, clientId %u, sequence %u, offset %u, "
-            "priority %u";
-    timeTrace(fmt, downCast<uint32_t>(messageToGrant->rpcId.clientId),
-            downCast<uint32_t>(messageToGrant->rpcId.sequence),
-            messageToGrant->grantOffset, priority);
-    driver->sendPacket(messageToGrant->senderAddress, &grant, NULL,
-            controlPacketPriority);
+    grantRecipients.push_back(messageToGrant->senderAddress);
+    grantPackets.emplace_back(messageToGrant->rpcId,
+            messageToGrant->grantOffset, priority, whoFrom);
 }
 
 }  // namespace RAMCloud
