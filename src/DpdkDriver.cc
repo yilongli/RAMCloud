@@ -76,11 +76,13 @@ constexpr uint16_t DpdkDriver::PRIORITY_TO_PCP[8];
  */
 DpdkDriver::DpdkDriver()
     : context(NULL)
+    , bytesBuffered(0)
     , packetBufsUtilized(0)
     , locatorString()
     , localMac()
     , portId(0)
     , packetPool(NULL)
+    , txBuffer()
     , loopbackRing(NULL)
     , hasHardwareFilter(true)
     , bandwidthMbps(10000)
@@ -114,11 +116,13 @@ DpdkDriver::DpdkDriver()
 
 DpdkDriver::DpdkDriver(Context* context, int port)
     : context(context)
+    , bytesBuffered(0)
     , packetBufsUtilized(0)
     , locatorString()
     , localMac()
     , portId(0)
     , packetPool(NULL)
+    , txBuffer()
     , loopbackRing(NULL)
     , hasHardwareFilter(true)             // Cleared later if not applicable
     , bandwidthMbps(10000)                // Default bandwidth = 10 gbs
@@ -423,22 +427,35 @@ DpdkDriver::release(char *payload)
     rte_pktmbuf_free(mbuf);
 }
 
-// See docs in Driver class.
-void
-DpdkDriver::sendPacket(const Address* addr,
+/**
+ * TODO
+ * \param addr
+ * \param header
+ * \param headerLen
+ * \param payload
+ * \param priority
+ * \param[out] physPacketLength
+ *      Size of the Ethernet packet at physical layer, in bytes.
+ * \return
+ *      The packet buffer ready to be sent out.
+ */
+struct rte_mbuf*
+DpdkDriver::prepareMbuf(const Address* addr,
                        const void* header,
                        uint32_t headerLen,
                        Buffer::Iterator* payload,
-                       int priority)
+                       int priority,
+                       uint32_t* physPacketLength)
 {
     // Convert transport-level packet priority to Ethernet priority.
     assert(priority >= 0 && priority <= getHighestPacketPriority());
     priority += lowestPriorityAvail;
 
     uint32_t etherPayloadLength = headerLen + (payload ? payload->size() : 0);
+    assert(etherPayloadLength <= MAX_PAYLOAD_SIZE);
     timeTrace("sendPacket invoked, payload size %u", etherPayloadLength);
     uint32_t frameLength = etherPayloadLength + ETHER_VLAN_HDR_LEN;
-    assert(etherPayloadLength <= MAX_PAYLOAD_SIZE);
+    *physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
 
 #if TESTING
     struct rte_mbuf mockMbuf;
@@ -446,10 +463,14 @@ DpdkDriver::sendPacket(const Address* addr,
 #else
     struct rte_mbuf* mbuf = rte_pktmbuf_alloc(packetPool);
 #endif
-    if (NULL == mbuf) {
-        RAMCLOUD_CLOG(NOTICE,
-                "Failed to allocate a packet buffer; dropping packet");
-        return;
+    if (unlikely(NULL == mbuf)) {
+        uint32_t numMbufsAvail = rte_mempool_avail_count(packetPool);
+        uint32_t numMbufsInUse = rte_mempool_in_use_count(packetPool);
+        RAMCLOUD_CLOG(WARNING,
+                "Failed to allocate a packet buffer; dropping packet; "
+                "%u mbufs available, %u mbufs in use",
+                numMbufsAvail, numMbufsInUse);
+        return NULL;
     }
 
 #if TESTING
@@ -458,11 +479,11 @@ DpdkDriver::sendPacket(const Address* addr,
 #else
     char* data = rte_pktmbuf_append(mbuf, downCast<uint16_t>(frameLength));
 #endif
-    if (NULL == data) {
+    if (unlikely(NULL == data)) {
         RAMCLOUD_CLOG(NOTICE,
                 "rte_pktmbuf_append call failed; dropping packet");
         rte_pktmbuf_free(mbuf);
-        return;
+        return NULL;
     }
 
     // Fill out the destination and source MAC addresses plus the Ethernet
@@ -492,6 +513,23 @@ DpdkDriver::sendPacket(const Address* addr,
         payload->next();
     }
     timeTrace("about to enqueue outgoing packet");
+    return mbuf;
+}
+
+// See docs in Driver class.
+void
+DpdkDriver::bufferPacket(const Address* addr,
+                       const void* header,
+                       uint32_t headerLen,
+                       Buffer::Iterator* payload,
+                       int priority)
+{
+    uint32_t physPacketLength;
+    struct rte_mbuf* mbuf = prepareMbuf(
+            addr, header, headerLen, payload, priority, &physPacketLength);
+    if (unlikely(NULL == mbuf)) {
+        return;
+    }
 
 #if TESTING
     string hexEtherHeader;
@@ -507,27 +545,109 @@ DpdkDriver::sendPacket(const Address* addr,
     if (!memcmp(static_cast<const MacAddress*>(addr)->address,
             localMac->address, 6)) {
         int ret = rte_ring_enqueue(loopbackRing, mbuf);
-        if (ret != 0) {
+        if (unlikely(ret != 0)) {
             LOG(WARNING, "rte_ring_enqueue returned %d; packet may be lost?",
                     ret);
             rte_pktmbuf_free(mbuf);
-            return;
+        }
+        timeTrace("loopback packet enqueued");
+        return;
+    }
+
+    bytesBuffered += physPacketLength;
+    txBuffer.push_back(mbuf);
+    timeTrace("outgoing packet buffered");
+#endif
+}
+
+// See docs in Driver class.
+void
+DpdkDriver::flushTxBuffer()
+{
+    uint16_t numPkts = downCast<uint16_t>(txBuffer.size());
+    if (numPkts == 0) {
+        return;
+    }
+
+    uint32_t ret = rte_eth_tx_burst(portId, 0, txBuffer.data(), numPkts);
+    if (unlikely(ret != numPkts)) {
+        LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
+        // The congestion at the TX queue must be pretty bad if we got here:
+        // set the queue size to be relatively large.
+        queueEstimator.setQueueSize(maxTransmitQueueSize*2, Cycles::rdtsc());
+        // Release packets that are not transmitted.
+        for (uint32_t i = ret; i < numPkts; i++) {
+            rte_pktmbuf_free(txBuffer[i]);
         }
     } else {
-        uint32_t ret = rte_eth_tx_burst(portId, 0, &mbuf, 1);
-        if (ret != 1) {
-            LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?",
+        timeTrace("%u buffered packets enqueued", numPkts);
+        queueEstimator.packetQueued(bytesBuffered);
+        PerfStats::threadStats.networkOutputBytes += bytesBuffered;
+    }
+
+    bytesBuffered = 0;
+    txBuffer.clear();
+}
+
+// See docs in Driver class.
+void
+DpdkDriver::sendPacket(const Address* addr,
+                       const void* header,
+                       uint32_t headerLen,
+                       Buffer::Iterator* payload,
+                       int priority)
+{
+    // TODO: Now sendPacket involves flushing out all buffered packets;
+    // is it the right decision?
+//    bufferPacket(addr, header, headerLen, payload, priority);
+//    flushTxBuffer();
+
+    // #################################################################
+    // alternative semantics: no buffer flush
+    // #################################################################
+
+    uint32_t physPacketLength;
+    struct rte_mbuf* mbuf = prepareMbuf(
+            addr, header, headerLen, payload, priority, &physPacketLength);
+    if (unlikely(NULL == mbuf)) {
+        return;
+    }
+
+#if TESTING
+    string hexEtherHeader;
+    for (unsigned i = 0; i < ETHER_VLAN_HDR_LEN; i++) {
+        char hex[3];
+        snprintf(hex, sizeof(hex), "%02x", mockEtherFrame[i]);
+        hexEtherHeader += hex;
+    }
+    LOG(NOTICE, "Ethernet frame header %s, payload %s", hexEtherHeader.c_str(),
+            &mockEtherFrame[ETHER_VLAN_HDR_LEN]);
+#else
+    // loopback if src mac == dst mac
+    if (!memcmp(static_cast<const MacAddress*>(addr)->address,
+            localMac->address, 6)) {
+        int ret = rte_ring_enqueue(loopbackRing, mbuf);
+        if (unlikely(ret != 0)) {
+            LOG(WARNING, "rte_ring_enqueue returned %d; packet may be lost?",
                     ret);
             rte_pktmbuf_free(mbuf);
-            queueEstimator.setQueueSize(maxTransmitQueueSize, Cycles::rdtsc());
-            return;
         }
+        timeTrace("loopback packet enqueued");
+        return;
     }
-#endif
+
+    uint32_t ret = rte_eth_tx_burst(portId, 0, &mbuf, 1);
+    if (unlikely(ret != 1)) {
+                LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
+        // The congestion at the TX queue must be pretty bad if we got here:
+        // set the queue size to be relatively large.
+        queueEstimator.setQueueSize(maxTransmitQueueSize * 2, Cycles::rdtsc());
+        rte_pktmbuf_free(mbuf);
+        return;
+    }
     timeTrace("outgoing packet enqueued");
-    uint32_t physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
+#endif
     queueEstimator.packetQueued(physPacketLength);
-    // TODO: MONITORING BANDWIDTH AT SHORT PERIOD TO CHECK HOW WELL THE QUEUEESTIMATOR WORKS
     PerfStats::threadStats.networkOutputBytes += physPacketLength;
 }
 

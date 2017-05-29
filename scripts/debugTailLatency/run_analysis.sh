@@ -16,4 +16,16 @@ for host in client1 client2 server1 server2; do
     grep "$host ->" ${dir}/all_tx_delay.txt | awk "$awk_script" > ${dir}/${host}_tx_delay.txt &
     grep " -> $host" ${dir}/all_rx_delay.txt | awk "$awk_script" > ${dir}/${host}_rx_delay.txt &
 done
+
+# Extract RPCs that experienced high latency.
 $SCRIPT_DIR/badTailLatencies.sh merged.tt > bad_tail_latency.txt
+
+# Summarize the cost of calling Driver::receivedPackets
+grep -h "start of polling" -A 1 server*.tt | \
+    grep "server received" | \
+    awk '{s+=$4;c++;print} END {print s/c, c}' > receivedPackets_cost.txt
+
+# Summarize the server turnaround time for small RPCs
+grep -h "server received ALL_DATA" -A 1 server*.tt |
+    grep "sendReply invoked.*length [0-9]\{2\}$" | \
+    awk '{s+=$4;c++;print} END {print s/c, c}' > server_rpc_turnaround.txt

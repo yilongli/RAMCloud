@@ -34,7 +34,7 @@
 // Maximum number of packet buffers that the memory pool can hold. The
 // documentation of `rte_mempool_create` suggests that the optimum value
 // (in terms of memory usage) of this number is a power of two minus one.
-#define NB_MBUF 8191
+#define NB_MBUF 32767
 // per-element size for the packet buffer memory pool
 #define MBUF_SIZE (2048 + static_cast<uint32_t>(sizeof(struct rte_mbuf)) \
                    + RTE_PKTMBUF_HEADROOM)
@@ -66,6 +66,12 @@ class DpdkDriver : public Driver
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
+    virtual void bufferPacket(const Address* addr,
+                            const void* header,
+                            uint32_t headerLen,
+                            Buffer::Iterator* payload,
+                            int priority = 0);
+    virtual void flushTxBuffer();
     virtual void sendPacket(const Address* addr,
                             const void* header,
                             uint32_t headerLen,
@@ -79,6 +85,13 @@ class DpdkDriver : public Driver
     }
 
   PRIVATE:
+    struct rte_mbuf* prepareMbuf(const Address* addr,
+                            const void* header,
+                            uint32_t headerLen,
+                            Buffer::Iterator* payload,
+                            int priority,
+                            uint32_t* physPacketLength);
+
     // The MTU (Maximum Transmission Unit) size of an Ethernet frame, which
     // is the maximum size of the packet an Ethernet frame can carry in its
     // payload.
@@ -104,6 +117,9 @@ class DpdkDriver : public Driver
 
     Context* context;
 
+    /// Track number of bytes buffered in `txBuffer`.
+    uint32_t bytesBuffered;
+
     /// Tracks number of outstanding allocated payloads.  For detecting leaks.
     int packetBufsUtilized;
 
@@ -119,11 +135,14 @@ class DpdkDriver : public Driver
 
     /// Holds packet buffers that are dequeued from the NIC's HW queues
     /// via DPDK.
-    struct rte_mempool *packetPool;
+    struct rte_mempool* packetPool;
+
+    /// Holds packet buffers that are need to be sent out.
+    std::vector<struct rte_mbuf*> txBuffer;
 
     /// Holds packets that are addressed to localhost instead of going through
     /// the HW queues.
-    struct rte_ring *loopbackRing;
+    struct rte_ring* loopbackRing;
 
     /// Hardware packet filter is provided by the NIC
     bool hasHardwareFilter;

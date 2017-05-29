@@ -361,6 +361,19 @@ class Driver {
                             Buffer::Iterator* payload,
                             int priority = 0) = 0;
 
+    // TODO: document; also, should I try to implement the method here?
+    virtual void flushTxBuffer() {}
+
+    // TODO: document
+    virtual void bufferPacket(const Address* recipient,
+                            const void* header,
+                            uint32_t headerLen,
+                            Buffer::Iterator* payload,
+                            int priority = 0)
+    {
+        sendPacket(recipient, header, headerLen, payload, priority);
+    }
+
     /**
      * Alternate form of sendPacket.
      *
@@ -387,6 +400,34 @@ class Driver {
                     int priority = 0)
     {
         sendPacket(recipient, header, sizeof(T), payload, priority);
+    }
+
+    /**
+     * Alternate form of bufferPacket.
+     *
+     * \param recipient
+     *      Where to send the packet.
+     * \param header
+     *      Contents of this object will be placed in the packet ahead
+     *      of payload.  The driver will make a copy of this data, so
+     *      the caller need not preserve it after the method returns, even
+     *      if the packet hasn't yet been transmitted.
+     * \param payload
+     *      A buffer iterator positioned at the bytes for the payload to
+     *      follow the headerLen bytes from header.  May be NULL to
+     *      indicate "no payload". Note: caller must preserve the buffer
+     *      data (but not the actual iterator) even after the method returns,
+     *      since the data may not yet have been transmitted.
+     * \param priority
+     *      The priority level of this packet. 0 is the lowest priority.
+     */
+    template<typename T>
+    void bufferPacket(const Address* recipient,
+                    const T* header,
+                    Buffer::Iterator* payload,
+                    int priority = 0)
+    {
+        bufferPacket(recipient, header, sizeof(T), payload, priority);
     }
 
     /**
