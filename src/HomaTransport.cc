@@ -627,6 +627,7 @@ HomaTransport::tryToTransmitData()
             } else {
                 maxBytes = grantedBytesLeft;
             }
+            timeTrace("Estimated queue space %u", transmitQueueSpace);
             bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -655,6 +656,7 @@ HomaTransport::tryToTransmitData()
             } else {
                 maxBytes = grantedBytesLeft;
             }
+            timeTrace("Estimated queue space %u", transmitQueueSpace);
             bytesSent = sendBytes(serverRpc->clientAddress,
                     serverRpc->rpcId, &serverRpc->replyPayload,
                     serverRpc->transmitOffset, maxBytes,
