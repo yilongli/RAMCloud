@@ -34,7 +34,7 @@
 // Maximum number of packet buffers that the memory pool can hold. The
 // documentation of `rte_mempool_create` suggests that the optimum value
 // (in terms of memory usage) of this number is a power of two minus one.
-#define NB_MBUF 32767
+#define NB_MBUF 8191
 // per-element size for the packet buffer memory pool
 #define MBUF_SIZE (2048 + static_cast<uint32_t>(sizeof(struct rte_mbuf)) \
                    + RTE_PKTMBUF_HEADROOM)

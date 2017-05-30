@@ -524,6 +524,7 @@ DpdkDriver::bufferPacket(const Address* addr,
                        Buffer::Iterator* payload,
                        int priority)
 {
+    /*
     uint32_t physPacketLength;
     struct rte_mbuf* mbuf = prepareMbuf(
             addr, header, headerLen, payload, priority, &physPacketLength);
@@ -558,12 +559,14 @@ DpdkDriver::bufferPacket(const Address* addr,
     txBuffer.push_back(mbuf);
     timeTrace("outgoing packet buffered");
 #endif
+     */
 }
 
 // See docs in Driver class.
 void
 DpdkDriver::flushTxBuffer()
 {
+    /*
     uint16_t numPkts = downCast<uint16_t>(txBuffer.size());
     if (numPkts == 0) {
         return;
@@ -587,6 +590,7 @@ DpdkDriver::flushTxBuffer()
 
     bytesBuffered = 0;
     txBuffer.clear();
+     */
 }
 
 // See docs in Driver class.
@@ -597,21 +601,70 @@ DpdkDriver::sendPacket(const Address* addr,
                        Buffer::Iterator* payload,
                        int priority)
 {
-    // TODO: Now sendPacket involves flushing out all buffered packets;
-    // is it the right decision?
-//    bufferPacket(addr, header, headerLen, payload, priority);
-//    flushTxBuffer();
+    // Convert transport-level packet priority to Ethernet priority.
+    assert(priority >= 0 && priority <= getHighestPacketPriority());
+    priority += lowestPriorityAvail;
 
-    // #################################################################
-    // alternative semantics: no buffer flush
-    // #################################################################
+    uint32_t etherPayloadLength = headerLen + (payload ? payload->size() : 0);
+    assert(etherPayloadLength <= MAX_PAYLOAD_SIZE);
+    timeTrace("sendPacket invoked, payload size %u", etherPayloadLength);
+    uint32_t frameLength = etherPayloadLength + ETHER_VLAN_HDR_LEN;
+    uint32_t physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
 
-    uint32_t physPacketLength;
-    struct rte_mbuf* mbuf = prepareMbuf(
-            addr, header, headerLen, payload, priority, &physPacketLength);
+#if TESTING
+    struct rte_mbuf mockMbuf;
+    struct rte_mbuf* mbuf = &mockMbuf;
+#else
+    struct rte_mbuf* mbuf = rte_pktmbuf_alloc(packetPool);
+#endif
     if (unlikely(NULL == mbuf)) {
-        return;
+        uint32_t numMbufsAvail = rte_mempool_avail_count(packetPool);
+        uint32_t numMbufsInUse = rte_mempool_in_use_count(packetPool);
+        RAMCLOUD_CLOG(WARNING,
+                "Failed to allocate a packet buffer; dropping packet; "
+                "%u mbufs available, %u mbufs in use",
+                numMbufsAvail, numMbufsInUse);
     }
+
+#if TESTING
+    uint8_t mockEtherFrame[ETHER_MAX_VLAN_FRAME_LEN] = {};
+    char* data = reinterpret_cast<char*>(mockEtherFrame);
+#else
+    char* data = rte_pktmbuf_append(mbuf, downCast<uint16_t>(frameLength));
+#endif
+    if (unlikely(NULL == data)) {
+        RAMCLOUD_CLOG(NOTICE,
+                "rte_pktmbuf_append call failed; dropping packet");
+        rte_pktmbuf_free(mbuf);
+    }
+
+    // Fill out the destination and source MAC addresses plus the Ethernet
+    // frame type (i.e., IEEE 802.1Q VLAN tagging).
+    char *p = data;
+    struct ether_hdr* ethHdr = reinterpret_cast<struct ether_hdr*>(p);
+    rte_memcpy(&ethHdr->d_addr, static_cast<const MacAddress*>(addr)->address,
+            ETHER_ADDR_LEN);
+    rte_memcpy(&ethHdr->s_addr, localMac->address, ETHER_ADDR_LEN);
+    ethHdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_VLAN);
+    p += ETHER_HDR_LEN;
+
+    // Fill out the PCP field and the Ethernet frame type of the encapsulated
+    // frame (DEI and VLAN ID are not relevant and trivially set to 0).
+    struct vlan_hdr* vlanHdr = reinterpret_cast<struct vlan_hdr*>(p);
+    vlanHdr->vlan_tci = rte_cpu_to_be_16(PRIORITY_TO_PCP[priority]);
+    vlanHdr->eth_proto = rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD);
+    p += VLAN_TAG_LEN;
+
+    // Copy `header` and `payload`.
+    rte_memcpy(p, header, headerLen);
+    p += headerLen;
+    while (payload && !payload->isDone())
+    {
+        rte_memcpy(p, payload->getData(), payload->getLength());
+        p += payload->getLength();
+        payload->next();
+    }
+    timeTrace("about to enqueue outgoing packet");
 
 #if TESTING
     string hexEtherHeader;
