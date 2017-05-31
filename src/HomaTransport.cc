@@ -1086,12 +1086,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                 serverRpc = serverRpcPool.construct(this,
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
-                serverRpc->singlePacketRequest = true;
                 nextServerSequenceNumber++;
-                // TODO: Actually, I don't think the following line is even
-                // necessary; incomingRpcs is really only useful for RPC with
-                // multi-packet response
-//                incomingRpcs[header->common.rpcId] = serverRpc;
+                // TODO: the following operation is very expensive;
+                // easily > 250ns
+                incomingRpcs[header->common.rpcId] = serverRpc;
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
@@ -1348,11 +1346,6 @@ HomaTransport::ServerRpc::sendReply()
     transmitPriority = t->getUnschedTrafficPrio(replyPayload.size());
     t->outgoingResponses.push_back(*this);
     t->serverTimerList.push_back(*this);
-    // TODO: WHY SO CONSERVATIVE; ONLY SINGLE PACKET REPLY? WHAT ABOUT ONLY
-    // INSERT INTO THE UNORDERED_MAP WHEN THE RESPONSE IS A SCHEDULED MESSAGE?
-    if (singlePacketRequest && replyPayload.size() > unscheduledBytes) {
-        t->incomingRpcs[this->rpcId] = this;
-    }
     uint32_t bytesSent = t->tryToTransmitData();
     if (bytesSent > 0) {
         timeTrace("sendReply transmitted %u bytes", bytesSent);

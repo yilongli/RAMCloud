@@ -403,10 +403,6 @@ class HomaTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
-        // TODO: document WHY we need this
-        /// True means the request of this RPC fits in one packet.
-        bool singlePacketRequest;
-
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
@@ -435,7 +431,6 @@ class HomaTransport : public Transport {
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
-            , singlePacketRequest(false)
             , accumulator()
             , scheduledMessage()
             , timerLinks()
