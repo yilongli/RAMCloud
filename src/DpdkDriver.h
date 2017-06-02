@@ -115,10 +115,16 @@ class DpdkDriver : public Driver
             {1 << 13, 0 << 13, 2 << 13, 3 << 13, 4 << 13, 5 << 13, 6 << 13,
              7 << 13};
 
+    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;
+
     Context* context;
 
     /// Track number of bytes buffered in `txBuffer`.
     uint32_t bytesBuffered;
+
+    /// Holds packet buffers that are no longer in use, for use in future
+    /// requests; saves the overhead of calling malloc/free for each request.
+    ObjectPool<PacketBuf> packetBufPool;
 
     /// Tracks number of outstanding allocated payloads.  For detecting leaks.
     int packetBufsUtilized;

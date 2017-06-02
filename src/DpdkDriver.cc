@@ -77,6 +77,7 @@ constexpr uint16_t DpdkDriver::PRIORITY_TO_PCP[8];
 DpdkDriver::DpdkDriver()
     : context(NULL)
     , bytesBuffered(0)
+    , packetBufPool()
     , packetBufsUtilized(0)
     , locatorString()
     , localMac()
@@ -117,6 +118,7 @@ DpdkDriver::DpdkDriver()
 DpdkDriver::DpdkDriver(Context* context, int port)
     : context(context)
     , bytesBuffered(0)
+    , packetBufPool()
     , packetBufsUtilized(0)
     , locatorString()
     , localMac()
@@ -362,7 +364,8 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     // objects and copying the payload from the DPDK packet buffers.
     for (uint32_t i = 0; i < totalPkts; i++) {
         struct rte_mbuf* m = mPkts[i];
-        if (unlikely(m->nb_segs > 1)) {
+        rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+        if (m->nb_segs > 1) {
             RAMCLOUD_CLOG(WARNING,
                     "Can't handle packet with %u segments; discarding",
                     m->nb_segs);
@@ -392,19 +395,15 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         }
 
         PerfStats::threadStats.networkInputBytes += rte_pktmbuf_pkt_len(m);
-        MacAddress* sender = reinterpret_cast<MacAddress*>(m->buf_addr);
-        if (unlikely(reinterpret_cast<char*>(sender + 1) >
-                rte_pktmbuf_mtod(m, char*))) {
-            LOG(ERROR, "Not enough headroom in the packet mbuf; "
-                    "dropping packet");
-            rte_pktmbuf_free(m);
-            continue;
-        }
-        new(sender) MacAddress(ethHdr->s_addr.addr_bytes);
+        PacketBuf* buffer = packetBufPool.construct();
         packetBufsUtilized++;
+        buffer->sender.construct(ethHdr->s_addr.addr_bytes);
         uint32_t length = rte_pktmbuf_pkt_len(m) - headerLength;
         assert(length <= MAX_PAYLOAD_SIZE);
-        receivedPackets->emplace_back(sender, this, length, payload);
+        rte_memcpy(buffer->payload, payload, length);
+        receivedPackets->emplace_back(buffer->sender.get(), this,
+                length, buffer->payload);
+        rte_pktmbuf_free(m);
         timeTrace("received packet processed, payload size %u", length);
     }
 }
@@ -417,14 +416,12 @@ DpdkDriver::release(char *payload)
     // be invoked in a worker.
     Dispatch::Lock _(context->dispatch);
 
+    // Note: the payload is actually contained in a PacketBuf structure,
+    // which we return to a pool for reuse later.
     packetBufsUtilized--;
     assert(packetBufsUtilized >= 0);
-    struct rte_mbuf* mbuf = reinterpret_cast<struct rte_mbuf*>(payload -
-            ETHER_HDR_LEN - RTE_PKTMBUF_HEADROOM - sizeof(struct rte_mbuf));
-    if (unlikely(rte_pktmbuf_mtod(mbuf, char*) + ETHER_HDR_LEN != payload)) {
-        DIE("Unable to release the packet mbuf");
-    }
-    rte_pktmbuf_free(mbuf);
+    packetBufPool.destroy(
+        reinterpret_cast<PacketBuf*>(payload - OFFSET_OF(PacketBuf, payload)));
 }
 
 /**
