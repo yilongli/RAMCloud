@@ -311,6 +311,13 @@ DpdkDriver::getMaxPacketSize()
 }
 
 // See docs in Driver class.
+uint32_t
+DpdkDriver::getMaxTransmitQueueSize()
+{
+    return maxTransmitQueueSize;
+}
+
+// See docs in Driver class.
 int
 DpdkDriver::getTransmitQueueSpace(uint64_t currentTime)
 {

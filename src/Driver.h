@@ -239,6 +239,15 @@ class Driver {
     }
 
     /**
+     * Upper limit on how many bytes should be queued for transmission
+     * at any given time.
+     */
+    virtual uint32_t getMaxTransmitQueueSize()
+    {
+        return 10000000;
+    }
+
+    /**
      * This method provides a hint to transports about how many bytes
      * they should send. The driver will operate most efficiently if
      * transports don't send more bytes than indicated by the return value.
@@ -260,7 +269,7 @@ class Driver {
     {
         // Default: no throttling of transmissions (probably not a good
         // idea).
-        return 10000000;
+        return getMaxTransmitQueueSize();
     }
 
     /**
