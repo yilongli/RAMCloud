@@ -70,7 +70,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         Driver* driver, uint64_t clientId)
     : context(context)
     , driver(driver)
-    , lastPollTime(0)
     , locatorString("homa+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
@@ -262,7 +261,12 @@ uint32_t
 HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
 {
     uint32_t gBitsPerSec = 0;
-    uint32_t roundTripMicros = 7;
+    // TODO: The RTT in the m510 cluster is more like 5us (2us of propogation
+    // delay plus 1us of service time). Figure out how to set "rttMicros" from
+    // command line. Changing 7 to 5 reduces 99% from 12.4us to 12.0us when
+    // TIME_TRACE = 1.
+    uint32_t roundTripMicros = 5;
+//    uint32_t roundTripMicros = 7;
 
     if (locator  != NULL) {
         if (locator->hasOption("gbs")) {
@@ -392,6 +396,7 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         uint32_t unscheduledBytes, uint8_t priority, uint8_t flags,
         bool partialOK)
 {
+    uint64_t queueSize = 0;
     uint32_t messageSize = message->size();
 
     uint32_t curOffset = offset;
@@ -414,11 +419,10 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer::Iterator iter(message, 0, messageSize);
             const char* fmt = (flags & FROM_CLIENT) ?
                     "client sending ALL_DATA, clientId %u, sequence %u, "
-                    "length %u, priority %u" :
+                    "priority %u" :
                     "server sending ALL_DATA, clientId %u, sequence %u, "
-                    "length %u, priority %u";
-            timeTrace(fmt, rpcId.clientId, rpcId.sequence, messageSize,
-                    priority);
+                    "priority %u";
+            timeTrace(fmt, rpcId.clientId, rpcId.sequence, priority);
             driver->sendPacket(address, &header, &iter, priority);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
@@ -433,8 +437,13 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     priority);
             driver->sendPacket(address, &header, &iter, priority);
         }
-        timeTrace("sent data, clientId %u, sequence %u, offset %u, length %u",
-                  rpcId.clientId, rpcId.sequence, offset, bytesThisPacket);
+#if TIME_TRACE
+        queueSize = driver->getLastQueueingDelay();
+#endif
+        timeTrace(driver->getLastTransmitTime(),
+                  "sent data, clientId %u, sequence %u, offset %u, "
+                  "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
+                  curOffset, queueSize);
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
     }
@@ -626,8 +635,6 @@ HomaTransport::tryToTransmitData()
             } else {
                 maxBytes = grantedBytesLeft;
             }
-            timeTrace("client about to send bytes, estimated TX queue size %u",
-                    driver->getMaxTransmitQueueSize() - transmitQueueSpace);
             bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -656,8 +663,6 @@ HomaTransport::tryToTransmitData()
             } else {
                 maxBytes = grantedBytesLeft;
             }
-            timeTrace("server about to send bytes, estimated TX queue size %u",
-                    driver->getMaxTransmitQueueSize() - transmitQueueSpace);
             bytesSent = sendBytes(serverRpc->clientAddress,
                     serverRpc->rpcId, &serverRpc->replyPayload,
                     serverRpc->transmitOffset, maxBytes,
@@ -784,8 +789,10 @@ void
 HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier)
 {
-    timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u",
-            t->clientId, t->nextClientSequenceNumber, request->size());
+    timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
+            "opcode %u",
+            t->clientId, t->nextClientSequenceNumber, request->size(),
+            request->getStart<WireFormat::RequestCommon>()->opcode);
     response->reset();
     if (aborted) {
         notifier->failed();
@@ -1640,6 +1647,7 @@ HomaTransport::Poller::poll()
     int result = 0;
 #if TIME_TRACE
     uint64_t startTime = Cycles::rdtsc();
+    uint64_t lastIdleTime = t->driver->getLastIdleTime();
 #endif
 
     // Process any available incoming packets.
@@ -1653,7 +1661,7 @@ HomaTransport::Poller::poll()
         // Log the beginning of poll() here so that timetrace entries do not
         // go back in time.
         if (totalPackets == 0 && numPackets > 0) {
-            uint64_t ns = Cycles::toNanoseconds(startTime - t->lastPollTime);
+            uint64_t ns = Cycles::toNanoseconds(startTime - lastIdleTime);
             timeTrace(startTime, "start of polling iteration %u, "
                     "last poll was %u ns ago", owner->iteration, ns);
         }
@@ -1665,9 +1673,6 @@ HomaTransport::Poller::poll()
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
     result |= totalPackets;
-#if TIME_TRACE
-    t->lastPollTime = startTime;
-#endif
 
     // Send out GRANTs that are produced in the previous processing step
     // in a batch.

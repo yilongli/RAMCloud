@@ -120,6 +120,9 @@ DpdkDriver::DpdkDriver(Context* context, int port)
     , bytesBuffered(0)
     , packetBufPool()
     , packetBufsUtilized(0)
+    , lastIdleTime()
+    , lastTransmitTime()
+    , lastKnownQueuedBytes(0)
     , locatorString()
     , localMac()
     , portId(0)
@@ -311,18 +314,32 @@ DpdkDriver::getMaxPacketSize()
 }
 
 // See docs in Driver class.
-uint32_t
-DpdkDriver::getMaxTransmitQueueSize()
-{
-    return maxTransmitQueueSize;
-}
-
-// See docs in Driver class.
 int
 DpdkDriver::getTransmitQueueSpace(uint64_t currentTime)
 {
     return static_cast<int>(maxTransmitQueueSize) -
             queueEstimator.getQueueSize(currentTime);
+}
+
+// See docs in Driver class.
+uint64_t
+DpdkDriver::getLastIdleTime()
+{
+    return lastIdleTime;
+}
+
+// See docs in Driver class.
+uint64_t
+DpdkDriver::getLastTransmitTime()
+{
+    return lastTransmitTime;
+}
+
+// See docs in Driver class.
+uint32_t
+DpdkDriver::getLastQueueingDelay()
+{
+    return lastKnownQueuedBytes;
 }
 
 // See docs in Driver class.
@@ -343,6 +360,10 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     // as well as from the loopback ring.
     uint32_t incomingPkts = rte_eth_rx_burst(portId, 0, mPkts,
             downCast<uint16_t>(maxPackets));
+    if (incomingPkts < maxPackets) {
+        // TODO: make this optional?
+        lastIdleTime = Cycles::rdtsc();
+    }
 
     if (incomingPkts > 0) {
 #if TIME_TRACE
@@ -704,7 +725,10 @@ DpdkDriver::sendPacket(const Address* addr,
     }
     timeTrace("outgoing packet enqueued");
 #endif
-    queueEstimator.packetQueued(physPacketLength);
+    lastTransmitTime = Cycles::rdtsc();
+    lastKnownQueuedBytes =
+            maxTransmitQueueSize - getTransmitQueueSpace(lastTransmitTime);
+    queueEstimator.packetQueued(physPacketLength, lastTransmitTime);
     PerfStats::threadStats.networkOutputBytes += physPacketLength;
 }
 

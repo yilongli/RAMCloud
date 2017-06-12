@@ -662,10 +662,6 @@ class HomaTransport : public Transport {
     /// The Driver used to send and receive packets.
     Driver* driver;
 
-    /// Cycles::rdtsc time of the most recent time that we polled the NIC
-    /// for incoming packets.
-    uint64_t lastPollTime;
-
     /// Service locator string of this transport.
     string locatorString;
 

@@ -238,14 +238,14 @@ class Driver {
         return 0;
     }
 
-    /**
-     * Upper limit on how many bytes should be queued for transmission
-     * at any given time.
-     */
-    virtual uint32_t getMaxTransmitQueueSize()
-    {
-        return 10000000;
-    }
+//    /**
+//     * Upper limit on how many bytes should be queued for transmission
+//     * at any given time.
+//     */
+//    virtual uint32_t getMaxTransmitQueueSize()
+//    {
+//        return 10000000;
+//    }
 
     /**
      * This method provides a hint to transports about how many bytes
@@ -269,7 +269,43 @@ class Driver {
     {
         // Default: no throttling of transmissions (probably not a good
         // idea).
-        return getMaxTransmitQueueSize();
+        return 10000000;
+    }
+
+    /**
+     * The most recent time that we polled NIC for incoming packets and get
+     * less than what we asked for (i.e., we have retrieved all the packets
+     * from the NIC).
+     * \return
+     *      Last idle time of the NIC RX queue, in Cycles::rdtsc ticks.
+     *      0 means this feature is not supported.
+     */
+    virtual uint64_t getLastIdleTime()
+    {
+        // Default: not implemented
+        return 0;
+    }
+
+    /**
+     * The most recent time that a packet was enqueued to the NIC.
+     * \return
+     *      Last transmit time, in Cycles::rdtsc ticks. 0 means
+     *      this feature is not supported.
+     */
+    virtual uint64_t getLastTransmitTime()
+    {
+        // Default: not implemented
+        return 0;
+    }
+
+    /**
+     * Returns the estimated # bytes outstanding at the NIC's transmit queue
+     * when the last packet was enqueued to the NIC.
+     */
+    virtual uint32_t getLastQueueingDelay()
+    {
+        // Default: not implemented
+        return 0;
     }
 
     /**

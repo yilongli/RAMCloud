@@ -62,8 +62,10 @@ class DpdkDriver : public Driver
     virtual int getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();
-    virtual uint32_t getMaxTransmitQueueSize();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
+    virtual uint64_t getLastIdleTime();
+    virtual uint64_t getLastTransmitTime();
+    virtual uint32_t getLastQueueingDelay();
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
@@ -129,6 +131,15 @@ class DpdkDriver : public Driver
 
     /// Tracks number of outstanding allocated payloads.  For detecting leaks.
     int packetBufsUtilized;
+
+    /// The most recent time that we are sure the NIC RX queue is empty.
+    uint64_t lastIdleTime;
+
+    /// The most recent time that we enqueued a packet to the NIC.
+    uint64_t lastTransmitTime;
+
+    /// The most recent time that we are sure the NIC RX queue is empty.
+    uint32_t lastKnownQueuedBytes;
 
     /// The original ServiceLocator string. May be empty if the constructor
     /// argument was NULL. May also differ if dynamic ports are used.

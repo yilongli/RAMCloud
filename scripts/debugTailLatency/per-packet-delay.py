@@ -4,6 +4,56 @@ from optparse import OptionParser
 import os
 import re
 import sys
+import math
+from itertools import groupby
+
+# Minimum cost to receive a full packet, in microseconds
+MIN_RX_PACKET_COST = 0.3
+
+class Packet:
+    '''
+    TODO
+    '''
+    def __init__(self, packetId):
+        # Unique identifier of the packet as a quadruple:
+        # (RequestOrReply, clientId, sequenceNum, offset)
+        self.packetId = packetId
+
+        # Sender and recipient of the packet
+        self.sender = None
+        self.recipient = None
+
+        # Other properties of the packet
+        self.length = float('NaN')
+        self.priority = None
+        self.isAllData = None
+
+        # Timestamps
+        self.sentTime = float('NaN')
+        self.recvTime = float('NaN')
+        self.orderTime = None
+
+        # Runtime properties
+        self.delay = float('NaN')
+        self.extraDelay = None
+        self.txQueuedBytes = float('NaN')
+
+        # Sources of delays:
+        # 1) Queueing delay at the NIC's transmit queue
+        # 2) Queueing delay at TOR switch
+        # 3) Polling gap: corresponding to the max. polling delay
+        # 4) Software overhead of receiving packets
+        self.txQueueDelay = None
+        self.maxTorQueueDelay = float('NaN')
+        self.maxPollingDelay = float('NaN')
+        self.rxDelay = float('NaN')
+
+    def isComplete(self):
+        return not math.isnan(self.sentTime) and \
+                not math.isnan(self.recvTime) and self.priority
+
+    def getMessageId(self):
+        return self.packetId[0], self.packetId[1:3]
 
 
 class MessageParser:
@@ -14,9 +64,21 @@ class MessageParser:
 
     def __init__(self):
         self.regex = re.compile("|".join([
-            " (.*) \| (.*) us .*: (sent) data, clientId (\d+), sequence (\d+), offset (\d+), length (\d+)",
-            " (.*) \| (.*) us .*: \D+ (received) DATA, clientId (\d+), sequence (\d+), offset (\d+)",
-            " (.*) \| (.*) us .*: \D+ (received) ALL_DATA, clientId (\d+), sequence (\d+)"]))
+            " (.*) \| (.*) us .*: (start) of polling iteration \d+, last poll was (\d+) ns ago",
+            " (.*) \| (.*) us .*: \D+ (sending) ALL_DATA, clientId (\d+), sequence (\d+), priority (\d+)",
+            " (.*) \| (.*) us .*: \D+ (sending) DATA, clientId (\d+), sequence (\d+), offset (\d+), priority (\d+)",
+            " (.*) \| (.*) us .*: (sent) data, clientId (\d+), sequence (\d+), offset (\d+), (\d+) bytes queued ahead",
+            " (.*) \| (.*) us .*: \D+ (received) DATA, clientId (\d+), sequence (\d+), offset (\d+), length (\d+)",
+            " (.*) \| (.*) us .*: \D+ (received) ALL_DATA, clientId (\d+), sequence (\d+), length (\d+)"]))
+        self.packets = {}
+        self.startOfPoll = {}
+        self.maxPollingDelays = {}
+
+        # RpcId :-> (client, server)
+        self.rpcClientServer = {}
+
+    def getPackets(self):
+        return [p for p in self.packets.values()]
 
     def parse(self, message):
         '''
@@ -26,39 +88,108 @@ class MessageParser:
 
         matchObj = self.regex.match(message)
         if matchObj is None:
-            return None
+            return
 
         matchedGroups = [x for x in matchObj.groups() if x]
         who = matchedGroups[0]
         time = float(matchedGroups[1])
-        sendingData = matchedGroups[2] == "sent"
-        isRequest = who.startswith("server") ^ sendingData
-        if sendingData:
-            # sent data
-            clientId, sequenceNum, offset, lengthOrDataFlag = \
-                    [int(x) for x in matchedGroups[3:]]
-        elif len(matchedGroups) == 6:
-            # received DATA
-            clientId, sequenceNum, offset = [int(x) for x in matchedGroups[3:]]
-            lengthOrDataFlag = False
-        else:
-            # received ALL_DATA
-            assert len(matchedGroups) == 5
-            clientId, sequenceNum = [int(x) for x in matchedGroups[3:]]
-            offset = 0
-            lengthOrDataFlag = True
+        action = matchedGroups[2]
+        isRequest = who.startswith("server") ^ (action in ["sent", "sending"])
 
-        return (isRequest, clientId, sequenceNum, offset), \
-                (who, sendingData, time, lengthOrDataFlag)
+        if action == "start":
+            # Case 0: the beginning of a polling iteration
+            lastIdleTime = int(matchedGroups[3])
+            self.startOfPoll[who] = time
+            self.maxPollingDelays[who] = lastIdleTime / 1000.0
+        elif action == "sending":
+            # Case 1: about to send a packet (note: this message won't be
+            # necessary if RAMCloud::TimeTrace::record can take > 4 arguments)
+            if len(matchedGroups) == 6:
+                clientId, sequenceNum, priority = \
+                        [int(x) for x in matchedGroups[3:]]
+                offset = 0
+            else:
+                clientId, sequenceNum, offset, priority = \
+                        [int(x) for x in matchedGroups[3:]]
+
+            packetId = (isRequest, clientId, sequenceNum, offset)
+            packet = Packet(packetId)
+            packet.sender = who
+            packet.priority = priority
+            self.packets[packetId] = packet
+        elif action == "sent":
+            # Case 2: a data packet has been sent
+            clientId, sequenceNum, offset, queueSize = \
+                    [int(x) for x in matchedGroups[3:]]
+
+            packetId = (isRequest, clientId, sequenceNum, offset)
+            if packetId not in self.packets:
+                self.packets[packetId] = Packet(packetId)
+            packet = self.packets[packetId]
+            packet.sender = who
+            packet.sentTime = time
+            packet.txQueuedBytes = queueSize
+        else:
+            # Case 3: received a data packet
+            isAllData = len(matchedGroups) == 6
+            if isAllData:
+                assert len(matchedGroups) == 6
+                clientId, sequenceNum, length = \
+                        [int(x) for x in matchedGroups[3:]]
+                offset = 0
+            else:
+                clientId, sequenceNum, offset, length = \
+                        [int(x) for x in matchedGroups[3:]]
+
+            packetId = (isRequest, clientId, sequenceNum, offset)
+            if packetId not in self.packets:
+                # We don't have the TX record of this packet.
+                self.packets[packetId] = Packet(packetId)
+            if (packetId not in self.packets) or (who not in self.maxPollingDelays):
+                # We don't have the polling start record
+                self.maxPollingDelays[who] = float('NaN')
+
+            packet = self.packets[packetId]
+            packet.recipient = who
+            packet.recvTime = time
+            packet.length = length
+            packet.isAllData = isAllData
+
+            packet.delay = packet.recvTime - packet.sentTime
+            if who not in self.startOfPoll:
+                self.startOfPoll[who] = float('NaN')
+                self.maxPollingDelays[who] = float('NaN')
+            packet.maxPollingDelay = self.maxPollingDelays[who]
+            packet.rxDelay = max(0,
+                    time - self.startOfPoll[who] - MIN_RX_PACKET_COST)
+
+            # TODO: WHAT ABOUT JITTER BEFORE PREVIOUS POLL? CAN IT AFFECT THIS PACKET?
+
+            self.updateRpcInfo(packet)
+
+    def updateRpcInfo(self, packet):
+        '''
+        Infer the sender and recipient of an RPC based on the sender
+        and recipient of a data packet.
+        '''
+        if packet.sender is None or packet.recipient is None:
+            return
+        isRequest, rpcId = packet.getMessageId()
+        if rpcId not in self.rpcClientServer:
+            self.rpcClientServer[rpcId] = (packet.sender, packet.recipient) \
+                    if isRequest else (packet.recipient, packet.sender)
+
 
 if __name__ == "__main__":
     optParser = OptionParser(description=
             'Extract the per-packet delay information from a time trace file.',
             usage='%prog [options] inputFile',
             conflict_handler='resolve')
-    optParser.add_option('-s', '--sender', default='', metavar='TX',
+    optParser.add_option('-b', '--bandwidth', default=10, metavar='BW',
+            dest='bandwidth', help='bandwidth of the NIC, in Gb/s')
+    optParser.add_option('-s', '--sender', default=None, metavar='TX',
             dest='sender', help='only print packets sent from TX')
-    optParser.add_option('-r', '--receiver', default='', metavar='RX',
+    optParser.add_option('-r', '--receiver', default=None, metavar='RX',
             dest='receiver', help='only print packets received by RX')
     optParser.add_option('--orderByRx', action='store_true', default=False,
             help='sort packets by their received time')
@@ -67,34 +198,69 @@ if __name__ == "__main__":
         print("Wrong number of arguments!")
         exit()
 
+    bwBytesPerMicros = options.bandwidth / 8 * 1000.0
+    print "Bandwidth = %.1f B/us" % bwBytesPerMicros
+    print("# options: %s" % options)
+
     # Parse time trace messages
     parser = MessageParser()
-    packetSent = {}
-    records = []
-    for line in fileinput.input(args[0]):
-        result = parser.parse(line)
-        if result is None:
-            continue
+    map(parser.parse, fileinput.input(args[0]))
 
-        packetId, (who, sendingData, time, lengthOrDataFlag) = result
-        if sendingData:
-            packetSent[packetId] = (who, time, lengthOrDataFlag)
-        elif packetId in packetSent:
-            sender, sentTime, length = packetSent[packetId]
-            delay = time - sentTime
-            records.append((sender, who,
-                    time if options.orderByRx else sentTime,
-                    delay, packetId[1:]+(length,),
-                    'S' if lengthOrDataFlag is True else ''))
-    records = sorted(records, key=lambda r : r[2])
+    # Fix up missing senders/recipients if possible
+    packets = parser.getPackets()
+    for p in packets:
+        if p.sender is None or p.recipient is None:
+            isRequest, rpcId = p.getMessageId()
+            if rpcId in parser.rpcClientServer:
+                if isRequest:
+                    p.sender, p.recipient = parser.rpcClientServer[rpcId]
+                else:
+                    p.recipient, p.sender = parser.rpcClientServer[rpcId]
 
-    # Print per-packet delay filtered by specific sender(s) and/or receiver(s)
-    records = filter(lambda x :
-            (options.sender == '' or x[0] == options.sender) and
-            (options.receiver == '' or x[1] == options.receiver), records)
-    print("# options: %s" % options)
-    prevTime = records[0][2]
-    for r in records:
-        r = r[:3] + (r[2] - prevTime,) + r[3:]
-        prevTime = r[2]
-        print(" %s -> %s | %.2f (+ %.2f) %5.2f %s %s" % r)
+    # Analytics
+    # Step 1: compute min. delay for each packet size
+    minDelay = {None : float('NaN')}
+    ps = sorted([p for p in packets if p.length is not None \
+            and not math.isnan(p.delay)], key=lambda p : p.length)
+    for pktLength, group in groupby(ps, lambda p : p.length):
+        ds = map(lambda p : p.delay, group)
+        minDelay[pktLength] = min(ds)
+        print "packet size %d, #samples %d, min. delay %.2f us" % \
+                (pktLength, len(ds), minDelay[pktLength])
+
+    # Step 2: derive the rest of the properties
+    packets = [p for p in packets if
+            (options.sender is None or options.sender == p.sender) and
+            (options.receiver is None or options.receiver == p.recipient)]
+    for pkt in packets:
+        pkt.orderTime = pkt.recvTime if options.orderByRx else pkt.sentTime
+        pkt.extraDelay = pkt.delay - minDelay.get(pkt.length, float('NaN'))
+        pkt.txQueueDelay = pkt.txQueuedBytes / bwBytesPerMicros
+        pkt.maxTorQueueDelay = max(0, pkt.extraDelay - pkt.txQueueDelay \
+                - pkt.maxPollingDelay - pkt.rxDelay)
+
+    # Print per-packet delay
+    line = 0
+    if len(packets) > 0:
+        packets = sorted(filter(lambda p : not math.isnan(p.orderTime), packets),
+                key=lambda p : p.orderTime)
+        prevTime = packets[0].orderTime
+        for p in packets:
+            deltaTime = p.orderTime - prevTime
+            prevTime = p.orderTime
+            normalize = lambda x : x / p.extraDelay if p.extraDelay > 0 else float('NaN')
+
+            if line % 50 == 0:
+                print " sender     receiver|    time     delta    delay  extra|   TX queue    TOR switch    polling      RX overhead|  clientId   seq.   off.   len.  prio"
+            line += 1
+            print(" %s -> %s | %9.2f (+ %.2f) %6.2f %6.2f | %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) | %s%s" % (
+                    '   ?   ' if p.sender is None else p.sender,
+                    '   ?   ' if p.recipient is None else p.recipient,
+                    p.orderTime, deltaTime, p.delay, p.extraDelay,
+                    p.txQueueDelay, normalize(p.txQueueDelay),
+                    p.maxTorQueueDelay, normalize(p.maxTorQueueDelay),
+                    p.maxPollingDelay, normalize(p.maxPollingDelay),
+                    p.rxDelay, normalize(p.rxDelay),
+                    p.packetId[1:]+(p.length, p.priority),
+                    ' S' if p.isAllData else ''))
+

@@ -54,11 +54,13 @@ class QueueEstimator {
      * \param length
      *      Total number of bytes in packet(s) that were just added to the
      *      NIC's queue.
+     * \param transmitTime
+     *      Time when the packet was queued in the NIC, in Cycles::rdtsc ticks.
      */
     void
-    packetQueued(uint32_t length)
+    packetQueued(uint32_t length, uint64_t transmitTime = Cycles::rdtsc())
     {
-        getQueueSize(Cycles::rdtsc());
+        getQueueSize(transmitTime);
         queueSize += length;
     }
 
