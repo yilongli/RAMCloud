@@ -231,6 +231,10 @@ class HomaTransport : public Transport {
         /// haven't sent any GRANTs.
         uint32_t grantOffset;
 
+        /// Packet priority embedded in the most recent GRANT packet we have
+        /// sent for this incoming message, or 0 if we haven't sent any GRANTS.
+        uint8_t grantPriority;
+
         /// Unique identifier for the RPC this message belongs to.
         RpcId rpcId;
 
@@ -703,12 +707,9 @@ class HomaTransport : public Transport {
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
 
-    /// Holds the recipients of `grantPackets`.
-    std::vector<const Driver::Address*> grantRecipients;
-
-    /// Holds outgoing GRANT packets about to be sent. Always empty, except
+    /// Holds incoming messages we are about to grant. Always empty, except
     /// when the poll method is receiving and processing incoming packets.
-    std::vector<GrantHeader> grantPackets;
+    std::vector<ScheduledMessage*> grantRecipients;
 
     /// Holds message buffers that are consist of payloads that are retained
     /// and assembled by the MessageAccumulator. These retained payloads are

@@ -85,7 +85,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , nextServerSequenceNumber(1)
     , receivedPackets()
     , grantRecipients()
-    , grantPackets()
     , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
@@ -1585,6 +1584,7 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
     , activeMessageLinks()
     , inactiveMessageLinks()
     , grantOffset(unscheduledBytes)
+    , grantPriority(0)
     , rpcId(rpcId)
     , senderAddress(senderAddress)
     , senderHash(std::hash<std::string>{}(senderAddress->toString()))
@@ -1670,25 +1670,27 @@ HomaTransport::Poller::poll()
 #endif
 
     // Send out GRANTs that are produced in the previous processing step
-    // in a batch-stypl
-    for (unsigned i = 0; i < t->grantPackets.size(); i++) {
-        GrantHeader* grant = &t->grantPackets[i];
-        CommonHeader* common = &grant->common;
-        const char* fmt = (common->flags & FROM_CLIENT) ?
+    // in a batch.
+    for (ScheduledMessage* recipient : t->grantRecipients) {
+        uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
+                FROM_SERVER : FROM_CLIENT;
+        GrantHeader grant(recipient->rpcId, recipient->grantOffset,
+                recipient->grantPriority, whoFrom);
+        const char* fmt = (whoFrom == FROM_CLIENT) ?
                 "client sending GRANT, clientId %u, sequence %u, offset %u, "
                 "priority %u" :
                 "server sending GRANT, clientId %u, sequence %u, offset %u, "
                 "priority %u";
-        timeTrace(fmt, common->rpcId.clientId, common->rpcId.sequence,
-                grant->offset, grant->priority);
-        t->driver->sendPacket(t->grantRecipients[i], grant, NULL,
+        timeTrace(fmt, recipient->rpcId.clientId, recipient->rpcId.sequence,
+                grant.offset, grant.priority);
+
+        t->driver->sendPacket(recipient->senderAddress, &grant, NULL,
                 t->controlPacketPriority);
-//        t->driver->bufferPacket(t->grantRecipients[i], grant, NULL,
+//        t->driver->bufferPacket(recipient->senderAddress, &grant, NULL,
 //                t->controlPacketPriority);
     }
 //    t->driver->flushTxBuffer();
     t->grantRecipients.clear();
-    t->grantPackets.clear();
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -2185,6 +2187,7 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     }
 
     messageToGrant->grantOffset += grantIncrement;
+    messageToGrant->grantPriority = priority;
     if (messageToGrant->grantOffset >=
             messageToGrant->accumulator->totalLength) {
         // Slow path: a message has been fully granted. Purge it from the
@@ -2194,11 +2197,10 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     }
 
     // Output a GRANT for the selected message.
-    uint8_t whoFrom = (messageToGrant->whoFrom == FROM_CLIENT) ?
-            FROM_SERVER : FROM_CLIENT;
-    grantRecipients.push_back(messageToGrant->senderAddress);
-    grantPackets.emplace_back(messageToGrant->rpcId,
-            messageToGrant->grantOffset, priority, whoFrom);
+    if (std::find(grantRecipients.begin(), grantRecipients.end(),
+            messageToGrant) == grantRecipients.end()) {
+        grantRecipients.push_back(messageToGrant);
+    }
 }
 
 }  // namespace RAMCloud
