@@ -11,10 +11,12 @@ wait
 # Example delay message:
 # client1 -> server1 | 7.86 (+ 6.40)  5.47 (2139013751, 71122, 271950, 1470)
 awk_script='BEGIN {p=0} {delta=sprintf("%.2f)", $5-p); sub(".*", delta, $7); print $0; p=$5;}'
-for host in client1 client2 server1 server2; do
+for logfile in *.log; do
+    [[ $logfile == coordinator* ]] && continue
+    who=$(echo $logfile | cut -d . -f 1)
     # Grep delay messages from a specific sender and rewrite the timestamp delta
-    grep "$host ->" ${dir}/all_tx_delay.txt | awk "$awk_script" > ${dir}/${host}_tx_delay.txt &
-    grep " -> $host" ${dir}/all_rx_delay.txt | awk "$awk_script" > ${dir}/${host}_rx_delay.txt &
+    grep "$who ->" ${dir}/all_tx_delay.txt | awk "$awk_script" > ${dir}/${who}_tx_delay.txt &
+    grep " -> $who" ${dir}/all_rx_delay.txt | awk "$awk_script" > ${dir}/${who}_rx_delay.txt &
 done
 
 # Extract RPCs that experienced high latency.
