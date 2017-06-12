@@ -1827,19 +1827,29 @@ HomaTransport::checkTimeouts()
         } else if (!scheduledMessage ||
                 (scheduledMessage->state == ScheduledMessage::ACTIVE) ||
                 (scheduledMessage->state == ScheduledMessage::PURGED)) {
-            // We have received part of the response and the response message
-            // is either a unscheduled, active or purged message. If the server
-            // has gone silent, this must mean packets were lost, grants were
-            // lost, or the server has preempted this response for higher
-            // priority messages, so request retransmission anyway.
+            // We have received part of the response and expect to receive
+            // more, meaning that the response message is either a unscheduled,
+            // active or purged message. If the server has gone silent, this
+            // must mean packets were lost, grants were lost, or the server
+            // has preempted this response for higher priority messages, so
+            // request retransmission anyway.
             if (clientRpc->silentIntervals >= 2) {
                 uint32_t grantOffset = scheduledMessage ?
                         scheduledMessage->grantOffset : 0;
-                if (grantOffset == clientRpc->accumulator->buffer->size()) {
-                    // TODO: NOT SURE WHY THIS COULD HAPPEN?
-                    LOG(WARNING, "client rpc starved of grant, sequence %lu, "
-                            "grantOffset %u",
-                            clientRpc->sequence, grantOffset);
+                if (scheduledMessage &&
+                        grantOffset == clientRpc->accumulator->buffer->size())
+                {
+                    // TODO: NOT SURE WHY THIS COULD HAPPEN? WE HAVE RECEIVED
+                    // ALL WE HAVE ASKED FOR; IT'S OUR PROBLEM TO NOT SEND ENOUGH
+                    // GRANTs!!!
+                    LOG(WARNING, "client rpc starved of grant, clientId %lu, "
+                            "sequence %lu, grantOffset %u, %lu activeMessages",
+                            clientRpc->rpcId.clientId, clientRpc->sequence,
+                            grantOffset, activeMessages.size());
+                    timeTrace("server rpc starved of grant, clientId %u, "
+                            "sequence %u, grantOffset %u, %u active messages",
+                            clientRpc->rpcId.clientId, clientRpc->sequence,
+                            grantOffset, activeMessages.size());
                     continue;
                 }
                 clientRpc->accumulator->requestRetransmission(this,
@@ -1896,9 +1906,13 @@ HomaTransport::checkTimeouts()
             if (grantOffset == serverRpc->accumulator->buffer->size()) {
                 // TODO: NOT SURE WHY THIS COULD HAPPEN?
                 LOG(WARNING, "server rpc starved of grant, clientId %lu, "
-                        "sequence %lu, grantOffset %u",
+                        "sequence %lu, grantOffset %u, %lu active messages",
                         serverRpc->rpcId.clientId, serverRpc->rpcId.sequence,
-                        grantOffset);
+                        grantOffset, activeMessages.size());
+                timeTrace("server rpc starved of grant, clientId %u, "
+                        "sequence %u, grantOffset %u, %u active messages",
+                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence,
+                        grantOffset, activeMessages.size());
                 continue;
             }
             serverRpc->accumulator->requestRetransmission(this,
