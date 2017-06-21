@@ -318,6 +318,9 @@ class HomaTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
+        // TODO
+        int topOutgoingRequest;
+
         /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
 
@@ -344,6 +347,7 @@ class HomaTransport : public Transport {
             , lastTransmitTime(0)
             , silentIntervals(0)
             , transmitPending(false)
+            , topOutgoingRequest(-1)
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
@@ -648,7 +652,11 @@ class HomaTransport : public Transport {
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
             bool partialOK = false);
+    template<typename T>
+    void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
+    void removeTopOutgoingRequest(ClientRpc* request);
+    void tryToPromote(ClientRpc* request);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
@@ -728,6 +736,9 @@ class HomaTransport : public Transport {
     /// fewer than about 20 objects.
     typedef std::map<uint64_t, ClientRpc*> ClientRpcMap;
     ClientRpcMap outgoingRpcs;
+    // TODO: The way we are uing this map is quite inefficient!!!
+    // (e.g. frequently iterating the entire map) especially when there is
+    // a large number of outstanding RPCs
 
     /// Holds RPCs for which we are the client, and for which the
     /// request message has not yet been completely transmitted (once
@@ -737,6 +748,11 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ClientRpc, outgoingRequestLinks)
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
+
+    // TODO: Top K outgoing requests; how to decide K? we want it small so
+    // scanning is fast but not too small the sender has to frequently look
+    // outside this set
+    ClientRpc* topOutgoingRequests[8];
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and
@@ -838,6 +854,35 @@ class HomaTransport : public Transport {
     /// Maximum # incoming messages that can be actively granted by the
     /// transport at any time.
     uint32_t maxGrantedMessages;
+
+    //---------------------------
+    // NETWORK THROUGHPUT MONITOR
+    //---------------------------
+
+    // TODO: figure out why ClusterPerf load factor doesn't match the tput
+    // measured at transport layer
+
+    /// The beginning of the current monitoring interval, in units of
+    /// rdtsc ticks.
+    uint64_t lastMeasureTime;
+
+    /// Total # control bytes transmitted in the current interval.
+    uint32_t outputControlBytes;
+
+    /// Total # data bytes (excluding packet headers) transmitted in the
+    /// current interval.
+    uint32_t outputDataBytes;
+
+    /// Total # retransmitted data bytes (excluding packet headers) in the
+    /// current interval.
+    uint32_t outputResentBytes;
+
+    /// `monitorMillis` in units of rdtsc ticks.
+    uint64_t monitorInterval;
+
+    /// Specifies the period over which to compute average network throughput,
+    /// in milliseconds.
+    uint32_t monitorMillis;
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };

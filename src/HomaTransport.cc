@@ -89,6 +89,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , clientRpcPool()
     , outgoingRpcs()
     , outgoingRequests()
+    , topOutgoingRequests()
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
@@ -110,6 +111,12 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , inactiveMessages()
     , highestGrantedPrio(-1)
     , maxGrantedMessages(3)
+    , lastMeasureTime(0)
+    , outputControlBytes(0)
+    , outputDataBytes(0)
+    , outputResentBytes(0)
+    , monitorInterval()
+    , monitorMillis()
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -117,6 +124,10 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // intervals result in unnecessary retransmissions.
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
+
+    // Measure network throughput at 1 ms intervals.
+    monitorMillis = 1;
+    monitorInterval = Cycles::fromMicroseconds(1000*monitorMillis);
 
     // If we are allowed to use more than one priority, split the available
     // priorities equally between unscheduled and scheduled traffic.
@@ -143,11 +154,13 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
             "roundTripBytes %u, grantIncrement %u, pingIntervals %d, "
             "timeoutIntervals %d, timerInterval %.2f ms, "
+            "monitorInterval %.2f ms, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
             "highestSchedPriority %d, unscheduledTrafficPrioBrackets %s",
             clientId, maxDataPerPacket, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3,
+            Cycles::toSeconds(monitorInterval)*1e3,
             highestAvailPriority, lowestUnschedPrio, highestSchedPriority,
             brackets.c_str());
 }
@@ -213,6 +226,9 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
     if (clientRpc->transmitPending) {
         erase(outgoingRequests, *clientRpc);
     }
+    if (clientRpc->topOutgoingRequest >= 0) {
+        removeTopOutgoingRequest(clientRpc);
+    }
     clientRpcPool.destroy(clientRpc);
     timeTrace("deleted client RPC, clientId %u, sequence %u",
             clientId, sequence);
@@ -265,7 +281,8 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
     // delay plus 1us of service time). Figure out how to set "rttMicros" from
     // command line. Changing 7 to 5 reduces 99% from 12.4us to 12.0us when
     // TIME_TRACE = 1.
-    uint32_t roundTripMicros = 5;
+    uint32_t roundTripMicros = 9;
+//    uint32_t roundTripMicros = 5;
 //    uint32_t roundTripMicros = 7;
 
     if (locator  != NULL) {
@@ -446,9 +463,30 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                   curOffset, queueSize);
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
+        if (flags & RETRANSMISSION) {
+            outputResentBytes += bytesThisPacket;
+        }
     }
 
+    outputDataBytes += bytesSent;
     return bytesSent;
+}
+
+/**
+ * Send out a single control packet.
+ *
+ * \param recipient
+ *      Where to send the packet.
+ * \param packet
+ *      Address of the first byte of the control packet header.
+ */
+template<typename T>
+void
+HomaTransport::sendControlPacket(const Driver::Address* recipient,
+        const T* packet)
+{
+    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+    outputControlBytes += static_cast<uint32_t>(sizeof(T));
 }
 
 /**
@@ -456,7 +494,7 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
  * string describing the information in its header.
  * 
  * \param packet
- *      Address of the first bite of the packet header, which must be
+ *      Address of the first byte of the packet header, which must be
  *      contiguous in memory.
  * \param packetLength
  *      Size of the header, in bytes.
@@ -590,19 +628,37 @@ HomaTransport::tryToTransmitData()
         // need to be revisited.
         ClientRpc* clientRpc = NULL;
         ServerRpc* serverRpc = NULL;
-        // TODO: WHAT ABOUT FINDING NOT JUST THE MIN. MSG BUT ALSO THE 2ND MIN.
         uint32_t minBytesLeft = ~0u;
-        for (OutgoingRequestList::iterator it = outgoingRequests.begin();
-                    it != outgoingRequests.end(); it++) {
-            ClientRpc* rpc = &(*it);
-            if (rpc->transmitLimit <= rpc->transmitOffset) {
-                // Can't transmit this message: waiting for grants.
-                continue;
+        for (ClientRpc* rpc : topOutgoingRequests) {
+            if (rpc != NULL) {
+                if (rpc->transmitLimit <= rpc->transmitOffset) {
+                    // Can't transmit this message: waiting for grants.
+                    continue;
+                }
+                uint32_t bytesLeft =
+                        rpc->request->size() - rpc->transmitOffset;
+                if (bytesLeft < minBytesLeft) {
+                    minBytesLeft = bytesLeft;
+                    clientRpc = rpc;
+                }
             }
-            uint32_t bytesLeft = rpc->request->size() - rpc->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                clientRpc = rpc;
+        }
+#define unlikely(x) __glibc_unlikely(x)
+        if (unlikely(NULL == clientRpc && !outgoingRequests.empty())) {
+            timeTrace("slow path taken, iterating over %u outgoing requests",
+                    outgoingRequests.size());
+            for (OutgoingRequestList::iterator it = outgoingRequests.begin();
+                        it != outgoingRequests.end(); it++) {
+                ClientRpc* rpc = &(*it);
+                if (rpc->transmitLimit <= rpc->transmitOffset) {
+                    // Can't transmit this message: waiting for grants.
+                    continue;
+                }
+                uint32_t bytesLeft = rpc->request->size() - rpc->transmitOffset;
+                if (bytesLeft < minBytesLeft) {
+                    minBytesLeft = bytesLeft;
+                    clientRpc = rpc;
+                }
             }
         }
         for (OutgoingResponseList::iterator it = outgoingResponses.begin();
@@ -621,7 +677,7 @@ HomaTransport::tryToTransmitData()
             }
         }
 
-        int bytesSent = 0;
+        uint32_t bytesSent = 0;
         if (clientRpc != NULL) {
             // Transmit one or more request DATA packets from clientRpc,
             // if appropriate.
@@ -635,6 +691,8 @@ HomaTransport::tryToTransmitData()
             } else {
                 maxBytes = grantedBytesLeft;
             }
+            // TODO: REMOVE THIS
+            timeTrace("queue space %u, granted bytes left %u, maxBytes %u", transmitQueueSpace, grantedBytesLeft, maxBytes);
             bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -649,6 +707,11 @@ HomaTransport::tryToTransmitData()
             if (clientRpc->transmitOffset >= clientRpc->request->size()) {
                 erase(outgoingRequests, *clientRpc);
                 clientRpc->transmitPending = false;
+                if (clientRpc->topOutgoingRequest >= 0) {
+                    removeTopOutgoingRequest(clientRpc);
+                }
+            } else if (clientRpc->topOutgoingRequest < 0) {
+                tryToPromote(clientRpc);
             }
         } else if (serverRpc != NULL) {
             // Transmit one or more response DATA packets from serverRpc,
@@ -784,15 +847,51 @@ HomaTransport::Session::getRpcInfo()
     return result;
 }
 
+void
+HomaTransport::removeTopOutgoingRequest(ClientRpc *clientRpc) {
+    int k = clientRpc->topOutgoingRequest;
+    clientRpc->topOutgoingRequest = -1;
+    topOutgoingRequests[k] = NULL;
+}
+
+void
+HomaTransport::tryToPromote(ClientRpc *clientRpc)
+{
+    uint32_t bytesLeft = 0;
+    uint32_t maxBytesLeft = 0;
+    int i = 0, k = 0;
+    for (ClientRpc* rpc : topOutgoingRequests) {
+        if (NULL == rpc) {
+            topOutgoingRequests[i] = clientRpc;
+            clientRpc->topOutgoingRequest = i;
+            return;
+        }
+        bytesLeft = rpc->request->size() - rpc->transmitOffset;
+        if (maxBytesLeft < bytesLeft) {
+            maxBytesLeft = bytesLeft;
+            k = i;
+        }
+        i++;
+    }
+
+    bytesLeft = clientRpc->request->size() - clientRpc->transmitOffset;
+    if (maxBytesLeft > bytesLeft) {
+        topOutgoingRequests[k]->topOutgoingRequest = -1;
+        topOutgoingRequests[k] = clientRpc;
+        clientRpc->topOutgoingRequest = k;
+    }
+}
+
 // See Transport::Session::sendRequest for docs.
 void
 HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier)
 {
     timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
-            "opcode %u",
-            t->clientId, t->nextClientSequenceNumber, request->size(),
-            request->getStart<WireFormat::RequestCommon>()->opcode);
+            "%u outgoing requests", t->clientId, t->nextClientSequenceNumber,
+            request->size(), t->outgoingRequests.size());
+//    timeTrace("request opcode %u",
+//            request->getStart<WireFormat::RequestCommon>()->opcode);
     response->reset();
     if (aborted) {
         notifier->failed();
@@ -806,6 +905,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->outgoingRequests.push_back(*clientRpc);
     clientRpc->transmitPending = true;
+    t->tryToPromote(clientRpc);
     t->nextClientSequenceNumber++;
     uint32_t bytesSent = t->tryToTransmitData();
     if (bytesSent > 0) {
@@ -989,6 +1089,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
+                        tryToPromote(clientRpc);
+                    } else {
+                        if (clientRpc->topOutgoingRequest >= 0) {
+                            removeTopOutgoingRequest(clientRpc);
+                            tryToPromote(clientRpc);
+                        }
                     }
                     return;
                 }
@@ -1008,8 +1114,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // retransmit; just return an ACK so the server knows
                     // we're still alive.
                     AckHeader ack(header->common.rpcId, FROM_CLIENT);
-                    driver->sendPacket(clientRpc->session->serverAddress,
-                            &ack, NULL, controlPacketPriority);
+                    sendControlPacket(clientRpc->session->serverAddress, &ack);
                     return;
 
                 }
@@ -1258,8 +1363,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // TODO: roundTripBytes should be replaced with what?
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, 0, FROM_SERVER|RESTART);
-                    driver->sendPacket(received->sender, &resend, NULL,
-                            controlPacketPriority);
+                    sendControlPacket(received->sender, &resend);
                     return;
                 }
                 uint32_t resendEnd = header->offset + header->length;
@@ -1280,8 +1384,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // retransmit; just return an ACK so the client knows
                     // we're still alive.
                     AckHeader ack(serverRpc->rpcId, FROM_SERVER);
-                    driver->sendPacket(serverRpc->clientAddress, &ack, NULL,
-                            controlPacketPriority);
+                    sendControlPacket(serverRpc->clientAddress, &ack);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1346,8 +1449,9 @@ HomaTransport::ServerRpc::getClientServiceLocator()
 void
 HomaTransport::ServerRpc::sendReply()
 {
-    timeTrace("sendReply invoked, clientId %u, sequence %u, length %u",
-            rpcId.clientId, rpcId.sequence, replyPayload.size());
+    timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
+            "%u outgoing responses", rpcId.clientId, rpcId.sequence,
+            replyPayload.size(), t->outgoingResponses.size());
     sendingResponse = true;
     transmitLimit = t->roundTripBytes;
     unscheduledBytes = t->roundTripBytes;
@@ -1564,7 +1668,7 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
     // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
     ResendHeader resend(rpcId, buffer->size(), length,
             t->getUnschedTrafficPrio(length), whoFrom);
-    t->driver->sendPacket(address, &resend, NULL, t->controlPacketPriority);
+    t->sendControlPacket(address, &resend);
     return endOffset;
 }
 
@@ -1644,6 +1748,18 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
 int
 HomaTransport::Poller::poll()
 {
+    // See if we should compute the network throughput in the last interval.
+    if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
+        timeTrace("monitoring network outgoing throughput, "
+                  "data %u Mbps (resend %u Mbps), control %u Mbps",
+                  t->outputDataBytes*8/1000, t->outputResentBytes*8/1000,
+                  t->outputControlBytes*8/1000);
+        t->lastMeasureTime = owner->currentTime;
+        t->outputControlBytes = 0;
+        t->outputDataBytes = 0;
+        t->outputResentBytes = 0;
+    }
+
     int result = 0;
 #if TIME_TRACE
     uint64_t startTime = Cycles::rdtsc();
@@ -1689,8 +1805,7 @@ HomaTransport::Poller::poll()
         timeTrace(fmt, recipient->rpcId.clientId, recipient->rpcId.sequence,
                 grant.offset, grant.priority);
 
-        t->driver->sendPacket(recipient->senderAddress, &grant, NULL,
-                t->controlPacketPriority);
+        t->sendControlPacket(recipient->senderAddress, &grant);
 //        t->driver->bufferPacket(recipient->senderAddress, &grant, NULL,
 //                t->controlPacketPriority);
     }
@@ -1781,6 +1896,9 @@ void
 HomaTransport::checkTimeouts()
 {
     // Scan all of the ClientRpc objects.
+    timeTrace("checkTimeouts invoked, %u outgoing RPCs, "
+            "%u incomplete incoming requests",
+            outgoingRpcs.size(), serverTimerList.size());
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
             it != outgoingRpcs.end(); ) {
         uint64_t sequence = it->first;
@@ -1826,8 +1944,7 @@ HomaTransport::checkTimeouts()
                 ResendHeader resend(RpcId(clientId, sequence), 0,
                         roundTripBytes, 0, FROM_CLIENT);
                 // The RESEND packet is effectively a grant...
-                driver->sendPacket(clientRpc->session->serverAddress,
-                        &resend, NULL, controlPacketPriority);
+                sendControlPacket(clientRpc->session->serverAddress, &resend);
             }
         } else if (!scheduledMessage ||
                 (scheduledMessage->state == ScheduledMessage::ACTIVE) ||

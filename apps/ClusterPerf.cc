@@ -1376,16 +1376,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             totalMessageSize / numGeneratedMsgs);
 #endif
 
-    // Work out average message interval cycles.
-    double linkBandwidth = 10 << 27ul; // 10Gbps
-    double inputBytesPerSecond = linkBandwidth * loadFactor;
-    uint64_t averageIntervalCycles = Cycles::fromSeconds(
-            averageMessageSize / inputBytesPerSecond);
+    // Work out average message arrival interval, in rdtsc ticks.
+    double bandwidthMbps = 10000; // 10Gbps
+    uint64_t averageArrivalInterval = Cycles::fromSeconds(
+            averageMessageSize*8 / (bandwidthMbps*1e6*loadFactor));
     std::poisson_distribution<uint64_t> messageIntervalDist(
-            static_cast<double>(averageIntervalCycles));
-    LOG(NOTICE, "Average message size %.2f, average message interval %.2f us",
-            averageMessageSize,
-            Cycles::toSeconds(averageIntervalCycles) * 1e6);
+            static_cast<double>(averageArrivalInterval));
+    LOG(NOTICE, "Average message size %.2f, average arrival interval %.2f us",
+            averageMessageSize, Cycles::toSeconds(averageArrivalInterval)*1e6);
 
     uint64_t totalCycles = 0;
     size_t numReceivers = receivers.size();
@@ -1393,46 +1391,60 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     ObjectPool<EchoRpc> echoRpcPool;
     using OutstandingRpcs = std::list<std::pair<uint32_t, EchoRpc*>>;
     OutstandingRpcs outstandingRpcs = {};
-    uint64_t count = 0;
-    uint64_t accOutstandingRpcs = 0;
+    OutstandingRpcs::iterator it = outstandingRpcs.begin();
     uint64_t startTime = Cycles::rdtsc();
-    uint64_t stopTime = startTime + Cycles::fromSeconds(timeLimit);
+    uint64_t stopTime = ~0lu;
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
     const char* receiver = NULL;
     uint messageId = 0;
-    uint64_t totalTxMessageBytes = 0;
-    uint64_t warmupCount = 1000;
+    uint64_t totalBytesSent = 0;
+    uint64_t warmupCount = 100;
+    uint64_t count;
     for (count = 0; count < iteration;) {
         // Prepare the next message if it's not ready yet.
         if (receiver == NULL) {
             messageId = messageSizeDist(gen);
             receiver = receivers[generateRandom() % numReceivers].c_str();
-            // Hack: short message to server1; long messages to other servers
-//            if ((messageSizes[messageId] < 1500) || (numReceivers == 1)) {
-//                receiver = receivers[0].c_str();
-//            } else {
-//                receiver = receivers[1 + generateRandom() % (numReceivers- 1)].c_str();
-//            }
         }
 
         uint64_t now = Cycles::rdtsc();
         if (now >= stopTime) {
             LOG(NOTICE, "time expired after %lu iterations", count);
-            double actualLoadFactor = static_cast<double>(totalTxMessageBytes)
-                    / (timeLimit * linkBandwidth);
-            if (std::abs(actualLoadFactor - loadFactor) / loadFactor > 0.05) {
-                LOG(ERROR, "The experiment is unstable! Actual load factor %.3f,"
-                        " expected %.3f", actualLoadFactor, loadFactor);
+            double actualLoadFactor = static_cast<double>(totalBytesSent)*8
+                    / (timeLimit*bandwidthMbps*1e6);
+            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.05) {
+                LOG(ERROR, "Actual load factor %.3f, expecting %.3f",
+                        actualLoadFactor, loadFactor);
             } else {
                 LOG(NOTICE, "Generated load factor %.3f", actualLoadFactor);
             }
             break;
         }
 
+        // TODO: document why we need throttling
         // See if we need to send another message.
-        if (now > nextMessageArrival) {
+#define MAX_OUTSTANDING_RPCS 20
+        if ((now > nextMessageArrival) &&
+                (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS)) {
             if (warmupCount > 0) {
                 warmupCount--;
+                if (warmupCount == 0) {
+                    // Cancel warmup RPCs.
+//                    for (OutstandingRpcs::value_type p : outstandingRpcs) {
+//                        echoRpcPool.destroy(p.second);
+//                    }
+//                    outstandingRpcs.clear();
+//                    it = outstandingRpcs.begin();
+                    // TODO: WE CAN'T JUST CANCEL WARMUP RPCs, SOMEHOW
+                    // THE CLIENTS WILL NOT BE ABLE TO MAKE ANY PROGRESS BEYOND
+                    // UNSCHED BYTES?
+
+                    // Start the experiment officially in 10 ms (i.e., 500 us
+                    // multiplied by at most 20 oustanding RPCs).
+                    startTime = Cycles::rdtsc() + Cycles::fromSeconds(0.01);
+                    stopTime = startTime + Cycles::fromSeconds(timeLimit);
+                    nextMessageArrival = startTime + messageIntervalDist(gen);
+                }
             } else {
                 count++;
             }
@@ -1442,45 +1454,44 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             outstandingRpcs.emplace_back(messageId, echo);
             receiver = NULL;
             nextMessageArrival += messageIntervalDist(gen);
-
-            // Update debugging statistics
-            if (count > 0) {
-                accOutstandingRpcs += outstandingRpcs.size();
-                uint64_t averageQueueSize = accOutstandingRpcs / count;
-                if (outstandingRpcs.size() > averageQueueSize * 10) {
-                    TimeTrace::record(
-                            "%u outstanding RPCs queued up, %u RPCs in total",
-                            downCast<uint32_t>(outstandingRpcs.size()),
-                            downCast<uint32_t>(count));
-                }
-            }
         }
 
         // Check for RPC completion.
         context->dispatch->poll();
-        for (OutstandingRpcs::iterator it = outstandingRpcs.begin();
-                it != outstandingRpcs.end();) {
+        // TODO: As of 06/2017, checking 1 RPC takes 100~200 ns!!!!!!
+        // TODO: If # outstanding RPCs is relatively large, we would like to
+        // check more RPCs for completion at each round, but we couldn't
+        // becaues it's too expensive.
+        for (unsigned i = 0; i < 1; i++) {
+//        for (unsigned i = 0; i < 10; i++) {
+            if (it == outstandingRpcs.end()) {
+                it = outstandingRpcs.begin();
+                break;
+            }
+
             EchoRpc* echo = it->second;
+//            TimeTrace::record("Cperf about to check isReady(), i = %u", i);
             if (echo->isReady()) {
                 if (count > 0) {
                     uint id = it->first;
                     uint64_t completionTime = echo->getCompletionTime();
-                    totalTxMessageBytes += messageSizes[id];
+                    totalBytesSent += messageSizes[id];
                     roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
                             completionTime;
                     numSamples[id]++;
                 }
+                TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
                 echoRpcPool.destroy(echo);
                 it = outstandingRpcs.erase(it);
+                TimeTrace::record("Cperf finished cleaning one EchoRpc");
             } else {
                 it++;
             }
         }
+        TimeTrace::record("Cperf stop checking finished outstandingRpcs");
     }
     totalCycles = Cycles::rdtsc() - startTime;
     LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));
-    LOG(NOTICE, "Average outstanding RPC queue size %.1f",
-            static_cast<double>(accOutstandingRpcs) / static_cast<double>(count));
 
     // Cancel outstanding RPCs
     LOG(NOTICE, "Destroying %lu outstanding RPCs", outstandingRpcs.size());
@@ -7404,6 +7415,8 @@ int
 main(int argc, char *argv[])
 try
 {
+    Logger::installCrashBacktraceHandlers();
+
     // Parse command-line options.
     vector<string> testNames;
     OptionsDescription clusterperfOptions(

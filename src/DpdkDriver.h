@@ -62,6 +62,7 @@ class DpdkDriver : public Driver
     virtual int getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();
+    virtual uint32_t getMaxTransmitQueueSize();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
     virtual uint64_t getLastIdleTime();
     virtual uint64_t getLastTransmitTime();
