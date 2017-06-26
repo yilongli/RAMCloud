@@ -1421,10 +1421,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             break;
         }
 
-        // TODO: document why we need throttling
+        // TODO: I don't think throttling the number of oustanding RPCs is fair
+        // to the experiment because we are not using the "real" start time
+        // (i.e. the message arrival time) of an RPC to compute its completion
+        // time.
+
         // See if we need to send another message.
-#define MAX_OUTSTANDING_RPCS 50000
-//#define MAX_OUTSTANDING_RPCS 20
+//#define MAX_OUTSTANDING_RPCS 50000
+#define MAX_OUTSTANDING_RPCS 20
         if ((now > nextMessageArrival) &&
                 (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS)) {
             if (warmupCount > 0) {
