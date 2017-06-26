@@ -87,11 +87,15 @@ namespace RAMCloud {
 
 /// Return the number of elements in a statically allocated array.
 template<typename T, size_t length>
-uint32_t
+constexpr uint32_t
 arrayLength(const T (&array)[length])
 {
     return length;
 }
+
+template<typename T>
+constexpr uint32_t
+arrayLength(const T (&array)[0]) { return 0; }
 
 uint64_t _generateRandom();
 

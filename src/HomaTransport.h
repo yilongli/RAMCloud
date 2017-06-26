@@ -754,7 +754,7 @@ class HomaTransport : public Transport {
     // TODO: Top K outgoing requests; how to decide K? we want it small so
     // scanning is fast but not too small the sender has to frequently look
     // outside this set
-    ClientRpc* topOutgoingRequests[8];
+    ClientRpc* topOutgoingRequests[0];
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and

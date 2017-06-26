@@ -1423,7 +1423,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
         // TODO: document why we need throttling
         // See if we need to send another message.
-#define MAX_OUTSTANDING_RPCS 20
+#define MAX_OUTSTANDING_RPCS 50000
+//#define MAX_OUTSTANDING_RPCS 20
         if ((now > nextMessageArrival) &&
                 (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS)) {
             if (warmupCount > 0) {
