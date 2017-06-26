@@ -857,16 +857,35 @@ class HomaTransport : public Transport {
     /// transport at any time.
     uint32_t maxGrantedMessages;
 
-    //---------------------------
-    // NETWORK THROUGHPUT MONITOR
-    //---------------------------
-
-    // TODO: figure out why ClusterPerf load factor doesn't match the tput
-    // measured at transport layer
+    //--------------------
+    // Performance Monitor
+    //--------------------
 
     /// The beginning of the current monitoring interval, in units of
     /// rdtsc ticks.
     uint64_t lastMeasureTime;
+
+    /// The value of `PerfStats::activeDispatchCycles` at `lastMeasureTime`.
+    uint64_t lastDispatchActiveCycles;
+
+    /// `monitorMillis` in units of rdtsc ticks.
+    uint64_t monitorInterval;
+
+    /// Specifies the period over which to compute average network throughput,
+    /// in milliseconds.
+    uint32_t monitorMillis;
+
+    /// # total packets received and processed in the current interval.
+    uint32_t numPacketsReceived;
+
+    /// # data packets received and processed in the current interval.
+    uint32_t numDataPacketsReceived;
+
+    /// # total control packets transmitted in the current interval.
+    uint32_t numControlPacketsSent;
+
+    /// # data packets transmitted in the current interval.
+    uint32_t numDataPacketsSent;
 
     /// Total # control bytes transmitted in the current interval.
     uint32_t outputControlBytes;
@@ -878,13 +897,6 @@ class HomaTransport : public Transport {
     /// Total # retransmitted data bytes (excluding packet headers) in the
     /// current interval.
     uint32_t outputResentBytes;
-
-    /// `monitorMillis` in units of rdtsc ticks.
-    uint64_t monitorInterval;
-
-    /// Specifies the period over which to compute average network throughput,
-    /// in milliseconds.
-    uint32_t monitorMillis;
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };

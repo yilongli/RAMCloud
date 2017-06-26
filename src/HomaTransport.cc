@@ -110,13 +110,18 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , activeMessages()
     , inactiveMessages()
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(3)
+    , maxGrantedMessages(3) // TODO: why 3?
     , lastMeasureTime(0)
+    , lastDispatchActiveCycles(0)
+    , monitorInterval()
+    , monitorMillis()
+    , numPacketsReceived(0)
+    , numDataPacketsReceived(0)
+    , numControlPacketsSent(0)
+    , numDataPacketsSent(0)
     , outputControlBytes(0)
     , outputDataBytes(0)
     , outputResentBytes(0)
-    , monitorInterval()
-    , monitorMillis()
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -461,12 +466,15 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                   curOffset, queueSize);
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
+
+        // Update performance monitor metrics.
+        numDataPacketsSent++;
+        outputDataBytes += bytesThisPacket;
         if (flags & RETRANSMISSION) {
             outputResentBytes += bytesThisPacket;
         }
     }
 
-    outputDataBytes += bytesSent;
     return bytesSent;
 }
 
@@ -485,6 +493,7 @@ HomaTransport::sendControlPacket(const Driver::Address* recipient,
 {
     driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
     outputControlBytes += static_cast<uint32_t>(sizeof(T));
+    numControlPacketsSent++;
 }
 
 /**
@@ -951,6 +960,9 @@ HomaTransport::handlePacket(Driver::Received* received)
         RAMCLOUD_CLOG(WARNING, "packet from %s too short (%u bytes)",
                 received->sender->toString().c_str(), received->len);
         return;
+    }
+    if (common->opcode == ALL_DATA || common->opcode == DATA) {
+        numDataPacketsReceived++;
     }
 
     if (!(common->flags & FROM_CLIENT)) {
@@ -1769,20 +1781,41 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
 int
 HomaTransport::Poller::poll()
 {
+    int result = 0;
+
+#if TIME_TRACE
     // See if we should compute the network throughput in the last interval.
     if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
-        timeTrace("monitoring network outgoing throughput, "
-                  "data %u Mbps (resend %u Mbps), control %u Mbps",
-                  t->outputDataBytes*8/1000, t->outputResentBytes*8/1000,
-                  t->outputControlBytes*8/1000);
+        uint32_t millis = t->monitorMillis;
+        uint64_t dispatchActiveCycles =
+                PerfStats::threadStats.dispatchActiveCycles;
+        timeTrace("dispatch utilization %u%%, "
+                  "data bytes throughput %u Mbps, "
+                  "control bytes throughput %u Mbps"
+                  "retransmission bytes throughput %u Mbps",
+                  uint32_t(dispatchActiveCycles*100/t->monitorInterval),
+                  t->outputDataBytes*8/1000/millis,
+                  t->outputControlBytes*8/1000/millis,
+                  t->outputResentBytes*8/1000/millis);
+        timeTrace("data packet TX rate %u kpps, "
+                  "control packet TX rate %u kpps, "
+                  "data packet RX rate %u kpps, "
+                  "control packet RX rate %u kpps,",
+                  t->numDataPacketsSent/millis,
+                  t->numControlPacketsSent/millis,
+                  t->numDataPacketsReceived/millis,
+                  (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
         t->lastMeasureTime = owner->currentTime;
+        t->lastDispatchActiveCycles = dispatchActiveCycles;
+        t->numPacketsReceived = 0;
+        t->numDataPacketsReceived = 0;
+        t->numControlPacketsSent = 0;
+        t->numDataPacketsSent = 0;
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
         t->outputResentBytes = 0;
     }
 
-    int result = 0;
-#if TIME_TRACE
     uint64_t startTime = Cycles::rdtsc();
     uint64_t lastIdleTime = t->driver->getLastIdleTime();
 #endif
@@ -1809,6 +1842,7 @@ HomaTransport::Poller::poll()
         t->receivedPackets.clear();
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
+    t->numPacketsReceived += totalPackets;
     result |= totalPackets;
 
     // Send out GRANTs that are produced in the previous processing step

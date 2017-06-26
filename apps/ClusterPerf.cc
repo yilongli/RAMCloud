@@ -1376,14 +1376,33 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             totalMessageSize / numGeneratedMsgs);
 #endif
 
-    // Work out average message arrival interval, in rdtsc ticks.
+    // Work out 1) the average message arrival interval, in rdtsc ticks;
+    // 2) how many packets are generated per second; 3) the corresponding
+    // raw network load (including packet header overhead).
     double bandwidthMbps = 10000; // 10Gbps
     uint64_t averageArrivalInterval = Cycles::fromSeconds(
             averageMessageSize*8 / (bandwidthMbps*1e6*loadFactor));
+    double averagePacketsPerMessage = 0;
+    double averageRawBytesPerMessage = 0;
+    for (unsigned i = 0; i < messageSizes.size(); i++) {
+        double numPackets = std::ceil(messageSizes[i] / 1470.0);
+        averagePacketsPerMessage += numPackets * discreteProbabilities[i];
+        // TODO: per-packet overhead is 72 bytes in Homa + Ethernet
+        averageRawBytesPerMessage += (numPackets * 72 + messageSizes[i])
+            * discreteProbabilities[i];
+    }
+    double averageMessagesPerSecond = static_cast<double>(
+            Cycles::fromSeconds(1.0) / averageArrivalInterval);
+    double packetsPerSecond = averagePacketsPerMessage*averageMessagesPerSecond;
+    double rawLoadFactor = averageRawBytesPerMessage*8
+            * averageMessagesPerSecond / (bandwidthMbps*1e6);
+
+    LOG(NOTICE, "Average message size %.2f, average arrival interval %.2f us, "
+            "packet generation rate %.0f pps, raw network load %.2f",
+            averageMessageSize, Cycles::toSeconds(averageArrivalInterval)*1e6,
+            packetsPerSecond, rawLoadFactor);
     std::poisson_distribution<uint64_t> messageIntervalDist(
             static_cast<double>(averageArrivalInterval));
-    LOG(NOTICE, "Average message size %.2f, average arrival interval %.2f us",
-            averageMessageSize, Cycles::toSeconds(averageArrivalInterval)*1e6);
 
     uint64_t totalCycles = 0;
     size_t numReceivers = receivers.size();
