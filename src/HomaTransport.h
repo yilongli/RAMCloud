@@ -318,7 +318,9 @@ class HomaTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
-        // TODO
+        /// The index of this RPC in t->topOutgoingRequests. -1 means its
+        /// request message is not among the top K outgoing requests with
+        /// minimum bytes left.
         int topOutgoingRequest;
 
         /// Holds state of partially-received multi-packet responses.

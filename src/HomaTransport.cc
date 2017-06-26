@@ -277,12 +277,10 @@ uint32_t
 HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
 {
     uint32_t gBitsPerSec = 0;
-    // TODO: The RTT in the m510 cluster is more like 5us (2us of propogation
-    // delay plus 1us of service time). Figure out how to set "rttMicros" from
-    // command line. Changing 7 to 5 reduces 99% from 12.4us to 12.0us when
-    // TIME_TRACE = 1.
-    uint32_t roundTripMicros = 9;
-//    uint32_t roundTripMicros = 5;
+    // TODO: The RTT in the m510 cluster is more like 8us (5 us of data packet
+    // propagation delay plus 1 us of service time plus 1 us of grant packet
+    // propagation delay). Figure out how to set "rttMicros" from command line.
+    uint32_t roundTripMicros = 8;
 //    uint32_t roundTripMicros = 7;
 
     if (locator  != NULL) {
@@ -629,6 +627,8 @@ HomaTransport::tryToTransmitData()
         ClientRpc* clientRpc = NULL;
         ServerRpc* serverRpc = NULL;
         uint32_t minBytesLeft = ~0u;
+        if (arrayLength(topOutgoingRequests) > 0) {
+
         for (ClientRpc* rpc : topOutgoingRequests) {
             if (rpc != NULL) {
                 if (rpc->transmitLimit <= rpc->transmitOffset) {
@@ -654,6 +654,23 @@ HomaTransport::tryToTransmitData()
                     // Can't transmit this message: waiting for grants.
                     continue;
                 }
+                uint32_t bytesLeft =
+                        rpc->request->size() - rpc->transmitOffset;
+                if (bytesLeft < minBytesLeft) {
+                    minBytesLeft = bytesLeft;
+                    clientRpc = rpc;
+                }
+            }
+        }
+
+        } else {
+            for (OutgoingRequestList::iterator it = outgoingRequests.begin();
+                        it != outgoingRequests.end(); it++) {
+                ClientRpc* rpc = &(*it);
+                if (rpc->transmitLimit <= rpc->transmitOffset) {
+                    // Can't transmit this message: waiting for grants.
+                    continue;
+                }
                 uint32_t bytesLeft = rpc->request->size() - rpc->transmitOffset;
                 if (bytesLeft < minBytesLeft) {
                     minBytesLeft = bytesLeft;
@@ -661,6 +678,7 @@ HomaTransport::tryToTransmitData()
                 }
             }
         }
+
         for (OutgoingResponseList::iterator it = outgoingResponses.begin();
                     it != outgoingResponses.end(); it++) {
             ServerRpc* rpc = &(*it);
@@ -850,6 +868,7 @@ HomaTransport::Session::getRpcInfo()
 void
 HomaTransport::removeTopOutgoingRequest(ClientRpc *clientRpc) {
     int k = clientRpc->topOutgoingRequest;
+    assert(0 <= k && k < arrayLength(topOutgoingRequests));
     clientRpc->topOutgoingRequest = -1;
     topOutgoingRequests[k] = NULL;
 }
@@ -857,9 +876,11 @@ HomaTransport::removeTopOutgoingRequest(ClientRpc *clientRpc) {
 void
 HomaTransport::tryToPromote(ClientRpc *clientRpc)
 {
+    assert(clientRpc->topOutgoingRequest == -1);
     uint32_t bytesLeft = 0;
     uint32_t maxBytesLeft = 0;
-    int i = 0, k = 0;
+    int i = 0;
+    int k = -1;
     for (ClientRpc* rpc : topOutgoingRequests) {
         if (NULL == rpc) {
             topOutgoingRequests[i] = clientRpc;
