@@ -274,14 +274,28 @@ class Driver {
     }
 
     /**
+     * Return the interval for which the transmit queue had been empty
+     * right before the last packet was enqueued, in Cycles::rdtsc ticks.
+     */
+    virtual uint64_t getTxQueueIdleInterval()
+    {
+        // TODO: I am wondering if it is better to merge this function
+        // into the sendPacket API. I am currently implementing it as
+        // a separate function just to avoid modifying other driver subclasses.
+
+        // Default: not implemented
+        return ~0lu;
+    }
+
+    /**
      * The most recent time that we polled NIC for incoming packets and get
      * less than what we asked for (i.e., we have retrieved all the packets
      * from the NIC).
      * \return
-     *      Last idle time of the NIC RX queue, in Cycles::rdtsc ticks.
+     *      Last idle time of the NIC's RX queue, in Cycles::rdtsc ticks.
      *      0 means this feature is not supported.
      */
-    virtual uint64_t getLastIdleTime()
+    virtual uint64_t getRxQueueIdleTime()
     {
         // Default: not implemented
         return 0;

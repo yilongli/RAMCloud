@@ -1512,7 +1512,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 it++;
             }
         }
-        TimeTrace::record("Cperf stop checking finished outstandingRpcs");
+        TimeTrace::record("Cperf stop checking finished outstandingRpcs, %u",
+                (uint32_t)outstandingRpcs.size());
     }
     totalCycles = Cycles::rdtsc() - startTime;
     LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));

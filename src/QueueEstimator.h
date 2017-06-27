@@ -42,10 +42,12 @@ class QueueEstimator {
     explicit QueueEstimator(uint32_t mBitsPerSecond = 10000)
         : bandwidth()
         , currentTime(0)
+        , idleSince()
         , queueSize(0)
     {
         bandwidth = (static_cast<double>(mBitsPerSecond)*1e06/8.0)
                 / Cycles::perSecond();
+        idleSince = Cycles::rdtsc();
     }
 
     /**
@@ -56,12 +58,19 @@ class QueueEstimator {
      *      NIC's queue.
      * \param transmitTime
      *      Time when the packet was queued in the NIC, in Cycles::rdtsc ticks.
+     * \param[out] idleInterval
+     *      Number of Cycles::rdtsc ticks the transmit queue has been empty.
      */
     void
-    packetQueued(uint32_t length, uint64_t transmitTime = Cycles::rdtsc())
+    packetQueued(uint32_t length, uint64_t transmitTime = Cycles::rdtsc(),
+            uint64_t* idleInterval = NULL)
     {
         getQueueSize(transmitTime);
         queueSize += length;
+        if (idleInterval != NULL) {
+            *idleInterval = idleSince > 0 ? transmitTime - idleSince : 0;
+        }
+        idleSince = 0;
     }
 
     /**
@@ -76,6 +85,11 @@ class QueueEstimator {
         if (time > currentTime) {
             double newSize = queueSize
                     - static_cast<double>(time - currentTime) * bandwidth;
+            if (idleSince == 0 && newSize < 0) {
+                // The transmit queue became empty at some point between
+                // `currentTime` and `time`.
+                idleSince = time - (uint64_t)(-newSize / bandwidth);
+            }
             queueSize = (newSize < 0) ? 0 : (uint32_t) newSize;
             currentTime = time;
         }
@@ -93,6 +107,7 @@ class QueueEstimator {
     {
         bandwidth = (static_cast<double>(mBitsPerSecond)*1e06/8.0)
                 / Cycles::perSecond();
+        // TODO: log the following info in the driver instead
         double micros  = 1542 * 8.0 / mBitsPerSecond;
         double ticks = 1542 / bandwidth;
         RAMCLOUD_LOG(NOTICE, "bandwidth %u Mb/s, %.2f us (or %.1f ticks) to "
@@ -122,6 +137,11 @@ class QueueEstimator {
     /// A Cycles::rdtsc ticks value indicating the latest time we have ever
     /// seen when queueSize was calculated.
     uint64_t currentTime;
+
+    /// A Cycles::rdtsc ticks value indicating the time since when
+    /// the transmit queue has been empty. 0 means the transmit queue
+    /// is not empty at `currentTime`.
+    uint64_t idleSince;
 
     /// The number of bytes in the transmit queue at currentTime.
     double queueSize;

@@ -64,7 +64,8 @@ class DpdkDriver : public Driver
     virtual uint32_t getBandwidth();
     virtual uint32_t getMaxTransmitQueueSize();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
-    virtual uint64_t getLastIdleTime();
+    virtual uint64_t getTxQueueIdleInterval();
+    virtual uint64_t getRxQueueIdleTime();
     virtual uint64_t getLastTransmitTime();
     virtual uint32_t getLastQueueingDelay();
     virtual void receivePackets(uint32_t maxPackets,
@@ -133,8 +134,12 @@ class DpdkDriver : public Driver
     /// Tracks number of outstanding allocated payloads.  For detecting leaks.
     int packetBufsUtilized;
 
-    /// The most recent time that we are sure the NIC RX queue is empty.
-    uint64_t lastIdleTime;
+    /// The interval for which the NIC's transmit queue had been empty right
+    /// before when the last packet was transmitted at `lastTransmitTime`.
+    uint64_t txQueueIdleInterval;
+
+    /// The most recent time that we are sure the NIC's RX queue is empty.
+    uint64_t lastRxQueueIdleTime;
 
     /// The most recent time that we enqueued a packet to the NIC.
     uint64_t lastTransmitTime;

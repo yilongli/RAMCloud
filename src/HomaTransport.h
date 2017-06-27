@@ -887,6 +887,11 @@ class HomaTransport : public Transport {
     /// # data packets transmitted in the current interval.
     uint32_t numDataPacketsSent;
 
+    /// # times, in the current interval, we cannot transmit any message
+    /// because we are waiting for GRANTs and the transmit queue has run
+    /// dry.
+    uint32_t numTimesGrantRunDry;
+
     /// Total # control bytes transmitted in the current interval.
     uint32_t outputControlBytes;
 

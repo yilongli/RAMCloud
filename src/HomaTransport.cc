@@ -119,6 +119,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , numDataPacketsReceived(0)
     , numControlPacketsSent(0)
     , numDataPacketsSent(0)
+    , numTimesGrantRunDry(0)
     , outputControlBytes(0)
     , outputDataBytes(0)
     , outputResentBytes(0)
@@ -416,7 +417,6 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         uint32_t unscheduledBytes, uint8_t priority, uint8_t flags,
         bool partialOK)
 {
-    uint64_t queueSize = 0;
     uint32_t messageSize = message->size();
 
     uint32_t curOffset = offset;
@@ -457,15 +457,20 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     priority);
             driver->sendPacket(address, &header, &iter, priority);
         }
-#if TIME_TRACE
-        queueSize = driver->getLastQueueingDelay();
-#endif
-        timeTrace(driver->getLastTransmitTime(),
-                  "sent data, clientId %u, sequence %u, offset %u, "
-                  "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
-                  curOffset, queueSize);
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
+
+        // TODO: I wish I could pass 5 arguments to timeTrace...
+        uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
+        timeTrace(driver->getLastTransmitTime(),
+                "sent data, clientId %u, sequence %u, offset %u, "
+                "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
+                curOffset, bytesQueuedAhead);
+        if (bytesQueuedAhead == 0) {
+            timeTrace(driver->getLastTransmitTime(),
+                    "transmit queue queue has been idle for %u cyc",
+                    driver->getTxQueueIdleInterval());
+        }
 
         // Update performance monitor metrics.
         numDataPacketsSent++;
@@ -718,8 +723,6 @@ HomaTransport::tryToTransmitData()
             } else {
                 maxBytes = grantedBytesLeft;
             }
-            // TODO: REMOVE THIS
-            timeTrace("queue space %u, granted bytes left %u, maxBytes %u", transmitQueueSpace, grantedBytesLeft, maxBytes);
             bytesSent = sendBytes(
                     clientRpc->session->serverAddress,
                     RpcId(clientId, clientRpc->sequence),
@@ -727,8 +730,7 @@ HomaTransport::tryToTransmitData()
                     clientRpc->unscheduledBytes, clientRpc->transmitPriority,
                     FROM_CLIENT);
             clientRpc->transmitOffset += bytesSent;
-            // TODO: No need to call rdtsc directly if we provide a Driver::lastTransmitTime
-            clientRpc->lastTransmitTime = Cycles::rdtsc();
+            clientRpc->lastTransmitTime = driver->getLastTransmitTime();
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             if (clientRpc->transmitOffset >= clientRpc->request->size()) {
@@ -759,7 +761,7 @@ HomaTransport::tryToTransmitData()
                     serverRpc->unscheduledBytes, serverRpc->transmitPriority,
                     FROM_SERVER);
             serverRpc->transmitOffset += bytesSent;
-            serverRpc->lastTransmitTime = Cycles::rdtsc();
+            serverRpc->lastTransmitTime = driver->getLastTransmitTime();
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             if (serverRpc->transmitOffset >= serverRpc->replyPayload.size()) {
@@ -772,13 +774,13 @@ HomaTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
-            break;
-        }
-
-        // TODO: REMOVE? OR KEEP IT JUST FOR SAFE
-        if (bytesSent == 0) {
-            // THIS SHOULD NEVER HAPPEN
-            LOG(WARNING, "Infinite loop if I don't break out the loop");
+            bool transmitQueueEmpty =
+                    driver->getMaxTransmitQueueSize() == transmitQueueSpace;
+            if ((!outgoingRequests.empty() || !outgoingResponses.empty())
+                    && (totalBytesSent == 0) && transmitQueueEmpty) {
+                timeTrace("not enough GRANTs to transmit data");
+                numTimesGrantRunDry++;
+            }
             break;
         }
     }
@@ -1787,37 +1789,39 @@ HomaTransport::Poller::poll()
     // See if we should compute the network throughput in the last interval.
     if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
         uint32_t millis = t->monitorMillis;
-        uint64_t dispatchActiveCycles =
-                PerfStats::threadStats.dispatchActiveCycles;
-        timeTrace("dispatch utilization %u%%, "
-                  "data bytes throughput %u Mbps, "
-                  "control bytes throughput %u Mbps"
-                  "retransmission bytes throughput %u Mbps",
-                  uint32_t(dispatchActiveCycles*100/t->monitorInterval),
-                  t->outputDataBytes*8/1000/millis,
-                  t->outputControlBytes*8/1000/millis,
-                  t->outputResentBytes*8/1000/millis);
+        uint64_t activeCycles = PerfStats::threadStats.dispatchActiveCycles
+                - t->lastDispatchActiveCycles;
+        timeTrace("dispatch utilization %u%%, run out of grants %u times",
+                activeCycles*100/t->monitorInterval, t->numTimesGrantRunDry);
+        timeTrace("data bytes throughput %u Mbps, "
+                "control bytes throughput %u Mbps, "
+                "retransmission bytes throughput %u Mbps",
+                t->outputDataBytes*8/1000/millis,
+                t->outputControlBytes*8/1000/millis,
+                t->outputResentBytes*8/1000/millis);
         timeTrace("data packet TX rate %u kpps, "
-                  "control packet TX rate %u kpps, "
-                  "data packet RX rate %u kpps, "
-                  "control packet RX rate %u kpps,",
-                  t->numDataPacketsSent/millis,
-                  t->numControlPacketsSent/millis,
-                  t->numDataPacketsReceived/millis,
-                  (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
+                "control packet TX rate %u kpps, "
+                "data packet RX rate %u kpps, "
+                "control packet RX rate %u kpps,",
+                t->numDataPacketsSent/millis,
+                t->numControlPacketsSent/millis,
+                t->numDataPacketsReceived/millis,
+                (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
         t->lastMeasureTime = owner->currentTime;
-        t->lastDispatchActiveCycles = dispatchActiveCycles;
+        t->lastDispatchActiveCycles =
+                PerfStats::threadStats.dispatchActiveCycles;
         t->numPacketsReceived = 0;
         t->numDataPacketsReceived = 0;
         t->numControlPacketsSent = 0;
         t->numDataPacketsSent = 0;
+        t->numTimesGrantRunDry = 0;
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
         t->outputResentBytes = 0;
     }
 
     uint64_t startTime = Cycles::rdtsc();
-    uint64_t lastIdleTime = t->driver->getLastIdleTime();
+    uint64_t lastIdleTime = t->driver->getRxQueueIdleTime();
 #endif
 
     // Process any available incoming packets.

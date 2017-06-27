@@ -120,7 +120,8 @@ DpdkDriver::DpdkDriver(Context* context, int port)
     , bytesBuffered(0)
     , packetBufPool()
     , packetBufsUtilized(0)
-    , lastIdleTime()
+    , txQueueIdleInterval(0)
+    , lastRxQueueIdleTime()
     , lastTransmitTime()
     , lastKnownQueuedBytes(0)
     , locatorString()
@@ -330,9 +331,16 @@ DpdkDriver::getTransmitQueueSpace(uint64_t currentTime)
 
 // See docs in Driver class.
 uint64_t
-DpdkDriver::getLastIdleTime()
+DpdkDriver::getTxQueueIdleInterval()
 {
-    return lastIdleTime;
+    return txQueueIdleInterval;
+}
+
+// See docs in Driver class.
+uint64_t
+DpdkDriver::getRxQueueIdleTime()
+{
+    return lastRxQueueIdleTime;
 }
 
 // See docs in Driver class.
@@ -369,7 +377,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
             downCast<uint16_t>(maxPackets));
     if (incomingPkts < maxPackets) {
         // TODO: make this optional?
-        lastIdleTime = Cycles::rdtsc();
+        lastRxQueueIdleTime = Cycles::rdtsc();
     }
 
     if (incomingPkts > 0) {
@@ -735,7 +743,8 @@ DpdkDriver::sendPacket(const Address* addr,
     lastTransmitTime = Cycles::rdtsc();
     lastKnownQueuedBytes =
             maxTransmitQueueSize - getTransmitQueueSpace(lastTransmitTime);
-    queueEstimator.packetQueued(physPacketLength, lastTransmitTime);
+    queueEstimator.packetQueued(physPacketLength, lastTransmitTime,
+            &txQueueIdleInterval);
     PerfStats::threadStats.networkOutputBytes += physPacketLength;
 }
 
