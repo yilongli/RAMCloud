@@ -903,6 +903,10 @@ class HomaTransport : public Transport {
     /// current interval.
     uint32_t outputResentBytes;
 
+    /// Total # idle rdtsc ticks of the NIC's transmit queue in the
+    /// current interval.
+    uint64_t unusedBandwidth;
+
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
 

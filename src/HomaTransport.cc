@@ -123,6 +123,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , outputControlBytes(0)
     , outputDataBytes(0)
     , outputResentBytes(0)
+    , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -460,16 +461,19 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
 
-        // TODO: I wish I could pass 5 arguments to timeTrace...
         uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
-        timeTrace(driver->getLastTransmitTime(),
-                "sent data, clientId %u, sequence %u, offset %u, "
-                "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
-                curOffset, bytesQueuedAhead);
-        if (bytesQueuedAhead == 0) {
+        if (bytesQueuedAhead > 0) {
             timeTrace(driver->getLastTransmitTime(),
-                    "transmit queue queue has been idle for %u cyc",
-                    driver->getTxQueueIdleInterval());
+                    "sent data, clientId %u, sequence %u, offset %u, "
+                    "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
+                    curOffset, bytesQueuedAhead);
+        } else {
+            uint64_t idleInterval = driver->getTxQueueIdleInterval();
+            unusedBandwidth += idleInterval;
+            timeTrace(driver->getLastTransmitTime(),
+                    "sent data, clientId %u, sequence %u, offset %u, "
+                    "0 bytes queued ahead, idle time %u cyc",
+                    rpcId.clientId, rpcId.sequence, curOffset, idleInterval);
         }
 
         // Update performance monitor metrics.
@@ -497,6 +501,11 @@ HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
     driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+    uint64_t idleInterval = driver->getTxQueueIdleInterval();
+    if (idleInterval > 0) {
+        timeTrace("sent control packet, idle time %u cyc", idleInterval);
+        unusedBandwidth += idleInterval;
+    }
     outputControlBytes += static_cast<uint32_t>(sizeof(T));
     numControlPacketsSent++;
 }
@@ -774,12 +783,18 @@ HomaTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
-            bool transmitQueueEmpty =
-                    driver->getMaxTransmitQueueSize() == transmitQueueSpace;
             if ((!outgoingRequests.empty() || !outgoingResponses.empty())
-                    && (totalBytesSent == 0) && transmitQueueEmpty) {
-                timeTrace("not enough GRANTs to transmit data");
-                numTimesGrantRunDry++;
+                    && totalBytesSent == 0) {
+                uint64_t now = Cycles::rdtsc();
+                // transmitQueueSpace is computed w.r.t. a stale timestamp.
+                // It's too imprecise for the purpose of analyzing bandwidth
+                // wasted in waiting for grants.
+                bool transmitQueueEmpty = (driver->getTransmitQueueSpace(now)
+                        == (int)driver->getMaxTransmitQueueSize());
+                if (transmitQueueEmpty) {
+                    timeTrace(now, "not enough GRANTs to transmit data");
+                    numTimesGrantRunDry++;
+                }
             }
             break;
         }
@@ -1791,11 +1806,11 @@ HomaTransport::Poller::poll()
         uint32_t millis = t->monitorMillis;
         uint64_t activeCycles = PerfStats::threadStats.dispatchActiveCycles
                 - t->lastDispatchActiveCycles;
-        timeTrace("dispatch utilization %u%%, run out of grants %u times",
-                activeCycles*100/t->monitorInterval, t->numTimesGrantRunDry);
-        timeTrace("data bytes throughput %u Mbps, "
-                "control bytes throughput %u Mbps, "
-                "retransmission bytes throughput %u Mbps",
+        uint32_t wastedGoodput = t->numTimesGrantRunDry *
+                t->driver->getMaxPacketSize()*8/1000/millis;
+        timeTrace("data bytes goodput %u Mbps, "
+                "control bytes goodput %u Mbps, "
+                "retransmission bytes goodput %u Mbps",
                 t->outputDataBytes*8/1000/millis,
                 t->outputControlBytes*8/1000/millis,
                 t->outputResentBytes*8/1000/millis);
@@ -1807,6 +1822,12 @@ HomaTransport::Poller::poll()
                 t->numControlPacketsSent/millis,
                 t->numDataPacketsReceived/millis,
                 (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
+        timeTrace("dispatch utilization %u%%, unused uplink bandwidth %u%%, "
+                "run out of grants %u times, wasted goodput < %u Mbps",
+                activeCycles*100/t->monitorInterval,
+                t->unusedBandwidth*100/t->monitorInterval,
+                t->numTimesGrantRunDry, wastedGoodput);
+
         t->lastMeasureTime = owner->currentTime;
         t->lastDispatchActiveCycles =
                 PerfStats::threadStats.dispatchActiveCycles;
@@ -1818,6 +1839,7 @@ HomaTransport::Poller::poll()
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
         t->outputResentBytes = 0;
+        t->unusedBandwidth = 0;
     }
 
     uint64_t startTime = Cycles::rdtsc();

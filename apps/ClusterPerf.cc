@@ -714,7 +714,7 @@ class TscFrequencyCalibrator {
      */
     static uint64_t
     getMinRoundTripTime(const char* serviceLocator, uint64_t* clientTsc,
-            uint64_t* serverTsc, uint32_t runs = 10000)
+            uint64_t* serverTsc, uint32_t runs = 5000)
     {
         uint64_t minElapsedTime = ~0ul;
         for (unsigned i = 0; i < runs; i++) {
