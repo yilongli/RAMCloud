@@ -113,6 +113,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , maxGrantedMessages(3) // TODO: why 3?
     , lastMeasureTime(0)
     , lastDispatchActiveCycles(0)
+    , lastTimeGrantRunDry(0)
     , monitorInterval()
     , monitorMillis()
     , numPacketsReceived(0)
@@ -123,6 +124,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , outputControlBytes(0)
     , outputDataBytes(0)
     , outputResentBytes(0)
+    , processPacketCycles(0)
+    , transmitDataCycles(0)
+    , transmitGrantCycles(0)
     , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
@@ -666,25 +670,25 @@ HomaTransport::tryToTransmitData()
                 }
             }
         }
-#define unlikely(x) __glibc_unlikely(x)
-        if (unlikely(NULL == clientRpc && !outgoingRequests.empty())) {
-            timeTrace("slow path taken, iterating over %u outgoing requests",
-                    outgoingRequests.size());
-            for (OutgoingRequestList::iterator it = outgoingRequests.begin();
-                        it != outgoingRequests.end(); it++) {
-                ClientRpc* rpc = &(*it);
-                if (rpc->transmitLimit <= rpc->transmitOffset) {
-                    // Can't transmit this message: waiting for grants.
-                    continue;
-                }
-                uint32_t bytesLeft =
-                        rpc->request->size() - rpc->transmitOffset;
-                if (bytesLeft < minBytesLeft) {
-                    minBytesLeft = bytesLeft;
-                    clientRpc = rpc;
-                }
-            }
-        }
+//#define unlikely(x) __glibc_unlikely(x)
+//        if (unlikely(NULL == clientRpc && !outgoingRequests.empty())) {
+//            timeTrace("slow path taken, iterating over %u outgoing requests",
+//                    outgoingRequests.size());
+//            for (OutgoingRequestList::iterator it = outgoingRequests.begin();
+//                        it != outgoingRequests.end(); it++) {
+//                ClientRpc* rpc = &(*it);
+//                if (rpc->transmitLimit <= rpc->transmitOffset) {
+//                    // Can't transmit this message: waiting for grants.
+//                    continue;
+//                }
+//                uint32_t bytesLeft =
+//                        rpc->request->size() - rpc->transmitOffset;
+//                if (bytesLeft < minBytesLeft) {
+//                    minBytesLeft = bytesLeft;
+//                    clientRpc = rpc;
+//                }
+//            }
+//        }
 
         } else {
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
@@ -783,8 +787,12 @@ HomaTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
+            uint64_t currentTime = context->dispatch->currentTime;
+            // TODO: only correct on m510
+            const uint32_t cyclesPerPacket = 2500;
             if ((!outgoingRequests.empty() || !outgoingResponses.empty())
-                    && totalBytesSent == 0) {
+                    && (totalBytesSent == 0)
+                    && (lastTimeGrantRunDry + cyclesPerPacket < currentTime)) {
                 uint64_t now = Cycles::rdtsc();
                 // transmitQueueSpace is computed w.r.t. a stale timestamp.
                 // It's too imprecise for the purpose of analyzing bandwidth
@@ -794,6 +802,7 @@ HomaTransport::tryToTransmitData()
                 if (transmitQueueEmpty) {
                     timeTrace(now, "not enough GRANTs to transmit data");
                     numTimesGrantRunDry++;
+                    lastTimeGrantRunDry = currentTime;
                 }
             }
             break;
@@ -1788,6 +1797,24 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
     return r0 - r1;
 }
 
+// TODO: NOT SURE THIS IS THE RIGHT PLACE TO DEFINE IT.
+#if TIME_TRACE
+#define UPDATE_CYCLES(cycles) do { \
+    currentTime = Cycles::rdtsc(); \
+    cycles += currentTime - prevTime; \
+    prevTime = currentTime; \
+} while (0)
+#define UPDATE_CYCLES_IF(cond, cycles) do { \
+    if (!(cond)) break; \
+    currentTime = Cycles::rdtsc(); \
+    cycles += currentTime - prevTime; \
+    prevTime = currentTime; \
+} while (0)
+#else
+#define UPDATE_CYCLES(x) do {} while (0)
+#define UPDATE_CYCLES_IF(x) do {} while (0)
+#endif
+
 /**
  * This method is invoked in the inner polling loop of the dispatcher;
  * it drives the operation of the transport.
@@ -1808,13 +1835,14 @@ HomaTransport::Poller::poll()
                 - t->lastDispatchActiveCycles;
         uint32_t wastedGoodput = t->numTimesGrantRunDry *
                 t->driver->getMaxPacketSize()*8/1000/millis;
-        timeTrace("data bytes goodput %u Mbps, "
+        uint64_t now = Cycles::rdtsc();
+        timeTrace(now, "data bytes goodput %u Mbps, "
                 "control bytes goodput %u Mbps, "
                 "retransmission bytes goodput %u Mbps",
                 t->outputDataBytes*8/1000/millis,
                 t->outputControlBytes*8/1000/millis,
                 t->outputResentBytes*8/1000/millis);
-        timeTrace("data packet TX rate %u kpps, "
+        timeTrace(now, "data packet TX rate %u kpps, "
                 "control packet TX rate %u kpps, "
                 "data packet RX rate %u kpps, "
                 "control packet RX rate %u kpps,",
@@ -1822,9 +1850,14 @@ HomaTransport::Poller::poll()
                 t->numControlPacketsSent/millis,
                 t->numDataPacketsReceived/millis,
                 (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
-        timeTrace("dispatch utilization %u%%, unused uplink bandwidth %u%%, "
-                "run out of grants %u times, wasted goodput < %u Mbps",
+        timeTrace(now, "dispatch utilization %u%%, process packets %u%%, "
+                "transmit data %u%%, transmit grant %u%%",
                 activeCycles*100/t->monitorInterval,
+                t->processPacketCycles*100/t->monitorInterval,
+                t->transmitDataCycles*100/t->monitorInterval,
+                t->transmitGrantCycles*100/t->monitorInterval);
+        timeTrace(now, "unused uplink bandwidth %u%%, "
+                "run out of grants %u times, wasted goodput < %u Mbps",
                 t->unusedBandwidth*100/t->monitorInterval,
                 t->numTimesGrantRunDry, wastedGoodput);
 
@@ -1839,10 +1872,14 @@ HomaTransport::Poller::poll()
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
         t->outputResentBytes = 0;
+        t->processPacketCycles = 0;
+        t->transmitDataCycles = 0;
+        t->transmitGrantCycles = 0;
         t->unusedBandwidth = 0;
     }
 
     uint64_t startTime = Cycles::rdtsc();
+    uint64_t prevTime = startTime, currentTime;
     uint64_t lastIdleTime = t->driver->getRxQueueIdleTime();
 #endif
 
@@ -1870,6 +1907,7 @@ HomaTransport::Poller::poll()
     } while (numPackets == MAX_PACKETS);
     t->numPacketsReceived += totalPackets;
     result |= totalPackets;
+    UPDATE_CYCLES(t->processPacketCycles);
 
     // Send out GRANTs that are produced in the previous processing step
     // in a batch.
@@ -1891,6 +1929,7 @@ HomaTransport::Poller::poll()
 //                t->controlPacketPriority);
     }
 //    t->driver->flushTxBuffer();
+    UPDATE_CYCLES_IF(!t->grantRecipients.empty(), t->transmitGrantCycles);
     t->grantRecipients.clear();
 
     // See if we should check for timeouts. Ideally, we'd like to do this
@@ -1927,6 +1966,7 @@ HomaTransport::Poller::poll()
     // Transmit data packets if possible.
     uint32_t totalBytesSent = t->tryToTransmitData();
     result |= totalBytesSent;
+    UPDATE_CYCLES(t->transmitDataCycles);
 
     // TODO: INVESTIGATE WHY FLUSHING TX BUFFER HERE ACTUALLY MAKES TAIL LATENCY WORSE.
     // If no data packet is transmitted in the previous step, flush the GRANT

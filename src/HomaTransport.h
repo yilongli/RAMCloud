@@ -868,6 +868,10 @@ class HomaTransport : public Transport {
     /// The value of `PerfStats::activeDispatchCycles` at `lastMeasureTime`.
     uint64_t lastDispatchActiveCycles;
 
+    /// The start time of the last call to Dispatch::poll where
+    /// `numTimesGrantRunDry` increments.
+    uint64_t lastTimeGrantRunDry;
+
     /// `monitorMillis` in units of rdtsc ticks.
     uint64_t monitorInterval;
 
@@ -902,6 +906,13 @@ class HomaTransport : public Transport {
     /// Total # retransmitted data bytes (excluding packet headers) in the
     /// current interval.
     uint32_t outputResentBytes;
+
+    // TODO
+    uint64_t processPacketCycles;
+
+    uint64_t transmitDataCycles;
+
+    uint64_t transmitGrantCycles;
 
     /// Total # idle rdtsc ticks of the NIC's transmit queue in the
     /// current interval.

@@ -38,7 +38,7 @@ grep -h "server received ALL_DATA" -A 1 server*.tt |
 for tt_file in *.tt; do
     [[ $tt_file == merged* ]] && continue
     who=$(echo $tt_file | cut -d . -f 1)
-    egrep "data bytes goodput [1-9]" -A 2 $tt_file > perfMon.$who.txt &
+    egrep "data bytes goodput [1-9]" -A 3 $tt_file > perfMon.$who.txt &
     egrep "sent data|sent control packet|not enough GRANTs" $tt_file | \
         awk -f $SCRIPT_DIR/fix_tt_delta.awk > sentData.$who.txt &
 done

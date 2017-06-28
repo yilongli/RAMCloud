@@ -1419,6 +1419,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     uint64_t totalBytesSent = 0;
     uint64_t warmupCount = 100;
     uint64_t count;
+    PerfStats::registerStats(&PerfStats::threadStats);
+    uint64_t prevDispatchTime;
     for (count = 0; count < iteration;) {
         // Prepare the next message if it's not ready yet.
         if (receiver == NULL) {
@@ -1481,7 +1483,12 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         }
 
         // Check for RPC completion.
-        context->dispatch->poll();
+        prevDispatchTime = context->dispatch->currentTime;
+        if (context->dispatch->poll() > 0) {
+            PerfStats::threadStats.dispatchActiveCycles +=
+                    context->dispatch->currentTime - prevDispatchTime;
+        }
+
         // TODO: As of 06/2017, checking 1 RPC takes 100~200 ns!!!!!!
         // TODO: If # outstanding RPCs is relatively large, we would like to
         // check more RPCs for completion at each round, but we couldn't
