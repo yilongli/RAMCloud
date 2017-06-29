@@ -338,6 +338,15 @@ DpdkDriver::getTxQueueIdleInterval()
 
 // See docs in Driver class.
 uint64_t
+DpdkDriver::getTxQueueIdleInterval(uint64_t currentTime)
+{
+    // Enqueue an one-byte dummy packet just to get the idle interval.
+    queueEstimator.packetQueued(1, currentTime, &txQueueIdleInterval);
+    return txQueueIdleInterval;
+}
+
+// See docs in Driver class.
+uint64_t
 DpdkDriver::getRxQueueIdleTime()
 {
     return lastRxQueueIdleTime;

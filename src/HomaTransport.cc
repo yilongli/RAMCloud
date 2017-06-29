@@ -505,11 +505,11 @@ HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
     driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+    uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
     uint64_t idleInterval = driver->getTxQueueIdleInterval();
-    if (idleInterval > 0) {
-        timeTrace("sent control packet, idle time %u cyc", idleInterval);
-        unusedBandwidth += idleInterval;
-    }
+    timeTrace("sent control packet, %u bytes queued ahead, idle time %u cyc",
+            bytesQueuedAhead, idleInterval);
+    unusedBandwidth += idleInterval;
     outputControlBytes += static_cast<uint32_t>(sizeof(T));
     numControlPacketsSent++;
 }
@@ -1823,6 +1823,8 @@ HomaTransport::Poller::poll()
 #if TIME_TRACE
     // See if we should compute the network throughput in the last interval.
     if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
+        t->unusedBandwidth +=
+                t->driver->getTxQueueIdleInterval(owner->currentTime);
         uint32_t millis = t->monitorMillis;
         uint64_t activeCycles = PerfStats::threadStats.dispatchActiveCycles
                 - t->lastDispatchActiveCycles;
@@ -1850,7 +1852,7 @@ HomaTransport::Poller::poll()
                 t->transmitDataCycles*100/t->monitorInterval,
                 t->transmitGrantCycles*100/t->monitorInterval);
         timeTrace(now, "unused uplink bandwidth %u%%, "
-                "run out of grants %u times, wasted goodput < %u Mbps",
+                "run out of grants %u times, wasted goodput <= %u Mbps",
                 t->unusedBandwidth*100/t->monitorInterval,
                 t->numTimesGrantRunDry, wastedGoodput);
 

@@ -288,6 +288,18 @@ class Driver {
     }
 
     /**
+     * Alternate form of getTxQueueIdleInterval.
+     *
+     * TODO: merge the above method into sendPacket, define this one as getting
+     * current idle interval.
+     */
+    virtual uint64_t getTxQueueIdleInterval(uint64_t time)
+    {
+        // Default: not implemented
+        return ~0lu;
+    }
+
+    /**
      * The most recent time that we polled NIC for incoming packets and get
      * less than what we asked for (i.e., we have retrieved all the packets
      * from the NIC).

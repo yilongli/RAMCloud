@@ -65,6 +65,7 @@ class DpdkDriver : public Driver
     virtual uint32_t getMaxTransmitQueueSize();
     virtual int getTransmitQueueSpace(uint64_t currentTime);
     virtual uint64_t getTxQueueIdleInterval();
+    virtual uint64_t getTxQueueIdleInterval(uint64_t currentTime);
     virtual uint64_t getRxQueueIdleTime();
     virtual uint64_t getLastTransmitTime();
     virtual uint32_t getLastQueueingDelay();

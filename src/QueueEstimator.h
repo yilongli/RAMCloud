@@ -42,12 +42,11 @@ class QueueEstimator {
     explicit QueueEstimator(uint32_t mBitsPerSecond = 10000)
         : bandwidth()
         , currentTime(0)
-        , idleSince()
+        , idleSince(0)
         , queueSize(0)
     {
         bandwidth = (static_cast<double>(mBitsPerSecond)*1e06/8.0)
                 / Cycles::perSecond();
-        idleSince = Cycles::rdtsc();
     }
 
     /**
@@ -66,11 +65,10 @@ class QueueEstimator {
             uint64_t* idleInterval = NULL)
     {
         getQueueSize(transmitTime);
-        queueSize += length;
         if (idleInterval != NULL) {
-            *idleInterval = idleSince > 0 ? transmitTime - idleSince : 0;
+            *idleInterval = (queueSize > 0) ? 0 : transmitTime - idleSince;
         }
-        idleSince = 0;
+        queueSize += length;
     }
 
     /**
@@ -85,15 +83,16 @@ class QueueEstimator {
         if (time > currentTime) {
             double newSize = queueSize
                     - static_cast<double>(time - currentTime) * bandwidth;
-            if (idleSince == 0 && newSize < 0) {
+            uint32_t oldQueueSize = queueSize;
+            queueSize = (newSize < 0) ? 0 : static_cast<uint32_t>(newSize);
+            currentTime = time;
+            if ((oldQueueSize > 0) && (queueSize == 0)) {
                 // The transmit queue became empty at some point between
                 // `currentTime` and `time`.
                 idleSince = time - (uint64_t)(-newSize / bandwidth);
             }
-            queueSize = (newSize < 0) ? 0 : (uint32_t) newSize;
-            currentTime = time;
         }
-        return (uint32_t) queueSize;
+        return queueSize;
     }
 
     /**
@@ -138,13 +137,13 @@ class QueueEstimator {
     /// seen when queueSize was calculated.
     uint64_t currentTime;
 
-    /// A Cycles::rdtsc ticks value indicating the time since when
-    /// the transmit queue has been empty. 0 means the transmit queue
-    /// is not empty at `currentTime`.
+    /// A Cycles::rdtsc ticks value indicating the time since when the
+    /// transmit queue has been empty, only defined when the transmit queue
+    /// is empty at currentTime (i.e. queueSize == 0).
     uint64_t idleSince;
 
     /// The number of bytes in the transmit queue at currentTime.
-    double queueSize;
+    uint32_t queueSize;
 
     DISALLOW_COPY_AND_ASSIGN(QueueEstimator);
 };
