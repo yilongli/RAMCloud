@@ -1804,15 +1804,8 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
     cycles += currentTime - prevTime; \
     prevTime = currentTime; \
 } while (0)
-#define UPDATE_CYCLES_IF(cond, cycles) do { \
-    if (!(cond)) break; \
-    currentTime = Cycles::rdtsc(); \
-    cycles += currentTime - prevTime; \
-    prevTime = currentTime; \
-} while (0)
 #else
 #define UPDATE_CYCLES(x) do {} while (0)
-#define UPDATE_CYCLES_IF(x) do {} while (0)
 #endif
 
 /**
@@ -1929,7 +1922,9 @@ HomaTransport::Poller::poll()
 //                t->controlPacketPriority);
     }
 //    t->driver->flushTxBuffer();
-    UPDATE_CYCLES_IF(!t->grantRecipients.empty(), t->transmitGrantCycles);
+    if (!t->grantRecipients.empty()) {
+        UPDATE_CYCLES(t->transmitGrantCycles);
+    }
     t->grantRecipients.clear();
 
     // See if we should check for timeouts. Ideally, we'd like to do this

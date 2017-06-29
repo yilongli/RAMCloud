@@ -1414,80 +1414,22 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = ~0lu;
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
-    const char* receiver = NULL;
-    uint messageId = 0;
     uint64_t totalBytesSent = 0;
     uint64_t warmupCount = 100;
     uint64_t count;
     PerfStats::registerStats(&PerfStats::threadStats);
-    uint64_t prevDispatchTime;
+    uint64_t prevDispatchTime = startTime;
+    int prevResult = 0;
     for (count = 0; count < iteration;) {
-        // Prepare the next message if it's not ready yet.
-        if (receiver == NULL) {
-            messageId = messageSizeDist(gen);
-            receiver = receivers[generateRandom() % numReceivers].c_str();
-        }
-
-        uint64_t now = Cycles::rdtsc();
-        if (now >= stopTime) {
-            LOG(NOTICE, "time expired after %lu iterations", count);
-            double actualLoadFactor = static_cast<double>(totalBytesSent)*8
-                    / (timeLimit*bandwidthMbps*1e6);
-            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.05) {
-                LOG(ERROR, "Actual load factor %.3f, expecting %.3f",
-                        actualLoadFactor, loadFactor);
-            } else {
-                LOG(NOTICE, "Generated load factor %.3f", actualLoadFactor);
-            }
-            break;
-        }
-
-        // TODO: I don't think throttling the number of oustanding RPCs is fair
-        // to the experiment because we are not using the "real" start time
-        // (i.e. the message arrival time) of an RPC to compute its completion
-        // time.
-
-        // See if we need to send another message.
-//#define MAX_OUTSTANDING_RPCS 50000
-#define MAX_OUTSTANDING_RPCS 20
-        if ((now > nextMessageArrival) &&
-                (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS)) {
-            if (warmupCount > 0) {
-                warmupCount--;
-                if (warmupCount == 0) {
-                    // Cancel warmup RPCs.
-//                    for (OutstandingRpcs::value_type p : outstandingRpcs) {
-//                        echoRpcPool.destroy(p.second);
-//                    }
-//                    outstandingRpcs.clear();
-//                    it = outstandingRpcs.begin();
-                    // TODO: WE CAN'T JUST CANCEL WARMUP RPCs, SOMEHOW
-                    // THE CLIENTS WILL NOT BE ABLE TO MAKE ANY PROGRESS BEYOND
-                    // UNSCHED BYTES?
-
-                    // Start the experiment officially in 10 ms (i.e., 500 us
-                    // multiplied by at most 20 oustanding RPCs).
-                    startTime = Cycles::rdtsc() + Cycles::fromSeconds(0.01);
-                    stopTime = startTime + Cycles::fromSeconds(timeLimit);
-                    nextMessageArrival = startTime + messageIntervalDist(gen);
-                }
-            } else {
-                count++;
-            }
-            uint32_t length = messageSizes[messageId];
-            EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
-                    message.c_str(), length, length);
-            outstandingRpcs.emplace_back(messageId, echo);
-            receiver = NULL;
-            nextMessageArrival += messageIntervalDist(gen);
-        }
-
-        // Check for RPC completion.
-        prevDispatchTime = context->dispatch->currentTime;
-        if (context->dispatch->poll() > 0) {
+        // Invoke the main polling function.
+        int r = context->dispatch->poll();
+        uint64_t currentTime = context->dispatch->currentTime;
+        if (prevResult > 0) {
             PerfStats::threadStats.dispatchActiveCycles +=
-                    context->dispatch->currentTime - prevDispatchTime;
+                    currentTime - prevDispatchTime;
         }
+        prevResult = r;
+        prevDispatchTime = currentTime;
 
         // TODO: As of 06/2017, checking 1 RPC takes 100~200 ns!!!!!!
         // TODO: If # outstanding RPCs is relatively large, we would like to
@@ -1521,6 +1463,62 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         }
         TimeTrace::record("Cperf stop checking finished outstandingRpcs, %u",
                 (uint32_t)outstandingRpcs.size());
+
+        if (currentTime >= stopTime) {
+            LOG(NOTICE, "time expired after %lu iterations", count);
+            double actualLoadFactor = static_cast<double>(totalBytesSent)*8
+                    / (timeLimit*bandwidthMbps*1e6);
+            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.05) {
+                LOG(ERROR, "Actual load factor %.3f, expecting %.3f",
+                        actualLoadFactor, loadFactor);
+            } else {
+                LOG(NOTICE, "Generated load factor %.3f", actualLoadFactor);
+            }
+            break;
+        }
+
+        // TODO: I don't think throttling the number of oustanding RPCs is fair
+        // to the experiment because we are not using the "real" start time
+        // (i.e. the message arrival time) of an RPC to compute its completion
+        // time.
+
+        // See if it's time to send another message.
+//#define MAX_OUTSTANDING_RPCS 50000
+#define MAX_OUTSTANDING_RPCS 20
+        if ((currentTime > nextMessageArrival) &&
+                (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS)) {
+            if (warmupCount > 0) {
+                warmupCount--;
+                if (warmupCount == 0) {
+                    // Cancel warmup RPCs.
+//                    for (OutstandingRpcs::value_type p : outstandingRpcs) {
+//                        echoRpcPool.destroy(p.second);
+//                    }
+//                    outstandingRpcs.clear();
+//                    it = outstandingRpcs.begin();
+                    // TODO: WE CAN'T JUST CANCEL WARMUP RPCs, SOMEHOW
+                    // THE CLIENTS WILL NOT BE ABLE TO MAKE ANY PROGRESS BEYOND
+                    // UNSCHED BYTES?
+
+                    // Start the experiment officially in 10 ms (i.e., 500 us
+                    // multiplied by at most 20 oustanding RPCs).
+                    startTime = Cycles::rdtsc() + Cycles::fromSeconds(0.01);
+                    stopTime = startTime + Cycles::fromSeconds(timeLimit);
+                    nextMessageArrival = startTime + messageIntervalDist(gen);
+                }
+            } else {
+                count++;
+            }
+
+            unsigned messageId = messageSizeDist(gen);
+            const char* receiver =
+                    receivers[generateRandom() % numReceivers].c_str();
+            uint32_t length = messageSizes[messageId];
+            EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
+                    message.c_str(), length, length);
+            outstandingRpcs.emplace_back(messageId, echo);
+            nextMessageArrival += messageIntervalDist(gen);
+        }
     }
     totalCycles = Cycles::rdtsc() - startTime;
     LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));
