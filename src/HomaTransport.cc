@@ -462,9 +462,6 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     priority);
             driver->sendPacket(address, &header, &iter, priority);
         }
-        bytesSent += bytesThisPacket;
-        curOffset += bytesThisPacket;
-
         uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
         if (bytesQueuedAhead > 0) {
             timeTrace(driver->getLastTransmitTime(),
@@ -479,6 +476,8 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "0 bytes queued ahead, idle time %u cyc",
                     rpcId.clientId, rpcId.sequence, curOffset, idleInterval);
         }
+        bytesSent += bytesThisPacket;
+        curOffset += bytesThisPacket;
 
         // Update performance monitor metrics.
         numDataPacketsSent++;
