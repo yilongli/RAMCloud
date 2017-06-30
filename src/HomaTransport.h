@@ -891,6 +891,13 @@ class HomaTransport : public Transport {
     /// # data packets transmitted in the current interval.
     uint32_t numDataPacketsSent;
 
+    // TODO: I have not decided whether to keep the following two metrics.
+    // # GRANTs generated upon the arrival of a scheduled message packet.
+    uint32_t numGrantsGenerated;
+
+    // # packets received that belong to a scheduled message.
+    uint32_t numSchedMessagePackets;
+
     /// # times, in the current interval, we cannot transmit any message
     /// because we are waiting for GRANTs and the transmit queue has run
     /// dry.

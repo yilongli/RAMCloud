@@ -110,7 +110,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , activeMessages()
     , inactiveMessages()
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(3) // TODO: why 3?
+    , maxGrantedMessages(4) // TODO: why 4?
     , lastMeasureTime(0)
     , lastDispatchActiveCycles(0)
     , lastTimeGrantRunDry(0)
@@ -120,6 +120,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , numDataPacketsReceived(0)
     , numControlPacketsSent(0)
     , numDataPacketsSent(0)
+    , numGrantsGenerated(0)
+    , numSchedMessagePackets(0)
     , numTimesGrantRunDry(0)
     , outputControlBytes(0)
     , outputDataBytes(0)
@@ -1844,6 +1846,9 @@ HomaTransport::Poller::poll()
                 t->numControlPacketsSent/millis,
                 t->numDataPacketsReceived/millis,
                 (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
+        timeTrace(now, "received %u packets from scheduled messages, "
+                "generated %u grants",
+                t->numSchedMessagePackets, t->numGrantsGenerated);
         timeTrace(now, "dispatch utilization %u%%, process packets %u%%, "
                 "transmit data %u%%, transmit grant %u%%",
                 activeCycles*100/t->monitorInterval,
@@ -1862,6 +1867,8 @@ HomaTransport::Poller::poll()
         t->numDataPacketsReceived = 0;
         t->numControlPacketsSent = 0;
         t->numDataPacketsSent = 0;
+        t->numSchedMessagePackets = 0;
+        t->numGrantsGenerated = 0;
         t->numTimesGrantRunDry = 0;
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
@@ -1905,6 +1912,7 @@ HomaTransport::Poller::poll()
 
     // Send out GRANTs that are produced in the previous processing step
     // in a batch.
+    // TODO: should I do a bucket sort or something to rank them by priorities?
     for (ScheduledMessage* recipient : t->grantRecipients) {
         uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
                 FROM_SERVER : FROM_CLIENT;
@@ -2395,10 +2403,11 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
             LOG(ERROR, "unexpected message state %u", message->state);
             return;
     }
+    numSchedMessagePackets++;
 
     // Output a GRANT if this packet is scheduled (i.e., it corresponds to a
-    // GRANT sent in the past) or it belongs to a message is now active or
-    // purged.
+    // GRANT sent in the past) or it belongs to a message that is now active
+    // or purged.
     bool needGrant = scheduledPacket ||
             (message->state == ScheduledMessage::ACTIVE) ||
             (message->state == ScheduledMessage::PURGED);
@@ -2411,7 +2420,7 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     uint8_t priority;
     if (highestGrantedPrio >= 0) {
         priority = downCast<uint8_t>(highestGrantedPrio);
-    }  else {
+    } else {
         // No scheduled message.
         assert(activeMessages.size() + inactiveMessages.size() == 0);
         return;
@@ -2426,6 +2435,9 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
         }
         priority--;
     }
+
+    // TODO: We have a serious problem, we are consistently grant less than received
+    //
 
     if (messageToGrant == NULL) {
         return;
@@ -2450,6 +2462,7 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     }
 
     // Output a GRANT for the selected message.
+    numGrantsGenerated++;
     if (std::find(grantRecipients.begin(), grantRecipients.end(),
             messageToGrant) == grantRecipients.end()) {
         grantRecipients.push_back(messageToGrant);
