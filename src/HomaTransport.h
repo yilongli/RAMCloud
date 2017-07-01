@@ -271,14 +271,14 @@ class HomaTransport : public Transport {
     // TODO
     class OutgoingMessage {
       public:
+        /// Holds the contents of the message.
+        Buffer* buffer;
+
         /// True means this message is the request of a ClientRpc; false means
         /// it is the response of a ServerRpc.
         const bool isRequest;
 
-        /// Holds the message content.
-        Buffer* buffer;
-
-        // Where to send the message.
+        /// Where to send the message.
         const Driver::Address* recipient;
 
         /// Offset within the message of the next byte we should transmit to
@@ -294,13 +294,17 @@ class HomaTransport : public Transport {
         /// them.
         uint32_t transmitLimit;
 
+        /// True means this message is among the sender's top outgoing
+        /// messages with fewest bytes left (and this object is linked in
+        /// t->topOutgoingMessages).
+        bool topChoice;
+
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the message.
         uint64_t lastTransmitTime;
 
-        /// The index of this message in t->topOutgoingMessages. -1 means it is
-        /// not among the top K outgoing messages with minimum bytes left.
-        int topOutgoingMessage;
+        /// Used to link this object into t->topOutgoingMessages.
+        IntrusiveListHook outgoingMessageLinks;
 
         // TODO: doc. dynamic throttling
         /// # bytes that can be sent unilaterally.
@@ -308,14 +312,15 @@ class HomaTransport : public Transport {
 
         OutgoingMessage(bool isRequest, Buffer* buffer,
                 const Driver::Address* recipient)
-            : isRequest(isRequest)
-            , buffer(buffer)
+            : buffer(buffer)
+            , isRequest(isRequest)
             , recipient(recipient)
             , transmitOffset(0)
             , transmitPriority(0)
             , transmitLimit(0)
+            , topChoice(false)
             , lastTransmitTime(0)
-            , topOutgoingMessage(-1)
+            , outgoingMessageLinks()
             , unscheduledBytes()
         {}
 
@@ -659,8 +664,7 @@ class HomaTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void removeTopOutgoingMessage(OutgoingMessage* message);
-    void tryToPromote(OutgoingMessage* message);
+    void updateTopOutgoingMessageSet(OutgoingMessage* candidate);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
@@ -753,10 +757,17 @@ class HomaTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    // TODO: Top K outgoing requests; how to decide K? we want it small so
-    // scanning is fast but not too small the sender has to frequently look
-    // outside this set
-    OutgoingMessage* topOutgoingMessages[8];
+    /// A relatively small set of the sender's top K outgoing messages with
+    /// fewest bytes left. We keep this as a separate set so that the sender
+    /// doesn't have to consider all the outgoing messages in the common case.
+    /// K is dynamically adjusted based on the workload. The overall goal is
+    /// to keep K as small as possible while still ensuring that the sender
+    /// doesn't have to look outside this set when picking the next message
+    /// to transmit. Every time the sender decides to transmit a message
+    /// outside this set, we increment K by one.
+    INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
+            OutgoingMessageList;
+    OutgoingMessageList topOutgoingMessages;
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and
