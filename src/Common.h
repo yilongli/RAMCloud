@@ -93,10 +93,6 @@ arrayLength(const T (&array)[length])
     return length;
 }
 
-template<typename T>
-constexpr uint32_t
-arrayLength(const T (&array)[0]) { return 0; }
-
 uint64_t _generateRandom();
 
 #if TESTING

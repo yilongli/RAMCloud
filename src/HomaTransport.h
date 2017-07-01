@@ -268,11 +268,48 @@ class HomaTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
     };
 
+    // TODO
+    class OutgoingMessage {
+      public:
+        /// True means this message is the request of a ClientRpc; false means
+        /// it is the response of a ServerRpc.
+        const bool isRequest;
+
+        /// Holds the message content.
+        Buffer* buffer;
+
+        /// Offset within the message of the next byte we should transmit to
+        /// the recipient; all preceding bytes have already been sent.
+        uint32_t transmitOffset;
+
+        /// The number of bytes in the message that it's OK for us to transmit.
+        /// Bytes after this cannot be transmitted until we receive a GRANT for
+        /// them.
+        uint32_t transmitLimit;
+
+        /// The index of this message in t->topOutgoingMessages. -1 means it is
+        /// not among the top K outgoing messages with minimum bytes left.
+        int topOutgoingMessage;
+
+        OutgoingMessage(bool isRequest, Buffer* buffer)
+            : isRequest(isRequest)
+            , buffer(buffer)
+            , transmitOffset(0)
+            , transmitLimit(0)
+            , topOutgoingMessage(-1)
+        {}
+
+        virtual ~OutgoingMessage() {}
+
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(OutgoingMessage);
+    };
+
     /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    class ClientRpc {
+    class ClientRpc : public OutgoingMessage {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
@@ -292,19 +329,9 @@ class HomaTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// Offset within the request message of the next byte we should
-        /// transmit to the server; all preceding bytes have already
-        /// been sent.
-        uint32_t transmitOffset;
-
         /// Packet priority to use for transmitting the rest of the request
         /// message up to `transmitLimit`.
         uint8_t transmitPriority;
-
-        /// The number of bytes in the request message that it's OK for
-        /// us to transmit. Bytes after this cannot be transmitted until
-        /// we receive a GRANT for them.
-        uint32_t transmitLimit;
 
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the request.
@@ -317,11 +344,6 @@ class HomaTransport : public Transport {
         /// True means that the request message is in the process of being
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
-
-        /// The index of this RPC in t->topOutgoingRequests. -1 means its
-        /// request message is not among the top K outgoing requests with
-        /// minimum bytes left.
-        int topOutgoingRequest;
 
         /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
@@ -337,19 +359,17 @@ class HomaTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : session(session)
+            : OutgoingMessage(true, request)
+            , session(session)
             , sequence(sequence)
             , request(request)
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
-            , transmitOffset(0)
             , transmitPriority(0)
-            , transmitLimit(0)
             , lastTransmitTime(0)
             , silentIntervals(0)
             , transmitPending(false)
-            , topOutgoingRequest(-1)
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
@@ -363,7 +383,7 @@ class HomaTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc {
+    class ServerRpc : public Transport::ServerRpc, public OutgoingMessage {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -383,19 +403,9 @@ class HomaTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// Offset within the response message of the next byte we should
-        /// transmit to the client; all preceding bytes have already
-        /// been sent.
-        uint32_t transmitOffset;
-
         /// Packet priority to use for transmitting the rest of the response
         /// message up to `transmitLimit`.
         uint8_t transmitPriority;
-
-        /// The number of bytes in the response message that it's OK for
-        /// us to transmit. Bytes after this cannot be transmitted until
-        /// we receive a GRANT for them.
-        uint32_t transmitLimit;
 
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the response.
@@ -430,13 +440,12 @@ class HomaTransport : public Transport {
 
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : t(transport)
+            : OutgoingMessage(false, &replyPayload)
+            , t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
-            , transmitOffset(0)
             , transmitPriority(0)
-            , transmitLimit(0)
             , lastTransmitTime(0)
             , silentIntervals(0)
             , requestComplete(false)
@@ -657,8 +666,8 @@ class HomaTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void removeTopOutgoingRequest(ClientRpc* request);
-    void tryToPromote(ClientRpc* request);
+    void removeTopOutgoingMessage(OutgoingMessage* message);
+    void tryToPromote(OutgoingMessage* message);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
@@ -754,7 +763,7 @@ class HomaTransport : public Transport {
     // TODO: Top K outgoing requests; how to decide K? we want it small so
     // scanning is fast but not too small the sender has to frequently look
     // outside this set
-    ClientRpc* topOutgoingRequests[0];
+    OutgoingMessage* topOutgoingMessages[8];
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and
