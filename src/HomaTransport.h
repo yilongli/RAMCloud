@@ -278,25 +278,45 @@ class HomaTransport : public Transport {
         /// Holds the message content.
         Buffer* buffer;
 
+        // Where to send the message.
+        const Driver::Address* recipient;
+
         /// Offset within the message of the next byte we should transmit to
         /// the recipient; all preceding bytes have already been sent.
         uint32_t transmitOffset;
+
+        /// Packet priority to use for transmitting the rest of the message up
+        /// to `transmitLimit`.
+        uint8_t transmitPriority;
 
         /// The number of bytes in the message that it's OK for us to transmit.
         /// Bytes after this cannot be transmitted until we receive a GRANT for
         /// them.
         uint32_t transmitLimit;
 
+        /// Cycles::rdtsc time of the most recent time that we transmitted
+        /// data bytes of the message.
+        uint64_t lastTransmitTime;
+
         /// The index of this message in t->topOutgoingMessages. -1 means it is
         /// not among the top K outgoing messages with minimum bytes left.
         int topOutgoingMessage;
 
-        OutgoingMessage(bool isRequest, Buffer* buffer)
+        // TODO: doc. dynamic throttling
+        /// # bytes that can be sent unilaterally.
+        uint32_t unscheduledBytes;
+
+        OutgoingMessage(bool isRequest, Buffer* buffer,
+                const Driver::Address* recipient)
             : isRequest(isRequest)
             , buffer(buffer)
+            , recipient(recipient)
             , transmitOffset(0)
+            , transmitPriority(0)
             , transmitLimit(0)
+            , lastTransmitTime(0)
             , topOutgoingMessage(-1)
+            , unscheduledBytes()
         {}
 
         virtual ~OutgoingMessage() {}
@@ -329,14 +349,6 @@ class HomaTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// Packet priority to use for transmitting the rest of the request
-        /// message up to `transmitLimit`.
-        uint8_t transmitPriority;
-
-        /// Cycles::rdtsc time of the most recent time that we transmitted
-        /// data bytes of the request.
-        uint64_t lastTransmitTime;
-
         /// Number of times that the transport timer has fired since we
         /// received any packets from the server.
         uint32_t silentIntervals;
@@ -354,26 +366,20 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
-        // TODO: doc. dynamic throttling
-        uint32_t unscheduledBytes;
-
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : OutgoingMessage(true, request)
+            : OutgoingMessage(true, request, session->serverAddress)
             , session(session)
             , sequence(sequence)
             , request(request)
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
-            , transmitPriority(0)
-            , lastTransmitTime(0)
             , silentIntervals(0)
             , transmitPending(false)
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
-            , unscheduledBytes()
         {}
 
       PRIVATE:
@@ -397,19 +403,12 @@ class HomaTransport : public Transport {
         /// sequence number is in rpcId.
         uint64_t sequence;
 
+        // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
         /// Where to send the response once the RPC has executed.
         const Driver::Address* clientAddress;
 
         /// Unique identifier for this RPC.
         RpcId rpcId;
-
-        /// Packet priority to use for transmitting the rest of the response
-        /// message up to `transmitLimit`.
-        uint8_t transmitPriority;
-
-        /// Cycles::rdtsc time of the most recent time that we transmitted
-        /// data bytes of the response.
-        uint64_t lastTransmitTime;
 
         /// Number of times that the transport timer has fired since we
         /// received any packets from the client.
@@ -435,18 +434,13 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->outgoingResponses.
         IntrusiveListHook outgoingResponseLinks;
 
-        // TODO: doc. dynamic throttling
-        uint32_t unscheduledBytes;
-
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : OutgoingMessage(false, &replyPayload)
+            : OutgoingMessage(false, &replyPayload, clientAddress)
             , t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
-            , transmitPriority(0)
-            , lastTransmitTime(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
@@ -454,7 +448,6 @@ class HomaTransport : public Transport {
             , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
-            , unscheduledBytes()
         {}
 
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);

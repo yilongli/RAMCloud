@@ -640,8 +640,6 @@ HomaTransport::tryToTransmitData()
     if (static_cast<int>(transmitQueueSpace) < 0) {
         return 0;
     }
-    uint32_t maxBytes;
-    uint32_t grantedBytesLeft;
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
@@ -722,70 +720,50 @@ HomaTransport::tryToTransmitData()
             }
         }
 
-        uint32_t bytesSent = 0;
-        if (clientRpc != NULL) {
-            // Transmit one or more request DATA packets from clientRpc,
+        if (message != NULL) {
+            // Transmit one or more request DATA packets from the message,
             // if appropriate.
-            grantedBytesLeft = std::min(clientRpc->transmitLimit,
-                    clientRpc->request->size()) - clientRpc->transmitOffset;
-            if (transmitQueueSpace < grantedBytesLeft) {
-                if (transmitQueueSpace < maxDataPerPacket) {
-                    break;
-                }
+            uint32_t maxBytes = std::min(message->transmitLimit,
+                    message->buffer->size()) - message->transmitOffset;
+            if (maxBytes > transmitQueueSpace) {
                 maxBytes = transmitQueueSpace;
-            } else {
-                maxBytes = grantedBytesLeft;
             }
-            bytesSent = sendBytes(
-                    clientRpc->session->serverAddress,
-                    RpcId(clientId, clientRpc->sequence),
-                    clientRpc->request, clientRpc->transmitOffset, maxBytes,
-                    clientRpc->unscheduledBytes, clientRpc->transmitPriority,
-                    FROM_CLIENT);
-            clientRpc->transmitOffset += bytesSent;
-            clientRpc->lastTransmitTime = driver->getLastTransmitTime();
+
+            RpcId rpcId = clientRpc ?
+                    RpcId(clientId, clientRpc->sequence) : serverRpc->rpcId;
+            uint8_t whoFrom = clientRpc ? FROM_CLIENT : FROM_SERVER;
+            uint32_t bytesSent = sendBytes(message->recipient, rpcId,
+                    message->buffer, message->transmitOffset, maxBytes,
+                    message->unscheduledBytes, message->transmitPriority,
+                    whoFrom);
+            if (bytesSent == 0) {
+                // We can't transmit any more data because the queue space
+                // is too small.
+                break;
+            }
+
+            message->transmitOffset += bytesSent;
+            message->lastTransmitTime = driver->getLastTransmitTime();
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
-            if (clientRpc->transmitOffset >= clientRpc->request->size()) {
-                erase(outgoingRequests, *clientRpc);
-                clientRpc->transmitPending = false;
-                if (clientRpc->topOutgoingMessage >= 0) {
-                    removeTopOutgoingMessage(clientRpc);
+            if (message->transmitOffset >= message->buffer->size()) {
+                if (clientRpc) {
+                    erase(outgoingRequests, *clientRpc);
+                    clientRpc->transmitPending = false;
+                    if (message->topOutgoingMessage >= 0) {
+                        removeTopOutgoingMessage(message);
+                    }
+                } else {
+                    // Delete the ServerRpc object as soon as we have
+                    // transmitted the last byte. This has the disadvantage
+                    // that if some of this data is lost we won't be able to
+                    // retransmit it (the whole RPC will be retried). However,
+                    // this approach is simpler and faster in the common case
+                    // where data isn't lost.
+                    deleteServerRpc(serverRpc);
                 }
-            } else if (clientRpc->topOutgoingMessage < 0) {
-                tryToPromote(clientRpc);
-            }
-        } else if (serverRpc != NULL) {
-            // Transmit one or more response DATA packets from serverRpc,
-            // if appropriate.
-            grantedBytesLeft = std::min(serverRpc->transmitLimit,
-                    serverRpc->replyPayload.size()) - serverRpc->transmitOffset;
-            if (transmitQueueSpace < grantedBytesLeft) {
-                if (transmitQueueSpace < maxDataPerPacket) {
-                    break;
-                }
-                maxBytes = transmitQueueSpace;
-            } else {
-                maxBytes = grantedBytesLeft;
-            }
-            bytesSent = sendBytes(serverRpc->clientAddress,
-                    serverRpc->rpcId, &serverRpc->replyPayload,
-                    serverRpc->transmitOffset, maxBytes,
-                    serverRpc->unscheduledBytes, serverRpc->transmitPriority,
-                    FROM_SERVER);
-            serverRpc->transmitOffset += bytesSent;
-            serverRpc->lastTransmitTime = driver->getLastTransmitTime();
-            transmitQueueSpace -= bytesSent;
-            totalBytesSent += bytesSent;
-            if (serverRpc->transmitOffset >= serverRpc->replyPayload.size()) {
-                // Delete the ServerRpc object as soon as we have transmitted
-                // the last byte. This has the disadvantage that if some of
-                // this data is lost we won't be able to retransmit it (the
-                // whole RPC will be retried). However, this approach is
-                // simpler and faster in the common case where data isn't lost.
-                deleteServerRpc(serverRpc);
-            } else if (serverRpc->topOutgoingMessage < 0) {
-                tryToPromote(serverRpc);
+            } else if (message->topOutgoingMessage < 0) {
+                tryToPromote(message);
             }
         } else {
             // There are no messages with data that can be transmitted.
