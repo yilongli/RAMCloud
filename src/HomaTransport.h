@@ -669,8 +669,7 @@ class HomaTransport : public Transport {
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
             ScheduledMessage* newMessage, bool cancelled = false);
-    void dataArriveForScheduledMessage(ScheduledMessage* message,
-            bool scheduledPacket);
+    void dataPacketArrive(ScheduledMessage* message);
 
     /// Shared RAMCloud information.
     Context* context;

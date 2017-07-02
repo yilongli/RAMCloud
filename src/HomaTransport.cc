@@ -1071,13 +1071,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
-                if (clientRpc->scheduledMessage) {
-                    bool scheduledPacket = (header->offset + received->len >
-                            header->unscheduledBytes);
-                    dataArriveForScheduledMessage(
-                            clientRpc->scheduledMessage.get(),
-                            scheduledPacket);
-                }
+                dataPacketArrive(clientRpc->scheduledMessage.get());
                 if (clientRpc->response->size() >= header->totalLength) {
                     // Response complete.
                     if (clientRpc->response->size() > header->totalLength) {
@@ -1327,18 +1321,14 @@ HomaTransport::handlePacket(Driver::Received* received)
                             WireFormat::RequestCommon>()->opcode,
                             header->totalLength);
                 }
-                if (serverRpc->scheduledMessage) {
-                    if (header->offset > serverRpc->scheduledMessage->grantOffset) {
-                        LOG(ERROR, "DATA offset %u larger than grant offset %u",
-                                header->offset,
-                                serverRpc->scheduledMessage->grantOffset);
-                    }
-                    bool scheduledPacket = (header->offset + received->len >
-                            header->unscheduledBytes);
-                    dataArriveForScheduledMessage(
-                            serverRpc->scheduledMessage.get(),
-                            scheduledPacket);
-                }
+                dataPacketArrive(serverRpc->scheduledMessage.get());
+//                if (serverRpc->scheduledMessage) {
+//                    if (header->offset > serverRpc->scheduledMessage->grantOffset) {
+//                        LOG(ERROR, "DATA offset %u larger than grant offset %u",
+//                                header->offset,
+//                                serverRpc->scheduledMessage->grantOffset);
+//                    }
+//                }
                 if (serverRpc->requestPayload.size() >= header->totalLength) {
                     // Message complete; start servicing the RPC.
                     if (serverRpc->requestPayload.size()
@@ -1867,8 +1857,8 @@ HomaTransport::Poller::poll()
         t->numDataPacketsReceived = 0;
         t->numControlPacketsSent = 0;
         t->numDataPacketsSent = 0;
-//        t->numSchedMessagePackets = 0;
-//        t->numGrantsGenerated = 0;
+        t->numSchedMessagePackets = 0;
+        t->numGrantsGenerated = 0;
         t->numTimesGrantRunDry = 0;
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
@@ -2371,55 +2361,40 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
 }
 
 /**
- * When a scheduled message receives a data packet, this method is invoked to
- * to see if the scheduler needs to 1) activate an inactive message and put it
- * into the active message list, 2) adjust its scheduling precedence among the
- * active messages and 3) send out a GRANT for another data packet.
+ * When a full data packet is received, this method is invoked to see
+ * if the scheduler needs to 1) update its active message list and
+ * 2) send out a GRANT.
  *
  * \param message
- *      The message that receives new data.
- * \param scheduledPacket
- *      True if the data packet contains scheduled bytes of the message; false,
- *      otherwise.
+ *      NULL means the data packet belongs to a unscheduled message;
+ *      otherwise, it is the scheduled message that receives the data
+ *      packet.
  */
 void
-HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
-        bool scheduledPacket)
+HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
 {
-    // See if we need to adjust the scheduling precedence of this message.
-    switch (message->state) {
-        case ScheduledMessage::ACTIVE:
-            adjustSchedulingPrecedence(message);
-            break;
-        case ScheduledMessage::INACTIVE:
-            tryToSchedule(message);
-            break;
-        case ScheduledMessage::PURGED:
-            // A scheduled message will be purged from the scheduler as soon
-            // as it was fully granted. However, we will continue to receive
-            // data packets from it for a while.
-            break;
-        default:
-            LOG(ERROR, "unexpected message state %u", message->state);
-            return;
+    // If this data packet belongs to a scheduled message, see if we need to
+    // adjust the scheduling precedence of this message.
+    if (scheduledMessage) {
+        switch (scheduledMessage->state) {
+            case ScheduledMessage::ACTIVE:
+                adjustSchedulingPrecedence(scheduledMessage);
+                break;
+            case ScheduledMessage::INACTIVE:
+                tryToSchedule(scheduledMessage);
+                break;
+            case ScheduledMessage::PURGED:
+                // A scheduled message will be purged from the scheduler as
+                // soon as it was fully granted. However, we will continue to
+                // receive data packets from it for a while.
+                break;
+            default:
+                LOG(ERROR, "unexpected message state %u",
+                        scheduledMessage->state);
+                return;
+        }
     }
     numSchedMessagePackets++;
-
-    // Output a GRANT if this packet is scheduled (i.e., it corresponds to a
-    // GRANT sent in the past) or it belongs to a message that is now active
-    // or purged.
-    // TODO: this logic might not be correct; if we just receive some unscheduled
-    // packets from a new message that we consider as inactive; we should still
-    // output a grant for some other messages if appropriate because those packets
-    // do occupy some of our bw.
-    // TODO: SHALL WE OUTPUT GRANT FOR UNSCHEDULE MESSAGES AS WELL? IT MAKES SENSE
-    // FOR AT LEAST FULL-PACKETS, RIGHT?
-    bool needGrant = scheduledPacket ||
-            (message->state == ScheduledMessage::ACTIVE) ||
-            (message->state == ScheduledMessage::PURGED);
-    if (!needGrant) {
-        return;
-    }
 
     // Find the first active message that could use a GRANT.
     ScheduledMessage* messageToGrant = NULL;
@@ -2442,13 +2417,9 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
         priority--;
     }
 
-    // TODO: We have a serious problem, we are consistently grant less than received
-    //
-
     if (messageToGrant == NULL) {
-//        if (!inactiveMessages.empty()) {
-//            LOG(ERROR, "WE ARE WASTING OUT GRANTS! %lu active, %lu inactive", activeMessages.size(), inactiveMessages.size());
-//        }
+        // All of the active messages (or, more precisely, their senders) have
+        // been granted for 1 RTT incoming bytes.
         return;
     }
     if (messageToGrant->accumulator->totalLength - messageToGrant->grantOffset
