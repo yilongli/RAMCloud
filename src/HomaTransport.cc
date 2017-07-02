@@ -1867,8 +1867,8 @@ HomaTransport::Poller::poll()
         t->numDataPacketsReceived = 0;
         t->numControlPacketsSent = 0;
         t->numDataPacketsSent = 0;
-        t->numSchedMessagePackets = 0;
-        t->numGrantsGenerated = 0;
+//        t->numSchedMessagePackets = 0;
+//        t->numGrantsGenerated = 0;
         t->numTimesGrantRunDry = 0;
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
@@ -2408,6 +2408,12 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     // Output a GRANT if this packet is scheduled (i.e., it corresponds to a
     // GRANT sent in the past) or it belongs to a message that is now active
     // or purged.
+    // TODO: this logic might not be correct; if we just receive some unscheduled
+    // packets from a new message that we consider as inactive; we should still
+    // output a grant for some other messages if appropriate because those packets
+    // do occupy some of our bw.
+    // TODO: SHALL WE OUTPUT GRANT FOR UNSCHEDULE MESSAGES AS WELL? IT MAKES SENSE
+    // FOR AT LEAST FULL-PACKETS, RIGHT?
     bool needGrant = scheduledPacket ||
             (message->state == ScheduledMessage::ACTIVE) ||
             (message->state == ScheduledMessage::PURGED);
@@ -2440,6 +2446,9 @@ HomaTransport::dataArriveForScheduledMessage(ScheduledMessage* message,
     //
 
     if (messageToGrant == NULL) {
+//        if (!inactiveMessages.empty()) {
+//            LOG(ERROR, "WE ARE WASTING OUT GRANTS! %lu active, %lu inactive", activeMessages.size(), inactiveMessages.size());
+//        }
         return;
     }
     if (messageToGrant->accumulator->totalLength - messageToGrant->grantOffset
