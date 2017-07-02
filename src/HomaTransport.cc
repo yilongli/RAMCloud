@@ -120,8 +120,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , numDataPacketsReceived(0)
     , numControlPacketsSent(0)
     , numDataPacketsSent(0)
-    , numGrantsGenerated(0)
-    , numSchedMessagePackets(0)
     , numTimesGrantRunDry(0)
     , outputControlBytes(0)
     , outputDataBytes(0)
@@ -1836,9 +1834,6 @@ HomaTransport::Poller::poll()
                 t->numControlPacketsSent/millis,
                 t->numDataPacketsReceived/millis,
                 (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
-        timeTrace(now, "received %u packets from scheduled messages, "
-                "generated %u grants",
-                t->numSchedMessagePackets, t->numGrantsGenerated);
         timeTrace(now, "dispatch utilization %u%%, process packets %u%%, "
                 "transmit data %u%%, transmit grant %u%%",
                 activeCycles*100/t->monitorInterval,
@@ -1857,8 +1852,6 @@ HomaTransport::Poller::poll()
         t->numDataPacketsReceived = 0;
         t->numControlPacketsSent = 0;
         t->numDataPacketsSent = 0;
-        t->numSchedMessagePackets = 0;
-        t->numGrantsGenerated = 0;
         t->numTimesGrantRunDry = 0;
         t->outputControlBytes = 0;
         t->outputDataBytes = 0;
@@ -2031,6 +2024,10 @@ HomaTransport::checkTimeouts()
         // we delete the ClientRpc below.
         it++;
 
+        ScheduledMessage* scheduledMessage = clientRpc->scheduledMessage.get();
+        uint32_t grantOffset =
+                scheduledMessage ? scheduledMessage->grantOffset : 0;
+
         assert(timeoutIntervals > 2*pingIntervals);
         if (clientRpc->silentIntervals >= timeoutIntervals) {
             // A long time has elapsed with no communication whatsoever
@@ -2040,12 +2037,23 @@ HomaTransport::checkTimeouts()
                     WireFormat::opcodeSymbol(clientRpc->request),
                     clientRpc->session->serverAddress->toString().c_str(),
                     sequence);
+            // See if it is the client's problem for not granting more bytes
+            // to the response for a long time.
+            bool responseStarvedOfGrant = scheduledMessage &&
+                    (clientRpc->accumulator->buffer->size() == grantOffset);
+            if (responseStarvedOfGrant) {
+                LOG(WARNING, "RPC response starved of grant, clientId %lu, "
+                        "sequence %lu, grantOffset %u, %lu active messages",
+                        clientRpc->rpcId.clientId, clientRpc->sequence,
+                        grantOffset, activeMessages.size());
+                // TODO: IT SEEMS TO BE OUR PROBLEM THAT CAUSES THIS SITUATION
+                // SHOULD WE NOT DELETE THE ClientRpc AND CLEAR ITS SILENT INTERVAL?
+            }
             clientRpc->notifier->failed();
             deleteClientRpc(clientRpc);
             continue;
         }
 
-        ScheduledMessage* scheduledMessage = clientRpc->scheduledMessage.get();
         if (!clientRpc->accumulator) {
             // We haven't received any part of the response message.
             // Send occasional RESEND packets, which should produce some
@@ -2061,38 +2069,23 @@ HomaTransport::checkTimeouts()
                 // The RESEND packet is effectively a grant...
                 sendControlPacket(clientRpc->session->serverAddress, &resend);
             }
-        } else if (!scheduledMessage ||
-                (scheduledMessage->state == ScheduledMessage::ACTIVE) ||
-                (scheduledMessage->state == ScheduledMessage::PURGED)) {
-            // We have received part of the response and expect to receive
-            // more, meaning that the response message is either a unscheduled,
-            // active or purged message. If the server has gone silent, this
-            // must mean packets were lost, grants were lost, or the server
-            // has preempted this response for higher priority messages, so
-            // request retransmission anyway.
-            if (clientRpc->silentIntervals >= 2) {
-                uint32_t grantOffset = scheduledMessage ?
-                        scheduledMessage->grantOffset : 0;
-                if (scheduledMessage &&
-                        grantOffset == clientRpc->accumulator->buffer->size())
-                {
-                    // TODO: NOT SURE WHY THIS COULD HAPPEN? WE HAVE RECEIVED
-                    // ALL WE HAVE ASKED FOR; IT'S OUR PROBLEM TO NOT SEND ENOUGH
-                    // GRANTs!!!
-                    LOG(WARNING, "client rpc starved of grant, clientId %lu, "
-                            "sequence %lu, grantOffset %u, %lu activeMessages",
-                            clientRpc->rpcId.clientId, clientRpc->sequence,
-                            grantOffset, activeMessages.size());
-                    timeTrace("server rpc starved of grant, clientId %u, "
-                            "sequence %u, grantOffset %u, %u active messages",
-                            clientRpc->rpcId.clientId, clientRpc->sequence,
-                            grantOffset, activeMessages.size());
-                    continue;
-                }
-                clientRpc->accumulator->requestRetransmission(this,
-                        clientRpc->session->serverAddress,
-                        RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
+        } else if (clientRpc->silentIntervals >= 2) {
+            // We have received part of the response. See if we have received
+            // every byte we have granted. If we haven't but the server has
+            // gone silent, this must mean packets were lost, grants were lost,
+            // or the server has preempted this response for higher priority
+            // messages, so request retransmission anyway.
+            if (scheduledMessage &&
+                    (clientRpc->accumulator->buffer->size() == grantOffset)) {
+                // The client has received every byte of the response it has
+                // granted but hasn't got around to grant more because there
+                // are higher priority responses.
+                // TODO: DO WE EXPECT TO RECEIVE DATA FROM INACTIVE MESSAGE?
+                continue;
             }
+            clientRpc->accumulator->requestRetransmission(this,
+                    clientRpc->session->serverAddress,
+                    RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
         }
     }
 
@@ -2113,6 +2106,10 @@ HomaTransport::checkTimeouts()
         // delete the ServerRpc below.
         it++;
 
+        ScheduledMessage* scheduledMessage = serverRpc->scheduledMessage.get();
+        uint32_t grantOffset =
+                scheduledMessage ? scheduledMessage->grantOffset : 0;
+
         // If a long time has elapsed with no communication whatsoever
         // from the client, then abort the RPC. Note: this code should
         // only be executed when we're waiting to transmit or receive
@@ -2127,29 +2124,31 @@ HomaTransport::checkTimeouts()
         //     could process the RPC before the retransmitted data arrived.
         assert(serverRpc->sendingResponse || !serverRpc->requestComplete);
         if (serverRpc->silentIntervals >= timeoutIntervals) {
+            // See if it is the server's problem for not granting more bytes
+            // to the request for a long time.
+            bool requestStarvedOfGrant = !serverRpc->requestComplete &&
+                    scheduledMessage &&
+                    (serverRpc->accumulator->buffer->size() == grantOffset);
+            if (requestStarvedOfGrant) {
+                LOG(WARNING, "RPC request starved of grant, clientId %lu, "
+                        "sequence %lu, grantOffset %u, %lu active messages",
+                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence,
+                        grantOffset, activeMessages.size());
+                // TODO: IT SEEMS TO BE OUR PROBLEM THAT CAUSES THIS SITUATION
+                // SHOULD WE NOT DELETE THE ServerRpc AND CLEAR ITS SILENT INTERVAL?
+            }
             deleteServerRpc(serverRpc);
             continue;
         }
 
         // See if we need to request retransmission for part of the request
         // message.
-        ScheduledMessage* scheduledMessage = serverRpc->scheduledMessage.get();
-        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete &&
-                (!scheduledMessage ||
-                (scheduledMessage->state == ScheduledMessage::ACTIVE) ||
-                (scheduledMessage->state == ScheduledMessage::PURGED))) {
-            uint32_t grantOffset = scheduledMessage ?
-                    scheduledMessage->grantOffset : 0;
-            if (grantOffset == serverRpc->accumulator->buffer->size()) {
-                // TODO: NOT SURE WHY THIS COULD HAPPEN?
-                LOG(WARNING, "server rpc starved of grant, clientId %lu, "
-                        "sequence %lu, grantOffset %u, %lu active messages",
-                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence,
-                        grantOffset, activeMessages.size());
-                timeTrace("server rpc starved of grant, clientId %u, "
-                        "sequence %u, grantOffset %u, %u active messages",
-                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence,
-                        grantOffset, activeMessages.size());
+        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete) {
+            if (scheduledMessage &&
+                    (serverRpc->accumulator->buffer->size() == grantOffset)) {
+                // The server has received every byte of the request it has
+                // granted but hasn't got around to grant more because there
+                // are higher priority requests.
                 continue;
             }
             serverRpc->accumulator->requestRetransmission(this,
@@ -2394,7 +2393,6 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
                 return;
         }
     }
-    numSchedMessagePackets++;
 
     // Find the first active message that could use a GRANT.
     ScheduledMessage* messageToGrant = NULL;
@@ -2442,7 +2440,6 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
     }
 
     // Output a GRANT for the selected message.
-    numGrantsGenerated++;
     if (std::find(grantRecipients.begin(), grantRecipients.end(),
             messageToGrant) == grantRecipients.end()) {
         grantRecipients.push_back(messageToGrant);
