@@ -367,6 +367,13 @@ DpdkDriver::getLastQueueingDelay()
 }
 
 // See docs in Driver class.
+uint32_t
+DpdkDriver::getPacketOverhead()
+{
+    return ETHER_VLAN_HDR_LEN + ETHER_PACKET_OVERHEAD;
+}
+
+// See docs in Driver class.
 void
 DpdkDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)

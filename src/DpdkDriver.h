@@ -69,6 +69,7 @@ class DpdkDriver : public Driver
     virtual uint64_t getRxQueueIdleTime();
     virtual uint64_t getLastTransmitTime();
     virtual uint32_t getLastQueueingDelay();
+    virtual uint32_t getPacketOverhead();
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);

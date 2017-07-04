@@ -336,6 +336,16 @@ class Driver {
     }
 
     /**
+     * Returns the total protocol overhead (down to the physical layer) involved
+     * in transmitting one packet, in bytes.
+     */
+    virtual uint32_t getPacketOverhead()
+    {
+        // Default: not implemented
+        return 0;
+    }
+
+    /**
      * Return ownership of a packet buffer back to the driver.
      *
      * Invoked by a transport when it has finished processing the data

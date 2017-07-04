@@ -887,7 +887,7 @@ class HomaTransport : public Transport {
     /// `monitorMillis` in units of rdtsc ticks.
     uint64_t monitorInterval;
 
-    /// Specifies the period over which to compute average network throughput,
+    /// Specifies the period over which to log the performance metrics,
     /// in milliseconds.
     uint32_t monitorMillis;
 
@@ -919,8 +919,13 @@ class HomaTransport : public Transport {
     /// current interval.
     uint32_t outputResentBytes;
 
+    /// # performance monitor intervals we have experienced.
+    uint64_t perfMonitorIntervals;
+
     // TODO
     uint64_t processPacketCycles;
+
+    uint64_t timeoutCheckCycles;
 
     uint64_t transmitDataCycles;
 
