@@ -578,6 +578,7 @@ struct Echo {
         char padding[4];            // Ensure Request and Response have
                                     // the same size.
     } __attribute__((packed));
+    static_assert(sizeof(Request) == sizeof(Response), "");
 };
 
 struct EnlistServer {

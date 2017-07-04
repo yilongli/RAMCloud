@@ -10,6 +10,12 @@ from itertools import groupby
 # Minimum cost to receive a full packet, in microseconds
 MIN_RX_PACKET_COST = 0.3
 
+# How many full packets does the HomaTransport::roundTripBytes have?
+NUM_RTT_PACKETS = 7
+
+# Driver::getMaxPacketSize
+MAX_PACKET_SIZE = 1470
+
 class Packet:
     '''
     TODO
@@ -31,12 +37,17 @@ class Packet:
         # Timestamps
         self.sentTime = float('NaN')
         self.recvTime = float('NaN')
+        self.sentGrantTime = float('NaN')
+        self.recvGrantTime = float('NaN')
         self.orderTime = None
 
         # Runtime properties
         self.delay = float('NaN')
         self.extraDelay = None
         self.txQueuedBytes = float('NaN')
+        self.roundTripTime = float('NaN')   # recvGrantTime - sentTime
+        self.grantRespTime = float('NaN')   # sentGrantTime - recvTime
+        self.grantDelay = float('NaN')      # recvGrantTime - sentGrantTime
 
         # Sources of delays:
         # 1) Queueing delay at the NIC's transmit queue
@@ -69,7 +80,9 @@ class MessageParser:
             " (.*) \| (.*) us .*: \D+ (sending) DATA, clientId (\d+), sequence (\d+), offset (\d+), priority (\d+)",
             " (.*) \| (.*) us .*: (sent) data, clientId (\d+), sequence (\d+), offset (\d+), (\d+) bytes queued ahead",
             " (.*) \| (.*) us .*: \D+ (received) DATA, clientId (\d+), sequence (\d+), offset (\d+), length (\d+)",
-            " (.*) \| (.*) us .*: \D+ (received) ALL_DATA, clientId (\d+), sequence (\d+), length (\d+)"]))
+            " (.*) \| (.*) us .*: \D+ (received) ALL_DATA, clientId (\d+), sequence (\d+), length (\d+)",
+            " (.*) \| (.*) us .*: \D+ (sending GRANT), clientId (\d+), sequence (\d+), offset (\d+)",
+            " (.*) \| (.*) us .*: \D+ (received GRANT), clientId (\d+), sequence (\d+), offset (\d+)"]))
         self.packets = {}
         self.startOfPoll = {}
         self.maxPollingDelays = {}
@@ -94,7 +107,7 @@ class MessageParser:
         who = matchedGroups[0]
         time = float(matchedGroups[1])
         action = matchedGroups[2]
-        isRequest = who.startswith("server") ^ (action in ["sent", "sending"])
+        isRequest = who.startswith("server") ^ (action in ["sent", "sending", "received GRANT"])
 
         if action == "start":
             # Case 0: the beginning of a polling iteration
@@ -127,9 +140,15 @@ class MessageParser:
                 self.packets[packetId] = Packet(packetId)
             packet = self.packets[packetId]
             packet.sender = who
+            # Note: We are using the timestamp from the "sent data" message,
+            # rather than the "sending" message, as the packet enqueue time.
+            # This is usually more accurate. However, it's also an upper bound
+            # rather than lower bound. So if a jitter occurs right before we
+            # log the "sent data" message, we'll get a unrealistically small
+            # packet delay later in `pkt.delay = pkt.recvTime - pkt.sentTime`.
             packet.sentTime = time
             packet.txQueuedBytes = queueSize
-        else:
+        elif action == "received":
             # Case 3: received a data packet
             isAllData = len(matchedGroups) == 6
             if isAllData:
@@ -166,6 +185,28 @@ class MessageParser:
             # TODO: WHAT ABOUT JITTER BEFORE PREVIOUS POLL? CAN IT AFFECT THIS PACKET?
 
             self.updateRpcInfo(packet)
+        elif action == "sending GRANT":
+            # Case 4: sending a GRANT
+            clientId, sequenceNum, offset = \
+                    [int(x) for x in matchedGroups[3:]]
+            packetId = (isRequest, clientId, sequenceNum,
+                    offset - (NUM_RTT_PACKETS + 1) * MAX_PACKET_SIZE)
+            if packetId in self.packets:
+                packet = self.packets[packetId]
+                packet.sentGrantTime = time
+                packet.grantRespTime = time - packet.recvTime
+        else:
+            # Case 5: received a GRANT
+            assert(action == "received GRANT")
+            clientId, sequenceNum, offset = \
+                    [int(x) for x in matchedGroups[3:]]
+            packetId = (isRequest, clientId, sequenceNum,
+                    offset - (NUM_RTT_PACKETS + 1) * MAX_PACKET_SIZE)
+            if packetId in self.packets:
+                packet = self.packets[packetId]
+                packet.recvGrantTime = time
+                packet.grantDelay = time - packet.sentGrantTime
+                packet.roundTripTime = time - packet.sentTime
 
     def updateRpcInfo(self, packet):
         '''
@@ -198,7 +239,7 @@ if __name__ == "__main__":
         print("Wrong number of arguments!")
         exit()
 
-    bwBytesPerMicros = options.bandwidth / 8 * 1000.0
+    bwBytesPerMicros = options.bandwidth / 8.0 * 1000.0
     print "Bandwidth = %.1f B/us" % bwBytesPerMicros
     print("# options: %s" % options)
 
@@ -251,9 +292,9 @@ if __name__ == "__main__":
             normalize = lambda x : x / p.extraDelay if p.extraDelay > 0 else float('NaN')
 
             if line % 50 == 0:
-                print " sender     receiver|    time     delta    delay  extra|   TX queue    TOR switch    polling      RX overhead|  clientId   seq.   off.   len.  prio"
+                print " sender     receiver|    time     delta    delay  extra|   TX queue    TOR switch    polling      RX overhead|   RTT    resp.  G.delay|  clientId   seq.   off.   len.  prio"
             line += 1
-            print(" %s -> %s | %9.2f (+ %.2f) %6.2f %6.2f | %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) | %s%s" % (
+            print(" %s -> %s | %9.2f (+ %.2f) %6.2f %6.2f | %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) | %6.2f %6.2f %6.2f   | %s%s" % (
                     '   ?   ' if p.sender is None else p.sender,
                     '   ?   ' if p.recipient is None else p.recipient,
                     p.orderTime, deltaTime, p.delay, p.extraDelay,
@@ -261,6 +302,7 @@ if __name__ == "__main__":
                     p.maxTorQueueDelay, normalize(p.maxTorQueueDelay),
                     p.maxPollingDelay, normalize(p.maxPollingDelay),
                     p.rxDelay, normalize(p.rxDelay),
+                    p.roundTripTime, p.grantRespTime, p.grantDelay,
                     p.packetId[1:]+(p.length, p.priority),
                     ' S' if p.isAllData else ''))
 

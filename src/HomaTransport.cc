@@ -1243,11 +1243,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                 AllDataHeader* header = received->getOffset<AllDataHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received ALL_DATA, clientId %u, sequence %u, "
-                        "length %u",
-                        header->common.rpcId.clientId,
-                        header->common.rpcId.sequence,
-                        header->messageLength);
                 if (serverRpc != NULL) {
                     // This shouldn't normally happen: it means this packet is
                     // a duplicate, so we can just discard it.
@@ -1266,6 +1261,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     driver->release(payload);
                     return;
                 }
+                timeTrace("server received ALL_DATA, clientId %u, sequence %u, "
+                          "length %u", header->common.rpcId.clientId,
+                          header->common.rpcId.sequence, length);
                 serverRpc = serverRpcPool.construct(this,
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
