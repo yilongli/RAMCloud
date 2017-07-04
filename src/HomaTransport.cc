@@ -90,6 +90,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , outgoingRpcs()
     , outgoingRequests()
     , topOutgoingMessages()
+    , transmitDataSlowPath(true)
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
@@ -129,6 +130,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , timeoutCheckCycles(0)
     , transmitDataCycles(0)
     , transmitGrantCycles(0)
+    , tryToTransmitDataCacheMisses(0)
     , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
@@ -676,8 +678,9 @@ HomaTransport::tryToTransmitData()
             }
         }
 
-        if (expect_false((NULL == message)
+        if (expect_false((NULL == message) && transmitDataSlowPath
                 && (numOutgoingMessages > topOutgoingMessages.size()))) {
+            tryToTransmitDataCacheMisses++;
             timeTrace("slow path taken, iterating over %u outgoing messages",
                     outgoingRequests.size() + outgoingResponses.size());
 
@@ -720,10 +723,13 @@ HomaTransport::tryToTransmitData()
                 }
             }
 
-            // TODO: rephrase it
-            // Expand the top outgoing message set only if the message has the
-            // fewest bytes left among outgoing messages not in this set.
-            if ((message != NULL) && (minBytesLeft == outsideMinBytesLeft)) {
+            if (message == NULL) {
+                transmitDataSlowPath = false;
+            } else if (minBytesLeft == outsideMinBytesLeft) {
+                // TODO: rephrase it
+                // Expand the top outgoing message set only if the message
+                // has the fewest bytes left among outgoing messages not in
+                // this set.
                 message->topChoice = true;
                 topOutgoingMessages.push_back(*message);
             }
@@ -783,7 +789,7 @@ HomaTransport::tryToTransmitData()
                     deleteServerRpc(serverRpc);
                 }
             } else if (!message->topChoice) {
-                updateTopOutgoingMessageSet(message);
+                updateTopOutgoingMessageSet(message, false);
             }
         } else {
             // There are no messages with data that can be transmitted.
@@ -906,9 +912,14 @@ HomaTransport::Session::getRpcInfo()
  *
  * \param candidate
  *      A message that might be included in the top outgoing message set.
+ * \param newMessage
+ *      True means this message was just included in the outgoing
+ *      request/response set; false means the message was already in the
+ *      system.
  */
 void
-HomaTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate)
+HomaTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
+        bool newMessage)
 {
     assert(!candidate->topChoice);
 #define LOW_WATERMARK 4
@@ -932,8 +943,12 @@ HomaTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate)
         if (messageToReplace != NULL) {
             messageToReplace->topChoice = false;
             erase(topOutgoingMessages, *messageToReplace);
+            transmitDataSlowPath = true;
             candidate->topChoice = true;
             topOutgoingMessages.push_back(*candidate);
+        }
+        if (newMessage) {
+            transmitDataSlowPath = true;
         }
     }
 }
@@ -961,7 +976,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->outgoingRequests.push_back(*clientRpc);
     clientRpc->transmitPending = true;
-    t->updateTopOutgoingMessageSet(clientRpc);
+    t->updateTopOutgoingMessageSet(clientRpc, true);
     t->nextClientSequenceNumber++;
     uint32_t bytesSent = t->tryToTransmitData();
     if (bytesSent > 0) {
@@ -1107,6 +1122,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     clientRpc->transmitLimit = header->offset;
                     clientRpc->transmitPriority = header->priority;
                 }
+                if (!clientRpc->topChoice) {
+                    transmitDataSlowPath = true;
+                }
                 return;
             }
 
@@ -1142,13 +1160,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
-                        updateTopOutgoingMessageSet(clientRpc);
-                    } else {
-                        if (clientRpc->topChoice) {
-                            clientRpc->topChoice = false;
-                            erase(topOutgoingMessages, *clientRpc);
-                            updateTopOutgoingMessageSet(clientRpc);
-                        }
+                        updateTopOutgoingMessageSet(clientRpc, true);
+                    } else if (clientRpc->topChoice) {
+                        clientRpc->topChoice = false;
+                        erase(topOutgoingMessages, *clientRpc);
+                        updateTopOutgoingMessageSet(clientRpc, false);
                     }
                     return;
                 }
@@ -1375,6 +1391,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     serverRpc->transmitLimit = header->offset;
                     serverRpc->transmitPriority = header->priority;
                 }
+                if (!serverRpc->topChoice) {
+                    transmitDataSlowPath = true;
+                }
                 return;
             }
 
@@ -1508,7 +1527,7 @@ HomaTransport::ServerRpc::sendReply()
     transmitPriority = t->getUnschedTrafficPrio(replyPayload.size());
     t->outgoingResponses.push_back(*this);
     t->serverTimerList.push_back(*this);
-    t->updateTopOutgoingMessageSet(this);
+    t->updateTopOutgoingMessageSet(this, true);
     uint32_t bytesSent = t->tryToTransmitData();
     if (bytesSent > 0) {
         timeTrace("sendReply transmitted %u bytes", bytesSent);
@@ -1853,8 +1872,9 @@ HomaTransport::Poller::poll()
                 t->processPacketCycles*100/t->monitorInterval,
                 t->transmitDataCycles*100/t->monitorInterval,
                 t->transmitGrantCycles*100/t->monitorInterval);
-        timeTrace(now, "check timeouts %u%%",
-                t->timeoutCheckCycles*100/t->monitorInterval);
+        timeTrace(now, "check timeouts %u%%, tryToTxData cache misses %u",
+                t->timeoutCheckCycles*100/t->monitorInterval,
+                t->tryToTransmitDataCacheMisses);
         timeTrace(now, "unused uplink bandwidth %u%% (%u Mbps), "
                 "run out of grants %u times, wasted goodput <= %u Mbps",
                 static_cast<uint32_t>(unusedBandwidthPct),
@@ -1875,6 +1895,7 @@ HomaTransport::Poller::poll()
         t->timeoutCheckCycles = 0;
         t->transmitDataCycles = 0;
         t->transmitGrantCycles = 0;
+        t->tryToTransmitDataCacheMisses = 0;
         t->unusedBandwidth = 0;
     }
 

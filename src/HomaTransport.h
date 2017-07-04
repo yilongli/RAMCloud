@@ -664,7 +664,8 @@ class HomaTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void updateTopOutgoingMessageSet(OutgoingMessage* candidate);
+    void updateTopOutgoingMessageSet(OutgoingMessage* candidate,
+            bool newMessage);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
@@ -767,6 +768,11 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;
+
+    /// False means we know that no message outside t->topOutgoingMessages
+    /// has grants available and there is no need to take the slow path in
+    /// #tryToTransmitData.
+    bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and
@@ -930,6 +936,10 @@ class HomaTransport : public Transport {
     uint64_t transmitDataCycles;
 
     uint64_t transmitGrantCycles;
+
+    /// # times we have to look outside of t->topOutgoingMessages in order to
+    /// find a message to transmit in #tryToTransmitData.
+    uint32_t tryToTransmitDataCacheMisses;
 
     /// Total # idle rdtsc ticks of the NIC's transmit queue in the
     /// current interval.
