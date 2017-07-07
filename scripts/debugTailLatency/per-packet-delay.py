@@ -48,6 +48,7 @@ class Packet:
         self.roundTripTime = float('NaN')   # recvGrantTime - sentTime
         self.grantRespTime = float('NaN')   # sentGrantTime - recvTime
         self.grantDelay = float('NaN')      # recvGrantTime - sentGrantTime
+        self.grantTxQueuedBytes = float('NaN')
 
         # Sources of delays:
         # 1) Queueing delay at the NIC's transmit queue
@@ -81,7 +82,7 @@ class MessageParser:
             " (.*) \| (.*) us .*: (sent) data, clientId (\d+), sequence (\d+), offset (\d+), (\d+) bytes queued ahead",
             " (.*) \| (.*) us .*: \D+ (received) DATA, clientId (\d+), sequence (\d+), offset (\d+), length (\d+)",
             " (.*) \| (.*) us .*: \D+ (received) ALL_DATA, clientId (\d+), sequence (\d+), length (\d+)",
-            " (.*) \| (.*) us .*: \D+ (sending GRANT), clientId (\d+), sequence (\d+), offset (\d+)",
+            " (.*) \| (.*) us .*: (sent GRANT), clientId (\d+), sequence (\d+), offset (\d+), (\d+) bytes queued ahead",
             " (.*) \| (.*) us .*: \D+ (received GRANT), clientId (\d+), sequence (\d+), offset (\d+)"]))
         self.packets = {}
         self.startOfPoll = {}
@@ -185,9 +186,9 @@ class MessageParser:
             # TODO: WHAT ABOUT JITTER BEFORE PREVIOUS POLL? CAN IT AFFECT THIS PACKET?
 
             self.updateRpcInfo(packet)
-        elif action == "sending GRANT":
+        elif action == "sent GRANT":
             # Case 4: sending a GRANT
-            clientId, sequenceNum, offset = \
+            clientId, sequenceNum, offset, queueSize = \
                     [int(x) for x in matchedGroups[3:]]
             packetId = (isRequest, clientId, sequenceNum,
                     offset - (NUM_RTT_PACKETS + 1) * MAX_PACKET_SIZE)
@@ -195,6 +196,7 @@ class MessageParser:
                 packet = self.packets[packetId]
                 packet.sentGrantTime = time
                 packet.grantRespTime = time - packet.recvTime
+                packet.grantTxQueuedBytes = queueSize
         else:
             # Case 5: received a GRANT
             assert(action == "received GRANT")
@@ -207,6 +209,11 @@ class MessageParser:
                 packet.recvGrantTime = time
                 packet.grantDelay = time - packet.sentGrantTime
                 packet.roundTripTime = time - packet.sentTime
+                if not math.isnan(packet.grantDelay) and \
+                        not math.isnan(packet.delay):
+                    print "Incorrect MAX_PACKET_SIZE or NUM_RTT_PACKETS?"
+                    assert(abs(packet.delay + packet.grantRespTime
+                            + packet.grantDelay - packet.roundTripTime) < 1e-3)
 
     def updateRpcInfo(self, packet):
         '''
@@ -269,6 +276,13 @@ if __name__ == "__main__":
         print "packet size %d, #samples %d, min. delay %.2f us" % \
                 (pktLength, len(ds), minDelay[pktLength])
 
+    # Step 1.5: print runtime RTT distribution
+    rtts = sorted(filter(lambda x : not math.isnan(x),
+            map(lambda p : p.roundTripTime, packets)))
+    print "roundTripTime at runtime, min. %.2f us, median %.2f us, " \
+            "90%% %.2f us, 99%% %.2f us" % (rtts[0], rtts[int(len(rtts)*0.5)],
+            rtts[int(len(rtts)*0.9)], rtts[int(len(rtts)*0.99)])
+
     # Step 2: derive the rest of the properties
     packets = [p for p in packets if
             (options.sender is None or options.sender == p.sender) and
@@ -292,9 +306,9 @@ if __name__ == "__main__":
             normalize = lambda x : x / p.extraDelay if p.extraDelay > 0 else float('NaN')
 
             if line % 50 == 0:
-                print " sender     receiver|    time     delta    delay  extra|   TX queue    TOR switch    polling      RX overhead|   RTT    resp.  G.delay|  clientId   seq.   off.   len.  prio"
+                print " sender     receiver|    time     delta    delay  extra|   TX queue    TOR switch    polling      RX overhead|   RTT    resp.  G.delay  txQueue|  clientId   seq.   off.   len.  prio"
             line += 1
-            print(" %s -> %s | %9.2f (+ %.2f) %6.2f %6.2f | %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) | %6.2f %6.2f %6.2f   | %s%s" % (
+            print(" %s -> %s | %9.2f (+ %.2f) %6.2f %6.2f | %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) %5.2f (%4.2f) | %6.2f %6.2f   %6.2f  %6.2f  | %s%s" % (
                     '   ?   ' if p.sender is None else p.sender,
                     '   ?   ' if p.recipient is None else p.recipient,
                     p.orderTime, deltaTime, p.delay, p.extraDelay,
@@ -303,6 +317,7 @@ if __name__ == "__main__":
                     p.maxPollingDelay, normalize(p.maxPollingDelay),
                     p.rxDelay, normalize(p.rxDelay),
                     p.roundTripTime, p.grantRespTime, p.grantDelay,
+                    p.grantTxQueuedBytes / bwBytesPerMicros,
                     p.packetId[1:]+(p.length, p.priority),
                     ' S' if p.isAllData else ''))
 

@@ -513,8 +513,24 @@ HomaTransport::sendControlPacket(const Driver::Address* recipient,
     driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
     uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
     uint64_t idleInterval = driver->getTxQueueIdleInterval();
-    timeTrace("sent control packet, %u bytes queued ahead, idle time %u cyc",
-            bytesQueuedAhead, idleInterval);
+    if (std::is_same<T, GrantHeader>::value) {
+        const GrantHeader* grant = reinterpret_cast<const GrantHeader*>(packet);
+        const RpcId* rpcId = &grant->common.rpcId;
+        if (bytesQueuedAhead > 0) {
+            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
+                    "%u bytes queued ahead, idle time 0 cyc",
+                    rpcId->clientId, rpcId->sequence, grant->offset,
+                    bytesQueuedAhead);
+        } else {
+            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
+                    "0 bytes queued ahead, idle time %u cyc",
+                    rpcId->clientId, rpcId->sequence, grant->offset,
+                    idleInterval);
+        }
+    } else {
+        timeTrace("sent control packet, %u bytes queued ahead, "
+                "idle time %u cyc", bytesQueuedAhead, idleInterval);
+    }
     unusedBandwidth += idleInterval;
     outputControlBytes +=
             static_cast<uint32_t>(sizeof(T)) + driver->getPacketOverhead();
@@ -793,6 +809,7 @@ HomaTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
+#if TIME_TRACE
             uint64_t currentTime = context->dispatch->currentTime;
             // TODO: only correct on m510
             const uint32_t cyclesPerPacket = 2500;
@@ -805,11 +822,18 @@ HomaTransport::tryToTransmitData()
                 bool transmitQueueEmpty = (driver->getTransmitQueueSpace(now)
                         == (int)driver->getMaxTransmitQueueSize());
                 if (transmitQueueEmpty) {
-                    timeTrace(now, "not enough GRANTs to transmit data");
+                    std::set<const Driver::Address*> recipients;
+                    for (OutgoingMessage& m : topOutgoingMessages) {
+                        recipients.insert(m.recipient);
+                    }
+                    timeTrace(now, "not enough GRANTs to transmit data, "
+                            "%u top outgoing messages to %u recipients",
+                            topOutgoingMessages.size(), recipients.size());
                     numTimesGrantRunDry++;
                     lastTimeGrantRunDry = currentTime;
                 }
             }
+#endif
             break;
         }
     }
@@ -1870,13 +1894,17 @@ HomaTransport::Poller::poll()
                 t->processPacketCycles*100/t->monitorInterval,
                 t->transmitDataCycles*100/t->monitorInterval,
                 t->transmitGrantCycles*100/t->monitorInterval);
-        timeTrace(now, "check timeouts %u%%, tryToTxData cache misses %u",
-                t->timeoutCheckCycles*100/t->monitorInterval,
-                t->tryToTransmitDataCacheMisses);
         timeTrace(now, "unused uplink bandwidth %u%% (%u Mbps), "
                 "run out of grants %u times, wasted goodput <= %u Mbps",
                 static_cast<uint32_t>(unusedBandwidthPct),
                 unusedUplinkBandwidth, t->numTimesGrantRunDry, wastedGoodput);
+        timeTrace(now, "%u outgoing requests, %u outgoing responses, "
+                "%u top outgoing messages",
+                t->outgoingRequests.size(), t->outgoingResponses.size(),
+                t->topOutgoingMessages.size());
+        timeTrace(now, "check timeouts %u%%, tryToTxData cache misses %u",
+                t->timeoutCheckCycles*100/t->monitorInterval,
+                t->tryToTransmitDataCacheMisses);
 
         t->lastMeasureTime = owner->currentTime;
         t->lastDispatchActiveCycles =
