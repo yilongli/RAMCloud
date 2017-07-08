@@ -22,6 +22,7 @@ class Rpc(object):
         return self.tsc3 - self.tsc0
 
 LOG_FILE_REGEX = re.compile("(client|server)[0-9]*\.(.*)\.log")
+END_OF_CPERF_REGEX = re.compile(".*End of ClusterPerf experiment at TSC (\d+)")
 # Example: 1492031792.531004386 TimeTrace.cc:172 in printInternal NOTICE[8]: 255789.0 ns (+ 114.9 ns): server received DATA, sequence 61257, offset 13846, length 2008, flags 1
 STARTING_TSC_REGEX = re.compile(".*TimeTrace.cc:.*: Starting TSC (\d+), cyclesPerSec (\d+)")
 TIMETRACE_MSG_REGEX = re.compile(".*TimeTrace.cc:.*:\s+(\d+) cyc.*: (.*)")
@@ -41,6 +42,7 @@ scalars = {x : {y : None if x != y else 1 for y in hosts} for x in hosts}
 # List of rpcs indexed by (client, server)-pair.
 rpcsByCS = {}
 rpcs = {}
+endingTSC = None
 for fname in glob.glob("*.log"):
     matchResult = LOG_FILE_REGEX.match(fname)
     if not matchResult:
@@ -53,12 +55,20 @@ for fname in glob.glob("*.log"):
     with open(fname, 'r') as f:
         startingTSC = 0
         for line in f.readlines():
+            if endingTSC is None:
+                matchResult = END_OF_CPERF_REGEX.match(line)
+                if matchResult:
+                    endingTSC = int(matchResult.group(1))
+                    continue
+
             matchResult = STARTING_TSC_REGEX.match(line)
             if matchResult:
                 startingTSC = int(matchResult.group(1))
                 if baseTSC is None:
                     baseTSC = startingTSC
                     startingTSC = 0
+                    if fname.startswith("client1"):
+                        endingTSC -= baseTSC
                 else:
                     startingTSC -= baseTSC
                 continue
@@ -174,6 +184,12 @@ for role, host in role2Host.iteritems():
                     continue
                 currentTSC = int(matchResult.group(1)) * scalars[client1][host] + offsets[client1][host]
                 message = matchResult.group(2)
+
+                # Discard messages outside the scope (ie. [0, endingTSC]) of the client1's log
+                if currentTSC < 0:
+                    continue
+                if currentTSC > endingTSC:
+                    break
 
                 if prevTSC is None:
                     prevTSC = currentTSC

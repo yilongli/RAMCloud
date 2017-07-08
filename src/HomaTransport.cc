@@ -235,7 +235,7 @@ HomaTransport::getServiceLocator()
 void
 HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
-    uint64_t sequence = clientRpc->sequence;
+    uint64_t sequence = clientRpc->rpcId.sequence;
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
@@ -384,6 +384,8 @@ HomaTransport::opcodeSymbol(uint8_t opcode) {
             return "RESEND";
         case HomaTransport::PacketOpcode::ACK:
             return "ACK";
+        case HomaTransport::PacketOpcode::ABORT:
+            return "ABORT";
     }
 
     return format("%d", opcode);
@@ -618,12 +620,20 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
                             ? ", RESTART" : "");
             break;
         }
-        case HomaTransport::PacketOpcode::ACK:
+        case HomaTransport::PacketOpcode::ACK: {
             headerLength = sizeof32(HomaTransport::AckHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
             break;
+        }
+        case HomaTransport::PacketOpcode::ABORT: {
+            headerLength = sizeof32(HomaTransport::AbortHeader);
+            if (packetLength < headerLength) {
+                goto packetTooShort;
+            }
+            break;
+        }
     }
     return result;
 
@@ -770,8 +780,7 @@ HomaTransport::tryToTransmitData()
                 maxBytes = transmitQueueSpace;
             }
 
-            RpcId rpcId = clientRpc ?
-                    RpcId(clientId, clientRpc->sequence) : serverRpc->rpcId;
+            RpcId rpcId = clientRpc ? clientRpc->rpcId : serverRpc->rpcId;
             uint8_t whoFrom = clientRpc ? FROM_CLIENT : FROM_SERVER;
             uint32_t bytesSent = sendBytes(message->recipient, rpcId,
                     message->buffer, message->transmitOffset, maxBytes,
@@ -897,6 +906,8 @@ HomaTransport::Session::cancelRequest(RpcNotifier* notifier)
             it != t->outgoingRpcs.end(); it++) {
         ClientRpc* clientRpc = it->second;
         if (clientRpc->notifier == notifier) {
+            AbortHeader abort(clientRpc->rpcId);
+            t->sendControlPacket(clientRpc->session->serverAddress, &abort);
             t->deleteClientRpc(clientRpc);
 
             // It's no longer safe to use "it", but at this point we're
@@ -1504,6 +1515,17 @@ HomaTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
+            // ABORT from client
+            case PacketOpcode::ABORT: {
+                // Nothing to do.
+                timeTrace("server received ABORT, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (serverRpc != NULL) {
+                    deleteServerRpc(serverRpc);
+                }
+                return;
+            }
+
             default:
                 RAMCLOUD_CLOG(WARNING,
                         "unexpected opcode %s received from client %s",
@@ -1857,10 +1879,10 @@ HomaTransport::Poller::poll()
     // See if we should compute the network throughput in the last interval.
     if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
         t->perfMonitorIntervals++;
-        if (t->perfMonitorIntervals % 100 == 0) {
-            LOG(NOTICE, "%lu outgoing requests, %lu outgoing responses",
-                    t->outgoingRequests.size(), t->outgoingResponses.size());
-        }
+//        if (t->perfMonitorIntervals % 100 == 0) {
+//            LOG(NOTICE, "%lu outgoing requests, %lu outgoing responses",
+//                    t->outgoingRequests.size(), t->outgoingResponses.size());
+//        }
 
         t->unusedBandwidth +=
                 t->driver->getTxQueueIdleInterval(owner->currentTime);
@@ -1896,8 +1918,8 @@ HomaTransport::Poller::poll()
                 t->transmitGrantCycles*100/t->monitorInterval);
         timeTrace(now, "unused uplink bandwidth %u%% (%u Mbps), "
                 "run out of grants %u times, wasted goodput <= %u Mbps",
-                static_cast<uint32_t>(unusedBandwidthPct),
-                unusedUplinkBandwidth, t->numTimesGrantRunDry, wastedGoodput);
+                unusedBandwidthPct, unusedUplinkBandwidth,
+                t->numTimesGrantRunDry, wastedGoodput);
         timeTrace(now, "%u outgoing requests, %u outgoing responses, "
                 "%u top outgoing messages",
                 t->outgoingRequests.size(), t->outgoingResponses.size(),
@@ -2108,7 +2130,7 @@ HomaTransport::checkTimeouts()
             if (responseStarvedOfGrant) {
                 LOG(WARNING, "RPC response starved of grant, clientId %lu, "
                         "sequence %lu, grantOffset %u, %lu active messages",
-                        clientRpc->rpcId.clientId, clientRpc->sequence,
+                        clientRpc->rpcId.clientId, clientRpc->rpcId.sequence,
                         grantOffset, activeMessages.size());
                 // TODO: IT SEEMS TO BE OUR PROBLEM THAT CAUSES THIS SITUATION
                 // SHOULD WE NOT DELETE THE ClientRpc AND CLEAR ITS SILENT INTERVAL?

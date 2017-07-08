@@ -679,7 +679,7 @@ class TscFrequencyCalibrator {
             ReadTscResult r1 = it->result;
             ReadTscResult r2 = {0, 0, 0};
             r2.roundTripTime = getMinRoundTripTime(it->serviceLocator.c_str(),
-                    &r2.clientTsc, &r2.serverTsc);
+                    &r2.clientTsc, &r2.serverTsc, r1.roundTripTime);
 
             // Compute the server TSC frequency scalar relative to the client.
             double scalar = static_cast<double>(r2.clientTsc - r1.clientTsc)
@@ -706,6 +706,8 @@ class TscFrequencyCalibrator {
      * \param serverTsc[out]
      *      Records the TSC value on the server side when it starts processing
      *      the RPC.
+     * \param exptectRTT
+     *      TODO.
      * \param runs
      *      The number of times the experiment must be repeated before
      *      concluding the minimum round-trip time.
@@ -714,7 +716,8 @@ class TscFrequencyCalibrator {
      */
     static uint64_t
     getMinRoundTripTime(const char* serviceLocator, uint64_t* clientTsc,
-            uint64_t* serverTsc, uint32_t runs = 5000)
+            uint64_t* serverTsc, uint64_t expectedRTT = 0,
+            uint32_t runs = 5000)
     {
         uint64_t minElapsedTime = ~0ul;
         for (unsigned i = 0; i < runs; i++) {
@@ -725,6 +728,10 @@ class TscFrequencyCalibrator {
                 minElapsedTime = elapsedTime;
                 *clientTsc = startTime;
                 *serverTsc = tsc;
+                if ((elapsedTime < expectedRTT) ||
+                        ((elapsedTime-expectedRTT)*100 < elapsedTime)) {
+                    return minElapsedTime;
+                }
             }
         }
         return minElapsedTime;
@@ -1461,8 +1468,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 it++;
             }
         }
-        TimeTrace::record("Cperf stop checking finished outstandingRpcs, %u",
-                (uint32_t)outstandingRpcs.size());
+//        TimeTrace::record("Cperf stop checking finished outstandingRpcs, %u",
+//                (uint32_t)outstandingRpcs.size());
 
         if (currentTime >= stopTime) {
             LOG(NOTICE, "time expired after %lu iterations", count);
@@ -7558,6 +7565,10 @@ try
                 printf("No test named '%s'\n", name.c_str());
             }
         }
+    }
+    if (clientIndex == 0) {
+        LOG(NOTICE, "End of ClusterPerf experiment at TSC %lu",
+                Cycles::rdtsc());
     }
     tscFreqCalibrator.destroy();
 

@@ -28,10 +28,12 @@ echo $(date -u) "Extracting performance monitoring messages"
 for tt_file in *.tt; do
     [[ $tt_file == merged* ]] && continue
     who=$(echo $tt_file | cut -d . -f 1)
-    egrep "data packets goodput [1-9]" -A 4 $tt_file > perfMon.$who.txt &
+    egrep "data packets goodput [1-9]" -A 5 $tt_file > perfMon.$who.txt &
 done
 
+# TODO: Document why?
 egrep -o "run out of grants [1-9][0-9]* times" perfMon.* | sort -nr -k 5 > goodputWastedByLateGrants.txt
+cut -d: -f 1 goodputWastedByLateGrants.txt | sort | uniq -c >> goodputWastedByLateGrants.txt
 
 # 2) extract messages useful in explaining bubbles passed by senders.
 echo $(date -u) "Finding late grants"

@@ -10,6 +10,7 @@ from itertools import groupby
 # Minimum cost to receive a full packet, in microseconds
 MIN_RX_PACKET_COST = 0.3
 
+# TODO: parse this info from *.log
 # How many full packets does the HomaTransport::roundTripBytes have?
 NUM_RTT_PACKETS = 7
 
@@ -209,11 +210,20 @@ class MessageParser:
                 packet.recvGrantTime = time
                 packet.grantDelay = time - packet.sentGrantTime
                 packet.roundTripTime = time - packet.sentTime
-                if not math.isnan(packet.grantDelay) and \
-                        not math.isnan(packet.delay):
-                    print "Incorrect MAX_PACKET_SIZE or NUM_RTT_PACKETS?"
-                    assert(abs(packet.delay + packet.grantRespTime
-                            + packet.grantDelay - packet.roundTripTime) < 1e-3)
+
+                # TODO: The way we test whether a GRANT is generated due to
+                # some DATA packet is very hacky; I wonder how NanoLog can help
+                # with this
+                roundTripTime = packet.delay + packet.grantRespTime \
+                        + packet.grantDelay
+                grantMatchesData = False
+                if not math.isnan(roundTripTime):
+                    grantMatchesData = packet.grantRespTime < 1 and \
+                            abs(roundTripTime-packet.roundTripTime) < 1e-3
+                if not grantMatchesData:
+                    # We couldn't figure out which grant corresponds to which
+                    # DATA packet; roundTripTime
+                    packet.roundTripTime = float('NaN')
 
     def updateRpcInfo(self, packet):
         '''
@@ -279,9 +289,10 @@ if __name__ == "__main__":
     # Step 1.5: print runtime RTT distribution
     rtts = sorted(filter(lambda x : not math.isnan(x),
             map(lambda p : p.roundTripTime, packets)))
-    print "roundTripTime at runtime, min. %.2f us, median %.2f us, " \
-            "90%% %.2f us, 99%% %.2f us" % (rtts[0], rtts[int(len(rtts)*0.5)],
-            rtts[int(len(rtts)*0.9)], rtts[int(len(rtts)*0.99)])
+    if len(rtts) > 0:
+        print "roundTripTime at runtime, min. %.2f us, median %.2f us, " \
+                "90%% %.2f us, 99%% %.2f us" % (rtts[0], rtts[int(len(rtts)*0.5)],
+                rtts[int(len(rtts)*0.9)], rtts[int(len(rtts)*0.99)])
 
     # Step 2: derive the rest of the properties
     packets = [p for p in packets if
