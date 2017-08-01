@@ -179,7 +179,7 @@ struct TimeDist {
                                   // or 0 if no such measurement.
     double bandwidth;             // Average throughput in bytes/sec., or 0
                                   // if no such measurement.
-    uint64_t numSamples;          // TODO: number of samples collected.
+    uint64_t numSamples;          // # samples collected in the measurement.
 };
 
 // Forward declarations:
@@ -225,6 +225,8 @@ string formatTime(double seconds)
  */
 void getDist(std::vector<uint64_t>& times, TimeDist* dist)
 {
+    dist->bandwidth = 0;
+    dist->numSamples = times.size();
     int count = downCast<int>(times.size());
     std::sort(times.begin(), times.end());
     dist->min = Cycles::toSeconds(times[0]);
@@ -1257,8 +1259,8 @@ readObject(uint64_t tableId, const void* key, uint16_t keyLength,
  * Send and receive messages of given sizes, return information about the
  * distribution of message round-trip times and network bandwidth.
  *
- * \param receivers
- *      Service locators of master servers that are receivers of the messages.
+ * \param receiver
+ *      Service locator of the recipient.
  * \param length
  *      Size of the message being sent, in bytes.
  * \param echoLength
@@ -1273,44 +1275,33 @@ readObject(uint64_t tableId, const void* key, uint16_t keyLength,
  *      Information about how long the echos took.
  */
 TimeDist
-echoMessages(const vector<string>& receivers, uint32_t length,
-        uint32_t echoLength, uint64_t iteration, double timeLimit)
+echoMessages(string receiver, uint32_t length,
+        uint32_t echoLength, uint32_t iteration, double timeLimit)
 {
-    // Collect at most MAX_NUM_SAMPLE samples. Any more samples will simply
-    // overwrite old ones by wrapping around.
-    const uint32_t MAX_NUM_SAMPLE = 1000000;
-    std::vector<uint64_t> times(MAX_NUM_SAMPLE);
+    std::vector<uint64_t> times = {};
+    times.reserve(100000);
 
-    uint64_t totalCycles = 0;
     static const string message(length, 'x');
     Buffer buffer;
-    size_t numReceivers = receivers.size();
 
     // Each iteration of the following loop invokes an Echo RPC and records
     // its completion time.
-    uint64_t stopTime = Cycles::rdtsc() + Cycles::fromSeconds(timeLimit);
+    uint64_t startTime = Cycles::rdtsc();
+    uint64_t deadline = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t count;
     for (count = 0; count < iteration; count++) {
         uint64_t now = Cycles::rdtsc();
-        if (now >= stopTime) {
-            LOG(NOTICE, "time expired after %lu iterations", count);
+        if (now >= deadline) {
+            LOG(WARNING, "time expired after %lu iterations", count);
             break;
         }
 
-        const char* receiver = receivers[count % numReceivers].c_str();
-        EchoRpc rpc(cluster, receiver, message.c_str(), length, echoLength,
-                &buffer);
-        try {
-            rpc.wait();
-            totalCycles += rpc.getCompletionTime();
-            times[count % MAX_NUM_SAMPLE] = rpc.getCompletionTime();
-        } catch (ClientException& ex) {
-            LOG(NOTICE, "Echo RPC failed with exception %s", ex.toString());
-        }
+        EchoRpc rpc(cluster, receiver.c_str(), message.c_str(), length,
+                echoLength, &buffer);
+        rpc.wait();
+        times.push_back(rpc.getCompletionTime());
     }
-    if (count <= MAX_NUM_SAMPLE) {
-        times.resize(count);
-    }
+    uint64_t totalCycles = Cycles::rdtsc() - startTime;
 
     TimeDist result;
     getDist(times, &result);
@@ -2941,8 +2932,8 @@ echo_basic()
         cluster->logMessageAll(NOTICE,
                 "Starting echo test for %d-byte reply messages",
                 incomingSizes[i]);
-        echoDists.push_back(echoMessages({receiverLocator}, outgoingSizes[i],
-                incomingSizes[i], 1000, 2.0));
+        echoDists.push_back(echoMessages(receiverLocator, outgoingSizes[i],
+                incomingSizes[i], 1000, 10.0));
     }
     Logger::get().sync();
 
@@ -3029,7 +3020,7 @@ echo_incast()
         cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsBefore);
-        dist[0] = echoMessages({receiverLocator}, messageSize, echoSize, ~0u,
+        dist[0] = echoMessages(receiverLocator, messageSize, echoSize, ~0u,
                 masterRunningSecs);
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsAfter);
@@ -3125,10 +3116,10 @@ echo_incast()
                 messageSize, receiverLocator.c_str(), echoSize);
 
         // Do some warmup before setting its state to "running".
-        echoMessages({receiverLocator}, messageSize, echoSize, ~0u,
+        echoMessages(receiverLocator, messageSize, echoSize, ~0u,
                slaveWarmupSecs);
         setSlaveState("running");
-        dist[0] = echoMessages({receiverLocator}, messageSize, echoSize, ~0u,
+        dist[0] = echoMessages(receiverLocator, messageSize, echoSize, ~0u,
                slaveRunningSecs);
         setSlaveState("done");
 
@@ -7585,4 +7576,3 @@ catch (std::exception& e) {
     RAMCLOUD_LOG(ERROR, "%s", e.what());
     exit(1);
 }
-
