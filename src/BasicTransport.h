@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_BASICTRANSPORT_H
 #define RAMCLOUD_BASICTRANSPORT_H
 
+#include <deque>
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -149,6 +150,12 @@ class BasicTransport : public Transport {
 
         /// Transport that is managing this object.
         BasicTransport* t;
+
+        // TODO: NOT USING VECTOR BECAUSE EXPANSION COULD CAUSE SIGNIFICANT JITTER
+        // DEQUE SUPPORTS O(1) RANDOM ACCESS (BACKED BY FIXED-SIZE ARRAYS), CHEAPER
+        // EXPANSION AND BETTER CACHE LOCALITY THAN LINKED LIST.
+        using MessageBuffer = std::deque<char*>;
+        MessageBuffer* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -604,6 +611,13 @@ class BasicTransport : public Transport {
     /// want to reallocate space in every call to poll). Always empty,
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
+
+    /// Holds message buffers that are consist of payloads that are retained
+    /// and assembled by the MessageAccumulator. These retained payloads are
+    /// gradually released in the poll method so that the MessageAccumulator
+    /// doesn't have to release all its payloads at one shot in the destructor
+    /// and cause significant jitter.
+    std::vector<MessageAccumulator::MessageBuffer*> messageBuffers;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;

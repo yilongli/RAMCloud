@@ -67,6 +67,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , nextServerSequenceNumber(1)
     , transmitSequenceNumber(1)
     , receivedPackets()
+    , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
@@ -122,9 +123,20 @@ BasicTransport::~BasicTransport()
         deleteServerRpc(serverRpc);
     }
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
-            it != outgoingRpcs.end(); it++) {
+            it != outgoingRpcs.end(); ) {
         ClientRpc* clientRpc = it->second;
+
+        // Advance iterator; otherwise it will get invalidated by
+        // deleteClientRpc.
+        it++;
         deleteClientRpc(clientRpc);
+    }
+
+    // Release all retained payloads after reclaiming all RPC objects.
+    for (MessageAccumulator::MessageBuffer* messageBuffer : messageBuffers) {
+        for (char* payload : *messageBuffer) {
+            driver->release(payload);
+        }
     }
 }
 
@@ -1210,6 +1222,7 @@ BasicTransport::ServerRpc::sendReply()
 BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
         Buffer* buffer)
     : t(t)
+    , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , fragments()
     , grantOffset(0)
@@ -1228,6 +1241,7 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->release(fragment.header);
     }
     fragments.clear();
+    t->messageBuffers.push_back(assembledPayloads);
 }
 
 /**
@@ -1305,10 +1319,11 @@ BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
         // This entire fragment is redundant.
         return false;
     }
-    Driver::PayloadChunk::appendToBuffer(buffer,
-            reinterpret_cast<char*>(header) + sizeof32(DataHeader)
-            + bytesToSkip, length - bytesToSkip, t->driver,
-            reinterpret_cast<char*>(header));
+
+    char* payload = reinterpret_cast<char*>(header);
+    buffer->appendExternal(payload + sizeof32(DataHeader) + bytesToSkip,
+            length - bytesToSkip);
+    assembledPayloads->push_back(payload);
     return true;
 }
 
@@ -1435,6 +1450,31 @@ BasicTransport::Poller::poll()
     result |= t->tryToTransmitData();
 
     t->receivedPackets.clear();
+
+    // Release a few retained payloads to the driver. As of 02/2017, releasing
+    // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
+    // useful to do in this method uptill now, try to release more payloads.
+    const uint32_t maxRelease = result ? 2 : 5;
+    uint32_t releaseCount = 0;
+    while (!t->messageBuffers.empty()) {
+        MessageAccumulator::MessageBuffer* messageBuffer =
+                t->messageBuffers.back();
+        while (!messageBuffer->empty() && (releaseCount < maxRelease)) {
+            char* payload = messageBuffer->back();
+            messageBuffer->pop_back();
+            t->driver->release(payload);
+            releaseCount++;
+            result = 1;
+        }
+
+        if (messageBuffer->empty()) {
+            t->messageBuffers.pop_back();
+            delete messageBuffer;
+        } else {
+            break;
+        }
+    }
+
     return result;
 }
 
