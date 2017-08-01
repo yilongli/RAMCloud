@@ -297,7 +297,8 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
     uint32_t gBitsPerSec = 0;
     // TODO: The RTT in the m510 cluster is more like 8us (5 us of data packet
     // propagation delay plus 1 us of service time plus 1 us of grant packet
-    // propagation delay). Figure out how to set "rttMicros" from command line.
+    // propagation delay) in the unloaded case. Figure out how to set
+    // "rttMicros" from command line.
     uint32_t roundTripMicros = 8;
 //    uint32_t roundTripMicros = 7;
 
@@ -996,8 +997,6 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing requests", t->clientId, t->nextClientSequenceNumber,
             request->size(), t->outgoingRequests.size());
-//    timeTrace("request opcode %u",
-//            request->getStart<WireFormat::RequestCommon>()->opcode);
     response->reset();
     if (aborted) {
         notifier->failed();

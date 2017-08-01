@@ -571,7 +571,7 @@ class BasicTransport : public Transport {
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint8_t flags, bool partialOK = false);
-    int tryToTransmitData();
+    uint32_t tryToTransmitData();
 
     /// Shared RAMCloud information.
     Context* context;
