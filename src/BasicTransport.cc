@@ -371,6 +371,23 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
 }
 
 /**
+ * Send out a single control packet.
+ *
+ * \param recipient
+ *      Where to send the packet.
+ * \param packet
+ *      Address of the first byte of the control packet header.
+ */
+template<typename T>
+void
+BasicTransport::sendControlPacket(const Driver::Address* recipient,
+        const T* packet)
+{
+    driver->sendPacket(recipient, packet, NULL);
+
+}
+
+/**
  * Given a pointer to a BasicTransport packet, return a human-readable
  * string describing the information in its header.
  * 
@@ -878,12 +895,12 @@ BasicTransport::handlePacket(Driver::Received* received)
             // LOG_TIME_TRACE from server
             case PacketOpcode::LOG_TIME_TRACE: {
                 LOG(NOTICE, "Client received LOG_TIME_TRACE request from "
-                        "server %s for sequence %lu",
+                        "server %s for clientId %lu, sequence %lu",
                         received->sender->toString().c_str(),
-                        common->rpcId.sequence);
-                TimeTrace::record(
-                        "client received LOG_TIME_TRACE for sequence %u",
-                        downCast<uint32_t>(common->rpcId.sequence));
+                        common->rpcId.clientId, common->rpcId.sequence);
+                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
+                        "sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -893,9 +910,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 ResendHeader* header = received->getOffset<ResendHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("client received RESEND, sequence %u, offset %u, "
-                        "length %u",
-                        downCast<uint32_t>(header->common.rpcId.sequence),
+                timeTrace("client received RESEND, clientId %u, sequence %u, "
+                        "offset %u, length %u",
+                        header->common.rpcId.clientId,
+                        header->common.rpcId.sequence,
                         header->offset, header->length);
                 if (header->common.flags & RESTART) {
                     clientRpc->response->reset();
@@ -926,8 +944,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // retransmit; just return an ACK so the server knows
                     // we're still alive.
                     AckHeader ack(header->common.rpcId, FROM_CLIENT);
-                    driver->sendPacket(clientRpc->session->serverAddress,
-                            &ack, NULL);
+                    sendControlPacket(clientRpc->session->serverAddress, &ack);
                     return;
 
                 }
@@ -939,11 +956,14 @@ BasicTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
+                // TODO: document why pass bytes directly to NIC
                 sendBytes(clientRpc->session->serverAddress,
                         header->common.rpcId, clientRpc->request,
                         header->offset, header->length,
                         FROM_CLIENT|RETRANSMISSION|clientRpc->needGrantFlag,
                         true);
+                // TODO: NO NEED TO CALL RDTSC DIRECTLY; GET THIS FROM DRIVER;
+                // ALSO, MOVE THIS STATEMENT INTO sendBytes?
                 clientRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
@@ -951,8 +971,8 @@ BasicTransport::handlePacket(Driver::Received* received)
             // ACK from server
             case PacketOpcode::ACK: {
                 // Nothing to do.
-                timeTrace("client received ACK, sequence %u",
-                        downCast<uint32_t>(common->rpcId.sequence));
+                timeTrace("client received ACK, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
                 return;
             }
 
@@ -983,9 +1003,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                 AllDataHeader* header = received->getOffset<AllDataHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received ALL_DATA, sequence %u, length %u",
-                        downCast<uint32_t>(header->common.rpcId.sequence),
-                        header->messageLength);
                 if (serverRpc != NULL) {
                     // This shouldn't normally happen: it means this packet is
                     // a duplicate, so we can just discard it.
@@ -1004,10 +1021,15 @@ BasicTransport::handlePacket(Driver::Received* received)
                     driver->release(payload);
                     return;
                 }
+                timeTrace("server received ALL_DATA, clientId %u, sequence %u, "
+                          "length %u", header->common.rpcId.clientId,
+                          header->common.rpcId.sequence, length);
                 serverRpc = serverRpcPool.construct(this,
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
                 nextServerSequenceNumber++;
+                // TODO: the following operation is very expensive;
+                // easily > 250ns
                 incomingRpcs[header->common.rpcId] = serverRpc;
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
                         payload + sizeof32(AllDataHeader),
@@ -1023,10 +1045,11 @@ BasicTransport::handlePacket(Driver::Received* received)
                 bool retainPacket = false;
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received DATA, sequence %u, offset %u, "
-                        "length %u, flags %u",
-                        downCast<uint32_t>(header->common.rpcId.sequence),
-                        header->offset, received->len, header->common.flags);
+                timeTrace("server received DATA, clientId %u, sequence %u, "
+                        "offset %u, length %u",
+                        header->common.rpcId.clientId,
+                        header->common.rpcId.sequence,
+                        header->offset, received->len);
                 if (serverRpc == NULL) {
                     serverRpc = serverRpcPool.construct(this,
                             nextServerSequenceNumber, received->sender,
@@ -1097,8 +1120,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 GrantHeader* header = received->getOffset<GrantHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received GRANT, sequence %u, offset %u",
-                        downCast<uint32_t>(header->common.rpcId.sequence),
+                timeTrace("server received GRANT, clientId %u, sequence %u, "
+                        "offset %u",
+                        header->common.rpcId.clientId,
+                        header->common.rpcId.sequence,
                         header->offset);
                 if ((serverRpc == NULL) || !serverRpc->sendingResponse) {
                     RAMCLOUD_LOG(WARNING, "unexpected GRANT from client %s, "
@@ -1120,9 +1145,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "client %s for sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                TimeTrace::record(
-                        "server received LOG_TIME_TRACE for sequence %u",
-                        downCast<uint32_t>(common->rpcId.sequence));
+                timeTrace("server received LOG_TIME_TRACE for clientId %u, "
+                        "sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1132,9 +1157,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 ResendHeader* header = received->getOffset<ResendHeader>(0);
                 if (header == NULL)
                     goto packetLengthError;
-                timeTrace("server received RESEND, sequence %u, offset %u, "
-                        "length %u",
-                        downCast<uint32_t>(header->common.rpcId.sequence),
+                timeTrace("server received RESEND, clientId %u, sequence %u, "
+                        "offset %u, length %u",
+                        header->common.rpcId.clientId,
+                        header->common.rpcId.sequence,
                         header->offset, header->length);
 
                 if (serverRpc == NULL) {
@@ -1142,11 +1168,13 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // request, or if a packet of the response got lost but
                     // we have already freed the ServerRpc. In either case,
                     // ask the client to restart the RPC from scratch.
-                    timeTrace("server requesting restart, sequence %u",
-                            downCast<uint32_t>(common->rpcId.sequence));
+                    timeTrace("server requesting restart, clientId %u, "
+                            "sequence %u",
+                            common->rpcId.clientId, common->rpcId.sequence);
+                    // TODO: roundTripBytes should be replaced with what?
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, FROM_SERVER|RESTART);
-                    driver->sendPacket(received->sender, &resend, NULL);
+                    sendControlPacket(received->sender, &resend);
                     return;
                 }
                 uint32_t resendEnd = header->offset + header->length;
@@ -1167,8 +1195,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // retransmit; just return an ACK so the client knows
                     // we're still alive.
                     AckHeader ack(serverRpc->rpcId, FROM_SERVER);
-                    driver->sendPacket(serverRpc->clientAddress,
-                            &ack, NULL);
+                    sendControlPacket(serverRpc->clientAddress, &ack);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1179,6 +1206,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
+                // TODO: document why pass the bytes directly to NIC
                 sendBytes(serverRpc->clientAddress,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
@@ -1191,8 +1219,19 @@ BasicTransport::handlePacket(Driver::Received* received)
             // ACK from client
             case PacketOpcode::ACK: {
                 // Nothing to do.
-                timeTrace("server received ACK, sequence %u",
-                        downCast<uint32_t>(common->rpcId.sequence));
+                timeTrace("server received ACK, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                return;
+            }
+
+            // ABORT from client
+            case PacketOpcode::ABORT: {
+                // Nothing to do.
+                timeTrace("server received ABORT, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (serverRpc != NULL) {
+                    deleteServerRpc(serverRpc);
+                }
                 return;
             }
 
@@ -1232,8 +1271,9 @@ BasicTransport::ServerRpc::getClientServiceLocator()
 void
 BasicTransport::ServerRpc::sendReply()
 {
-    timeTrace("sendReply invoked, sequence %u, length %u",
-            downCast<uint32_t>(rpcId.sequence), replyPayload.size());
+    timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
+            "%u outgoing responses", rpcId.clientId, rpcId.sequence,
+            replyPayload.size(), t->outgoingResponses.size());
     sendingResponse = true;
     transmitLimit = t->roundTripBytes;
     if (transmitLimit < replyPayload.size()) {
@@ -1243,7 +1283,10 @@ BasicTransport::ServerRpc::sendReply()
     t->transmitSequenceNumber++;
     t->outgoingResponses.push_back(*this);
     t->serverTimerList.push_back(*this);
-    t->tryToTransmitData();
+    uint32_t bytesSent = t->tryToTransmitData();
+    if (bytesSent > 0) {
+        timeTrace("sendReply transmitted %u bytes", bytesSent);
+    }
 }
 
 /**
@@ -1263,7 +1306,9 @@ BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
     , buffer(buffer)
     , fragments()
     , grantOffset(0)
-{ }
+{
+    assert(buffer->size() == 0);
+}
 
 /**
  * Destructor for MessageAccumulators.
@@ -1285,7 +1330,7 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
  * This method is invoked whenever a new DATA packet arrives for a partially
  * complete message. It saves information about the new fragment and
  * (eventually) combines all of the fragments into a complete message.
- * 
+ *
  * \param header
  *      Pointer to the first byte of the packet, which must be a valid
  *      DATA packet.
@@ -1302,11 +1347,17 @@ bool
 BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         uint32_t length)
 {
+    length -= sizeof32(DataHeader);
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
-        fragments[header->offset] = MessageFragment(header, length);
-        return true;
+        if (fragments.find(header->offset) == fragments.end()) {
+            fragments[header->offset] = MessageFragment(header, length);
+            assert(buffer->size() < fragments.begin()->first);
+            return true;
+        } else {
+            return false;
+        }
     }
 
     // Append this fragment to the assembled message buffer, then see
@@ -1327,6 +1378,9 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         };
         fragments.erase(it);
     }
+    if (!fragments.empty()) {
+        assert(buffer->size() < fragments.begin()->first);
+    }
     return result;
 }
 
@@ -1334,11 +1388,11 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
  * This method is invoked to append a fragment to a partially-assembled
  * message. It handles the special cases where part or all of the
  * fragment is already in the assembled message.
- * 
+ *
  * \param header
  *      Address of the first byte of a DATA packet.
  * \param length
- *      Total size of the packet at *header (including header).
+ *      Size of the payload, in bytes.
  * \return
  *      True means that (some of) the data in this fragment was
  *      incorporated into the message buffer. False means that
@@ -1351,7 +1405,6 @@ BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
         uint32_t length)
 {
     uint32_t bytesToSkip = buffer->size() - header->offset;
-    length -= sizeof32(DataHeader);
     if (bytesToSkip >= length) {
         // This entire fragment is redundant.
         return false;
@@ -1367,7 +1420,7 @@ BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
 /**
  * This method is invoked to issue a RESEND packet when it appears that
  * packets have been lost. It is used by both servers and clients.
- * 
+ *
  * \param t
  *      Overall information about the transport.
  * \param address
@@ -1379,9 +1432,6 @@ BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
  *      this is how many total bytes we should have received already).
  *      May be 0 if the client never requested a grant (meaning that it
  *      planned to transmit the entire message unilaterally).
- * \param roundTripBytes
- *      Number of bytes that can be transmitted during the time it takes
- *      for a round-trip latency.
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that we are the client, or
  *      FROM_SERVER, indicating that we are the server.
@@ -1393,7 +1443,7 @@ BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
 uint32_t
 BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
-        uint32_t roundTripBytes, uint8_t whoFrom)
+        uint8_t whoFrom)
 {
     if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
         DIE("Bad fragment pointer: %p", &fragments);
@@ -1413,7 +1463,7 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         // We haven't issued a GRANT for this message; just request
         // the first round-trip's worth of data. Once this data arrives,
         // the normal grant mechanism should kick in if it's still needed.
-        endOffset = roundTripBytes;
+        endOffset = t->roundTripBytes;
     }
     assert(endOffset > buffer->size());
     if (whoFrom == FROM_SERVER) {
@@ -1425,9 +1475,10 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
                 "sequence %u", buffer->size(), endOffset,
                 downCast<uint32_t>(rpcId.sequence));
     }
+    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
             whoFrom);
-    t->driver->sendPacket(address, &resend, NULL);
+    t->sendControlPacket(address, &resend);
     return endOffset;
 }
 
@@ -1444,13 +1495,28 @@ BasicTransport::Poller::poll()
     int result = 0;
 
     // Process any available incoming packets.
-#define MAX_PACKETS 8
-    t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
-    int numPackets = downCast<int>(t->receivedPackets.size());
-    for (int i = 0; i < numPackets; i++) {
-        result = 1;
-        t->handlePacket(&t->receivedPackets[i]);
-    }
+#define MAX_PACKETS 4
+    uint32_t numPackets;
+    uint32_t totalPackets = 0;
+    do {
+        t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
+        numPackets = downCast<uint>(t->receivedPackets.size());
+#if TIME_TRACE
+        // Log the beginning of poll() here so that timetrace entries do not
+        // go back in time.
+        if (totalPackets == 0 && numPackets > 0) {
+            uint64_t ns = Cycles::toNanoseconds(startTime - lastIdleTime);
+            timeTrace(startTime, "start of polling iteration %u, "
+                    "last poll was %u ns ago", owner->iteration, ns);
+        }
+#endif
+        for (uint i = 0; i < numPackets; i++) {
+            t->handlePacket(&t->receivedPackets[i]);
+        }
+        t->receivedPackets.clear();
+        totalPackets += numPackets;
+    } while (numPackets == MAX_PACKETS);
+    result |= totalPackets;
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -1465,7 +1531,7 @@ BasicTransport::Poller::poll()
     // too many of these happen, it will create noise in the logs, which will
     // make it harder to notice when a *real* problem happens. Thus, it's
     // best to eliminate spurious retransmissions as much as possible.
-    uint64_t now = Cycles::rdtsc();
+    uint64_t now = owner->currentTime;
     if (now >= t->nextTimeoutCheck) {
         if (t->timeoutCheckDeadline == 0) {
             t->timeoutCheckDeadline = now + t->timerInterval;
@@ -1484,9 +1550,8 @@ BasicTransport::Poller::poll()
     }
 
     // Transmit data packets if possible.
-    result |= t->tryToTransmitData();
-
-    t->receivedPackets.clear();
+    uint32_t totalBytesSent = t->tryToTransmitData();
+    result |= totalBytesSent;
 
     // Release a few retained payloads to the driver. As of 02/2017, releasing
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
@@ -1512,6 +1577,11 @@ BasicTransport::Poller::poll()
         }
     }
 
+    if (result) {
+        timeTrace("end of polling iteration %u, received %u packets, "
+                "transmitted %u bytes, released %u packet buffers",
+                owner->iteration, totalPackets, totalBytesSent, releaseCount);
+    }
     return result;
 }
 
@@ -1525,6 +1595,9 @@ void
 BasicTransport::checkTimeouts()
 {
     // Scan all of the ClientRpc objects.
+    timeTrace("checkTimeouts invoked, %u outgoing RPCs, "
+            "%u incomplete incoming requests",
+            outgoingRpcs.size(), serverTimerList.size());
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
             it != outgoingRpcs.end(); ) {
         uint64_t sequence = it->first;

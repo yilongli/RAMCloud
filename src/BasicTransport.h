@@ -146,7 +146,7 @@ class BasicTransport : public Transport {
         bool appendFragment(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(BasicTransport *t,
                 const Driver::Address* address, RpcId grantOffset,
-                uint32_t limit, uint32_t roundTripBytes, uint8_t whoFrom);
+                uint32_t limit, uint8_t whoFrom);
 
         /// Transport that is managing this object.
         BasicTransport* t;
@@ -571,6 +571,8 @@ class BasicTransport : public Transport {
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
             uint8_t flags, bool partialOK = false);
+    template<typename T>
+    void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
 
     /// Shared RAMCloud information.
