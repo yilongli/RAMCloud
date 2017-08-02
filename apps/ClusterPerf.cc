@@ -1413,6 +1413,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     uint64_t stopTime = ~0lu;
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
     uint64_t totalBytesSent = 0;
+    uint64_t totalBytesDropped = 0;
     uint64_t warmupCount = 100;
     uint64_t count;
     PerfStats::registerStats(&PerfStats::threadStats);
@@ -1441,6 +1442,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             }
 
             EchoRpc* echo = it->second;
+            // TODO: I never really figure out how expensive is RpcWrapper::isReady
 //            TimeTrace::record("Cperf about to check isReady(), i = %u", i);
             if (echo->isReady()) {
                 if (count > 0) {
@@ -1451,24 +1453,26 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                             completionTime;
                     numSamples[id]++;
                 }
-                TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
+                // TODO: It appears that ~RpcWrapper is quite expensive (200ns ~ 1us); why?
+//                TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
                 echoRpcPool.destroy(echo);
+//                TimeTrace::record("Cperf destroyed EchoRpc");
                 it = outstandingRpcs.erase(it);
-                TimeTrace::record("Cperf finished cleaning one EchoRpc");
             } else {
                 it++;
             }
         }
-//        TimeTrace::record("Cperf stop checking finished outstandingRpcs, %u",
-//                (uint32_t)outstandingRpcs.size());
 
         if (currentTime >= stopTime) {
             LOG(NOTICE, "time expired after %lu iterations", count);
             double actualLoadFactor = static_cast<double>(totalBytesSent)*8
                     / (timeLimit*bandwidthMbps*1e6);
+            double droppedLoadFactor = static_cast<double>(totalBytesDropped)*8
+                    / (timeLimit*bandwidthMbps*1e6);
             if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.05) {
-                LOG(ERROR, "Actual load factor %.3f, expecting %.3f",
-                        actualLoadFactor, loadFactor);
+                LOG(ERROR, "Actual load factor %.3f, expecting %.3f, "
+                        "dropping %.3f", actualLoadFactor, loadFactor,
+                        droppedLoadFactor);
             } else {
                 LOG(NOTICE, "Generated load factor %.3f", actualLoadFactor);
             }
@@ -1483,8 +1487,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         // See if it's time to send another message.
 //#define MAX_OUTSTANDING_RPCS 50000
 #define MAX_OUTSTANDING_RPCS 20
-        if ((currentTime > nextMessageArrival) &&
-                (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS)) {
+        if (currentTime > nextMessageArrival) {
             if (warmupCount > 0) {
                 warmupCount--;
                 if (warmupCount == 0) {
@@ -1503,19 +1506,24 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     startTime = Cycles::rdtsc() + Cycles::fromSeconds(0.01);
                     stopTime = startTime + Cycles::fromSeconds(timeLimit);
                     nextMessageArrival = startTime + messageIntervalDist(gen);
+                    continue;
                 }
             } else {
                 count++;
             }
 
             unsigned messageId = messageSizeDist(gen);
-            const char* receiver =
-                    receivers[generateRandom() % numReceivers].c_str();
             uint32_t length = messageSizes[messageId];
-            EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
-                    message.c_str(), length, length);
-            outstandingRpcs.emplace_back(messageId, echo);
             nextMessageArrival += messageIntervalDist(gen);
+            if (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS) {
+                const char* receiver =
+                        receivers[generateRandom() % numReceivers].c_str();
+                EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
+                        message.c_str(), length, length);
+                outstandingRpcs.emplace_back(messageId, echo);
+            } else {
+                totalBytesDropped += length;
+            }
         }
     }
     totalCycles = Cycles::rdtsc() - startTime;

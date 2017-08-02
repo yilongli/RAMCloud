@@ -308,31 +308,6 @@ class EchoRpc : public RpcWrapper {
     DISALLOW_COPY_AND_ASSIGN(EchoRpc);
 };
 
-//// TODO: templatize it
-//struct EchoRpcContainer {
-//    RamCloud* ramcloud;
-//    const char* serviceLocator;
-//    const void* message;
-//    uint32_t length;
-//    uint32_t echoLength;
-//
-//    Buffer response;
-//    uint messageId;
-//    uint64_t startTime;
-//    uint64_t roundTripTime;
-//    Tub<EchoRpc> rpc;
-//
-//    EchoRpcContainer(uint messageId, RamCloud* ramcloud,
-//            const char* serviceLocator, const void* message, uint32_t length,
-//            uint32_t echoLength);
-//    void invokeRpc();
-//    void callback();
-//
-//    DISALLOW_COPY_AND_ASSIGN(EchoRpcContainer);
-//};
-//
-//extern vector<EchoRpcContainer*> __finishedRpcs;
-
 /**
  * Encapsulates the state of a RamCloud::enumerateTable
  * request, allowing it to execute asynchronously.
