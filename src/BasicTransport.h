@@ -398,7 +398,8 @@ class BasicTransport : public Transport {
         LOG_TIME_TRACE         = 23,
         RESEND                 = 24,
         ACK                    = 25,
-        BOGUS                  = 26,      // Used only in unit tests.
+        ABORT                  = 26,
+        BOGUS                  = 27,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -542,6 +543,17 @@ class BasicTransport : public Transport {
 
         explicit AckHeader(RpcId rpcId, uint8_t flags)
             : common(PacketOpcode::ACK, rpcId, flags) {}
+    } __attribute__((packed));
+
+    /**
+     * Describes the wire format for ABORT packets. These packets are used
+     * to let the server know that the client has cancelled the request.
+     */
+    struct AbortHeader {
+        CommonHeader common;         // Common header fields.
+
+        explicit AbortHeader(RpcId rpcId)
+            : common(PacketOpcode::ABORT, rpcId, FROM_CLIENT) {}
     } __attribute__((packed));
 
     /**

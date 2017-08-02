@@ -908,7 +908,7 @@ HomaTransport::Session::cancelRequest(RpcNotifier* notifier)
         ClientRpc* clientRpc = it->second;
         if (clientRpc->notifier == notifier) {
             AbortHeader abort(clientRpc->rpcId);
-            t->sendControlPacket(clientRpc->session->serverAddress, &abort);
+            t->sendControlPacket(this->serverAddress, &abort);
             t->deleteClientRpc(clientRpc);
 
             // It's no longer safe to use "it", but at this point we're

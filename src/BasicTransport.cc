@@ -23,7 +23,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -355,18 +355,41 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             AllDataHeader header(rpcId, flags,
                     downCast<uint16_t>(messageSize));
             Buffer::Iterator iter(message, 0, messageSize);
+            const char* fmt = (flags & FROM_CLIENT) ?
+                    "client sending ALL_DATA, clientId %u, sequence %u, "
+                    "priority %u" :
+                    "server sending ALL_DATA, clientId %u, sequence %u, "
+                    "priority %u";
+            timeTrace(fmt, rpcId.clientId, rpcId.sequence, 0);
             driver->sendPacket(address, &header, &iter);
         } else {
             DataHeader header(rpcId, message->size(), curOffset, flags);
             Buffer::Iterator iter(message, curOffset, bytesThisPacket);
+            const char* fmt = (flags & FROM_CLIENT) ?
+                    "client sending DATA, clientId %u, sequence %u, "
+                    "offset %u, priority %u" :
+                    "server sending DATA, clientId %u, sequence %u, "
+                    "offset %u, priority %u";
+            timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset, 0);
             driver->sendPacket(address, &header, &iter);
+        }
+        uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
+        if (bytesQueuedAhead > 0) {
+            timeTrace(driver->getLastTransmitTime(),
+                    "sent data, clientId %u, sequence %u, offset %u, "
+                    "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
+                    curOffset, bytesQueuedAhead);
+        } else {
+            uint64_t idleInterval = driver->getTxQueueIdleInterval();
+            timeTrace(driver->getLastTransmitTime(),
+                    "sent data, clientId %u, sequence %u, offset %u, "
+                    "0 bytes queued ahead, idle time %u cyc",
+                    rpcId.clientId, rpcId.sequence, curOffset, idleInterval);
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
     }
 
-    timeTrace("sent data, sequence %u, offset %u, length %u",
-            downCast<uint32_t>(rpcId.sequence), offset, bytesSent);
     return bytesSent;
 }
 
@@ -682,8 +705,9 @@ BasicTransport::Session::cancelRequest(RpcNotifier* notifier)
             it != t->outgoingRpcs.end(); it++) {
         ClientRpc* clientRpc = it->second;
         if (clientRpc->notifier == notifier) {
-            AbortHeader abort(clientRpc->rpcId);
-            t->sendControlPacket(clientRpc->session->serverAddress, &abort);
+            RpcId rpcId(t->clientId, clientRpc->sequence);
+            AbortHeader abort(rpcId);
+            t->sendControlPacket(this->serverAddress, &abort);
             t->deleteClientRpc(clientRpc);
 
             // It's no longer safe to use "it", but at this point we're
@@ -1494,6 +1518,11 @@ BasicTransport::Poller::poll()
 {
     int result = 0;
 
+#if TIME_TRACE
+    uint64_t startTime = Cycles::rdtsc();
+    uint64_t lastIdleTime = t->driver->getRxQueueIdleTime();
+#endif
+
     // Process any available incoming packets.
 #define MAX_PACKETS 4
     uint32_t numPackets;
@@ -1637,14 +1666,13 @@ BasicTransport::checkTimeouts()
             // than the server's wait time to request retransmission (first
             // give the server a chance to handle the problem).
             if ((clientRpc->silentIntervals % pingIntervals) == 0) {
-                timeTrace("client sending RESEND for sequence %u",
-                        downCast<uint32_t>(sequence));
+                timeTrace("client sending RESEND for clientId %u, sequence %u",
+                        clientId, sequence);
                 ResendHeader resend(RpcId(clientId, sequence), 0,
                         roundTripBytes, FROM_CLIENT);
                 // The RESEND packet is effectively a grant...
                 clientRpc->grantOffset = roundTripBytes;
-                driver->sendPacket(clientRpc->session->serverAddress,
-                        &resend, NULL);
+                sendControlPacket(clientRpc->session->serverAddress, &resend);
             }
         } else {
             // We have received part of the response. If the server has gone
@@ -1656,7 +1684,7 @@ BasicTransport::checkTimeouts()
                         clientRpc->accumulator->requestRetransmission(this,
                         clientRpc->session->serverAddress,
                         RpcId(clientId, sequence),
-                        clientRpc->grantOffset, roundTripBytes, FROM_CLIENT);
+                        clientRpc->grantOffset, FROM_CLIENT);
             }
         }
     }
@@ -1702,7 +1730,7 @@ BasicTransport::checkTimeouts()
             serverRpc->resendLimit =
                     serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId,
-                    serverRpc->grantOffset, roundTripBytes, FROM_SERVER);
+                    serverRpc->grantOffset, FROM_SERVER);
         }
     }
 }
