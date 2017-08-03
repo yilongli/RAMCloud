@@ -1504,7 +1504,6 @@ BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
     , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , fragments()
-    , grantOffset(0)
 {
     assert(buffer->size() == 0);
 }
@@ -1665,16 +1664,13 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         endOffset = t->roundTripBytes;
     }
     assert(endOffset > buffer->size());
-    if (whoFrom == FROM_SERVER) {
-        timeTrace("server requesting retransmission of bytes %u-%u, "
-                "sequence %u", buffer->size(), endOffset,
-                downCast<uint32_t>(rpcId.sequence));
-    } else {
-        timeTrace("client requesting retransmission of bytes %u-%u, "
-                "sequence %u", buffer->size(), endOffset,
-                downCast<uint32_t>(rpcId.sequence));
-    }
-    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
+    const char* fmt = (whoFrom == FROM_SERVER) ?
+            "server requesting retransmission of bytes %u-%u, clientId %u, "
+            "sequence %u" :
+            "client requesting retransmission of bytes %u-%u, clientId %u, "
+            "sequence %u";
+    timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
+    uint32_t length = endOffset - buffer->size();
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
             whoFrom);
     t->sendControlPacket(address, &resend);
@@ -1871,7 +1867,7 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->response->size() == 0) {
+        if (!clientRpc->accumulator) {
             // We haven't received any part of the response message.
             // Send occasional RESEND packets, which should produce some
             // response from the server, so that we know it's still alive

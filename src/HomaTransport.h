@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2016 Stanford University
+/* Copyright (c) 2015-2017 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -141,8 +141,7 @@ class HomaTransport : public Transport {
      */
     class MessageAccumulator {
       public:
-        MessageAccumulator(HomaTransport* t, Buffer* buffer,
-                uint32_t totalLength);
+        MessageAccumulator(HomaTransport* t, Buffer* buffer);
         ~MessageAccumulator();
         bool addPacket(DataHeader *header, uint32_t length);
         bool appendFragment(DataHeader *header, uint32_t length);
@@ -196,9 +195,6 @@ class HomaTransport : public Transport {
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
 
-        /// Total # bytes in the message.
-        const uint32_t totalLength;
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
@@ -213,7 +209,8 @@ class HomaTransport : public Transport {
       public:
         ScheduledMessage(RpcId rpcId, MessageAccumulator* accumulator,
                 uint32_t unscheduledBytes,
-                const Driver::Address* senderAddress, uint8_t whoFrom);
+                const Driver::Address* senderAddress, uint32_t totalLength,
+                uint8_t whoFrom);
         ~ScheduledMessage();
         int compareTo(ScheduledMessage& other) const;
 
@@ -258,6 +255,9 @@ class HomaTransport : public Transport {
         /// times during the lifetime of the message. Finally, when the message
         /// is fully granted, its state will be moved from ACTIVE to PURGED.
         State state;
+
+        /// Total # bytes in the message.
+        const uint32_t totalLength;
 
         /// Must be either FROM_CLIENT, indicating that this message is the
         /// request from a client, or FROM_SERVER, indicating that this is

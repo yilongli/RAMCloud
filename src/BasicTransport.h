@@ -17,6 +17,7 @@
 #define RAMCLOUD_BASICTRANSPORT_H
 
 #include <deque>
+
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -145,8 +146,8 @@ class BasicTransport : public Transport {
         bool addPacket(DataHeader *header, uint32_t length);
         bool appendFragment(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(BasicTransport *t,
-                const Driver::Address* address, RpcId grantOffset,
-                uint32_t limit, uint8_t whoFrom);
+                const Driver::Address* address, RpcId rpcId,
+                uint32_t grantOffset, uint8_t whoFrom);
 
         /// Transport that is managing this object.
         BasicTransport* t;
@@ -186,11 +187,6 @@ class BasicTransport : public Transport {
         /// corresponding fragment, which is a stolen Driver::Received.
         typedef std::map<uint32_t, MessageFragment>FragmentMap;
         FragmentMap fragments;
-
-        /// Offset into the message of the most recent GRANT packet
-        /// we have sent (i.e., we've already authorized the sender to
-        /// transmit bytes up to this point in the message).
-        uint32_t grantOffset;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
@@ -257,7 +253,7 @@ class BasicTransport : public Transport {
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    struct ClientRpc : public OutgoingMessage {
+    class ClientRpc : public OutgoingMessage {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
@@ -335,6 +331,7 @@ class BasicTransport : public Transport {
         /// sequence number is in rpcId.
         uint64_t sequence;
 
+        // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
         /// Where to send the response once the RPC has executed.
         const Driver::Address* clientAddress;
 
@@ -567,7 +564,8 @@ class BasicTransport : public Transport {
     class Poller : public Dispatch::Poller {
       public:
         explicit Poller(Context* context, BasicTransport* t)
-            : Dispatch::Poller(context->dispatch, "BasicTransport::Poller")
+            : Dispatch::Poller(context->dispatch, "BasicTransport(" +
+                    t->driver->getServiceLocator() + ")::Poller")
             , t(t) { }
         virtual int poll();
       private:
@@ -648,6 +646,9 @@ class BasicTransport : public Transport {
     /// fewer than about 20 objects.
     typedef std::map<uint64_t, ClientRpc*> ClientRpcMap;
     ClientRpcMap outgoingRpcs;
+    // TODO: The way we are uing this map is quite inefficient!!!
+    // (e.g. frequently iterating the entire map) especially when there is
+    // a large number of outstanding RPCs
 
     /// Holds RPCs for which we are the client, and for which the
     /// request message has not yet been completely transmitted (once
@@ -707,6 +708,7 @@ class BasicTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
+    // TODO: need to clean up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
