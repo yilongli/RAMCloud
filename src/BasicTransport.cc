@@ -98,6 +98,26 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // we don't want those delays to result in RPC timeouts.
     , timeoutIntervals(40)
     , pingIntervals(3)
+    , lastMeasureTime(0)
+    , lastDispatchActiveCycles(0)
+    , lastTimeGrantRunDry(0)
+    , monitorInterval()
+    , monitorMillis()
+    , numPacketsReceived(0)
+    , numDataPacketsReceived(0)
+    , numControlPacketsSent(0)
+    , numDataPacketsSent(0)
+    , numTimesGrantRunDry(0)
+    , outputControlBytes(0)
+    , outputDataBytes(0)
+    , outputResentBytes(0)
+    , perfMonitorIntervals(0)
+    , processPacketCycles(0)
+    , timeoutCheckCycles(0)
+    , transmitDataCycles(0)
+    , transmitGrantCycles(0)
+    , tryToTransmitDataCacheMisses(0)
+    , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -105,6 +125,10 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // intervals result in unnecessary retransmissions.
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
+
+    // Measure network throughput at 1 ms intervals.
+    monitorMillis = 1;
+    monitorInterval = Cycles::fromMicroseconds(1000*monitorMillis);
 
     LOG(NOTICE, "BasicTransport parameters: maxDataPerPacket %u, "
             "roundTripBytes %u, grantIncrement %u, pingIntervals %d, "
@@ -381,6 +405,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     curOffset, bytesQueuedAhead);
         } else {
             uint64_t idleInterval = driver->getTxQueueIdleInterval();
+            unusedBandwidth += idleInterval;
             timeTrace(driver->getLastTransmitTime(),
                     "sent data, clientId %u, sequence %u, offset %u, "
                     "0 bytes queued ahead, idle time %u cyc",
@@ -407,7 +432,27 @@ BasicTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
     driver->sendPacket(recipient, packet, NULL);
-
+    uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
+    uint64_t idleInterval = driver->getTxQueueIdleInterval();
+    if (std::is_same<T, GrantHeader>::value) {
+        const GrantHeader* grant = reinterpret_cast<const GrantHeader*>(packet);
+        const RpcId* rpcId = &grant->common.rpcId;
+        if (bytesQueuedAhead > 0) {
+            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
+                    "%u bytes queued ahead, idle time 0 cyc",
+                    rpcId->clientId, rpcId->sequence, grant->offset,
+                    bytesQueuedAhead);
+        } else {
+            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
+                    "0 bytes queued ahead, idle time %u cyc",
+                    rpcId->clientId, rpcId->sequence, grant->offset,
+                    idleInterval);
+        }
+    } else {
+        timeTrace("sent control packet, %u bytes queued ahead, "
+                "idle time %u cyc", bytesQueuedAhead, idleInterval);
+    }
+    unusedBandwidth += idleInterval;
 }
 
 /**
@@ -642,6 +687,24 @@ BasicTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
+#if TIME_TRACE
+            uint64_t currentTime = context->dispatch->currentTime;
+            // TODO: only correct on m510
+            const uint32_t cyclesPerPacket = 2500;
+            if ((totalBytesSent == 0)
+                    && (lastTimeGrantRunDry + cyclesPerPacket < currentTime)) {
+                uint64_t now = Cycles::rdtsc();
+                // transmitQueueSpace is computed w.r.t. a stale timestamp.
+                // It's too imprecise for the purpose of analyzing bandwidth
+                // wasted in waiting for grants.
+                bool transmitQueueEmpty = (driver->getTransmitQueueSpace(now)
+                        == (int)driver->getMaxTransmitQueueSize());
+                if (transmitQueueEmpty) {
+                    numTimesGrantRunDry++;
+                    lastTimeGrantRunDry = currentTime;
+                }
+            }
+#endif
             break;
         }
     }
@@ -1519,6 +1582,44 @@ BasicTransport::Poller::poll()
     int result = 0;
 
 #if TIME_TRACE
+    // See if we should compute the network throughput in the last interval.
+    if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
+        t->perfMonitorIntervals++;
+
+        t->unusedBandwidth +=
+                t->driver->getTxQueueIdleInterval(owner->currentTime);
+        uint32_t millis = t->monitorMillis;
+        uint64_t unusedBandwidthPct =
+                t->unusedBandwidth*100/t->monitorInterval;
+        uint64_t unusedUplinkBandwidth =
+                t->driver->getBandwidth()*unusedBandwidthPct/100;
+        uint32_t wastedGoodput = t->numTimesGrantRunDry *
+                t->driver->getMaxPacketSize()*8/1000/millis;
+        uint64_t now = Cycles::rdtsc();
+
+        timeTrace(now, "unused uplink bandwidth %u%% (%u Mbps), "
+                "run out of grants %u times, wasted goodput <= %u Mbps",
+                unusedBandwidthPct, unusedUplinkBandwidth,
+                t->numTimesGrantRunDry, wastedGoodput);
+
+        t->lastMeasureTime = owner->currentTime;
+        t->lastDispatchActiveCycles =
+                PerfStats::threadStats.dispatchActiveCycles;
+        t->numPacketsReceived = 0;
+        t->numDataPacketsReceived = 0;
+        t->numControlPacketsSent = 0;
+        t->numDataPacketsSent = 0;
+        t->numTimesGrantRunDry = 0;
+        t->outputControlBytes = 0;
+        t->outputDataBytes = 0;
+        t->outputResentBytes = 0;
+        t->processPacketCycles = 0;
+        t->timeoutCheckCycles = 0;
+        t->transmitDataCycles = 0;
+        t->transmitGrantCycles = 0;
+        t->tryToTransmitDataCacheMisses = 0;
+        t->unusedBandwidth = 0;
+    }
     uint64_t startTime = Cycles::rdtsc();
     uint64_t lastIdleTime = t->driver->getRxQueueIdleTime();
 #endif

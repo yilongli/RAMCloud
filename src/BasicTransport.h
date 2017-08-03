@@ -718,6 +718,76 @@ class BasicTransport : public Transport {
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
 
+    //--------------------
+    // Performance Monitor
+    //--------------------
+
+    /// The beginning of the current monitoring interval, in units of
+    /// rdtsc ticks.
+    uint64_t lastMeasureTime;
+
+    /// The value of `PerfStats::activeDispatchCycles` at `lastMeasureTime`.
+    uint64_t lastDispatchActiveCycles;
+
+    /// The start time of the last call to Dispatch::poll where
+    /// `numTimesGrantRunDry` increments.
+    uint64_t lastTimeGrantRunDry;
+
+    /// `monitorMillis` in units of rdtsc ticks.
+    uint64_t monitorInterval;
+
+    /// Specifies the period over which to log the performance metrics,
+    /// in milliseconds.
+    uint32_t monitorMillis;
+
+    /// # total packets received and processed in the current interval.
+    uint32_t numPacketsReceived;
+
+    /// # data packets received and processed in the current interval.
+    uint32_t numDataPacketsReceived;
+
+    /// # total control packets transmitted in the current interval.
+    uint32_t numControlPacketsSent;
+
+    /// # data packets transmitted in the current interval.
+    uint32_t numDataPacketsSent;
+
+    /// # times, in the current interval, we cannot transmit any message
+    /// because we are waiting for GRANTs and the transmit queue has run
+    /// dry.
+    uint32_t numTimesGrantRunDry;
+
+    /// Total # control bytes transmitted in the current interval.
+    uint32_t outputControlBytes;
+
+    /// Total # data bytes (excluding packet headers) transmitted in the
+    /// current interval.
+    uint32_t outputDataBytes;
+
+    /// Total # retransmitted data bytes (excluding packet headers) in the
+    /// current interval.
+    uint32_t outputResentBytes;
+
+    /// # performance monitor intervals we have experienced.
+    uint64_t perfMonitorIntervals;
+
+    // TODO
+    uint64_t processPacketCycles;
+
+    uint64_t timeoutCheckCycles;
+
+    uint64_t transmitDataCycles;
+
+    uint64_t transmitGrantCycles;
+
+    /// # times we have to look outside of t->topOutgoingMessages in order to
+    /// find a message to transmit in #tryToTransmitData.
+    uint32_t tryToTransmitDataCacheMisses;
+
+    /// Total # idle rdtsc ticks of the NIC's transmit queue in the
+    /// current interval.
+    uint64_t unusedBandwidth;
+
     DISALLOW_COPY_AND_ASSIGN(BasicTransport);
 };
 
