@@ -196,16 +196,71 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
 
+    // TODO
+    class OutgoingMessage {
+      public:
+        /// Holds the contents of the message.
+        Buffer* buffer;
+
+        /// True means this message is the request of a ClientRpc; false means
+        /// it is the response of a ServerRpc.
+        const bool isRequest;
+
+        /// Where to send the message.
+        const Driver::Address* recipient;
+
+        /// Offset within the message of the next byte we should transmit to
+        /// the recipient; all preceding bytes have already been sent.
+        uint32_t transmitOffset;
+
+        /// The number of bytes in the message that it's OK for us to transmit.
+        /// Bytes after this cannot be transmitted until we receive a GRANT for
+        /// them.
+        uint32_t transmitLimit;
+
+        /// True means this message is among the sender's top outgoing
+        /// messages with fewest bytes left (and this object is linked in
+        /// t->topOutgoingMessages).
+        bool topChoice;
+
+        /// Cycles::rdtsc time of the most recent time that we transmitted
+        /// data bytes of the message.
+        uint64_t lastTransmitTime;
+
+        /// Used to link this object into t->topOutgoingMessages.
+        IntrusiveListHook outgoingMessageLinks;
+
+        // TODO: doc. dynamic throttling
+        /// # bytes that can be sent unilaterally.
+        uint32_t unscheduledBytes;
+
+        OutgoingMessage(bool isRequest, Buffer* buffer,
+                const Driver::Address* recipient)
+            : buffer(buffer)
+            , isRequest(isRequest)
+            , recipient(recipient)
+            , transmitOffset(0)
+            , transmitLimit(0)
+            , topChoice(false)
+            , lastTransmitTime(0)
+            , outgoingMessageLinks()
+            , unscheduledBytes()
+        {}
+
+        virtual ~OutgoingMessage() {}
+
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(OutgoingMessage);
+    };
+
     /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    struct ClientRpc {
+    struct ClientRpc : public OutgoingMessage {
+      public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
-
-        /// Sequence number from this RPC's RpcId.
-        uint64_t sequence;
 
         /// Request message for the RPC.
         Buffer* request;
@@ -216,23 +271,8 @@ class BasicTransport : public Transport {
         /// Use this object to report completion.
         RpcNotifier* notifier;
 
-        /// Offset within the request message of the next byte we should
-        /// transmit to the server; all preceding bytes have already
-        /// been sent.
-        uint32_t transmitOffset;
-
-        /// The number of bytes in the request message that it's OK for
-        /// us to transmit. Bytes after this cannot be transmitted until
-        /// we receive a GRANT for them.
-        uint32_t transmitLimit;
-
-        /// Generated from t->transmitSequenceNumber, used to prioritize
-        /// transmission of the request message.
-        uint64_t transmitSequenceNumber;
-
-        /// Cycles::rdtsc time of the most recent time that we transmitted
-        /// data bytes of the request.
-        uint64_t lastTransmitTime;
+        /// Unique identifier for this RPC.
+        RpcId rpcId;
 
         /// Offset from the most recent GRANT packet we have sent for
         /// the response for this RPC, or 0 if we haven't sent any GRANTs.
@@ -248,10 +288,6 @@ class BasicTransport : public Transport {
         /// received any packets from the server.
         uint32_t silentIntervals;
 
-        /// Either 0 or NEED_GRANT; used in the flags for all outgoing
-        /// data packets.
-        uint8_t needGrantFlag;
-
         /// True means that the request message is in the process of being
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
@@ -264,19 +300,15 @@ class BasicTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : session(session)
-            , sequence(sequence)
+            : OutgoingMessage(true, request, session->serverAddress)
+            , session(session)
             , request(request)
             , response(response)
             , notifier(notifier)
-            , transmitOffset(0)
-            , transmitLimit(0)
-            , transmitSequenceNumber(0)
-            , lastTransmitTime(0)
+            , rpcId(session->t->clientId, sequence)
             , grantOffset(0)
             , resendLimit(0)
             , silentIntervals(0)
-            , needGrantFlag(0)
             , transmitPending(false)
             , accumulator()
             , outgoingRequestLinks()
@@ -289,7 +321,7 @@ class BasicTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc {
+    class ServerRpc : public Transport::ServerRpc, public OutgoingMessage {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -308,24 +340,6 @@ class BasicTransport : public Transport {
 
         /// Unique identifier for this RPC.
         RpcId rpcId;
-
-        /// Offset within the response message of the next byte we should
-        /// transmit to the client; all preceding bytes have already
-        /// been sent.
-        uint32_t transmitOffset;
-
-        /// The number of bytes in the response message that it's OK for
-        /// us to transmit. Bytes after this cannot be transmitted until
-        /// we receive a GRANT for them.
-        uint32_t transmitLimit;
-
-        /// Generated from t->transmitSequenceNumber, used to prioritize
-        /// transmission of the response message.
-        uint64_t transmitSequenceNumber;
-
-        /// Cycles::rdtsc time of the most recent time that we transmitted
-        /// data bytes of the response.
-        uint64_t lastTransmitTime;
 
         /// Offset from the most recent GRANT packet we have sent for
         /// the request message, or 0 if we haven't sent any GRANTs.
@@ -349,10 +363,6 @@ class BasicTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
-        /// Either 0 or NEED_GRANT; used in the flags for all outgoing
-        /// data packets.
-        uint8_t needGrantFlag;
-
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
@@ -364,20 +374,16 @@ class BasicTransport : public Transport {
 
         ServerRpc(BasicTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : t(transport)
+            : OutgoingMessage(false, &replyPayload, clientAddress)
+            , t(transport)
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
-            , transmitOffset(0)
-            , transmitLimit(0)
-            , transmitSequenceNumber(0)
-            , lastTransmitTime(0)
             , grantOffset(0)
             , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
-            , needGrantFlag(0)
             , accumulator()
             , timerLinks()
             , outgoingResponseLinks()
@@ -425,11 +431,6 @@ class BasicTransport : public Transport {
     //                           means it was sent from server to client.
     // FROM_SERVER:              Opposite of FROM_CLIENT; provided to make
     //                           code more readable.
-    // NEED_GRANT:               Used only in DATA packets. Nonzero means
-    //                           the sender is transmitting the entire
-    //                           message unilaterally; if not set, the last
-    //                           part of the message won't be sent without
-    //                           GRANTs from the recipient.
     // RETRANSMISSION:           Used only in DATA packets. Nonzero means
     //                           this packet is being sent in response to a
     //                           RESEND request (it has already been sent
@@ -440,9 +441,8 @@ class BasicTransport : public Transport {
     //                           indicate that everything needs to be resent.
     static const uint8_t FROM_CLIENT =    1;
     static const uint8_t FROM_SERVER =    0;
-    static const uint8_t NEED_GRANT =     2;
-    static const uint8_t RETRANSMISSION = 4;
-    static const uint8_t RESTART =        8;
+    static const uint8_t RETRANSMISSION = 2;
+    static const uint8_t RESTART =        4;
 
     /**
      * Describes the wire format for an ALL_DATA packet, which contains an
@@ -472,14 +472,18 @@ class BasicTransport : public Transport {
                                      // this packet!).
         uint32_t offset;             // Offset within the message of the first
                                      // byte of data in this packet.
+        uint32_t unscheduledBytes;   // # unscheduled bytes in the message.
 
         // The remaining packet bytes after the header constitute message
         // data starting at the given offset.
 
         DataHeader(RpcId rpcId, uint32_t totalLength, uint32_t offset,
-                uint8_t flags)
-            : common(PacketOpcode::DATA, rpcId, flags),
-            totalLength(totalLength), offset(offset) {}
+                uint32_t unscheduledBytes, uint8_t flags)
+            : common(PacketOpcode::DATA, rpcId, flags)
+            , totalLength(totalLength)
+            , offset(offset)
+            , unscheduledBytes(unscheduledBytes)
+        {}
     } __attribute__((packed));
 
     /**
@@ -582,10 +586,12 @@ class BasicTransport : public Transport {
     static string opcodeSymbol(uint8_t opcode);
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
-            uint8_t flags, bool partialOK = false);
+            uint32_t unscheduedBytes, uint8_t flags, bool partialOK = false);
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
+    void updateTopOutgoingMessageSet(OutgoingMessage* candidate,
+            bool newMessage);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -613,11 +619,6 @@ class BasicTransport : public Transport {
     /// The sequence number to use for the next incoming RPC (i.e., one
     /// higher than the highest number ever used in the past).
     uint64_t nextServerSequenceNumber;
-
-    /// Assigned to a request or response when it becomes ready to transmit;
-    /// sequences requests and responses in a single timeline to implement
-    /// a FIFO priority system for large messages.
-    uint64_t transmitSequenceNumber;
 
     /// Holds incoming packets received from the driver. This is only
     /// used temporarily during the poll method, but it's allocated here
@@ -656,6 +657,23 @@ class BasicTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ClientRpc, outgoingRequestLinks)
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
+
+    /// A relatively small set of the sender's top K outgoing messages with
+    /// fewest bytes left. We keep this as a separate set so that the sender
+    /// doesn't have to consider all the outgoing messages in the common case.
+    /// K is dynamically adjusted based on the workload. The overall goal is
+    /// to keep K as small as possible while still ensuring that the sender
+    /// doesn't have to look outside this set when picking the next message
+    /// to transmit. Every time the sender decides to transmit a message
+    /// outside this set, we increment K by one.
+    INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
+            OutgoingMessageList;
+    OutgoingMessageList topOutgoingMessages;
+
+    /// False means we know that no message outside t->topOutgoingMessages
+    /// has grants available and there is no need to take the slow path in
+    /// #tryToTransmitData.
+    bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and

@@ -75,13 +75,14 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , clientId(clientId)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
-    , transmitSequenceNumber(1)
     , receivedPackets()
     , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
     , outgoingRequests()
+    , topOutgoingMessages()
+    , transmitDataSlowPath(true)
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
@@ -193,11 +194,14 @@ BasicTransport::getServiceLocator()
 void
 BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
-    uint64_t sequence = clientRpc->sequence;
+    uint64_t sequence = clientRpc->rpcId.sequence;
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
         erase(outgoingRequests, *clientRpc);
+    }
+    if (clientRpc->topChoice) {
+        erase(topOutgoingMessages, *clientRpc);
     }
     clientRpcPool.destroy(clientRpc);
     timeTrace("deleted client RPC, clientId %u, sequence %u",
@@ -226,6 +230,9 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
     }
     if (serverRpc->sendingResponse || !serverRpc->requestComplete) {
         erase(serverTimerList, *serverRpc);
+    }
+    if (serverRpc->topChoice) {
+        erase(topOutgoingMessages, *serverRpc);
     }
     serverRpcPool.destroy(serverRpc);
     timeTrace("deleted server RPC, clientId %u, sequence %u",
@@ -342,6 +349,8 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
  *      Maximum number of bytes to transmit. If offset + maxBytes exceeds
  *      the message length, then all of the remaining bytes in message,
  *      will be transmitted.
+ * \param unscheduledBytes
+ *      Unscheduled bytes sent unilaterally in this message.
  * \param flags
  *      Extra flags to set in packet headers, such as FROM_CLIENT or
  *      RETRANSMISSION. Must at least specify either FROM_CLIENT or
@@ -357,7 +366,7 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
 uint32_t
 BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         Buffer* message, uint32_t offset, uint32_t maxBytes,
-        uint8_t flags, bool partialOK)
+        uint32_t unscheduledBytes, uint8_t flags, bool partialOK)
 {
     uint32_t messageSize = message->size();
 
@@ -387,7 +396,8 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, 0);
             driver->sendPacket(address, &header, &iter);
         } else {
-            DataHeader header(rpcId, message->size(), curOffset, flags);
+            DataHeader header(rpcId, message->size(), curOffset,
+                    unscheduledBytes, flags);
             Buffer::Iterator iter(message, curOffset, bytesThisPacket);
             const char* fmt = (flags & FROM_CLIENT) ?
                     "client sending DATA, clientId %u, sequence %u, "
@@ -497,10 +507,8 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
             }
             const BasicTransport::DataHeader* data =
                     static_cast<const BasicTransport::DataHeader*>(packet);
-            result += format(", totalLength %u, offset %u%s%s",
+            result += format(", totalLength %u, offset %u%s",
                     data->totalLength, data->offset,
-                    common->flags & BasicTransport::NEED_GRANT
-                            ? ", NEED_GRANT" : "",
                     common->flags & BasicTransport::RETRANSMISSION
                             ? ", RETRANSMISSION" : "");
             break;
@@ -584,21 +592,18 @@ BasicTransport::tryToTransmitData()
     if (static_cast<int>(transmitQueueSpace) < 0) {
         return 0;
     }
-    uint32_t maxBytes;
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
-    while (transmitQueueSpace >= maxDataPerPacket) {
+    while (true) {
+        uint64_t numOutgoingMessages =
+                outgoingRequests.size() + outgoingResponses.size();
+        if (numOutgoingMessages == 0) {
+            break;
+        }
+
         // Find an outgoing request or response that is ready to transmit.
-        // The policy here is as follows:
-        // * For messages less than 10 KB, transmit the shortest message
-        //   first.
-        // * Longer messages are sent in FIFO order, and they get lower
-        //   priority than short messages.
-        // This code used to use "shortest first" across all messages,
-        // but this resulted in spurious retransmissions when long messages
-        // got preempted by other long messages: the receiver for the
-        // preempted message thought packets must have been dropped.
+        // The policy here is "shortest remaining processing time" (SRPT).
 
         // Note: this code used to use std::maps instead of lists; the maps
         // were sorted by message length to avoid the cost of scanning
@@ -606,84 +611,132 @@ BasicTransport::tryToTransmitData()
         // (~50ns) even when empty, so it is faster overall to use lists.
         // If these lists were to become very long, then this decision made
         // need to be revisited.
-        ClientRpc* clientRpc = NULL;
-        ServerRpc* serverRpc = NULL;
-        uint32_t minLength = ~0;
-        uint64_t minSequence = ~0;
-        for (OutgoingRequestList::iterator it = outgoingRequests.begin();
-                    it != outgoingRequests.end(); it++) {
-            ClientRpc* rpc = &(*it);
-            if (rpc->transmitLimit <= rpc->transmitOffset) {
+        uint32_t minBytesLeft = ~0u;
+        OutgoingMessage* message = NULL;
+        for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
+                it != topOutgoingMessages.end(); it++) {
+            OutgoingMessage* m = &(*it);
+            if (m->transmitLimit <= m->transmitOffset) {
                 // Can't transmit this message: waiting for grants.
                 continue;
             }
-            if ((rpc->request->size() < 10000)
-                    ? (rpc->request->size() < minLength)
-                    : ((minLength >= 10000)
-                    && (rpc->transmitSequenceNumber < minSequence))) {
-                minLength = rpc->request->size();
-                minSequence = rpc->transmitSequenceNumber;
-                clientRpc = rpc;
-            }
-        }
-        for (OutgoingResponseList::iterator it = outgoingResponses.begin();
-                    it != outgoingResponses.end(); it++) {
-            ServerRpc* rpc = &(*it);
-            if (rpc->transmitLimit <= rpc->transmitOffset) {
-                // Can't transmit this message: waiting for grants.
-                continue;
-            }
-            if ((rpc->replyPayload.size() < 10000)
-                    ? (rpc->replyPayload.size() < minLength)
-                    : ((minLength >= 10000)
-                    && (rpc->transmitSequenceNumber < minSequence))) {
-                minLength = rpc->replyPayload.size();
-                minSequence = rpc->transmitSequenceNumber;
-                serverRpc = rpc;
-                clientRpc = NULL;
+            uint32_t bytesLeft = m->buffer->size() - m->transmitOffset;
+            if (bytesLeft < minBytesLeft) {
+                minBytesLeft = bytesLeft;
+                message = m;
             }
         }
 
-        if (clientRpc != NULL) {
-            // Transmit one or more request DATA packets from clientRpc,
-            // if appropriate.
-            maxBytes = std::min(transmitQueueSpace,
-                    clientRpc->transmitLimit - clientRpc->transmitOffset);
-            int bytesSent = sendBytes(
-                    clientRpc->session->serverAddress,
-                    RpcId(clientId, clientRpc->sequence),
-                    clientRpc->request, clientRpc->transmitOffset,
-                    maxBytes, FROM_CLIENT|clientRpc->needGrantFlag);
-            assert(bytesSent > 0);     // Otherwise, infinite loop.
-            clientRpc->transmitOffset += bytesSent;
-            clientRpc->lastTransmitTime = Cycles::rdtsc();
-            transmitQueueSpace -= bytesSent;
-            totalBytesSent += bytesSent;
-            if (clientRpc->transmitOffset >= clientRpc->request->size()) {
-                erase(outgoingRequests, *clientRpc);
-                clientRpc->transmitPending = false;
+        if (expect_false((NULL == message) && transmitDataSlowPath
+                && (numOutgoingMessages > topOutgoingMessages.size()))) {
+            tryToTransmitDataCacheMisses++;
+            timeTrace("slow path taken, iterating over %u outgoing messages",
+                    outgoingRequests.size() + outgoingResponses.size());
+
+            uint32_t outsideMinBytesLeft = ~0u;
+            for (OutgoingRequestList::iterator it = outgoingRequests.begin();
+                        it != outgoingRequests.end(); it++) {
+                ClientRpc* rpc = &(*it);
+                if (!rpc->topChoice) {
+                    uint32_t bytesLeft =
+                            rpc->request->size() - rpc->transmitOffset;
+                    outsideMinBytesLeft =
+                            std::min(bytesLeft, outsideMinBytesLeft);
+                    if (rpc->transmitLimit <= rpc->transmitOffset) {
+                        // Can't transmit this message: waiting for grants.
+                        continue;
+                    }
+                    if (bytesLeft < minBytesLeft) {
+                        minBytesLeft = bytesLeft;
+                        message = rpc;
+                    }
+                }
             }
-        } else if (serverRpc != NULL) {
-            // Transmit one or more response DATA packets from serverRpc,
+
+            for (OutgoingResponseList::iterator it = outgoingResponses.begin();
+                        it != outgoingResponses.end(); it++) {
+                ServerRpc* rpc = &(*it);
+                if (!rpc->topChoice) {
+                    uint32_t bytesLeft = rpc->replyPayload.size() -
+                            rpc->transmitOffset;
+                    outsideMinBytesLeft =
+                            std::min(bytesLeft, outsideMinBytesLeft);
+                    if (rpc->transmitLimit <= rpc->transmitOffset) {
+                        // Can't transmit this message: waiting for grants.
+                        continue;
+                    }
+                    if (bytesLeft < minBytesLeft) {
+                        minBytesLeft = bytesLeft;
+                        message = rpc;
+                    }
+                }
+            }
+
+            if (message == NULL) {
+                transmitDataSlowPath = false;
+            } else if (minBytesLeft == outsideMinBytesLeft) {
+                // TODO: rephrase it
+                // Expand the top outgoing message set only if the message
+                // has the fewest bytes left among outgoing messages not in
+                // this set.
+                message->topChoice = true;
+                topOutgoingMessages.push_back(*message);
+            }
+        }
+
+        ClientRpc* clientRpc = NULL;
+        ServerRpc* serverRpc = NULL;
+        if (message != NULL) {
+            if (message->isRequest) {
+                clientRpc = static_cast<ClientRpc*>(message);
+            } else {
+                serverRpc = static_cast<ServerRpc*>(message);
+            }
+        }
+
+        if (message != NULL) {
+            // Transmit one or more request DATA packets from the message,
             // if appropriate.
-            maxBytes = std::min(transmitQueueSpace,
-                    serverRpc->transmitLimit - serverRpc->transmitOffset);
-            int bytesSent = sendBytes(serverRpc->clientAddress,
-                    serverRpc->rpcId, &serverRpc->replyPayload,
-                    serverRpc->transmitOffset, maxBytes,
-                    FROM_SERVER|serverRpc->needGrantFlag);
-            assert(bytesSent > 0);     // Otherwise, infinite loop.
-            serverRpc->transmitOffset += bytesSent;
-            serverRpc->lastTransmitTime = Cycles::rdtsc();
+            uint32_t maxBytes = std::min(message->transmitLimit,
+                    message->buffer->size()) - message->transmitOffset;
+            if (maxBytes > transmitQueueSpace) {
+                maxBytes = transmitQueueSpace;
+            }
+
+            RpcId rpcId = clientRpc ? clientRpc->rpcId : serverRpc->rpcId;
+            uint8_t whoFrom = clientRpc ? FROM_CLIENT : FROM_SERVER;
+            uint32_t bytesSent = sendBytes(message->recipient, rpcId,
+                    message->buffer, message->transmitOffset, maxBytes,
+                    message->unscheduledBytes, whoFrom);
+            if (bytesSent == 0) {
+                // We can't transmit any more data because the queue space
+                // is too small.
+                break;
+            }
+
+            message->transmitOffset += bytesSent;
+            message->lastTransmitTime = driver->getLastTransmitTime();
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
-            if (serverRpc->transmitOffset >= serverRpc->replyPayload.size()) {
-                // Delete the ServerRpc object as soon as we have transmitted
-                // the last byte. This has the disadvantage that if some of
-                // this data is lost we won't be able to retransmit it (the
-                // whole RPC will be retried). However, this approach is
-                // simpler and faster in the common case where data isn't lost.
-                deleteServerRpc(serverRpc);
+            if (message->transmitOffset >= message->buffer->size()) {
+                if (clientRpc) {
+                    erase(outgoingRequests, *clientRpc);
+                    clientRpc->transmitPending = false;
+                    if (message->topChoice) {
+                        message->topChoice = false;
+                        erase(topOutgoingMessages, *message);
+                    }
+                } else {
+                    // Delete the ServerRpc object as soon as we have
+                    // transmitted the last byte. This has the disadvantage
+                    // that if some of this data is lost we won't be able to
+                    // retransmit it (the whole RPC will be retried). However,
+                    // this approach is simpler and faster in the common case
+                    // where data isn't lost.
+                    deleteServerRpc(serverRpc);
+                }
+            } else if (!message->topChoice) {
+                updateTopOutgoingMessageSet(message, false);
             }
         } else {
             // There are no messages with data that can be transmitted.
@@ -700,6 +753,13 @@ BasicTransport::tryToTransmitData()
                 bool transmitQueueEmpty = (driver->getTransmitQueueSpace(now)
                         == (int)driver->getMaxTransmitQueueSize());
                 if (transmitQueueEmpty) {
+                    std::set<const Driver::Address*> recipients;
+                    for (OutgoingMessage& m : topOutgoingMessages) {
+                        recipients.insert(m.recipient);
+                    }
+                    timeTrace(now, "not enough GRANTs to transmit data, "
+                            "%u top outgoing messages to %u recipients",
+                            topOutgoingMessages.size(), recipients.size());
                     numTimesGrantRunDry++;
                     lastTimeGrantRunDry = currentTime;
                 }
@@ -768,8 +828,7 @@ BasicTransport::Session::cancelRequest(RpcNotifier* notifier)
             it != t->outgoingRpcs.end(); it++) {
         ClientRpc* clientRpc = it->second;
         if (clientRpc->notifier == notifier) {
-            RpcId rpcId(t->clientId, clientRpc->sequence);
-            AbortHeader abort(rpcId);
+            AbortHeader abort(clientRpc->rpcId);
             t->sendControlPacket(this->serverAddress, &abort);
             t->deleteClientRpc(clientRpc);
 
@@ -803,6 +862,54 @@ BasicTransport::Session::getRpcInfo()
     return result;
 }
 
+/**
+ * Implements the logic of updating the top outgoing message set, if
+ * appropriate, when a new message arrives or we transmit a few more bytes
+ * of an existing message outside this set.
+ *
+ * \param candidate
+ *      A message that might be included in the top outgoing message set.
+ * \param newMessage
+ *      True means this message was just included in the outgoing
+ *      request/response set; false means the message was already in the
+ *      system.
+ */
+void
+BasicTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
+        bool newMessage)
+{
+    assert(!candidate->topChoice);
+#define LOW_WATERMARK 4
+    if (topOutgoingMessages.size() < LOW_WATERMARK) {
+        candidate->topChoice = true;
+        topOutgoingMessages.push_back(*candidate);
+    } else {
+        uint32_t maxBytesLeft =
+                candidate->buffer->size() - candidate->transmitOffset;
+        uint32_t bytesLeft;
+        OutgoingMessage* messageToReplace = NULL;
+        for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
+                it != topOutgoingMessages.end(); it++) {
+            OutgoingMessage* m = &(*it);
+            bytesLeft = m->buffer->size() - m->transmitOffset;
+            if (maxBytesLeft < bytesLeft) {
+                maxBytesLeft = bytesLeft;
+                messageToReplace = m;
+            }
+        }
+        if (messageToReplace != NULL) {
+            messageToReplace->topChoice = false;
+            erase(topOutgoingMessages, *messageToReplace);
+            transmitDataSlowPath = true;
+            candidate->topChoice = true;
+            topOutgoingMessages.push_back(*candidate);
+        }
+        if (newMessage) {
+            transmitDataSlowPath = true;
+        }
+    }
+}
+
 // See Transport::Session::sendRequest for docs.
 void
 BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
@@ -819,14 +926,11 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
     clientRpc->transmitLimit = t->roundTripBytes;
-    if (clientRpc->transmitLimit < request->size()) {
-        clientRpc->needGrantFlag = NEED_GRANT;
-    }
-    clientRpc->transmitSequenceNumber = t->transmitSequenceNumber;
-    t->transmitSequenceNumber++;
+    clientRpc->unscheduledBytes = t->roundTripBytes;
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->outgoingRequests.push_back(*clientRpc);
     clientRpc->transmitPending = true;
+    t->updateTopOutgoingMessageSet(clientRpc, true);
     t->nextClientSequenceNumber++;
     uint32_t bytesSent = t->tryToTransmitData();
     if (bytesSent > 0) {
@@ -939,7 +1043,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     deleteClientRpc(clientRpc);
                 } else {
                     // See if we need to output a GRANT.
-                    if ((header->common.flags & NEED_GRANT) &&
+                    if ((header->totalLength > header->unscheduledBytes) &&
                             (clientRpc->grantOffset <
                             (clientRpc->response->size() + roundTripBytes)) &&
                             (clientRpc->grantOffset < header->totalLength)) {
@@ -975,6 +1079,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->offset);
                 if (header->offset > clientRpc->transmitLimit) {
                     clientRpc->transmitLimit = header->offset;
+                }
+                if (!clientRpc->topChoice) {
+                    transmitDataSlowPath = true;
                 }
                 return;
             }
@@ -1012,6 +1119,11 @@ BasicTransport::handlePacket(Driver::Received* received)
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
+                        updateTopOutgoingMessageSet(clientRpc, true);
+                    } else if (clientRpc->topChoice) {
+                        clientRpc->topChoice = false;
+                        erase(topOutgoingMessages, *clientRpc);
+                        updateTopOutgoingMessageSet(clientRpc, false);
                     }
                     return;
                 }
@@ -1047,8 +1159,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                 sendBytes(clientRpc->session->serverAddress,
                         header->common.rpcId, clientRpc->request,
                         header->offset, header->length,
-                        FROM_CLIENT|RETRANSMISSION|clientRpc->needGrantFlag,
-                        true);
+                        clientRpc->unscheduledBytes,
+                        FROM_CLIENT|RETRANSMISSION, true);
                 // TODO: NO NEED TO CALL RDTSC DIRECTLY; GET THIS FROM DRIVER;
                 // ALSO, MOVE THIS STATEMENT INTO sendBytes?
                 clientRpc->lastTransmitTime = Cycles::rdtsc();
@@ -1175,7 +1287,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     context->workerManager->handleRpc(serverRpc);
                 } else {
                     // See if we need to output a GRANT.
-                    if ((header->common.flags & NEED_GRANT) &&
+                    if ((header->totalLength > header->unscheduledBytes) &&
                             (serverRpc->grantOffset <
                             (serverRpc->requestPayload.size()
                             + roundTripBytes)) &&
@@ -1222,6 +1334,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                 }
                 if (header->offset > serverRpc->transmitLimit) {
                     serverRpc->transmitLimit = header->offset;
+                }
+                if (!serverRpc->topChoice) {
+                    transmitDataSlowPath = true;
                 }
                 return;
             }
@@ -1297,8 +1412,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                 sendBytes(serverRpc->clientAddress,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
-                        RETRANSMISSION|FROM_SERVER|serverRpc->needGrantFlag,
-                        true);
+                        serverRpc->unscheduledBytes,
+                        RETRANSMISSION|FROM_SERVER, true);
                 serverRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
@@ -1363,13 +1478,10 @@ BasicTransport::ServerRpc::sendReply()
             replyPayload.size(), t->outgoingResponses.size());
     sendingResponse = true;
     transmitLimit = t->roundTripBytes;
-    if (transmitLimit < replyPayload.size()) {
-        needGrantFlag = NEED_GRANT;
-    }
-    transmitSequenceNumber = t->transmitSequenceNumber;
-    t->transmitSequenceNumber++;
+    unscheduledBytes = t->roundTripBytes;
     t->outgoingResponses.push_back(*this);
     t->serverTimerList.push_back(*this);
+    t->updateTopOutgoingMessageSet(this, true);
     uint32_t bytesSent = t->tryToTransmitData();
     if (bytesSent > 0) {
         timeTrace("sendReply transmitted %u bytes", bytesSent);

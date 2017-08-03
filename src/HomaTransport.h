@@ -534,7 +534,7 @@ class HomaTransport : public Transport {
                                      // this packet!).
         uint32_t offset;             // Offset within the message of the first
                                      // byte of data in this packet.
-        uint32_t unscheduledBytes;    // # unscheduled bytes in the message.
+        uint32_t unscheduledBytes;   // # unscheduled bytes in the message.
 
         // The remaining packet bytes after the header constitute message
         // data starting at the given offset.
