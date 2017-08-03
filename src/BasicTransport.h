@@ -214,17 +214,20 @@ class BasicTransport : public Transport {
         /// them.
         uint32_t transmitLimit;
 
-        /// True means this message is among the sender's top outgoing
-        /// messages with fewest bytes left (and this object is linked in
-        /// t->topOutgoingMessages).
-        bool topChoice;
-
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the message.
         uint64_t lastTransmitTime;
 
-        /// Used to link this object into t->topOutgoingMessages.
-        IntrusiveListHook outgoingMessageLinks;
+        /// Used to link this object into t->outgoingFIFOMessages.
+        IntrusiveListHook outgoingFIFOMessageLinks;
+
+        /// Used to link this object into t->outgoingSRPTMessages.
+        IntrusiveListHook outgoingSRPTMessageLinks;
+
+        /// True means this object is linked in t->outgoingFIFOMessages during
+        /// transmission. Similarly, false means this object is linked in
+        /// t->outgoingSRPTMessages during transmission.
+        bool scheduledByFIFO;
 
         // TODO: doc. dynamic throttling
         /// # bytes that can be sent unilaterally.
@@ -237,9 +240,10 @@ class BasicTransport : public Transport {
             , recipient(recipient)
             , transmitOffset(0)
             , transmitLimit(0)
-            , topChoice(false)
             , lastTransmitTime(0)
-            , outgoingMessageLinks()
+            , outgoingFIFOMessageLinks()
+            , outgoingSRPTMessageLinks()
+            , scheduledByFIFO()
             , unscheduledBytes()
         {}
 
@@ -588,8 +592,6 @@ class BasicTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void updateTopOutgoingMessageSet(OutgoingMessage* candidate,
-            bool newMessage);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -659,23 +661,6 @@ class BasicTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    /// A relatively small set of the sender's top K outgoing messages with
-    /// fewest bytes left. We keep this as a separate set so that the sender
-    /// doesn't have to consider all the outgoing messages in the common case.
-    /// K is dynamically adjusted based on the workload. The overall goal is
-    /// to keep K as small as possible while still ensuring that the sender
-    /// doesn't have to look outside this set when picking the next message
-    /// to transmit. Every time the sender decides to transmit a message
-    /// outside this set, we increment K by one.
-    INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
-            OutgoingMessageList;
-    OutgoingMessageList topOutgoingMessages;
-
-    /// False means we know that no message outside t->topOutgoingMessages
-    /// has grants available and there is no need to take the slow path in
-    /// #tryToTransmitData.
-    bool transmitDataSlowPath;
-
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and
     /// (c) the last byte of the response message has not yet been passed
@@ -692,6 +677,15 @@ class BasicTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ServerRpc, outgoingResponseLinks)
             OutgoingResponseList;
     OutgoingResponseList outgoingResponses;
+
+    // FIXME
+    INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingFIFOMessageLinks)
+            OutgoingFIFOMessageList;
+    OutgoingFIFOMessageList outgoingFIFOMessages;
+
+    INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingSRPTMessageLinks)
+            OutgoingSRPTMessageList;
+    OutgoingSRPTMessageList outgoingSRPTMessages;
 
     /// Subset of the objects in incomingRpcs that require monitoring by
     /// the timer. We keep this as a separate list so that the timer doesn't
@@ -799,10 +793,6 @@ class BasicTransport : public Transport {
     uint64_t transmitDataCycles;
 
     uint64_t transmitGrantCycles;
-
-    /// # times we have to look outside of t->topOutgoingMessages in order to
-    /// find a message to transmit in #tryToTransmitData.
-    uint32_t tryToTransmitDataCacheMisses;
 
     /// Total # idle rdtsc ticks of the NIC's transmit queue in the
     /// current interval.

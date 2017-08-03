@@ -1760,14 +1760,6 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
             "sequence %u";
     timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
     uint32_t length = endOffset - buffer->size();
-    if (length > t->roundTripBytes) {
-        // TODO: This is not only suspicious but could also cause significant queueing on
-        // the other side's NIC since retransmission bytes are passed to the driver directly
-        LOG(WARNING, "%s requesting retransmission of a large range %u-%u, "
-                "clientId %lu, sequence %lu",
-                whoFrom == FROM_SERVER ? "server" : "client",
-                buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
-    }
     // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
     ResendHeader resend(rpcId, buffer->size(), length,
             t->getUnschedTrafficPrio(length), whoFrom);
