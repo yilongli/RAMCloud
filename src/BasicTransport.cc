@@ -1504,7 +1504,6 @@ BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
     , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , fragments()
-    , grantOffset(0)
 {
     assert(buffer->size() == 0);
 }
@@ -1665,16 +1664,21 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         endOffset = t->roundTripBytes;
     }
     assert(endOffset > buffer->size());
-    if (whoFrom == FROM_SERVER) {
-        timeTrace("server requesting retransmission of bytes %u-%u, "
-                "sequence %u", buffer->size(), endOffset,
-                downCast<uint32_t>(rpcId.sequence));
-    } else {
-        timeTrace("client requesting retransmission of bytes %u-%u, "
-                "sequence %u", buffer->size(), endOffset,
-                downCast<uint32_t>(rpcId.sequence));
+    const char* fmt = (whoFrom == FROM_SERVER) ?
+            "server requesting retransmission of bytes %u-%u, clientId %u, "
+            "sequence %u" :
+            "client requesting retransmission of bytes %u-%u, clientId %u, "
+            "sequence %u";
+    timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
+    uint32_t length = endOffset - buffer->size();
+    if (length > t->roundTripBytes) {
+        // TODO: This is not only suspicious but could also cause significant queueing on
+        // the other side's NIC since retransmission bytes are passed to the driver directly
+        LOG(WARNING, "%s requesting retransmission of a large range %u-%u, "
+                "clientId %lu, sequence %lu",
+                whoFrom == FROM_SERVER ? "server" : "client",
+                buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
     }
-    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
             whoFrom);
     t->sendControlPacket(address, &resend);
@@ -1871,7 +1875,7 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->response->size() == 0) {
+        if (!clientRpc->accumulator) {
             // We haven't received any part of the response message.
             // Send occasional RESEND packets, which should produce some
             // response from the server, so that we know it's still alive

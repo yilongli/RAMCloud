@@ -1,4 +1,4 @@
-/* Copyright (c) 2015-2016 Stanford University
+/* Copyright (c) 2015-2017 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -1109,13 +1109,13 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.sequence,
                         header->offset, received->len);
                 if (!clientRpc->accumulator) {
-                    clientRpc->accumulator.construct(this, clientRpc->response,
-                            uint32_t(header->totalLength));
+                    clientRpc->accumulator.construct(this, clientRpc->response);
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
                                 clientRpc->rpcId, clientRpc->accumulator.get(),
                                 uint32_t(header->unscheduledBytes),
                                 clientRpc->session->serverAddress,
+                                uint32_t(header->totalLength),
                                 static_cast<uint8_t>(FROM_SERVER));
                     }
                 }
@@ -1346,13 +1346,13 @@ HomaTransport::handlePacket(Driver::Received* received)
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload,
-                            uint32_t(header->totalLength));
+                            &serverRpc->requestPayload);
                     if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
                                 serverRpc->rpcId, serverRpc->accumulator.get(),
                                 uint32_t(header->unscheduledBytes),
                                 serverRpc->clientAddress,
+                                uint32_t(header->totalLength),
                                 static_cast<uint8_t>(FROM_CLIENT));
                     }
                     serverTimerList.push_back(*serverRpc);
@@ -1371,13 +1371,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                             header->totalLength);
                 }
                 dataPacketArrive(serverRpc->scheduledMessage.get());
-//                if (serverRpc->scheduledMessage) {
-//                    if (header->offset > serverRpc->scheduledMessage->grantOffset) {
-//                        LOG(ERROR, "DATA offset %u larger than grant offset %u",
-//                                header->offset,
-//                                serverRpc->scheduledMessage->grantOffset);
-//                    }
-//                }
                 if (serverRpc->requestPayload.size() >= header->totalLength) {
                     // Message complete; start servicing the RPC.
                     if (serverRpc->requestPayload.size()
@@ -1586,17 +1579,14 @@ HomaTransport::ServerRpc::sendReply()
  *      The complete message will be assembled here; caller should ensure
  *      that this is initially empty. The caller owns the storage for this
  *      and must ensure that it persists as long as this object persists.
- * \param totalLength
- *      Total # bytes in the message.
  */
 HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
-        Buffer* buffer, uint32_t totalLength)
+        Buffer* buffer)
     : t(t)
     , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , estimatedReceivedBytes(0)
     , fragments()
-    , totalLength(totalLength)
 {
     assert(buffer->size() == 0);
 }
@@ -1797,13 +1787,16 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
  *      # bytes sent unilaterally.
  * \param senderAddress
  *      Network address of the message sender.
+ * \param totalLength
+ *      Total # bytes in the message.
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that this is a request, or
  *      FROM_SERVER, indicating that this is a response.
  */
 HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
         MessageAccumulator* accumulator, uint32_t unscheduledBytes,
-        const Driver::Address* senderAddress, uint8_t whoFrom)
+        const Driver::Address* senderAddress, uint32_t totalLength,
+        uint8_t whoFrom)
     : accumulator(accumulator)
     , activeMessageLinks()
     , inactiveMessageLinks()
@@ -1813,6 +1806,7 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
     , senderAddress(senderAddress)
     , senderHash(std::hash<std::string>{}(senderAddress->toString()))
     , state(NEW)
+    , totalLength(totalLength)
     , whoFrom(whoFrom)
 {
     accumulator->t->tryToSchedule(this);
@@ -1845,9 +1839,8 @@ int
 HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
 {
     // Implement the SRPT policy.
-    int r0 = accumulator->totalLength - accumulator->buffer->size();
-    int r1 = other.accumulator->totalLength -
-            other.accumulator->buffer->size();
+    int r0 = totalLength - accumulator->buffer->size();
+    int r1 = other.totalLength - other.accumulator->buffer->size();
     return r0 - r1;
 }
 
@@ -2318,8 +2311,7 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
             newMessage->state == ScheduledMessage::NEW ||
             newMessage->state == ScheduledMessage::INACTIVE);
 
-    bool purgeOK = (oldMessage->grantOffset ==
-            oldMessage->accumulator->totalLength);
+    bool purgeOK = (oldMessage->grantOffset == oldMessage->totalLength);
 
     if (oldMessage == &activeMessages.front()) {
         // The top message is removed. Reclaim the highest granted priority.
@@ -2505,22 +2497,22 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
         // been granted for 1 RTT incoming bytes.
         return;
     }
-    if (messageToGrant->accumulator->totalLength - messageToGrant->grantOffset
+    if (messageToGrant->totalLength - messageToGrant->grantOffset
             <= roundTripBytes) {
         // For the last 1 RTT remaining bytes of a scheduled message
         // with size (1+a)RTT, use the same priority as an unscheduled
         // message that has size min{1, a}*RTT.
         priority = getUnschedTrafficPrio(std::min(roundTripBytes,
-                messageToGrant->accumulator->totalLength - roundTripBytes));
+                messageToGrant->totalLength - roundTripBytes));
     }
 
     messageToGrant->grantOffset += grantIncrement;
     messageToGrant->grantPriority = priority;
     if (messageToGrant->grantOffset >=
-            messageToGrant->accumulator->totalLength) {
+            messageToGrant->totalLength) {
         // Slow path: a message has been fully granted. Purge it from the
         // scheduler.
-        messageToGrant->grantOffset = messageToGrant->accumulator->totalLength;
+        messageToGrant->grantOffset = messageToGrant->totalLength;
         replaceActiveMessage(messageToGrant, NULL);
     }
 
