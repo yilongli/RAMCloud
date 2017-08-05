@@ -1395,9 +1395,13 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     double rawLoadFactor = averageRawBytesPerMessage*8
             * averageMessagesPerSecond / (bandwidthMbps*1e6);
 
-    LOG(NOTICE, "Average message size %.2f, average arrival interval %.2f us, "
+    LOG(NOTICE, "Average message size %.2f (%.2f raw bytes), "
+            "average packets per message %.2f, "
+            "average arrival interval %.2f us, "
             "packet generation rate %.0f pps, raw network load %.2f",
-            averageMessageSize, Cycles::toSeconds(averageArrivalInterval)*1e6,
+            averageMessageSize, averageRawBytesPerMessage,
+            averagePacketsPerMessage,
+            Cycles::toSeconds(averageArrivalInterval)*1e6,
             packetsPerSecond, rawLoadFactor);
     std::poisson_distribution<uint64_t> messageIntervalDist(
             static_cast<double>(averageArrivalInterval));
