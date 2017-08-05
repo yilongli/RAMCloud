@@ -45,6 +45,8 @@ ensure_servers_bin = '%s/apps/ensureServers' % remote_obj_path
 # Used to prepend debugging tool commands (e.g., valgrind) before the various
 # RAMCloud executables.
 prefix_command = ''
+# Suppress memory leak detection when using AddressSanitizer
+prefix_command = 'ASAN_OPTIONS=detect_leaks=0'
 
 # Info used to construct service locators for each of the transports
 # supported by RAMCloud.  In some cases the locator for the coordinator

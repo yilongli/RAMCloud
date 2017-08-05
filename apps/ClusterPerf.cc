@@ -1281,7 +1281,7 @@ echoMessages(string receiver, uint32_t length,
     std::vector<uint64_t> times = {};
     times.reserve(100000);
 
-    static const string message(length, 'x');
+    const string message(length, 'x');
     Buffer buffer;
 
     // Each iteration of the following loop invokes an Echo RPC and records
