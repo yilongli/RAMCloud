@@ -10,18 +10,19 @@ def is_number(s):
     except ValueError:
         return False
 
-if len(argv) != 6:
-    print "Usage: transport loadFactor workloadType baseline_file experiment_file"
-    exit
+if len(argv) != 4:
+    print "Usage: transport loadFactor workloadType"
+    quit()
 
 transport = argv[1]
-loadFactor = float(argv[2])
-workloadType = argv[3]
+workloadType = argv[2]
+loadFactor = argv[3]
 
 regex = re.compile("echo(\d+).min\s+(\d+\.\d+) (us|ms|s)")
 
 # Example: echo50.min             4.7 us     send 50B message, receive 50B message minimum
-baseline = argv[4]
+baseline = "homa_eval/%s_%s_baseline.txt" % (transport, workloadType)
+#print "Reading baseline performance file %s" % baseline
 minRTT = {}
 with open(baseline) as f:
     for line in f.readlines():
@@ -39,7 +40,8 @@ with open(baseline) as f:
         minRTT[size] = time
 
 # Example: Size   Samples       Min    Median       90%       99%     99.9%       Max
-experiment = argv[5]
+experiment = "homa_eval/%s_%s_%s_experiment.txt" % (transport, workloadType, loadFactor)
+#print "Reading workload performance file %s" % experiment
 numSamples = {}
 medianRTT = {}
 tailRTT = {}
@@ -59,7 +61,7 @@ with open(experiment) as f:
         totalSamples += samples
 
 for size in sorted(numSamples.iterkeys()):
-    print "%s %5.2f %s %8d %5d %10.7f %8.2f %8.2f" % (transport, loadFactor,
+    print "%s %s %s %8d %5d %10.7f %8.2f %8.2f" % (transport, loadFactor,
             workloadType, size, numSamples[size],
             numSamples[size]/totalSamples, medianRTT[size]/minRTT[size],
             tailRTT[size]/minRTT[size])
