@@ -1434,11 +1434,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         prevResult = r;
         prevDispatchTime = currentTime;
 
-        // TODO: As of 06/2017, checking 1 RPC takes 100~200 ns!!!!!!
-        // TODO: If # outstanding RPCs is relatively large, we would like to
+        // TODO: As of 08/2017, checking 1 RPC takes 10~20 ns.
+        // If # outstanding RPCs is relatively large, we would like to
         // check more RPCs for completion at each round, but we couldn't
         // becaues it's too expensive.
-        for (unsigned i = 0; i < 1; i++) {
+        for (unsigned i = 0; i < 5; i++) {
 //        for (unsigned i = 0; i < 10; i++) {
             if (it == outstandingRpcs.end()) {
                 it = outstandingRpcs.begin();
@@ -1446,8 +1446,8 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             }
 
             EchoRpc* echo = it->second;
-            // TODO: I never really figure out how expensive is RpcWrapper::isReady
-//            TimeTrace::record("Cperf about to check isReady(), i = %u", i);
+            // Before changing to std::atomic, invoking isReady 10 times takes about
+            // 1000 cycles; now it is 200~350 cycles.
             if (echo->isReady()) {
                 if (count > 0) {
                     uint id = it->first;
@@ -1462,6 +1462,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 echoRpcPool.destroy(echo);
 //                TimeTrace::record("Cperf destroyed EchoRpc");
                 it = outstandingRpcs.erase(it);
+                break;
             } else {
                 it++;
             }
@@ -1490,7 +1491,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
         // See if it's time to send another message.
 //#define MAX_OUTSTANDING_RPCS 50000
-#define MAX_OUTSTANDING_RPCS 20
+#define MAX_OUTSTANDING_RPCS 200
         if (currentTime > nextMessageArrival) {
             if (warmupCount > 0) {
                 warmupCount--;
@@ -1522,11 +1523,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             if (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS) {
                 const char* receiver =
                         receivers[generateRandom() % numReceivers].c_str();
+                TimeTrace::record("Start new RPC, %u outstanding RPCs",
+                        (uint32_t)outstandingRpcs.size());
                 EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
                         message.c_str(), length, length);
                 outstandingRpcs.emplace_back(messageId, echo);
             } else {
                 totalBytesDropped += length;
+                TimeTrace::record("Drop %u-byte message", length);
             }
         }
     }

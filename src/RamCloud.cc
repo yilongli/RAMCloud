@@ -512,7 +512,7 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     WireFormat::Echo::Request* reqHdr(allocHeader<WireFormat::Echo>());
     reqHdr->length = length;
     reqHdr->echoLength = echoLength;
-    request.append(message, length);
+    request.appendExternal(message, length);
     startTime = Cycles::rdtsc();
     send();
 }

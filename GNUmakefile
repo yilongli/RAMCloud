@@ -17,6 +17,8 @@ ARCH ?= native
 COMPILER ?= gnu
 CCACHE ?= no
 GLIBCXX_USE_CXX11_ABI ?= no
+GEN_PGO ?= no
+USE_PGO ?= no
 LINKER ?= default
 SANITIZER ?= none
 VALGRIND ?= no
@@ -99,6 +101,14 @@ LDFLAGS += -fsanitize=thread -pie
 else ifeq ($(SANITIZER),undefined)
 COMFLAGS += -DUBSAN -fsanitize=undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=undefined
+endif
+PGO_DIR ?= /shome/RAMCloud/pgo_profile
+ifeq ($(GEN_PGO),yes)
+COMFLAGS += -fprofile-generate=$(PGO_DIR)
+LDFLAGS += -fprofile-generate=$(PGO_DIR)
+else ifeq ($(USE_PGO),yes)
+COMFLAGS += -fprofile-use=$(PGO_DIR)
+LDFLAGS += -fprofile-use=$(PGO_DIR)
 endif
 ifeq ($(VALGRIND),yes)
 COMFLAGS += -DVALGRIND

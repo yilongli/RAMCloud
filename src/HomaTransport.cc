@@ -24,7 +24,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -235,6 +235,7 @@ HomaTransport::getServiceLocator()
 void
 HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
+    timeTrace("deleteClientRpc invoked");
     uint64_t sequence = clientRpc->rpcId.sequence;
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
@@ -245,8 +246,8 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
         erase(topOutgoingMessages, *clientRpc);
     }
     clientRpcPool.destroy(clientRpc);
-    timeTrace("deleted client RPC, clientId %u, sequence %u",
-            clientId, sequence);
+    timeTrace("deleted client RPC, clientId %u, sequence %u, %u outgoing RPCs",
+            clientId, sequence, outgoingRpcs.size());
 }
 
 /**
@@ -261,6 +262,7 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 void
 HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
+    timeTrace("deleteServerRpc invoked");
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
@@ -276,8 +278,8 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
         erase(topOutgoingMessages, *serverRpc);
     }
     serverRpcPool.destroy(serverRpc);
-    timeTrace("deleted server RPC, clientId %u, sequence %u",
-            serverRpc->rpcId.clientId, sequence);
+    timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
+            serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
 }
 
 /**
