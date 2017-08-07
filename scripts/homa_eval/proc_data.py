@@ -11,7 +11,7 @@ def is_number(s):
         return False
 
 if len(argv) != 4:
-    print "Usage: transport loadFactor workloadType"
+    print "Usage: transport workloadType loadFactor"
     quit()
 
 transport = argv[1]

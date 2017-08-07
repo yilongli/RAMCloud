@@ -1366,12 +1366,16 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     // Test distribution of generated messages.
     uint64_t totalMessageSize = 0;
     uint64_t numGeneratedMsgs = 10000000;
+    uint64_t now = Cycles::rdtsc();
     for (uint i = 0; i < numGeneratedMsgs; i++) {
         totalMessageSize += messageSizes[messageSizeDist(gen)];
     }
     LOG(ERROR, "theoretical average message size %.1f, "
-            "generated average message size %lu", averageMessageSize,
-            totalMessageSize / numGeneratedMsgs);
+            "generated %lu messages, average message size %lu,"
+            "spent %.1f us",
+            averageMessageSize, numGeneratedMsgs,
+            totalMessageSize / numGeneratedMsgs,
+            Cycles::toSeconds(Cycles::rdtsc() - now) * 1e6);
 #endif
 
     // Work out 1) the average message arrival interval, in rdtsc ticks;
@@ -1406,13 +1410,34 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     std::poisson_distribution<uint64_t> messageIntervalDist(
             static_cast<double>(averageArrivalInterval));
 
-    uint64_t totalCycles = 0;
-    size_t numReceivers = receivers.size();
+    // Generate pseduo-random message recipients, size and arrival interval
+    // in advance. As of 2017/8, generating these three numbers could take
+    // a few hundred nanoseconds.
+    // TODO: we cannot simply pre-generate a relatively short list of the
+    // message sizes because some message has extremely low probability.
+    // This adds about 80 ns overhead per RPC.
+    const int PRE_GEN_LIST_SIZE = 1000;
+//    std::array<uint32_t, PRE_GEN_LIST_SIZE> preGeneratedMessageIds;
+    std::array<uint64_t, PRE_GEN_LIST_SIZE> preGeneratedMessageIntervals;
+    std::array<const char*, PRE_GEN_LIST_SIZE> preGeneratedRecipients;
+    for (int i = 0; i < PRE_GEN_LIST_SIZE; i++) {
+//        preGeneratedMessageIds[i] = messageSizeDist(gen);
+        preGeneratedMessageIntervals[i] = messageIntervalDist(gen);
+        preGeneratedRecipients[i] =
+                receivers[generateRandom() % receivers.size()].c_str();
+    }
 
+    uint64_t totalCycles = 0;
+    // FIXME: compute deadline due cycles
+//    uint64_t missedDeadlineCycles = 0;
     ObjectPool<EchoRpc> echoRpcPool;
-    using OutstandingRpcs = std::list<std::pair<uint32_t, EchoRpc*>>;
-    OutstandingRpcs outstandingRpcs = {};
-    OutstandingRpcs::iterator it = outstandingRpcs.begin();
+#define MAX_OUTSTANDING_RPCS 20
+    std::array<Tub<std::pair<uint32_t, EchoRpc*>>, MAX_OUTSTANDING_RPCS>
+            outstandingRpcs = {};
+    uint32_t numOutstandingRpcs = 0;
+    uint32_t nextSlotToCheck = 0;
+    uint32_t nextSlotToInsert = 0;
+
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = ~0lu;
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
@@ -1433,42 +1458,45 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         }
         prevResult = r;
         prevDispatchTime = currentTime;
+//        TimeTrace::record("Cperf finished polling");
 
-        // TODO: As of 08/2017, checking 1 RPC takes 10~20 ns.
-        // If # outstanding RPCs is relatively large, we would like to
-        // check more RPCs for completion at each round, but we couldn't
-        // becaues it's too expensive.
-        for (unsigned i = 0; i < 5; i++) {
-//        for (unsigned i = 0; i < 10; i++) {
-            if (it == outstandingRpcs.end()) {
-                it = outstandingRpcs.begin();
+        // As of 08/2017, it takes ~120ns to reclaim an RPC object;
+        // out of which calling RpcWrapper::isReady only takes 10-20 ns.
+        for (int i = 0; i < 1; i++) {
+            Tub<std::pair<uint32_t, EchoRpc*>>& outstandingRpc =
+                    outstandingRpcs[nextSlotToCheck];
+            nextSlotToCheck++;
+            if (nextSlotToCheck == outstandingRpcs.size()) {
+                nextSlotToCheck = 0;
                 break;
             }
 
-            EchoRpc* echo = it->second;
-            // Before changing to std::atomic, invoking isReady 10 times takes about
-            // 1000 cycles; now it is 200~350 cycles.
-            if (echo->isReady()) {
-                if (count > 0) {
-                    uint id = it->first;
-                    uint64_t completionTime = echo->getCompletionTime();
-                    totalBytesSent += messageSizes[id];
-                    roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
-                            completionTime;
-                    numSamples[id]++;
+            if (outstandingRpc) {
+                EchoRpc* echo = outstandingRpc.get()->second;
+                // Before changing to std::atomic, invoking isReady 10 times
+                // takes about 1000 cycles; now it is 200~350 cycles.
+                if (echo->isReady()) {
+                    if (count > 0) {
+                        uint32_t id = outstandingRpc.get()->first;
+                        uint64_t completionTime = echo->getCompletionTime();
+                        totalBytesSent += messageSizes[id];
+                        roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
+                                completionTime;
+                        numSamples[id]++;
+                    }
+                    // TODO: It appears that sometimes ~RpcWrapper is quite expensive (200ns ~ 1us); why?
+//                    TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
+                    echoRpcPool.destroy(echo);
+//                    TimeTrace::record("Cperf destroyed EchoRpc");
+                    outstandingRpc.destroy();
+                    numOutstandingRpcs--;
+                    break;
                 }
-                // TODO: It appears that ~RpcWrapper is quite expensive (200ns ~ 1us); why?
-//                TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
-                echoRpcPool.destroy(echo);
-//                TimeTrace::record("Cperf destroyed EchoRpc");
-                it = outstandingRpcs.erase(it);
-                break;
-            } else {
-                it++;
             }
         }
+//        TimeTrace::record("Cperf finished checking isReady");
 
-        if (currentTime >= stopTime) {
+        if (expect_false(currentTime >= stopTime)) {
             LOG(NOTICE, "time expired after %lu iterations", count);
             double actualLoadFactor = static_cast<double>(totalBytesSent)*8
                     / (timeLimit*bandwidthMbps*1e6);
@@ -1490,9 +1518,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         // time.
 
         // See if it's time to send another message.
-//#define MAX_OUTSTANDING_RPCS 50000
-#define MAX_OUTSTANDING_RPCS 200
         if (currentTime > nextMessageArrival) {
+//            missedDeadlineCycles += currentTime - nextMessageArrival;
+
+            // Index into the pre-generated random list.
+            uint64_t kRandom;
             if (warmupCount > 0) {
                 warmupCount--;
                 if (warmupCount == 0) {
@@ -1513,21 +1543,31 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     nextMessageArrival = startTime + messageIntervalDist(gen);
                     continue;
                 }
+                kRandom = warmupCount % PRE_GEN_LIST_SIZE;
             } else {
                 count++;
+                kRandom = count % PRE_GEN_LIST_SIZE;
             }
 
-            unsigned messageId = messageSizeDist(gen);
+            uint32_t messageId = messageSizeDist(gen);
+//            uint32_t messageId = preGeneratedMessageIds[kRandom];
             uint32_t length = messageSizes[messageId];
-            nextMessageArrival += messageIntervalDist(gen);
-            if (outstandingRpcs.size() < MAX_OUTSTANDING_RPCS) {
-                const char* receiver =
-                        receivers[generateRandom() % numReceivers].c_str();
+            nextMessageArrival += preGeneratedMessageIntervals[kRandom];
+            if (numOutstandingRpcs < MAX_OUTSTANDING_RPCS) {
+                const char* receiver = preGeneratedRecipients[kRandom];
                 TimeTrace::record("Start new RPC, %u outstanding RPCs",
-                        (uint32_t)outstandingRpcs.size());
+                        (uint32_t)numOutstandingRpcs);
                 EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
                         message.c_str(), length, length);
-                outstandingRpcs.emplace_back(messageId, echo);
+                while (true) {
+                    int i = nextSlotToInsert;
+                    nextSlotToInsert = (nextSlotToInsert + 1) % MAX_OUTSTANDING_RPCS;
+                    if (!outstandingRpcs[i]) {
+                        outstandingRpcs[i].construct(messageId, echo);
+                        break;
+                    }
+                }
+                numOutstandingRpcs++;
             } else {
                 totalBytesDropped += length;
                 TimeTrace::record("Drop %u-byte message", length);
@@ -1538,9 +1578,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));
 
     // Cancel outstanding RPCs
-    LOG(NOTICE, "Destroying %lu outstanding RPCs", outstandingRpcs.size());
-    for (OutstandingRpcs::value_type p : outstandingRpcs) {
-        echoRpcPool.destroy(p.second);
+    LOG(NOTICE, "Destroying %u outstanding RPCs", numOutstandingRpcs);
+    for (int i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
+        if (outstandingRpcs[i]) {
+            echoRpcPool.destroy((*outstandingRpcs[i]).second);
+        }
     }
 
     // Aggregate the results into TimeDist format.
