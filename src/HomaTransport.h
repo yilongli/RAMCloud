@@ -404,6 +404,9 @@ class HomaTransport : public Transport {
         /// sequence number is in rpcId.
         uint64_t sequence;
 
+        /// True if the RPC has been cancelled by the client.
+        bool cancelled;
+
         // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
         /// Where to send the response once the RPC has executed.
         const Driver::Address* clientAddress;
@@ -440,6 +443,7 @@ class HomaTransport : public Transport {
             : OutgoingMessage(false, &replyPayload, clientAddress)
             , t(transport)
             , sequence(sequence)
+            , cancelled(false)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
             , silentIntervals(0)
@@ -467,7 +471,8 @@ class HomaTransport : public Transport {
         RESEND                 = 24,
         ACK                    = 25,
         ABORT                  = 26,
-        BOGUS                  = 27,      // Used only in unit tests.
+        PING                   = 27,
+        BOGUS                  = 28,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -630,13 +635,24 @@ class HomaTransport : public Transport {
 
     /**
      * Describes the wire format for ABORT packets. These packets are used
-     * to let the server know that the client has cancelled the request.
+     * to let the server know that the client has cancelled the RPC.
      */
     struct AbortHeader {
         CommonHeader common;         // Common header fields.
 
         explicit AbortHeader(RpcId rpcId)
             : common(PacketOpcode::ABORT, rpcId, FROM_CLIENT) {}
+    } __attribute__((packed));
+
+    /**
+     * Describes the wire format for PING packets. These packets are used
+     * to check if a client or server is still alive.
+     */
+    struct PingHeader {
+        CommonHeader common;         // Common header fields.
+
+        explicit PingHeader(RpcId rpcId, uint8_t flags)
+            : common(PacketOpcode::PING, rpcId, flags) {}
     } __attribute__((packed));
 
     /**
@@ -705,6 +721,7 @@ class HomaTransport : public Transport {
 
     // The highest priority to use for scheduled traffic.
     int highestSchedPriority;
+    // FIXME: Priority -> Prio or the other way around?
 
     /// The packet priority used for sending control packets.
     const int controlPacketPriority;
@@ -863,6 +880,9 @@ class HomaTransport : public Transport {
             ActiveMessageList;
     ActiveMessageList activeMessages;
 
+    // FIXME
+    std::vector<int> activeMessagePrio;
+
     /// Holds a list of scheduled messages that we have received at least one
     /// packet for each of them, but haven't yet fully granted them and aren't
     /// actively sending grants to them in order to avoid overloading the
@@ -875,7 +895,7 @@ class HomaTransport : public Transport {
 
     /// The highest priority currently granted to the incoming messages that
     /// are scheduled by this transport. The valid range of this value is
-    /// [-1, #lowestUnschedPrio). -1 means no message is being scheduled
+    /// [-1, #highestSchedPriority]. -1 means no message is being scheduled
     /// by the transport.
     int highestGrantedPrio;
 

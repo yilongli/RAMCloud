@@ -77,9 +77,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
 
     // For now, assume we can use all the priorities supported by the driver.
     , highestAvailPriority(driver->getHighestPacketPriority())
-    , highestSchedPriority(0)
+    , highestSchedPriority()
     , controlPacketPriority(highestAvailPriority)
-    , lowestUnschedPrio(0)
+    , lowestUnschedPrio()
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
@@ -109,9 +109,10 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , pingIntervals(3)
     , unschedTrafficPrioBrackets()
     , activeMessages()
+    , activeMessagePrio()
     , inactiveMessages()
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(4) // TODO: why 4?
+    , maxGrantedMessages(4) // TODO: Why 4?
     , lastMeasureTime(0)
     , lastDispatchActiveCycles(0)
     , lastTimeGrantRunDry(0)
@@ -149,9 +150,27 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     if (highestAvailPriority > 0) {
         lowestUnschedPrio = (highestAvailPriority + 1) >> 1;
         highestSchedPriority = lowestUnschedPrio - 1;
-        maxGrantedMessages = std::min(maxGrantedMessages,
-                downCast<uint32_t>(highestSchedPriority + 1));
+    } else {
+        lowestUnschedPrio = 0;
+        highestSchedPriority = 0;
     }
+    // FIXME: according to the paper, "the number of scheduled priority levels
+    // limits the degree of over-commitment". However, I think this will result
+    // in poor network utilization in a single-priority setting
+    maxGrantedMessages = std::min(maxGrantedMessages,
+            downCast<uint32_t>(highestSchedPriority + 1));
+
+    // TODO: Useless until we decide to handle the case where "maxGrantedMessages > numSchedPrio"
+    // Map ranks of active messages to the scheduled priorities.
+    int numSchedPrio = highestSchedPriority + 1;
+    int numMessagesPerPrio = int(maxGrantedMessages) / numSchedPrio;
+    if (numMessagesPerPrio == 0) {
+        numMessagesPerPrio = 1;
+    }
+    for (int i = 0; i < int(maxGrantedMessages); i++) {
+        activeMessagePrio.push_back(i / numMessagesPerPrio);
+    }
+    std::reverse(activeMessagePrio.begin(), activeMessagePrio.end());
 
     // Set up the initial unscheduled traffic priority brackets for messages.
     // TODO: better name for brackets; and better name for unschedTrafficPrioBrackets...
@@ -169,13 +188,13 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
             "roundTripBytes %u, grantIncrement %u, pingIntervals %d, "
             "timeoutIntervals %d, timerInterval %.2f ms, "
-            "monitorInterval %.2f ms, "
+            "monitorInterval %.2f ms, maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
             "highestSchedPriority %d, unscheduledTrafficPrioBrackets %s",
             clientId, maxDataPerPacket, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3,
-            Cycles::toSeconds(monitorInterval)*1e3,
+            Cycles::toSeconds(monitorInterval)*1e3, maxGrantedMessages,
             highestAvailPriority, lowestUnschedPrio, highestSchedPriority,
             brackets.c_str());
 }
@@ -389,6 +408,8 @@ HomaTransport::opcodeSymbol(uint8_t opcode) {
             return "ACK";
         case HomaTransport::PacketOpcode::ABORT:
             return "ABORT";
+        case HomaTransport::PacketOpcode::PING:
+            return "PING";
     }
 
     return format("%d", opcode);
@@ -632,6 +653,13 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
         }
         case HomaTransport::PacketOpcode::ABORT: {
             headerLength = sizeof32(HomaTransport::AbortHeader);
+            if (packetLength < headerLength) {
+                goto packetTooShort;
+            }
+            break;
+        }
+        case HomaTransport::PacketOpcode::PING: {
+            headerLength = sizeof32(HomaTransport::PingHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -1252,6 +1280,17 @@ HomaTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
+            // PING from server
+            case PacketOpcode::PING: {
+                timeTrace("client received PING, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (clientRpc != NULL) {
+                    AckHeader ack(common->rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress, &ack);
+                }
+                return;
+            }
+
             default:
             RAMCLOUD_CLOG(WARNING,
                     "unexpected opcode %s received from server %s",
@@ -1408,10 +1447,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->offset);
                 if ((serverRpc == NULL) || !serverRpc->sendingResponse) {
                     RAMCLOUD_LOG(WARNING, "unexpected GRANT from client %s, "
-                            "id (%lu,%lu), grantOffset %u",
+                            "id (%lu,%lu), grantOffset %u, serverRpc %s",
                             received->sender->toString().c_str(),
                             header->common.rpcId.clientId,
-                            header->common.rpcId.sequence, header->offset);
+                            header->common.rpcId.sequence, header->offset,
+                            serverRpc ? "receiving request" : "not found");
                     return;
                 }
                 if (header->offset > serverRpc->transmitLimit) {
@@ -1453,6 +1493,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // request, or if a packet of the response got lost but
                     // we have already freed the ServerRpc. In either case,
                     // ask the client to restart the RPC from scratch.
+//                    RAMCLOUD_LOG(WARNING, "server received RESEND, "
+//                            "id (%lu,%lu), %u-%u, requesting RESTART",
+//                            header->common.rpcId.clientId,
+//                            header->common.rpcId.sequence, header->offset,
+//                            header->offset + header->length);
                     timeTrace("server requesting restart, clientId %u, "
                             "sequence %u",
                             common->rpcId.clientId, common->rpcId.sequence);
@@ -1511,11 +1556,28 @@ HomaTransport::handlePacket(Driver::Received* received)
 
             // ABORT from client
             case PacketOpcode::ABORT: {
-                // Nothing to do.
                 timeTrace("server received ABORT, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
                 if (serverRpc != NULL) {
-                    deleteServerRpc(serverRpc);
+                    // Delete the ServerRpc if it is not being processed.
+                    // Otherwise, delay the deletion to sendReply().
+                    if (!serverRpc->requestComplete ||
+                            serverRpc->sendingResponse) {
+                        deleteServerRpc(serverRpc);
+                    } else {
+                        serverRpc->cancelled = true;
+                    }
+                }
+                return;
+            }
+
+            // PING from client
+            case PacketOpcode::PING: {
+                timeTrace("server received PING, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (serverRpc != NULL) {
+                    AckHeader ack(common->rpcId, FROM_SERVER);
+                    sendControlPacket(serverRpc->clientAddress, &ack);
                 }
                 return;
             }
@@ -1559,6 +1621,13 @@ HomaTransport::ServerRpc::sendReply()
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
             replyPayload.size(), t->outgoingResponses.size());
+    if (cancelled) {
+        // TODO: when this method returns, the caller's handle to this
+        // ServerRpc may become invalid; however, this behavior is already
+        // possible since tryToTransmitData may also invoke deleteServerRpc.
+        t->deleteServerRpc(this);
+        return;
+    }
     sendingResponse = true;
     transmitLimit = t->roundTripBytes;
     unscheduledBytes = t->roundTripBytes;
@@ -1719,7 +1788,7 @@ HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
  * \param grantOffset
  *      Largest grantOffset that we have sent for this message (i.e.
  *      this is how many total bytes we should have received already).
- *      May be 0 if the client never requested a grant (meaning that it
+ *      May be 0 if the sender never requested a grant (meaning that it
  *      planned to transmit the entire message unilaterally).
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that we are the client, or
@@ -2109,55 +2178,60 @@ HomaTransport::checkTimeouts()
                     WireFormat::opcodeSymbol(clientRpc->request),
                     clientRpc->session->serverAddress->toString().c_str(),
                     sequence);
-            // See if it is the client's problem for not granting more bytes
-            // to the response for a long time.
-            bool responseStarvedOfGrant = scheduledMessage &&
-                    (clientRpc->accumulator->buffer->size() == grantOffset);
-            if (responseStarvedOfGrant) {
-                LOG(WARNING, "RPC response starved of grant, clientId %lu, "
-                        "sequence %lu, grantOffset %u, %lu active messages",
-                        clientRpc->rpcId.clientId, clientRpc->rpcId.sequence,
-                        grantOffset, activeMessages.size());
-                // TODO: IT SEEMS TO BE OUR PROBLEM THAT CAUSES THIS SITUATION
-                // SHOULD WE NOT DELETE THE ClientRpc AND CLEAR ITS SILENT INTERVAL?
-            }
             clientRpc->notifier->failed();
             deleteClientRpc(clientRpc);
             continue;
         }
 
-        if (!clientRpc->accumulator) {
-            // We haven't received any part of the response message.
-            // Send occasional RESEND packets, which should produce some
-            // response from the server, so that we know it's still alive
-            // and working. Note: the wait time for this ping is longer
-            // than the server's wait time to request retransmission (first
-            // give the server a chance to handle the problem).
-            if ((clientRpc->silentIntervals % pingIntervals) == 0) {
-                timeTrace("client sending RESEND for clientId %u, sequence %u",
-                        clientId, sequence);
-                ResendHeader resend(RpcId(clientId, sequence), 0,
-                        roundTripBytes, 0, FROM_CLIENT);
-                // The RESEND packet is effectively a grant...
-                sendControlPacket(clientRpc->session->serverAddress, &resend);
+        if (clientRpc->silentIntervals >= 2) {
+            if (clientRpc->transmitPending) {
+                // We haven't finished transmitting the request.
+                if (clientRpc->transmitOffset == clientRpc->transmitLimit) {
+                    // The client has transmitted every granted byte. Poke the
+                    // server to see if it's still alive.
+                    PingHeader ping(clientRpc->rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress,
+                            &ping);
+                } else {
+                    clientRpc->silentIntervals = 0;
+                }
+            } else {
+                if (!clientRpc->accumulator) {
+                    // We haven't received any part of the response message.
+                    // Send occasional RESEND packets, which should produce
+                    // some response from the server, so that we know it's
+                    // still alive and working. Note: the wait time for this
+                    // ping is longer than the server's wait time to request
+                    // retransmission (first give the server a chance to handle
+                    // the problem).
+                    if ((clientRpc->silentIntervals % pingIntervals) == 0) {
+                        timeTrace("client sending RESEND for clientId %u, "
+                                "sequence %u", clientId, sequence);
+                        ResendHeader resend(RpcId(clientId, sequence), 0,
+                                roundTripBytes, 0, FROM_CLIENT);
+                        sendControlPacket(clientRpc->session->serverAddress,
+                                &resend);
+                    }
+                } else {
+                    // We have received part of the response.
+                    if (scheduledMessage && (grantOffset ==
+                            clientRpc->accumulator->buffer->size())) {
+                        // The client has received every byte of the response it has
+                        // granted but hasn't got around to grant more because there
+                        // are higher priority responses.
+                        clientRpc->silentIntervals = 0;
+                        continue;
+                    }
+                    // The client expects to receive more bytes but the server
+                    // has gone silent, this must mean packets were lost,
+                    // grants were lost, or the server has preempted this
+                    // response for higher priority messages, so request
+                    // retransmission anyway.
+                    clientRpc->accumulator->requestRetransmission(this,
+                            clientRpc->session->serverAddress,
+                            RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
+                }
             }
-        } else if (clientRpc->silentIntervals >= 2) {
-            // We have received part of the response. See if we have received
-            // every byte we have granted. If we haven't but the server has
-            // gone silent, this must mean packets were lost, grants were lost,
-            // or the server has preempted this response for higher priority
-            // messages, so request retransmission anyway.
-            if (scheduledMessage &&
-                    (clientRpc->accumulator->buffer->size() == grantOffset)) {
-                // The client has received every byte of the response it has
-                // granted but hasn't got around to grant more because there
-                // are higher priority responses.
-                // TODO: DO WE EXPECT TO RECEIVE DATA FROM INACTIVE MESSAGE?
-                continue;
-            }
-            clientRpc->accumulator->requestRetransmission(this,
-                    clientRpc->session->serverAddress,
-                    RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
         }
     }
 
@@ -2196,36 +2270,35 @@ HomaTransport::checkTimeouts()
         //     could process the RPC before the retransmitted data arrived.
         assert(serverRpc->sendingResponse || !serverRpc->requestComplete);
         if (serverRpc->silentIntervals >= timeoutIntervals) {
-            // See if it is the server's problem for not granting more bytes
-            // to the request for a long time.
-            bool requestStarvedOfGrant = !serverRpc->requestComplete &&
-                    scheduledMessage &&
-                    (serverRpc->accumulator->buffer->size() == grantOffset);
-            if (requestStarvedOfGrant) {
-                LOG(WARNING, "RPC request starved of grant, clientId %lu, "
-                        "sequence %lu, grantOffset %u, %lu active messages",
-                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence,
-                        grantOffset, activeMessages.size());
-                // TODO: IT SEEMS TO BE OUR PROBLEM THAT CAUSES THIS SITUATION
-                // SHOULD WE NOT DELETE THE ServerRpc AND CLEAR ITS SILENT INTERVAL?
-            }
             deleteServerRpc(serverRpc);
             continue;
         }
 
-        // See if we need to request retransmission for part of the request
-        // message.
-        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete) {
-            if (scheduledMessage &&
-                    (serverRpc->accumulator->buffer->size() == grantOffset)) {
-                // The server has received every byte of the request it has
-                // granted but hasn't got around to grant more because there
-                // are higher priority requests.
-                continue;
+        if (serverRpc->silentIntervals >= 2) {
+            if (!serverRpc->requestComplete) {
+                // See if we need to request retransmission for part of the
+                // request message.
+                if (scheduledMessage && (grantOffset ==
+                        serverRpc->accumulator->buffer->size())) {
+                    // The server has received every byte of the request it has
+                    // granted but hasn't got around to grant more because there
+                    // are higher priority requests.
+                    serverRpc->silentIntervals = 0;
+                    continue;
+                }
+                serverRpc->accumulator->requestRetransmission(this,
+                        serverRpc->clientAddress, serverRpc->rpcId,
+                        grantOffset, FROM_SERVER);
+            } else if (serverRpc->sendingResponse) {
+                if (serverRpc->transmitOffset == serverRpc->transmitLimit) {
+                    // The server has transmitted every granted byte. Poke the
+                    // client to see if it's still alive.
+                    PingHeader ping(serverRpc->rpcId, FROM_SERVER);
+                    sendControlPacket(serverRpc->clientAddress, &ping);
+                } else {
+                    serverRpc->silentIntervals = 0;
+                }
             }
-            serverRpc->accumulator->requestRetransmission(this,
-                    serverRpc->clientAddress, serverRpc->rpcId, grantOffset,
-                    FROM_SERVER);
         }
     }
 }
