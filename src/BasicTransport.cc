@@ -76,6 +76,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
+    , grantRecipients()
     , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
@@ -1027,6 +1028,14 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->offset, received->len);
                 if (!clientRpc->accumulator) {
                     clientRpc->accumulator.construct(this, clientRpc->response);
+                    if (header->totalLength > header->unscheduledBytes) {
+                        clientRpc->scheduledMessage.construct(
+                                clientRpc->rpcId, clientRpc->accumulator.get(),
+                                uint32_t(header->unscheduledBytes),
+                                clientRpc->session->serverAddress,
+                                (uint32_t)header->totalLength,
+                                static_cast<uint8_t>(FROM_SERVER));
+                    }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
@@ -1043,21 +1052,19 @@ BasicTransport::handlePacket(Driver::Received* received)
                     deleteClientRpc(clientRpc);
                 } else {
                     // See if we need to output a GRANT.
-                    if ((header->totalLength > header->unscheduledBytes) &&
-                            (clientRpc->grantOffset <
+                    ScheduledMessage* schedMessage =
+                            clientRpc->scheduledMessage.get();
+                    if ((schedMessage != NULL) &&
+                            (schedMessage->grantOffset <
                             (clientRpc->response->size() + roundTripBytes)) &&
-                            (clientRpc->grantOffset < header->totalLength)) {
-                        clientRpc->grantOffset = clientRpc->response->size()
+                            (schedMessage->grantOffset < header->totalLength)) {
+                        schedMessage->grantOffset = clientRpc->response->size()
                                 + roundTripBytes + grantIncrement;
-                        timeTrace(
-                                "client sending GRANT, sequence %u, offset %u",
-                                downCast<uint32_t>(
-                                header->common.rpcId.sequence),
-                                clientRpc->grantOffset);
-                        GrantHeader grant(header->common.rpcId,
-                                clientRpc->grantOffset, FROM_CLIENT);
-                        driver->sendPacket(clientRpc->session->serverAddress,
-                                &grant, NULL);
+                        if (std::find(grantRecipients.begin(),
+                                grantRecipients.end(), schedMessage) ==
+                                grantRecipients.end()) {
+                            grantRecipients.push_back(schedMessage);
+                        }
                     }
                 }
                 if (retainPacket) {
@@ -1113,9 +1120,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                     clientRpc->response->reset();
                     clientRpc->transmitOffset = 0;
                     clientRpc->transmitLimit = header->length;
-                    clientRpc->grantOffset = 0;
                     clientRpc->resendLimit = 0;
                     clientRpc->accumulator.destroy();
+                    clientRpc->scheduledMessage.destroy();
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
@@ -1249,6 +1256,21 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
+                if ((header->offset > header->unscheduledBytes) &&
+                        ((serverRpc == NULL) || (header->offset >
+                        serverRpc->scheduledMessage->grantOffset))) {
+                    // TODO: THIS COULD HAPPEN BECAUSE?
+                    uint32_t grantOffset = (serverRpc == NULL) ?
+                            header->unscheduledBytes :
+                            serverRpc->scheduledMessage->grantOffset;
+                    LOG(WARNING, "unexpected DATA from client %s, "
+                            "id (%lu,%lu), offset %u, grantOffset %u",
+                            received->sender->toString().c_str(),
+                            header->common.rpcId.clientId,
+                            header->common.rpcId.sequence, header->offset,
+                            grantOffset);
+                    goto serverDataDone;
+                }
                 if (serverRpc == NULL) {
                     serverRpc = serverRpcPool.construct(this,
                             nextServerSequenceNumber, received->sender,
@@ -1257,6 +1279,14 @@ BasicTransport::handlePacket(Driver::Received* received)
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
                             &serverRpc->requestPayload);
+                    if (header->totalLength > header->unscheduledBytes) {
+                        serverRpc->scheduledMessage.construct(
+                                serverRpc->rpcId, serverRpc->accumulator.get(),
+                                uint32_t(header->unscheduledBytes),
+                                serverRpc->clientAddress,
+                                (uint32_t)header->totalLength,
+                                static_cast<uint8_t>(FROM_CLIENT));
+                    }
                     serverTimerList.push_back(*serverRpc);
                 } else if (serverRpc->requestComplete) {
                     // We've already received the full message, so
@@ -1287,23 +1317,21 @@ BasicTransport::handlePacket(Driver::Received* received)
                     context->workerManager->handleRpc(serverRpc);
                 } else {
                     // See if we need to output a GRANT.
+                    ScheduledMessage* schedMessage =
+                            serverRpc->scheduledMessage.get();
                     if ((header->totalLength > header->unscheduledBytes) &&
-                            (serverRpc->grantOffset <
+                            (schedMessage->grantOffset <
                             (serverRpc->requestPayload.size()
                             + roundTripBytes)) &&
-                            (serverRpc->grantOffset < header->totalLength)) {
-                        serverRpc->grantOffset =
+                            (schedMessage->grantOffset < header->totalLength)) {
+                        schedMessage->grantOffset =
                                 serverRpc->requestPayload.size()
                                 + roundTripBytes + grantIncrement;
-                        timeTrace(
-                                "server sending GRANT, sequence %u, offset %u",
-                                downCast<uint32_t>(
-                                header->common.rpcId.sequence),
-                                serverRpc->grantOffset);
-                        GrantHeader grant(header->common.rpcId,
-                                serverRpc->grantOffset, FROM_SERVER);
-                        driver->sendPacket(serverRpc->clientAddress,
-                                &grant, NULL);
+                        if (std::find(grantRecipients.begin(),
+                                grantRecipients.end(), schedMessage) ==
+                                grantRecipients.end()) {
+                            grantRecipients.push_back(schedMessage);
+                        }
                     }
                 }
                 serverDataDone:
@@ -1677,6 +1705,41 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
 }
 
 /**
+ * Constructor for ScheduledMessages.
+ *
+ * \param rpcId
+ *      Unique identifier for the RPC this message belongs to.
+ * \param accumulator
+ *      Overall information about this multi-packet message.
+ * \param unscheduledBytes
+ *      # bytes sent unilaterally.
+ * \param senderAddress
+ *      Network address of the message sender.
+ * \param totalLength
+ *      Total # bytes in the message.
+ * \param whoFrom
+ *      Must be either FROM_CLIENT, indicating that this is a request, or
+ *      FROM_SERVER, indicating that this is a response.
+ */
+BasicTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
+        MessageAccumulator* accumulator, uint32_t unscheduledBytes,
+        const Driver::Address* senderAddress, uint32_t totalLength,
+        uint8_t whoFrom)
+    : accumulator(accumulator)
+    , grantOffset(unscheduledBytes)
+    , rpcId(rpcId)
+    , senderAddress(senderAddress)
+    , totalLength(totalLength)
+    , whoFrom(whoFrom)
+{}
+
+/**
+ * Destructor for ScheduledMessages.
+ */
+BasicTransport::ScheduledMessage::~ScheduledMessage()
+{}
+
+/**
  * This method is invoked in the inner polling loop of the dispatcher;
  * it drives the operation of the transport.
  * \return
@@ -1754,6 +1817,22 @@ BasicTransport::Poller::poll()
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
     result |= totalPackets;
+    // Send out GRANTs that are produced in the previous processing step
+    // in a batch.
+    // TODO: should I do a bucket sort or something to rank them by priorities?
+    for (ScheduledMessage* recipient : t->grantRecipients) {
+        uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
+                FROM_SERVER : FROM_CLIENT;
+        GrantHeader grant(recipient->rpcId, recipient->grantOffset, whoFrom);
+        const char* fmt = (whoFrom == FROM_CLIENT) ?
+                "client sending GRANT, clientId %u, sequence %u, offset %u" :
+                "server sending GRANT, clientId %u, sequence %u, offset %u";
+        timeTrace(fmt, recipient->rpcId.clientId, recipient->rpcId.sequence,
+                grant.offset);
+
+        t->sendControlPacket(recipient->senderAddress, &grant);
+    }
+    t->grantRecipients.clear();
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -1878,22 +1957,21 @@ BasicTransport::checkTimeouts()
                         clientId, sequence);
                 ResendHeader resend(RpcId(clientId, sequence), 0,
                         roundTripBytes, FROM_CLIENT);
-                // The RESEND packet is effectively a grant...
-                clientRpc->grantOffset = roundTripBytes;
                 sendControlPacket(clientRpc->session->serverAddress, &resend);
             }
-        } else {
+        } else if (clientRpc->silentIntervals >= 2) {
             // We have received part of the response. If the server has gone
             // silent, this must mean packets were lost, so request
             // retransmission.
-            assert(clientRpc->accumulator);
-            if (clientRpc->silentIntervals >= 2) {
-                clientRpc->resendLimit =
-                        clientRpc->accumulator->requestRetransmission(this,
-                        clientRpc->session->serverAddress,
-                        RpcId(clientId, sequence),
-                        clientRpc->grantOffset, FROM_CLIENT);
-            }
+            ScheduledMessage* scheduledMessage =
+                    clientRpc->scheduledMessage.get();
+            uint32_t grantOffset =
+                    scheduledMessage ? scheduledMessage->grantOffset : 0;
+            clientRpc->resendLimit =
+                    clientRpc->accumulator->requestRetransmission(this,
+                    clientRpc->session->serverAddress,
+                    RpcId(clientId, sequence),
+                    grantOffset, FROM_CLIENT);
         }
     }
 
@@ -1935,10 +2013,14 @@ BasicTransport::checkTimeouts()
         // See if we need to request retransmission for part of the request
         // message.
         if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete) {
+            ScheduledMessage* scheduledMessage =
+                    serverRpc->scheduledMessage.get();
+            uint32_t grantOffset =
+                    scheduledMessage ? scheduledMessage->grantOffset : 0;
             serverRpc->resendLimit =
                     serverRpc->accumulator->requestRetransmission(this,
                     serverRpc->clientAddress, serverRpc->rpcId,
-                    serverRpc->grantOffset, FROM_SERVER);
+                    grantOffset, FROM_SERVER);
         }
     }
 }

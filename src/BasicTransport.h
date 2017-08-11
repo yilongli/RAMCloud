@@ -192,6 +192,46 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
 
+    /**
+     * An object of this class stores the state for a scheduled message for
+     * for which at least one packet has been received. It is used both for
+     * request messages on the server and for response messages on the client.
+     * Not used for messages that can be sent unilaterally.
+     */
+    class ScheduledMessage {
+      public:
+        ScheduledMessage(RpcId rpcId, MessageAccumulator* accumulator,
+                uint32_t unscheduledBytes,
+                const Driver::Address* senderAddress, uint32_t totalLength,
+                uint8_t whoFrom);
+        ~ScheduledMessage();
+
+        /// Holds state of partially-received multi-packet messages.
+        const MessageAccumulator* const accumulator;
+
+        /// Offset from the most recent GRANT packet we have sent for this
+        /// incoming message, or # unscheduled bytes in this message if we
+        /// haven't sent any GRANTs.
+        uint32_t grantOffset;
+
+        /// Unique identifier for the RPC this message belongs to.
+        RpcId rpcId;
+
+        /// Network address of the message sender.
+        const Driver::Address* senderAddress;
+
+        /// Total # bytes in the message.
+        const uint32_t totalLength;
+
+        /// Must be either FROM_CLIENT, indicating that this message is the
+        /// request from a client, or FROM_SERVER, indicating that this is
+        /// the response from a server.
+        const uint8_t whoFrom;
+
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
+    };
+
     // TODO
     class OutgoingMessage {
       public:
@@ -270,10 +310,6 @@ class BasicTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// Offset from the most recent GRANT packet we have sent for
-        /// the response for this RPC, or 0 if we haven't sent any GRANTs.
-        uint32_t grantOffset;
-
         /// The sum of the offset and length fields from the most recent
         /// RESEND we have sent, 0 if no RESEND has been sent for this
         /// RPC. Used to detect unnecessary RESENDs (because the original
@@ -291,6 +327,9 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
 
+        /// Holds state of response messages that require scheduling.
+        Tub<ScheduledMessage> scheduledMessage;
+
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
@@ -302,11 +341,11 @@ class BasicTransport : public Transport {
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
-            , grantOffset(0)
             , resendLimit(0)
             , silentIntervals(0)
             , transmitPending(false)
             , accumulator()
+            , scheduledMessage()
             , outgoingRequestLinks()
         {}
 
@@ -338,10 +377,6 @@ class BasicTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// Offset from the most recent GRANT packet we have sent for
-        /// the request message, or 0 if we haven't sent any GRANTs.
-        uint32_t grantOffset;
-
         /// The sum of the offset and length fields from the most recent
         /// RESEND we have sent, 0 if no RESEND has been sent for this
         /// RPC. Used to detect unnecessary RESENDs (because the original
@@ -363,6 +398,9 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
+        /// Holds state of request messages that require scheduling.
+        Tub<ScheduledMessage> scheduledMessage;
+
         /// Used to link this object into t->serverTimerList.
         IntrusiveListHook timerLinks;
 
@@ -376,12 +414,12 @@ class BasicTransport : public Transport {
             , sequence(sequence)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
-            , grantOffset(0)
             , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
             , accumulator()
+            , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
         {}
@@ -624,6 +662,10 @@ class BasicTransport : public Transport {
     /// want to reallocate space in every call to poll). Always empty,
     /// except when the poll method is executing.
     std::vector<Driver::Received> receivedPackets;
+
+    /// Holds incoming messages we are about to grant. Always empty, except
+    /// when the poll method is receiving and processing incoming packets.
+    std::vector<ScheduledMessage*> grantRecipients;
 
     /// Holds message buffers that are consist of payloads that are retained
     /// and assembled by the MessageAccumulator. These retained payloads are
