@@ -517,6 +517,27 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     send();
 }
 
+EchoRpc::EchoRpc(RamCloud* ramcloud, Transport::SessionRef session,
+        const void* message, uint32_t length, uint32_t echoLength,
+        Buffer* echo)
+    : RpcWrapper(sizeof(WireFormat::Echo::Response), echo)
+    , ramcloud(ramcloud)
+    , startTime(0)
+    , endTime(~0u)
+    , length(length)
+{
+    TimeTrace::record("EchoRpc invoked");
+    this->session = session;
+    TimeTrace::record("Got a session!");
+    WireFormat::Echo::Request* reqHdr(allocHeader<WireFormat::Echo>());
+    reqHdr->length = length;
+    reqHdr->echoLength = echoLength;
+    request.appendExternal(message, length);
+    startTime = Cycles::rdtsc();
+    TimeTrace::record(startTime, "Echo echo echo...");
+    send();
+}
+
 // See Transport::Notifier for documentation.
 void
 EchoRpc::completed() {

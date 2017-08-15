@@ -17,6 +17,7 @@ ARCH ?= native
 COMPILER ?= gnu
 CCACHE ?= no
 GLIBCXX_USE_CXX11_ABI ?= no
+LTO ?= no
 GEN_PGO ?= no
 USE_PGO ?= no
 LINKER ?= default
@@ -102,6 +103,10 @@ else ifeq ($(SANITIZER),undefined)
 COMFLAGS += -DUBSAN -fsanitize=undefined -fno-omit-frame-pointer
 LDFLAGS += -fsanitize=undefined
 endif
+ifeq ($(LTO),yes)
+COMFLAGS += -flto
+LDFLAGS += -flto
+endif
 PGO_DIR ?= /shome/RAMCloud/pgo_profile
 ifeq ($(GEN_PGO),yes)
 COMFLAGS += -fprofile-generate=$(PGO_DIR)
@@ -156,7 +161,7 @@ endif
 
 CC ?= gcc
 CXX ?= g++
-AR ?= ar
+AR ?= gcc-ar
 PERL ?= perl
 PYTHON ?= python
 LINT := $(PYTHON) cpplint.py --filter=-runtime/threadsafe_fn,-readability/streams,-whitespace/blank_line,-whitespace/braces,-whitespace/comments,-runtime/arrays,-build/include_what_you_use,-whitespace/semicolon
@@ -166,6 +171,9 @@ PROTOC ?= protoc
 EPYDOC ?= epydoc
 EPYDOCFLAGS ?= --simple-term -v
 DOXYGEN ?= doxygen
+
+C_STANDARD ?= c11
+CXX_STANDARD ?= c++11
 
 # Using ccache is as simple as prefixing the compilation commands with `ccache`.
 ifeq ($(CCACHE),yes)
@@ -189,7 +197,7 @@ endif
 
 # Test whether Infiniband support is available. Avoids using $(COMFLAGS)
 # (particularly, -MD) which results in bad interactions with mergedeps.
-INFINIBAND = $(shell $(CXX) -std=c++11 $(INCLUDES) src/HaveInfiniband.cc \
+INFINIBAND = $(shell $(CXX) -std=$(CXX_STANDARD) $(INCLUDES) src/HaveInfiniband.cc \
                          $(LIBS) -libverbs -o /dev/null >/dev/null 2>&1 \
                          && echo yes || echo no)
 
@@ -285,13 +293,13 @@ ifeq ($(YIELD),yes)
 COMFLAGS += -DYIELD=1
 endif
 
-CFLAGS_BASE := $(COMFLAGS) -std=gnu11 $(INCLUDES)
+CFLAGS_BASE := $(COMFLAGS) -std=$(C_STANDARD) $(INCLUDES)
 CFLAGS_SILENT := $(CFLAGS_BASE)
 CFLAGS_NOWERROR := $(CFLAGS_BASE) $(CWARNS)
 # CFLAGS := $(CFLAGS_BASE) $(CWARNS)
 CFLAGS := $(CFLAGS_BASE) -Werror $(CWARNS)
 
-CXXFLAGS_BASE := $(COMFLAGS) -std=c++11 $(INCLUDES)
+CXXFLAGS_BASE := $(COMFLAGS) -std=$(CXX_STANDARD) $(INCLUDES)
 CXXFLAGS_SILENT := $(CXXFLAGS_BASE) $(EXTRACXXFLAGS)
 CXXFLAGS_NOWERROR := $(CXXFLAGS_BASE) $(CXXWARNS) $(EXTRACXXFLAGS)
 # CXXFLAGS := $(CXXFLAGS_BASE) $(CXXWARNS) $(EXTRACXXFLAGS) $(PERF)

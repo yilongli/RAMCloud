@@ -320,7 +320,7 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
     // propagation delay plus 1 us of service time plus 1 us of grant packet
     // propagation delay) in the unloaded case. Figure out how to set
     // "rttMicros" from command line.
-    uint32_t roundTripMicros = 8;
+    uint32_t roundTripMicros = 14;
 //    uint32_t roundTripMicros = 7;
 
     if (locator  != NULL) {
@@ -1024,27 +1024,47 @@ void
 HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier)
 {
+    uint32_t length = request->size();
     timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing requests", t->clientId, t->nextClientSequenceNumber,
-            request->size(), t->outgoingRequests.size());
-    response->reset();
+            length, t->outgoingRequests.size());
     if (aborted) {
         notifier->failed();
         return;
     }
+    response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
-    clientRpc->transmitLimit = t->roundTripBytes;
-    clientRpc->unscheduledBytes = t->roundTripBytes;
-    clientRpc->transmitPriority = t->getUnschedTrafficPrio(request->size());
-    t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
-    t->outgoingRequests.push_back(*clientRpc);
-    clientRpc->transmitPending = true;
-    t->updateTopOutgoingMessageSet(clientRpc, true);
+    // TODO: set `transmitPriority` in ctor once OutgoingMessage is not implemented as a base class
+    clientRpc->transmitPriority = t->getUnschedTrafficPrio(length);
+    t->outgoingRpcs.emplace(t->nextClientSequenceNumber, clientRpc);
     t->nextClientSequenceNumber++;
-    uint32_t bytesSent = t->tryToTransmitData();
+
+    uint32_t bytesSent;
+    // TODO: how to justify this threshold?
+#define SMALL_MESSAGE_SIZE 300
+    if (length < SMALL_MESSAGE_SIZE) {
+        // Pass small messages directly to NIC: it's not worth going through
+        // all the hassles of tryToTransmitData and sendBytes
+        RpcId rpcId = clientRpc->rpcId;
+        AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
+        Buffer::Iterator iter(request, 0, length);
+        timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
+                "priority %u", rpcId.clientId, rpcId.sequence,
+                clientRpc->transmitPriority);
+        t->driver->sendPacket(serverAddress, &header, &iter,
+                clientRpc->transmitPriority);
+        clientRpc->transmitOffset = length;
+//        clientRpc->lastTransmitTime = t->driver->getLastTransmitTime();
+        clientRpc->transmitPending = false;
+        bytesSent = length;
+    } else {
+        t->outgoingRequests.push_back(*clientRpc);
+        t->updateTopOutgoingMessageSet(clientRpc, true);
+        bytesSent = t->tryToTransmitData();
+    }
     if (bytesSent > 0) {
-        timeTrace("sendRequest trasmitted %u bytes", bytesSent);
+        timeTrace("sendRequest transmitted %u bytes", bytesSent);
     }
 }
 
@@ -1618,9 +1638,10 @@ HomaTransport::ServerRpc::getClientServiceLocator()
 void
 HomaTransport::ServerRpc::sendReply()
 {
+    uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
-            replyPayload.size(), t->outgoingResponses.size());
+            length, t->outgoingResponses.size());
     if (cancelled) {
         // TODO: when this method returns, the caller's handle to this
         // ServerRpc may become invalid; however, this behavior is already
@@ -1628,14 +1649,27 @@ HomaTransport::ServerRpc::sendReply()
         t->deleteServerRpc(this);
         return;
     }
-    sendingResponse = true;
-    transmitLimit = t->roundTripBytes;
-    unscheduledBytes = t->roundTripBytes;
-    transmitPriority = t->getUnschedTrafficPrio(replyPayload.size());
-    t->outgoingResponses.push_back(*this);
-    t->serverTimerList.push_back(*this);
-    t->updateTopOutgoingMessageSet(this, true);
-    uint32_t bytesSent = t->tryToTransmitData();
+    transmitPriority = t->getUnschedTrafficPrio(length);
+
+    uint32_t bytesSent;
+    if (length < SMALL_MESSAGE_SIZE) {
+        AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
+        Buffer::Iterator iter(&replyPayload, 0, length);
+        timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
+                "priority %u", rpcId.clientId, rpcId.sequence,
+                transmitPriority);
+        t->driver->sendPacket(clientAddress, &header, &iter, transmitPriority);
+//        transmitOffset = length;
+//        lastTransmitTime = t->driver->getLastTransmitTime();
+        t->deleteServerRpc(this);
+        bytesSent = length;
+    } else {
+        sendingResponse = true;
+        t->outgoingResponses.push_back(*this);
+        t->serverTimerList.push_back(*this);
+        t->updateTopOutgoingMessageSet(this, true);
+        bytesSent = t->tryToTransmitData();
+    }
     if (bytesSent > 0) {
         timeTrace("sendReply transmitted %u bytes", bytesSent);
     }
@@ -1654,6 +1688,7 @@ HomaTransport::ServerRpc::sendReply()
 HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
         Buffer* buffer)
     : t(t)
+    // FIXME: avoid doing dynamic allocation? profile it first
     , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , estimatedReceivedBytes(0)

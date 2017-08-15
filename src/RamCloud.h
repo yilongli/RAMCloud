@@ -291,6 +291,10 @@ class EchoRpc : public RpcWrapper {
     EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
             const void* message, uint32_t length, uint32_t echoLength,
             Buffer* echo = NULL);
+    // FIXME: this method is a hack to avoid the cost of retrieving a SessionRef
+    EchoRpc(RamCloud* ramcloud, Transport::SessionRef session,
+            const void* message, uint32_t length, uint32_t echoLength,
+            Buffer* echo = NULL);
     ~EchoRpc() {}
     virtual void completed();
     uint64_t getCompletionTime();

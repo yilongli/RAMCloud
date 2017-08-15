@@ -368,16 +368,17 @@ TransportManager::getSession(const string& serviceLocator)
 {
     // If we're running on a server (i.e., multithreaded) must exclude
     // other threads.
-    Tub<std::lock_guard<SpinLock>> lock;
+    Tub<SpinLock::Guard> lock;
     if (isServer) {
         lock.construct(mutex);
     }
 
     // First check to see if we have already opened a session for the
     // locator; this should almost always be true.
-    auto it = sessionCache.find(serviceLocator);
-    if (it != sessionCache.end())
+    SessionCache::iterator it = sessionCache.find(serviceLocator);
+    if (it != sessionCache.end()) {
         return it->second;
+    }
 
     CycleCounter<RawMetric> counter;
 

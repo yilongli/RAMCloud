@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <unordered_set>
 namespace po = boost::program_options;
 
@@ -1338,6 +1339,13 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         vector<uint32_t>& messageSizes, vector<double>& cumulativeProbabilities,
         uint64_t iteration, double timeLimit, vector<Samples>& roundTripTimes)
 {
+    // FIXME: Performance hack: precompute session handles
+    vector<Transport::SessionRef> sessionRefs = {};
+    for (string serviceLocator : receivers) {
+        sessionRefs.push_back(cluster->clientContext->
+                transportManager->getSession(serviceLocator));
+    }
+
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
     // Any more samples will simply overwrite old ones by wrapping around.
     const uint32_t MAX_SAMPLES = 1000000;
@@ -1419,12 +1427,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     const int PRE_GEN_LIST_SIZE = 1000;
 //    std::array<uint32_t, PRE_GEN_LIST_SIZE> preGeneratedMessageIds;
     std::array<uint64_t, PRE_GEN_LIST_SIZE> preGeneratedMessageIntervals;
-    std::array<const char*, PRE_GEN_LIST_SIZE> preGeneratedRecipients;
+    std::array<uint64_t, PRE_GEN_LIST_SIZE> preGeneratedRecipients;
     for (int i = 0; i < PRE_GEN_LIST_SIZE; i++) {
 //        preGeneratedMessageIds[i] = messageSizeDist(gen);
         preGeneratedMessageIntervals[i] = messageIntervalDist(gen);
-        preGeneratedRecipients[i] =
-                receivers[generateRandom() % receivers.size()].c_str();
+        preGeneratedRecipients[i] = generateRandom() % receivers.size();
     }
 
     uint64_t totalCycles = 0;
@@ -1554,11 +1561,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             uint32_t length = messageSizes[messageId];
             nextMessageArrival += preGeneratedMessageIntervals[kRandom];
             if (numOutstandingRpcs < MAX_OUTSTANDING_RPCS) {
-                const char* receiver = preGeneratedRecipients[kRandom];
+                uint64_t recipient = preGeneratedRecipients[kRandom];
                 TimeTrace::record("Start new RPC, %u outstanding RPCs",
                         (uint32_t)numOutstandingRpcs);
-                EchoRpc* echo = echoRpcPool.construct(cluster, receiver,
-                        message.c_str(), length, length);
+                EchoRpc* echo = echoRpcPool.construct(cluster,
+                        sessionRefs[recipient], message.c_str(), length,
+                        length);
+//                EchoRpc* echo = echoRpcPool.construct(cluster, receivers[recipient].c_str(),
+//                        message.c_str(), length, length);
                 while (true) {
                     int i = nextSlotToInsert;
                     nextSlotToInsert = (nextSlotToInsert + 1) % MAX_OUTSTANDING_RPCS;
