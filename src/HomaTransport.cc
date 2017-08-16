@@ -1037,7 +1037,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
             t->nextClientSequenceNumber, request, response, notifier);
     // TODO: set `transmitPriority` in ctor once OutgoingMessage is not implemented as a base class
     clientRpc->transmitPriority = t->getUnschedTrafficPrio(length);
-    t->outgoingRpcs.emplace(t->nextClientSequenceNumber, clientRpc);
+    t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
     uint32_t bytesSent;
@@ -1364,8 +1364,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
                 nextServerSequenceNumber++;
-                // TODO: the following operation is very expensive;
-                // easily > 250ns
                 incomingRpcs[header->common.rpcId] = serverRpc;
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
                         payload + sizeof32(AllDataHeader),
