@@ -1159,7 +1159,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.sequence,
                         header->offset, received->len);
                 if (!clientRpc->accumulator) {
-                    clientRpc->accumulator.construct(this, clientRpc->response);
+                    clientRpc->accumulator.construct(this, clientRpc->response,
+                            uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
                                 clientRpc->rpcId, clientRpc->accumulator.get(),
@@ -1407,7 +1408,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload);
+                            &serverRpc->requestPayload,
+                            uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
                                 serverRpc->rpcId, serverRpc->accumulator.get(),
@@ -1684,17 +1686,24 @@ HomaTransport::ServerRpc::sendReply()
  *      The complete message will be assembled here; caller should ensure
  *      that this is initially empty. The caller owns the storage for this
  *      and must ensure that it persists as long as this object persists.
+ * \param totalLength
+ *      Length of the message.
  */
 HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
-        Buffer* buffer)
+        Buffer* buffer, uint32_t totalLength)
     : t(t)
     // FIXME: avoid doing dynamic allocation? profile it first
     , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
-    , estimatedReceivedBytes(0)
     , fragments()
+    , packetLost(false)
 {
     assert(buffer->size() == 0);
+#define FRAGMENTS_HIGH_WATERMARK 64
+    int numPackets = totalLength / t->maxDataPerPacket +
+            (totalLength % t->maxDataPerPacket == 0 ? 0 : 1);
+    assembledPayloads->reserve(numPackets);
+    fragments.reserve(std::min(numPackets, FRAGMENTS_HIGH_WATERMARK));
 }
 
 /**
@@ -1737,77 +1746,55 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
     // Assume the payload contains no redundant bytes for now. The redundant
     // portion will be deducted when this packet is discarded/assembled.
     length -= sizeof32(DataHeader);
-    estimatedReceivedBytes += length;
 
+    assert((header->offset % t->maxDataPerPacket == 0) &&
+           ((length == t->maxDataPerPacket) ||
+           (header->offset + length == header->totalLength)));
+
+    bool retainPacket;
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
-        if (fragments.find(header->offset) == fragments.end()) {
-            fragments[header->offset] = MessageFragment(header, length);
-            assert(buffer->size() < fragments.begin()->first);
-            return true;
-        } else {
-            estimatedReceivedBytes -= length;
-            return false;
+        FragmentMap::iterator iter;
+        std::tie(iter, retainPacket) = fragments.emplace(
+                uint32_t(header->offset), MessageFragment(header, length));
+        if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
+            packetLost = true;
+            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
+            timeTrace("Packet might be lost, offset %u", buffer->size());
         }
+        return retainPacket;
     }
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
-    bool result = appendFragment(header, length);
-    while (true) {
-        FragmentMap::iterator it = fragments.begin();
-        if (it == fragments.end()) {
-            break;
-        }
-        uint32_t offset = it->first;
-        if (offset > buffer->size()) {
-            break;
-        }
-        MessageFragment fragment = it->second;
-        if (!appendFragment(fragment.header, fragment.length)) {
-            t->driver->release(fragment.header);
-        };
-        fragments.erase(it);
-    }
-    if (!fragments.empty()) {
-        assert(buffer->size() < fragments.begin()->first);
-    }
-    return result;
-}
+    if (header->offset == buffer->size()) {
+        uint64_t numPayloads = assembledPayloads->size();
+        while (true) {
+            char* payload = reinterpret_cast<char*>(header);
+            buffer->appendExternal(payload + sizeof32(DataHeader), length);
+            assembledPayloads->push_back(payload);
 
-/**
- * This method is invoked to append a fragment to a partially-assembled
- * message. It handles the special cases where part or all of the
- * fragment is already in the assembled message.
- *
- * \param header
- *      Address of the first byte of a DATA packet.
- * \param length
- *      Size of the payload, in bytes.
- * \return
- *      True means that (some of) the data in this fragment was
- *      incorporated into the message buffer. False means that
- *      the data in this fragment is entirely redundant, so we
- *      didn't save any pointers to it (the caller may want to
- *      free this packet).
- */
-bool
-HomaTransport::MessageAccumulator::appendFragment(DataHeader *header,
-        uint32_t length)
-{
-    uint32_t bytesToSkip = buffer->size() - header->offset;
-    estimatedReceivedBytes -= std::min(bytesToSkip, length);
-    if (bytesToSkip >= length) {
-        // This entire fragment is redundant.
+            FragmentMap::iterator it = fragments.find(buffer->size());
+            if (it == fragments.end()) {
+                break;
+            }
+            MessageFragment fragment = it->second;
+            header = fragment.header;
+            length = fragment.length;
+            fragments.erase(it);
+        }
+        numPayloads = assembledPayloads->size() - numPayloads;
+        if (numPayloads > 1) {
+            timeTrace("addPacket assembled %u unappended fragments",
+                    numPayloads-1);
+        }
+        packetLost = false;
+        return true;
+    } else {
+        // This packet is redundant.
         return false;
     }
-
-    char* payload = reinterpret_cast<char*>(header);
-    buffer->appendExternal(payload + sizeof32(DataHeader) + bytesToSkip,
-            length - bytesToSkip);
-    assembledPayloads->push_back(payload);
-    return true;
 }
 
 /**
@@ -1842,12 +1829,15 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         DIE("Bad fragment pointer: %p", &fragments);
     }
     uint32_t endOffset;
-    FragmentMap::iterator it = fragments.begin();
 
     // Compute the end of the retransmission range.
-    if (it != fragments.end()) {
+    if (!fragments.empty()) {
         // Retransmit the entire gap up to the first fragment.
-        endOffset = it->first;
+        endOffset = ~0u;
+        for (FragmentMap::iterator it = fragments.begin();
+                it != fragments.end(); it++) {
+            endOffset = std::min(endOffset, it->first);
+        }
     } else if (grantOffset > 0) {
         // Retransmit everything that we've asked the sender to send:
         // we don't seem to have received any of it.
@@ -2584,10 +2574,13 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
         return;
     }
     for (ScheduledMessage& m : activeMessages) {
-        // TODO: DO WE WANT TO MAKE THE OUTSTANDING BYTES CONFIGURABLE/EXPLICIT
-        // BY INTRODUCING A VAR NAMED `outstandingBytesWindow`?
-        if (m.grantOffset <
-                m.accumulator->estimatedReceivedBytes + roundTripBytes) {
+        uint32_t estimatedReceivedBytes = downCast<uint32_t>(
+                m.accumulator->buffer->size() +
+                maxDataPerPacket * m.accumulator->fragments.size());
+        // When a packet might be lost, stop granting the message so that
+        // the size of message fragment map does not grow without bound.
+        if (!m.accumulator->packetLost &&
+                (m.grantOffset < estimatedReceivedBytes + roundTripBytes)) {
             messageToGrant = &m;
             break;
         }

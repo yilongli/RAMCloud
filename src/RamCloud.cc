@@ -526,15 +526,14 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, Transport::SessionRef session,
     , endTime(~0u)
     , length(length)
 {
-    TimeTrace::record("EchoRpc invoked");
+//    TimeTrace::record("EchoRpc invoked");
     this->session = session;
-    TimeTrace::record("Got a session!");
+//    TimeTrace::record("Got a session!");
     WireFormat::Echo::Request* reqHdr(allocHeader<WireFormat::Echo>());
     reqHdr->length = length;
     reqHdr->echoLength = echoLength;
     request.appendExternal(message, length);
     startTime = Cycles::rdtsc();
-    TimeTrace::record(startTime, "Echo echo echo...");
     send();
 }
 

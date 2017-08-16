@@ -142,10 +142,10 @@ class HomaTransport : public Transport {
      */
     class MessageAccumulator {
       public:
-        MessageAccumulator(HomaTransport* t, Buffer* buffer);
+        MessageAccumulator(HomaTransport* t, Buffer* buffer,
+                uint32_t totalLength);
         ~MessageAccumulator();
         bool addPacket(DataHeader *header, uint32_t length);
-        bool appendFragment(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(HomaTransport *t,
                 const Driver::Address* address, RpcId rpcId,
                 uint32_t grantOffset, uint8_t whoFrom);
@@ -153,23 +153,13 @@ class HomaTransport : public Transport {
         /// Transport that is managing this object.
         HomaTransport* t;
 
-        // TODO: NOT USING VECTOR BECAUSE EXPANSION COULD CAUSE SIGNIFICANT JITTER
-        // DEQUE SUPPORTS O(1) RANDOM ACCESS (BACKED BY FIXED-SIZE ARRAYS), CHEAPER
-        // EXPANSION AND BETTER CACHE LOCALITY THAN LINKED LIST.
-        using MessageBuffer = std::deque<char*>;
+        using MessageBuffer = std::vector<char*>;
         MessageBuffer* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
         /// first byte that has not yet been received.
         Buffer* buffer;
-
-        // TODO: SIMPLIFY OR REMOVE IT?
-        /// Estimates the total # non-redundant payload bytes received. This
-        /// value cannot be precisely computed at all time because we cannot
-        /// tell how many redundant bytes a new data packet carries in its
-        /// payload before we actually manage to assemble it in the buffer.
-        uint32_t estimatedReceivedBytes;
 
         /// Describes a portion of an incoming message.
         struct MessageFragment {
@@ -193,11 +183,12 @@ class HomaTransport : public Transport {
         /// more preceding packets have not yet been received. Each
         /// key is an offset in the message; each value describes the
         /// corresponding fragment, which is a stolen Driver::Received.
-        typedef std::map<uint32_t, MessageFragment> FragmentMap;
-        // FIXME: Can't use flat_hash_map because we need to extract the min element
-        // we should try ObjectPoolAllocator though after profiling
-//        typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
+        typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
+
+        // True if a packet might be lost (which prevents many message
+        // fragments from being assembled to the buffer).
+        bool packetLost;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
