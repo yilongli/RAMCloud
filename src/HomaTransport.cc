@@ -73,6 +73,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , locatorString("homa+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
+    // TODO: document the choice of this parameter
+    , maxZeroCopyMessage(100*maxDataPerPacket)
     , clientId(clientId)
 
     // For now, assume we can use all the priorities supported by the driver.
@@ -1158,6 +1160,14 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
+                if (header->totalLength > maxZeroCopyMessage) {
+                    // For relatively long messages, it's possible we need to
+                    // retain their packets for quite some time; give the
+                    // driver a chance to copy out the contents of the
+                    // underlying NIC packet buffer and then release it.
+                    driver->releaseHwPacketBuf(received);
+                    header = received->getOffset<DataHeader>(0);
+                }
                 if (!clientRpc->accumulator) {
                     clientRpc->accumulator.construct(this, clientRpc->response,
                             uint32_t(header->totalLength));
@@ -1398,6 +1408,14 @@ HomaTransport::handlePacket(Driver::Received* received)
                             header->common.rpcId.sequence, header->offset,
                             grantOffset);
                     goto serverDataDone;
+                }
+                if (header->totalLength > maxZeroCopyMessage) {
+                    // For relatively long messages, it's possible we need to
+                    // retain their packets for quite some time; give the
+                    // driver a chance to copy out the contents of the
+                    // underlying NIC packet buffer and then release it.
+                    driver->releaseHwPacketBuf(received);
+                    header = received->getOffset<DataHeader>(0);
                 }
                 if (serverRpc == NULL) {
                     serverRpc = serverRpcPool.construct(this,
@@ -2073,10 +2091,7 @@ HomaTransport::Poller::poll()
                 grant.offset, grant.priority);
 
         t->sendControlPacket(recipient->senderAddress, &grant);
-//        t->driver->bufferPacket(recipient->senderAddress, &grant, NULL,
-//                t->controlPacketPriority);
     }
-//    t->driver->flushTxBuffer();
     if (!t->grantRecipients.empty()) {
         UPDATE_CYCLES(t->transmitGrantCycles);
     }
@@ -2118,13 +2133,6 @@ HomaTransport::Poller::poll()
     uint32_t totalBytesSent = t->tryToTransmitData();
     result |= totalBytesSent;
     UPDATE_CYCLES(t->transmitDataCycles);
-
-    // TODO: INVESTIGATE WHY FLUSHING TX BUFFER HERE ACTUALLY MAKES TAIL LATENCY WORSE.
-    // If no data packet is transmitted in the previous step, flush the GRANT
-    // packets waiting in the driver's TX queue manually.
-//    if (totalBytesSent == 0) {
-//        t->driver->flushTxBuffer();
-//    }
 
     // Release a few retained payloads to the driver. As of 02/2017, releasing
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything

@@ -73,12 +73,7 @@ class DpdkDriver : public Driver
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
-    virtual void bufferPacket(const Address* addr,
-                            const void* header,
-                            uint32_t headerLen,
-                            Buffer::Iterator* payload,
-                            int priority = 0);
-    virtual void flushTxBuffer();
+    virtual void releaseHwPacketBuf(Driver::Received* received);
     virtual void sendPacket(const Address* addr,
                             const void* header,
                             uint32_t headerLen,
@@ -92,17 +87,13 @@ class DpdkDriver : public Driver
     }
 
   PRIVATE:
-    struct rte_mbuf* prepareMbuf(const Address* addr,
-                            const void* header,
-                            uint32_t headerLen,
-                            Buffer::Iterator* payload,
-                            int priority,
-                            uint32_t* physPacketLength);
-
     // The MTU (Maximum Transmission Unit) size of an Ethernet frame, which
     // is the maximum size of the packet an Ethernet frame can carry in its
     // payload.
     static const uint32_t MAX_PAYLOAD_SIZE = 1500;
+
+    // Size of packet buffer metadata (used to store PacketBufType), in bytes.
+    static const uint32_t METADATA_SIZE = 1;
 
     /// Size of VLAN tag, in bytes. We are using the PCP (Priority Code Point)
     /// field defined in the VLAN tag to specify the packet priority.
@@ -122,7 +113,17 @@ class DpdkDriver : public Driver
             {1 << 13, 0 << 13, 2 << 13, 3 << 13, 4 << 13, 5 << 13, 6 << 13,
              7 << 13};
 
-    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;
+    /// See docs in Driver class.
+    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE, METADATA_SIZE>
+            PacketBuf;
+
+    /**
+     * This enum defines the type of the packet buffer returned to the
+     * transport by this driver. It's stored in PacketBuf::headroom.
+     */
+    enum PacketBufType {
+        DPDK_MBUF, RAMCLOUD_PACKET_BUF
+    };
 
     Context* context;
 
@@ -162,9 +163,6 @@ class DpdkDriver : public Driver
     /// Holds packet buffers that are dequeued from the NIC's HW queues
     /// via DPDK.
     struct rte_mempool* packetPool;
-
-    /// Holds packet buffers that are need to be sent out.
-    std::vector<struct rte_mbuf*> txBuffer;
 
     /// Holds packets that are addressed to localhost instead of going through
     /// the HW queues.

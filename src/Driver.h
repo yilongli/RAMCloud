@@ -71,7 +71,7 @@ class Driver {
      * \tparam N
      *      the maximum size of the payload
      */
-    template<typename T, uint32_t N>
+    template<typename T, uint32_t N, uint32_t M=0>
     struct PacketBuf {
         PacketBuf()
             : sender()
@@ -82,6 +82,9 @@ class Driver {
 
         /// Address of sender (used to send reply).
         Tub<T> sender;
+
+        /// Optional small headroom space (used to embed extra metadata).
+        char headroom[M];
 
         /// Packet data (may not fill all of the allocated space).
         char payload[N];
@@ -150,7 +153,7 @@ class Driver {
         /// to by this pointer will be stable as long as the packet data
         /// is stable (i.e., if steal() is invoked, then the Address will
         /// live until release is invoked).
-        const Address* const sender;
+        const Address* sender;
 
         /// Driver the packet came from, where resources should be returned.
         Driver* const driver;
@@ -365,6 +368,22 @@ class Driver {
     }
 
     /**
+     * Return the ownership of a NIC packet buffer to the driver as long
+     * as it can provide a Driver::PacketBuf with the same content as
+     * a replacement.
+     *
+     * \param received
+     *      The incoming packet whose backing packet buffer might be
+     *      replaced.
+     */
+    virtual void releaseHwPacketBuf(Driver::Received* received)
+    {
+        // The default implementation does nothing. It can be used by
+        // drivers that don't support zero-copy RX or have sufficient
+        // NIC packet buffers.
+    }
+
+    /**
      * Return a new Driver-specific network address for the given service
      * locator.
      * This function may be called from worker threads and should contain any
@@ -443,19 +462,6 @@ class Driver {
                             Buffer::Iterator* payload,
                             int priority = 0) = 0;
 
-    // TODO: document; also, should I try to implement the method here?
-    virtual void flushTxBuffer() {}
-
-    // TODO: document
-    virtual void bufferPacket(const Address* recipient,
-                            const void* header,
-                            uint32_t headerLen,
-                            Buffer::Iterator* payload,
-                            int priority = 0)
-    {
-        sendPacket(recipient, header, headerLen, payload, priority);
-    }
-
     /**
      * Alternate form of sendPacket.
      *
@@ -482,34 +488,6 @@ class Driver {
                     int priority = 0)
     {
         sendPacket(recipient, header, sizeof(T), payload, priority);
-    }
-
-    /**
-     * Alternate form of bufferPacket.
-     *
-     * \param recipient
-     *      Where to send the packet.
-     * \param header
-     *      Contents of this object will be placed in the packet ahead
-     *      of payload.  The driver will make a copy of this data, so
-     *      the caller need not preserve it after the method returns, even
-     *      if the packet hasn't yet been transmitted.
-     * \param payload
-     *      A buffer iterator positioned at the bytes for the payload to
-     *      follow the headerLen bytes from header.  May be NULL to
-     *      indicate "no payload". Note: caller must preserve the buffer
-     *      data (but not the actual iterator) even after the method returns,
-     *      since the data may not yet have been transmitted.
-     * \param priority
-     *      The priority level of this packet. 0 is the lowest priority.
-     */
-    template<typename T>
-    void bufferPacket(const Address* recipient,
-                    const T* header,
-                    Buffer::Iterator* payload,
-                    int priority = 0)
-    {
-        bufferPacket(recipient, header, sizeof(T), payload, priority);
     }
 
     /**

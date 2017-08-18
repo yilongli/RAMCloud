@@ -705,7 +705,10 @@ class HomaTransport : public Transport {
     Poller poller;
 
     /// Maximum # bytes of message data that can fit in one packet.
-    uint32_t maxDataPerPacket;
+    const uint32_t maxDataPerPacket;
+
+    /// Maximum # bytes of message that we support zero-copy reception.
+    const uint32_t maxZeroCopyMessage;
 
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
