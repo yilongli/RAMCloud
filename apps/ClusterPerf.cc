@@ -1348,6 +1348,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
     // Any more samples will simply overwrite old ones by wrapping around.
+    // FIXME: Can we set it to 10M w/o affecting the experiment? what's the limit?
     const uint32_t MAX_SAMPLES = 1000000;
     roundTripTimes.assign(messageSizes.size(), {});
     vector<uint32_t> numSamples(messageSizes.size());
@@ -1438,7 +1439,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     // FIXME: compute deadline due cycles
 //    uint64_t missedDeadlineCycles = 0;
     ObjectPool<EchoRpc> echoRpcPool;
-#define MAX_OUTSTANDING_RPCS 20
+    // FIXME: How to choose the following parameter? 20 is usually enough for
+    // Homa with 8 priorities. However, for Homa with no priority, it's harder
+    // to simulate SRPT so the avg. # outstanding RPCs is larger; thus, setting
+    // this parameter to 20 results in significant message drops.
+#define MAX_OUTSTANDING_RPCS 40
     std::array<Tub<std::pair<uint32_t, EchoRpc*>>, MAX_OUTSTANDING_RPCS>
             outstandingRpcs = {};
     uint32_t numOutstandingRpcs = 0;

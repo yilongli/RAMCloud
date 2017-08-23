@@ -24,7 +24,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -111,10 +111,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , pingIntervals(3)
     , unschedTrafficPrioBrackets()
     , activeMessages()
-    , activeMessagePrio()
     , inactiveMessages()
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(4) // TODO: Why 4?
+    , maxGrantedMessages()
     , lastMeasureTime(0)
     , lastDispatchActiveCycles(0)
     , lastTimeGrantRunDry(0)
@@ -147,6 +146,18 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     monitorMillis = 1;
     monitorInterval = Cycles::fromMicroseconds(1000*monitorMillis);
 
+#define WORKLOAD_TYPE 4
+#if WORKLOAD_TYPE > 3
+    // For heavy-tail workloads, only the highest priority is allocated to
+    // unscheduled traffic.
+    lowestUnschedPrio = highestAvailPriority;
+    if (highestAvailPriority > 0) {
+        highestSchedPriority = lowestUnschedPrio - 1;
+    } else {
+        highestSchedPriority = 0;
+    }
+#elif WORKLOAD_TYPE == 3
+    // FIXME: the following policy is probably incorrect
     // If we are allowed to use more than one priority, split the available
     // priorities equally between unscheduled and scheduled traffic.
     if (highestAvailPriority > 0) {
@@ -156,23 +167,17 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         lowestUnschedPrio = 0;
         highestSchedPriority = 0;
     }
-    // FIXME: according to the paper, "the number of scheduled priority levels
-    // limits the degree of over-commitment". However, I think this will result
-    // in poor network utilization in a single-priority setting
-    maxGrantedMessages = std::min(maxGrantedMessages,
-            downCast<uint32_t>(highestSchedPriority + 1));
+#endif
 
-    // TODO: Useless until we decide to handle the case where "maxGrantedMessages > numSchedPrio"
-    // Map ranks of active messages to the scheduled priorities.
+    // By default, set the degree of over-commitment to # scheduled
+    // priorities.
     int numSchedPrio = highestSchedPriority + 1;
-    int numMessagesPerPrio = int(maxGrantedMessages) / numSchedPrio;
-    if (numMessagesPerPrio == 0) {
-        numMessagesPerPrio = 1;
-    }
-    for (int i = 0; i < int(maxGrantedMessages); i++) {
-        activeMessagePrio.push_back(i / numMessagesPerPrio);
-    }
-    std::reverse(activeMessagePrio.begin(), activeMessagePrio.end());
+    maxGrantedMessages = downCast<uint32_t>(numSchedPrio);
+    // Uncomment the following line to set a different over-commitment degree.
+//    maxGrantedMessages = 1;
+    // FIXME: eventually, we would like to decouple # scheduled priorities and
+    // the degree of over-commitment so that the former could be less than the
+    // latter.
 
     // Set up the initial unscheduled traffic priority brackets for messages.
     // TODO: better name for brackets; and better name for unschedTrafficPrioBrackets...
@@ -1285,6 +1290,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - clientRpc->lastTransmitTime)*1e06;
+                // FIXME: W4 seems to have some spurious(?) retransmissions
                 RAMCLOUD_CLOG(NOTICE, "Retransmitting to server %s: "
                         "sequence %lu, offset %u, length %u, elapsed "
                         "time %.1f us",
@@ -1776,7 +1782,8 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
                 uint32_t(header->offset), MessageFragment(header, length));
         if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
             packetLost = true;
-            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
+            // FIXME: investigate why W4 produces so many false(?) alarms
+//            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
             timeTrace("Packet might be lost, offset %u", buffer->size());
         }
         return retainPacket;

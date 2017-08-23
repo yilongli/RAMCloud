@@ -883,9 +883,6 @@ class HomaTransport : public Transport {
             ActiveMessageList;
     ActiveMessageList activeMessages;
 
-    // FIXME
-    std::vector<int> activeMessagePrio;
-
     /// Holds a list of scheduled messages that we have received at least one
     /// packet for each of them, but haven't yet fully granted them and aren't
     /// actively sending grants to them in order to avoid overloading the
