@@ -672,7 +672,8 @@ class HomaTransport : public Transport {
     void checkTimeouts();
     void deleteClientRpc(ClientRpc* clientRpc);
     void deleteServerRpc(ServerRpc* serverRpc);
-    uint32_t getRoundTripBytes(const ServiceLocator* locator);
+    uint32_t getRoundTripBytes(const ServiceLocator* locator,
+            uint32_t roundTripMicros);
     uint8_t getUnschedTrafficPrio(uint32_t messageSize);
     void handlePacket(Driver::Received* received);
     static string headerToString(const void* header, uint32_t headerLength);
@@ -882,9 +883,6 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
             ActiveMessageList;
     ActiveMessageList activeMessages;
-
-    // FIXME
-    std::vector<int> activeMessagePrio;
 
     /// Holds a list of scheduled messages that we have received at least one
     /// packet for each of them, but haven't yet fully granted them and aren't

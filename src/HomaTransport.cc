@@ -13,6 +13,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <algorithm>
+#include <fstream>
 
 #include "HomaTransport.h"
 #include "Service.h"
@@ -24,7 +25,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -52,6 +53,11 @@ namespace {
     }
 }
 
+// FIXME: temporary hack to collapse priority levels (evaluation only)
+static int P = 1;
+#define SEND_PACKET(driver, addr, header, payload, prio) \
+    driver->sendPacket(addr, header, payload, prio / P)
+
 /**
  * Construct a new HomaTransport.
  * 
@@ -59,6 +65,8 @@ namespace {
  *      Shared state about various RAMCloud modules.
  * \param locator
  *      Service locator that contains parameters for this transport.
+ *      NULL means this transport is created on the client-side to handle
+ *      outgoing requests.
  * \param driver
  *      Used to send and receive packets. This transport becomes owner
  *      of the driver and will free it in when this object is deleted.
@@ -79,9 +87,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
 
     // For now, assume we can use all the priorities supported by the driver.
     , highestAvailPriority(driver->getHighestPacketPriority())
-    , highestSchedPriority()
+    , highestSchedPriority(-1)
     , controlPacketPriority(highestAvailPriority)
-    , lowestUnschedPrio()
+    , lowestUnschedPrio(-1)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
@@ -96,7 +104,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
-    , roundTripBytes(getRoundTripBytes(locator))
+    , roundTripBytes()
     , grantIncrement(maxDataPerPacket)
     , timerInterval(0)
     , nextTimeoutCheck(0)
@@ -111,10 +119,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , pingIntervals(3)
     , unschedTrafficPrioBrackets()
     , activeMessages()
-    , activeMessagePrio()
     , inactiveMessages()
     , highestGrantedPrio(-1)
-    , maxGrantedMessages(4) // TODO: Why 4?
+    , maxGrantedMessages()
     , lastMeasureTime(0)
     , lastDispatchActiveCycles(0)
     , lastTimeGrantRunDry(0)
@@ -147,32 +154,78 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     monitorMillis = 1;
     monitorInterval = Cycles::fromMicroseconds(1000*monitorMillis);
 
-    // If we are allowed to use more than one priority, split the available
-    // priorities equally between unscheduled and scheduled traffic.
-    if (highestAvailPriority > 0) {
-        lowestUnschedPrio = (highestAvailPriority + 1) >> 1;
-        highestSchedPriority = lowestUnschedPrio - 1;
-    } else {
-        lowestUnschedPrio = 0;
-        highestSchedPriority = 0;
+    // FIXME: use context->options->getOption("configDir")?
+    std::ifstream configFile("/shome/RAMCloud/config/transport.txt");
+    Tub<ServiceLocator> params;
+    if (configFile.is_open()) {
+        std::string line;
+        try {
+            ServiceLocator localSL(locatorString);
+            while (std::getline(configFile, line)) {
+                if (line.find(localSL.getProtocol()) != string::npos) {
+                    params.construct(line);
+                    break;
+                }
+            }
+        } catch (ServiceLocator::BadServiceLocatorException&) {
+            // FIXME: sometimes driver->getLocator can be empty...
+            // leaving our locatorString as "homa+"
+        }
     }
-    // FIXME: according to the paper, "the number of scheduled priority levels
-    // limits the degree of over-commitment". However, I think this will result
-    // in poor network utilization in a single-priority setting
-    maxGrantedMessages = std::min(maxGrantedMessages,
-            downCast<uint32_t>(highestSchedPriority + 1));
+    uint32_t value;
 
-    // TODO: Useless until we decide to handle the case where "maxGrantedMessages > numSchedPrio"
-    // Map ranks of active messages to the scheduled priorities.
+    // As of 08/2017, The RTT in the m510 cluster is ~8us (5 us of data packet
+    // propagation delay plus 1 us of service time plus 1 us of grant packet
+    // propagation delay) in the unloaded case.
+    uint32_t roundTripMicros = 8;
+    if (params && params->hasOption("rttMicros")) {
+        value = downCast<uint32_t>(stoi(params->getOption("rttMicros")));
+        if (value != 0) {
+            roundTripMicros = value;
+        } else {
+            LOG(ERROR, "Bad HomaTransport rttMicros option value '%u' "
+                    "(expected positive integer); ignoring option", value);
+        }
+    }
+    roundTripBytes = getRoundTripBytes(locator, roundTripMicros);
+
+    // Assign priority levels to unscheduled and scheduled traffic.
+    // By default, use the highest priority for all unscheduled traffic.
+    int numPrio = highestAvailPriority + 1;
+    lowestUnschedPrio = highestAvailPriority;
+    if (params && params->hasOption("unschedPrio")) {
+        value = downCast<uint32_t>(stoi(params->getOption("unschedPrio")));
+        if ((value > 0) && (value <= numPrio)) {
+            lowestUnschedPrio = numPrio - value;
+        } else {
+            LOG(ERROR, "Bad HomaTransport unschedPrio option value '%u' "
+                    "(expected positive integer < %d); ignoring option",
+                    value, numPrio);
+        }
+    }
+    highestSchedPriority = std::max(lowestUnschedPrio-1, 0);
+
+    // By default, set the degree of over-commitment to # scheduled
+    // priorities.
     int numSchedPrio = highestSchedPriority + 1;
-    int numMessagesPerPrio = int(maxGrantedMessages) / numSchedPrio;
-    if (numMessagesPerPrio == 0) {
-        numMessagesPerPrio = 1;
+    maxGrantedMessages = downCast<uint32_t>(numSchedPrio);
+    if (params && params->hasOption("degreeOC")) {
+        value = downCast<uint32_t>(stoi(params->getOption("degreeOC")));
+        // FIXME: eventually, we would like to decouple # scheduled priorities
+        // and the degree of over-commitment so that the former could be less
+        // than the latter.
+        if ((value > 0) && (value <= numSchedPrio)) {
+            maxGrantedMessages = value;
+        } else {
+            LOG(ERROR, "Bad HomaTransport degreeOC option value '%u' "
+                    "(expected positive integer < %d); ignoring option",
+                    value, numSchedPrio);
+        }
     }
-    for (int i = 0; i < int(maxGrantedMessages); i++) {
-        activeMessagePrio.push_back(i / numMessagesPerPrio);
+
+    if (params && params->hasOption("dpdkPrio")) {
+        P = 8 / stoi(params->getOption("dpdkPrio"));
     }
-    std::reverse(activeMessagePrio.begin(), activeMessagePrio.end());
 
     // Set up the initial unscheduled traffic priority brackets for messages.
     // TODO: better name for brackets; and better name for unschedTrafficPrioBrackets...
@@ -188,12 +241,12 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     brackets += format(", %u]", ~0u);
 
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
-            "roundTripBytes %u, grantIncrement %u, pingIntervals %d, "
-            "timeoutIntervals %d, timerInterval %.2f ms, "
+            "roundTripMicros %u, roundTripBytes %u, grantIncrement %u, "
+            "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
             "monitorInterval %.2f ms, maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
             "highestSchedPriority %d, unscheduledTrafficPrioBrackets %s",
-            clientId, maxDataPerPacket, roundTripBytes,
+            clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3,
             Cycles::toSeconds(monitorInterval)*1e3, maxGrantedMessages,
@@ -313,19 +366,18 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
  *      If NULL, or if any of the options  are missing, then defaults
  *      are supplied.  Note: as of 8/2016 these options don't work very well
  *      because they are only visible to servers, not clients.
+ * \param roundTripMicros
+ *      Round-trip time between two machines, in microseconds.
  */
 uint32_t
-HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
+HomaTransport::getRoundTripBytes(const ServiceLocator* locator,
+        uint32_t roundTripMicros)
 {
     uint32_t gBitsPerSec = 0;
-    // TODO: The RTT in the m510 cluster is more like 8us (5 us of data packet
-    // propagation delay plus 1 us of service time plus 1 us of grant packet
-    // propagation delay) in the unloaded case. Figure out how to set
-    // "rttMicros" from command line.
-    uint32_t roundTripMicros = 14;
-//    uint32_t roundTripMicros = 7;
 
-    if (locator  != NULL) {
+    // FIXME: I don't understand how options like "rttMicros" can be
+    // implemented this way since `locator` is always NULL on client-side.
+    if (locator != NULL) {
         if (locator->hasOption("gbs")) {
             char* end;
             uint32_t value = downCast<uint32_t>(strtoul(
@@ -336,18 +388,6 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
                 LOG(ERROR, "Bad HomaTransport gbs option value '%s' "
                         "(expected positive integer); ignoring option",
                         locator->getOption("gbs").c_str());
-            }
-        }
-        if (locator->hasOption("rttMicros")) {
-            char* end;
-            uint32_t value = downCast<uint32_t>(strtoul(
-                    locator->getOption("rttMicros").c_str(), &end, 10));
-            if ((*end == 0) && (value != 0)) {
-                roundTripMicros = value;
-            } else {
-                LOG(ERROR, "Bad HomaTransport rttMicros option value '%s' "
-                        "(expected positive integer); ignoring option",
-                        locator->getOption("rttMicros").c_str());
             }
         }
     }
@@ -483,7 +523,8 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "server sending ALL_DATA, clientId %u, sequence %u, "
                     "priority %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, priority);
-            driver->sendPacket(address, &header, &iter, priority);
+            SEND_PACKET(driver, address, &header, &iter, priority);
+//            driver->sendPacket(address, &header, &iter, priority);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
                     unscheduledBytes, flags);
@@ -495,7 +536,8 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "offset %u, priority %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset,
                     priority);
-            driver->sendPacket(address, &header, &iter, priority);
+            SEND_PACKET(driver, address, &header, &iter, priority);
+//            driver->sendPacket(address, &header, &iter, priority);
         }
         uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
         if (bytesQueuedAhead > 0) {
@@ -538,7 +580,8 @@ void
 HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
-    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+//    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+    SEND_PACKET(driver, recipient, packet, NULL, controlPacketPriority);
     uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
     uint64_t idleInterval = driver->getTxQueueIdleInterval();
     if (std::is_same<T, GrantHeader>::value) {
@@ -1054,8 +1097,10 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
         timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence,
                 clientRpc->transmitPriority);
-        t->driver->sendPacket(serverAddress, &header, &iter,
+        SEND_PACKET(t->driver, serverAddress, &header, &iter,
                 clientRpc->transmitPriority);
+//        t->driver->sendPacket(serverAddress, &header, &iter,
+//                clientRpc->transmitPriority);
         clientRpc->transmitOffset = length;
 //        clientRpc->lastTransmitTime = t->driver->getLastTransmitTime();
         clientRpc->transmitPending = false;
@@ -1285,6 +1330,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - clientRpc->lastTransmitTime)*1e06;
+                // FIXME: W4 seems to have some spurious(?) retransmissions
                 RAMCLOUD_CLOG(NOTICE, "Retransmitting to server %s: "
                         "sequence %lu, offset %u, length %u, elapsed "
                         "time %.1f us",
@@ -1676,7 +1722,8 @@ HomaTransport::ServerRpc::sendReply()
         timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence,
                 transmitPriority);
-        t->driver->sendPacket(clientAddress, &header, &iter, transmitPriority);
+        SEND_PACKET(t->driver, clientAddress, &header, &iter, transmitPriority);
+//        t->driver->sendPacket(clientAddress, &header, &iter, transmitPriority);
 //        transmitOffset = length;
 //        lastTransmitTime = t->driver->getLastTransmitTime();
         t->deleteServerRpc(this);
@@ -1765,7 +1812,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
 
     assert((header->offset % t->maxDataPerPacket == 0) &&
            ((length == t->maxDataPerPacket) ||
-           (header->offset + length == header->totalLength)));
+           (header->offset + length >= header->totalLength)));
 
     bool retainPacket;
     if (header->offset > buffer->size()) {
@@ -1776,7 +1823,8 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
                 uint32_t(header->offset), MessageFragment(header, length));
         if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
             packetLost = true;
-            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
+            // FIXME: investigate why W4/5 produces so many false(?) alarms
+//            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
             timeTrace("Packet might be lost, offset %u", buffer->size());
         }
         return retainPacket;

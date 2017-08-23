@@ -125,8 +125,8 @@ class ServiceLocator {
     const string getDriverLocatorString() const {
         // Drop the transport information.
         size_t pos = originalString.find_first_of('+');
-        if (pos != string::npos) {
-            return originalString.substr(pos+1);
+        if ((pos != string::npos) && (pos + 1 < originalString.size())) {
+            return originalString.substr(pos + 1);
         } else {
             return originalString;
         }
