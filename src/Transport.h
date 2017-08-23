@@ -56,10 +56,17 @@ class Transport {
   public:
     class RpcNotifier;
 
+// Change 0 -> 1 in the following line to increase MAX_RPC_LEN to 32MB.
+// This is only useful for running the workloads used in the Homa paper.
+#define TESTING_TRANSPORT 1
+
       /// Maximum allowable size for an RPC request or response message: must
       /// be large enough to hold an 8MB segment plus header information.
+#if !TESTING_TRANSPORT
       static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
-
+#else
+      static const uint32_t MAX_RPC_LEN = (1 << 25);
+#endif
     /**
      * An RPC request that has been received and is either being serviced or
      * waiting for service.

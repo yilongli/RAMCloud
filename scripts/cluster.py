@@ -64,9 +64,11 @@ server_locator_templates = {
     'unreliable+infeth': 'unreliable+infeth:mac=00:11:22:33:44:%(id)02x',
     'basic+dpdk': 'basic+dpdk:',
     'homa+dpdk': 'homa+dpdk:',
+    'mtcp': 'mtcp:port=%(port)d',
 }
 coord_locator_templates = {
     'tcp': 'tcp:host=%(host)s,port=%(port)d',
+    'mtcp': 'tcp:host=%(host)s,port=%(port)d',
     'tcp-1g': 'tcp:host=%(host1g)s,port=%(port)d',
     'basic+udp': 'basic+udp:host=%(host)s,port=%(port)d',
     'basic+udp-1g': 'basic+udp:host=%(host1g)s,port=%(port)d',

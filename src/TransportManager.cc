@@ -28,6 +28,10 @@
 #include "WorkerManager.h"
 #include "WorkerSession.h"
 
+#ifdef MTCP
+#include "MTcpTransport.h"
+#endif
+
 #ifdef DPDK
 #include "DpdkDriver.h"
 #endif
@@ -51,6 +55,17 @@ static struct TcpTransportFactory : public TransportFactory {
         return new TcpTransport(context, localServiceLocator);
     }
 } tcpTransportFactory;
+
+#ifdef MTCP
+static struct MTcpTransportFactory : public TransportFactory {
+    MTcpTransportFactory()
+        : TransportFactory("mTcp", "mtcp") {}
+    Transport* createTransport(Context* context,
+            const ServiceLocator* localServiceLocator) {
+        return new MTcpTransport(context, localServiceLocator);
+    }
+} mtcpTransportFactory;
+#endif
 
 static struct BasicUdpTransportFactory : public TransportFactory {
     BasicUdpTransportFactory()
@@ -209,7 +224,11 @@ TransportManager::TransportManager(Context* context)
     transportFactories.push_back(&homaInfUdTransportFactory);
     transportFactories.push_back(&infRcTransportFactory);
 #endif
+#ifdef MTCP
+    transportFactories.push_back(&mtcpTransportFactory);
+#endif
 #ifdef DPDK
+/*
     transportFactories.push_back(&basicDpdkTransportFactory);
     transportFactories.push_back(&homaDpdkTransportFactory);
     if (context->options != NULL) {
@@ -220,6 +239,7 @@ TransportManager::TransportManager(Context* context)
             homaDpdkTransportFactory.setDpdkDriver(dpdkDriver);
         }
     }
+*/
 #endif
     transports.resize(transportFactories.size(), NULL);
     if (context->options != NULL) {

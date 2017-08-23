@@ -136,6 +136,7 @@ CXXWARNS := $(COMWARNS) -Wno-non-template-friend -Woverloaded-virtual \
 ifeq ($(COMPILER),gnu)
 CXXWARNS += -Weffc++
 endif
+CXXWARNS += -w
 # Too many false positives list:
 # -Wunreachable-code
 # Failed deconstructor inlines are generating noise
@@ -204,6 +205,12 @@ INFINIBAND = $(shell $(CXX) -std=$(CXX_STANDARD) $(INCLUDES) src/HaveInfiniband.
 ifeq ($(INFINIBAND),yes)
 COMFLAGS += -DINFINIBAND
 LIBS += -libverbs
+endif
+
+MTCP := yes
+ifeq ($(MTCP),yes)
+COMFLAGS += -DMTCP -Imtcp/include
+LIBS += -Lmtcp/lib -lmtcp -lnuma
 endif
 
 # DPDK definitions:

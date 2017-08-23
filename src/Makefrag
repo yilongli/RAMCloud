@@ -154,6 +154,7 @@ SHARED_SRCFILES := \
 		   src/Tablet.cc \
 		   src/TabletManager.cc \
 		   src/TaskQueue.cc \
+		   src/MTcpTransport.cc \
 		   src/TcpTransport.cc \
 		   src/TestLog.cc \
 		   src/ThreadId.cc \

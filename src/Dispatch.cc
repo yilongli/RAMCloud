@@ -500,7 +500,7 @@ Dispatch::File::File(Dispatch* dispatch, int fd, int events)
     }
 
     if (owner->files.size() <= static_cast<uint32_t>(fd)) {
-        owner->files.resize(2*fd);
+        owner->files.resize(2*fd+1);
     }
     if (owner->files[fd] != NULL) {
             throw FatalError(HERE, "can't have more than 1 Dispatch::File "

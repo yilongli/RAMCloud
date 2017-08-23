@@ -102,6 +102,7 @@ CLIENT_SRCFILES := \
 		   src/Status.cc \
 		   src/StringUtil.cc \
 		   src/TableEnumerator.cc \
+		   src/MTcpTransport.cc \
 		   src/TcpTransport.cc \
 		   src/TestLog.cc \
 		   src/ThreadId.cc \
