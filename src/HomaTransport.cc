@@ -59,6 +59,8 @@ namespace {
  *      Shared state about various RAMCloud modules.
  * \param locator
  *      Service locator that contains parameters for this transport.
+ *      NULL means this transport is created on the client-side to handle
+ *      outgoing requests.
  * \param driver
  *      Used to send and receive packets. This transport becomes owner
  *      of the driver and will free it in when this object is deleted.
@@ -70,7 +72,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         Driver* driver, uint64_t clientId)
     : context(context)
     , driver(driver)
-    , locatorString("homa+"+driver->getServiceLocator())
+    , locatorString("homa+"+driver->getServiceLocator()+
+            (locator != NULL ? ","+locator->getParameters() : ""))
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
     // TODO: document the choice of this parameter
@@ -96,6 +99,11 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
+
+    // As of 08/2017, The RTT in the m510 cluster is ~8us (5 us of data packet
+    // propagation delay plus 1 us of service time plus 1 us of grant packet
+    // propagation delay) in the unloaded case.
+    , roundTripMicros(8)
     , roundTripBytes(getRoundTripBytes(locator))
     , grantIncrement(maxDataPerPacket)
     , timerInterval(0)
@@ -193,12 +201,12 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     brackets += format(", %u]", ~0u);
 
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
-            "roundTripBytes %u, grantIncrement %u, pingIntervals %d, "
-            "timeoutIntervals %d, timerInterval %.2f ms, "
+            "roundTripMicros %u, roundTripBytes %u, grantIncrement %u, "
+            "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
             "monitorInterval %.2f ms, maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
             "highestSchedPriority %d, unscheduledTrafficPrioBrackets %s",
-            clientId, maxDataPerPacket, roundTripBytes,
+            clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3,
             Cycles::toSeconds(monitorInterval)*1e3, maxGrantedMessages,
@@ -323,14 +331,10 @@ uint32_t
 HomaTransport::getRoundTripBytes(const ServiceLocator* locator)
 {
     uint32_t gBitsPerSec = 0;
-    // TODO: The RTT in the m510 cluster is more like 8us (5 us of data packet
-    // propagation delay plus 1 us of service time plus 1 us of grant packet
-    // propagation delay) in the unloaded case. Figure out how to set
-    // "rttMicros" from command line.
-    uint32_t roundTripMicros = 14;
-//    uint32_t roundTripMicros = 7;
 
-    if (locator  != NULL) {
+    // FIXME: I don't understand how options like "rttMicros" can be
+    // implemented this way since `locator` is always NULL on client-side.
+    if (locator != NULL) {
         if (locator->hasOption("gbs")) {
             char* end;
             uint32_t value = downCast<uint32_t>(strtoul(
@@ -1771,7 +1775,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
 
     assert((header->offset % t->maxDataPerPacket == 0) &&
            ((length == t->maxDataPerPacket) ||
-           (header->offset + length == header->totalLength)));
+           (header->offset + length >= header->totalLength)));
 
     bool retainPacket;
     if (header->offset > buffer->size()) {
@@ -1782,7 +1786,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
                 uint32_t(header->offset), MessageFragment(header, length));
         if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
             packetLost = true;
-            // FIXME: investigate why W4 produces so many false(?) alarms
+            // FIXME: investigate why W4/5 produces so many false(?) alarms
 //            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
             timeTrace("Packet might be lost, offset %u", buffer->size());
         }

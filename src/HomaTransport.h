@@ -826,6 +826,9 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ServerRpc, timerLinks) ServerTimerList;
     ServerTimerList serverTimerList;
 
+    /// Round-trip time between two machines, in microseconds.
+    uint32_t roundTripMicros;
+
     /// The number of bytes corresponding to a round-trip time between
     /// two machines.  This serves two purposes. First, senders may
     /// transmit this many initial bytes without receiving a GRANT; this

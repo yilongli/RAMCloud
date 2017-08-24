@@ -96,11 +96,20 @@ def server_locator(transport, host, port=server_port):
     @return: A service locator.
     @rtype: C{str}
     """
+    if ":" in transport:
+        transport, options = [x.strip() for x in transport.split(':')]
+    else:
+        transport = transport.strip()
+        options = ""
     locator = (server_locator_templates[transport] %
                {'host': host[1],
                 'host1g': host[0],
                 'port': port,
                 'id': host[2]})
+    if locator.endswith(":"):
+        locator += options
+    elif options:
+        locator += "," + options
     return locator
 
 def coord_locator(transport, host):
@@ -115,11 +124,20 @@ def coord_locator(transport, host):
     @return: A service locator.
     @rtype: C{str}
     """
+    if ":" in transport:
+        transport, options = [x.strip() for x in transport.split(':')]
+    else:
+        transport = transport.strip()
+        options = ""
     locator = (coord_locator_templates[transport] %
                {'host': host[1],
                 'host1g': host[0],
                 'port': coordinator_port,
                 'id': host[2]})
+    if locator.endswith(":"):
+        locator += options
+    elif options:
+        locator += "," + options
     return locator
 
 class Cluster(object):
