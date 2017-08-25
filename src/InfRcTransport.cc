@@ -1487,14 +1487,16 @@ InfRcTransport::Poller::poll()
 
             port->portAlarm.requestArrived(); // Restarts the port watchdog
             interval.stop();
-            r->rpcServiceTime.start();
-            t->context->workerManager->handleRpc(r);
-            ++metrics->transport.receive.messageCount;
-            ++metrics->transport.receive.packetCount;
+            // Update the metrics before ServerRpc `r` is destroyed inside
+            // handleRpc.
             metrics->transport.receive.iovecCount +=
                 r->requestPayload.getNumberChunks();
             metrics->transport.receive.byteCount +=
                 r->requestPayload.size();
+            r->rpcServiceTime.start();
+            t->context->workerManager->handleRpc(r);
+            ++metrics->transport.receive.messageCount;
+            ++metrics->transport.receive.packetCount;
             metrics->transport.receive.ticks += receiveTicks.stop();
         }
     }
