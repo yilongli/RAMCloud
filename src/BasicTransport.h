@@ -18,6 +18,7 @@
 
 #include <deque>
 
+#include "flat_hash_map.h"
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -141,10 +142,10 @@ class BasicTransport : public Transport {
      */
     class MessageAccumulator {
       public:
-        MessageAccumulator(BasicTransport* t, Buffer* buffer);
+        MessageAccumulator(BasicTransport* t, Buffer* buffer,
+                uint32_t totalLength);
         ~MessageAccumulator();
         bool addPacket(DataHeader *header, uint32_t length);
-        bool appendFragment(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(BasicTransport *t,
                 const Driver::Address* address, RpcId rpcId,
                 uint32_t grantOffset, uint8_t whoFrom);
@@ -152,10 +153,7 @@ class BasicTransport : public Transport {
         /// Transport that is managing this object.
         BasicTransport* t;
 
-        // TODO: NOT USING VECTOR BECAUSE EXPANSION COULD CAUSE SIGNIFICANT JITTER
-        // DEQUE SUPPORTS O(1) RANDOM ACCESS (BACKED BY FIXED-SIZE ARRAYS), CHEAPER
-        // EXPANSION AND BETTER CACHE LOCALITY THAN LINKED LIST.
-        using MessageBuffer = std::deque<char*>;
+        using MessageBuffer = std::vector<char*>;
         MessageBuffer* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
@@ -185,8 +183,12 @@ class BasicTransport : public Transport {
         /// more preceding packets have not yet been received. Each
         /// key is an offset in the message; each value describes the
         /// corresponding fragment, which is a stolen Driver::Received.
-        typedef std::map<uint32_t, MessageFragment>FragmentMap;
+        typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
+
+        // True if a packet might be lost (which prevents many message
+        // fragments from being assembled to the buffer).
+        bool packetLost;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
@@ -270,17 +272,17 @@ class BasicTransport : public Transport {
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
-        OutgoingMessage(bool isRequest, Buffer* buffer,
+        OutgoingMessage(bool isRequest, BasicTransport* t, Buffer* buffer,
                 const Driver::Address* recipient)
             : buffer(buffer)
             , isRequest(isRequest)
             , recipient(recipient)
             , transmitOffset(0)
-            , transmitLimit(0)
+            , transmitLimit(t->roundTripBytes)
             , topChoice(false)
             , lastTransmitTime(0)
             , outgoingMessageLinks()
-            , unscheduledBytes()
+            , unscheduledBytes(t->roundTripBytes)
         {}
 
         virtual ~OutgoingMessage() {}
@@ -335,7 +337,8 @@ class BasicTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : OutgoingMessage(true, request, session->serverAddress)
+            : OutgoingMessage(true, session->t, request,
+                    session->serverAddress)
             , session(session)
             , request(request)
             , response(response)
@@ -343,7 +346,7 @@ class BasicTransport : public Transport {
             , rpcId(session->t->clientId, sequence)
             , resendLimit(0)
             , silentIntervals(0)
-            , transmitPending(false)
+            , transmitPending(true)
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
@@ -369,6 +372,9 @@ class BasicTransport : public Transport {
         /// this server. This is the *server's* sequence number; the client's
         /// sequence number is in rpcId.
         uint64_t sequence;
+
+        /// True if the RPC has been cancelled by the client.
+        bool cancelled;
 
         // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
         /// Where to send the response once the RPC has executed.
@@ -409,9 +415,10 @@ class BasicTransport : public Transport {
 
         ServerRpc(BasicTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : OutgoingMessage(false, &replyPayload, clientAddress)
+            : OutgoingMessage(false, transport, &replyPayload, clientAddress)
             , t(transport)
             , sequence(sequence)
+            , cancelled(false)
             , clientAddress(clientAddress)
             , rpcId(rpcId)
             , resendLimit(0)
@@ -440,7 +447,8 @@ class BasicTransport : public Transport {
         RESEND                 = 24,
         ACK                    = 25,
         ABORT                  = 26,
-        BOGUS                  = 27,      // Used only in unit tests.
+        PING                   = 27,
+        BOGUS                  = 28,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -586,13 +594,24 @@ class BasicTransport : public Transport {
 
     /**
      * Describes the wire format for ABORT packets. These packets are used
-     * to let the server know that the client has cancelled the request.
+     * to let the server know that the client has cancelled the RPC.
      */
     struct AbortHeader {
         CommonHeader common;         // Common header fields.
 
         explicit AbortHeader(RpcId rpcId)
             : common(PacketOpcode::ABORT, rpcId, FROM_CLIENT) {}
+    } __attribute__((packed));
+
+    /**
+     * Describes the wire format for PING packets. These packets are used
+     * to check if a client or server is still alive.
+     */
+    struct PingHeader {
+        CommonHeader common;         // Common header fields.
+
+        explicit PingHeader(RpcId rpcId, uint8_t flags)
+            : common(PacketOpcode::PING, rpcId, flags) {}
     } __attribute__((packed));
 
     /**
@@ -642,7 +661,10 @@ class BasicTransport : public Transport {
     Poller poller;
 
     /// Maximum # bytes of message data that can fit in one packet.
-    uint32_t maxDataPerPacket;
+    const uint32_t maxDataPerPacket;
+
+    /// Maximum # bytes of message that we support zero-copy reception.
+    const uint32_t maxZeroCopyMessage;
 
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
@@ -683,10 +705,8 @@ class BasicTransport : public Transport {
     /// Holds RPCs for which we are the client, and for which a
     /// response has not yet been completely received (we have sent
     /// at least part of the request, but not necessarily the entire
-    /// request yet). Keys are RPC sequence numbers. Note: as of
-    /// 10/2015, maps are faster than unordered_maps if they hold
-    /// fewer than about 20 objects.
-    typedef std::map<uint64_t, ClientRpc*> ClientRpcMap;
+    /// request yet). Keys are RPC sequence numbers.
+    typedef ska::flat_hash_map<uint64_t, ClientRpc*> ClientRpcMap;
     ClientRpcMap outgoingRpcs;
     // TODO: The way we are uing this map is quite inefficient!!!
     // (e.g. frequently iterating the entire map) especially when there is
@@ -724,7 +744,7 @@ class BasicTransport : public Transport {
     /// to the driver.  Note: this map could get large if the server gets
     /// backed up, so that there are a large number of RPCs that have been
     /// received but haven't yet been assigned to worker threads.
-    typedef std::unordered_map<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
+    typedef ska::flat_hash_map<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
     ServerRpcMap incomingRpcs;
 
     /// Holds RPCs for which we are the server, and whose response is

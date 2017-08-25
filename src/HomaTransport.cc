@@ -19,7 +19,6 @@
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
-#include "Util.h"
 
 namespace RAMCloud {
 
@@ -1806,8 +1805,6 @@ bool
 HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         uint32_t length)
 {
-    // Assume the payload contains no redundant bytes for now. The redundant
-    // portion will be deducted when this packet is discarded/assembled.
     length -= sizeof32(DataHeader);
 
     assert((header->offset % t->maxDataPerPacket == 0) &&
@@ -2244,10 +2241,6 @@ HomaTransport::checkTimeouts()
         // we delete the ClientRpc below.
         it++;
 
-        ScheduledMessage* scheduledMessage = clientRpc->scheduledMessage.get();
-        uint32_t grantOffset =
-                scheduledMessage ? scheduledMessage->grantOffset : 0;
-
         assert(timeoutIntervals > 2*pingIntervals);
         if (clientRpc->silentIntervals >= timeoutIntervals) {
             // A long time has elapsed with no communication whatsoever
@@ -2293,6 +2286,10 @@ HomaTransport::checkTimeouts()
                     }
                 } else {
                     // We have received part of the response.
+                    ScheduledMessage* scheduledMessage =
+                            clientRpc->scheduledMessage.get();
+                    uint32_t grantOffset = scheduledMessage ?
+                            scheduledMessage->grantOffset : 0;
                     if (scheduledMessage && (grantOffset ==
                             clientRpc->accumulator->buffer->size())) {
                         // The client has received every byte of the response it has

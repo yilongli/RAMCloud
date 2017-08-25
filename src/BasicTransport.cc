@@ -58,6 +58,8 @@ namespace {
  *      Shared state about various RAMCloud modules.
  * \param locator
  *      Service locator that contains parameters for this transport.
+ *      NULL means this transport is created on the client-side to handle
+ *      outgoing requests.
  * \param driver
  *      Used to send and receive packets. This transport becomes owner
  *      of the driver and will free it in when this object is deleted.
@@ -72,6 +74,8 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , locatorString("basic+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
+    // TODO: document the choice of this parameter
+    , maxZeroCopyMessage(100*maxDataPerPacket)
     , clientId(clientId)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
@@ -205,8 +209,8 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
         erase(topOutgoingMessages, *clientRpc);
     }
     clientRpcPool.destroy(clientRpc);
-    timeTrace("deleted client RPC, clientId %u, sequence %u",
-            clientId, sequence);
+    timeTrace("deleted client RPC, clientId %u, sequence %u, %u outgoing RPCs",
+            clientId, sequence, outgoingRpcs.size());
 }
 
 /**
@@ -236,8 +240,8 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
         erase(topOutgoingMessages, *serverRpc);
     }
     serverRpcPool.destroy(serverRpc);
-    timeTrace("deleted server RPC, clientId %u, sequence %u",
-            serverRpc->rpcId.clientId, sequence);
+    timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
+            serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
 }
 
 /**
@@ -260,9 +264,8 @@ BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
     // propagation delay) in the unloaded case. Figure out how to set
     // "rttMicros" from command line.
     uint32_t roundTripMicros = 8;
-//    uint32_t roundTripMicros = 7;
 
-    if (locator  != NULL) {
+    if (locator != NULL) {
         if (locator->hasOption("gbs")) {
             char* end;
             uint32_t value = downCast<uint32_t>(strtoul(
@@ -327,6 +330,8 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
             return "ACK";
         case BasicTransport::PacketOpcode::ABORT:
             return "ABORT";
+        case BasicTransport::PacketOpcode::PING:
+            return "PING";
     }
 
     return format("%d", opcode);
@@ -553,6 +558,13 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
         }
         case BasicTransport::PacketOpcode::ABORT: {
             headerLength = sizeof32(BasicTransport::AbortHeader);
+            if (packetLength < headerLength) {
+                goto packetTooShort;
+            }
+            break;
+        }
+        case BasicTransport::PacketOpcode::PING: {
+            headerLength = sizeof32(BasicTransport::PingHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -916,26 +928,43 @@ void
 BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier)
 {
+    uint32_t length = request->size();
     timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing requests", t->clientId, t->nextClientSequenceNumber,
-            request->size(), t->outgoingRequests.size());
-    response->reset();
+            length, t->outgoingRequests.size());
     if (aborted) {
         notifier->failed();
         return;
     }
+    response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
-    clientRpc->transmitLimit = t->roundTripBytes;
-    clientRpc->unscheduledBytes = t->roundTripBytes;
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
-    t->outgoingRequests.push_back(*clientRpc);
-    clientRpc->transmitPending = true;
-    t->updateTopOutgoingMessageSet(clientRpc, true);
     t->nextClientSequenceNumber++;
-    uint32_t bytesSent = t->tryToTransmitData();
+
+    uint32_t bytesSent;
+    // TODO: how to justify this threshold?
+#define SMALL_MESSAGE_SIZE 300
+    if (length < SMALL_MESSAGE_SIZE) {
+        // Pass small messages directly to NIC: it's not worth going through
+        // all the hassles of tryToTransmitData and sendBytes
+        RpcId rpcId = clientRpc->rpcId;
+        AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
+        Buffer::Iterator iter(request, 0, length);
+        timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
+                "priority %u", rpcId.clientId, rpcId.sequence, 0);
+        t->driver->sendPacket(serverAddress, &header, &iter, 0);
+        clientRpc->transmitOffset = length;
+//        clientRpc->lastTransmitTime = t->driver->getLastTransmitTime();
+        clientRpc->transmitPending = false;
+        bytesSent = length;
+    } else {
+        t->outgoingRequests.push_back(*clientRpc);
+        t->updateTopOutgoingMessageSet(clientRpc, true);
+        bytesSent = t->tryToTransmitData();
+    }
     if (bytesSent > 0) {
-        timeTrace("sendRequest trasmitted %u bytes", bytesSent);
+        timeTrace("sendRequest transmitted %u bytes", bytesSent);
     }
 }
 
@@ -1026,8 +1055,17 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
+                if (header->totalLength > maxZeroCopyMessage) {
+                    // For relatively long messages, it's possible we need to
+                    // retain their packets for quite some time; give the
+                    // driver a chance to copy out the contents of the
+                    // underlying NIC packet buffer and then release it.
+                    driver->releaseHwPacketBuf(received);
+                    header = received->getOffset<DataHeader>(0);
+                }
                 if (!clientRpc->accumulator) {
-                    clientRpc->accumulator.construct(this, clientRpc->response);
+                    clientRpc->accumulator.construct(this, clientRpc->response,
+                            uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
                                 clientRpc->rpcId, clientRpc->accumulator.get(),
@@ -1182,6 +1220,17 @@ BasicTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
+            // PING from server
+            case PacketOpcode::PING: {
+                timeTrace("client received PING, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (clientRpc != NULL) {
+                    AckHeader ack(common->rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress, &ack);
+                }
+                return;
+            }
+
             default:
             RAMCLOUD_CLOG(WARNING,
                     "unexpected opcode %s received from server %s",
@@ -1234,8 +1283,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
                 nextServerSequenceNumber++;
-                // TODO: the following operation is very expensive;
-                // easily > 250ns
                 incomingRpcs[header->common.rpcId] = serverRpc;
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
                         payload + sizeof32(AllDataHeader),
@@ -1271,6 +1318,14 @@ BasicTransport::handlePacket(Driver::Received* received)
                             grantOffset);
                     goto serverDataDone;
                 }
+                if (header->totalLength > maxZeroCopyMessage) {
+                    // For relatively long messages, it's possible we need to
+                    // retain their packets for quite some time; give the
+                    // driver a chance to copy out the contents of the
+                    // underlying NIC packet buffer and then release it.
+                    driver->releaseHwPacketBuf(received);
+                    header = received->getOffset<DataHeader>(0);
+                }
                 if (serverRpc == NULL) {
                     serverRpc = serverRpcPool.construct(this,
                             nextServerSequenceNumber, received->sender,
@@ -1278,13 +1333,14 @@ BasicTransport::handlePacket(Driver::Received* received)
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload);
+                            &serverRpc->requestPayload,
+                            uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
                                 serverRpc->rpcId, serverRpc->accumulator.get(),
                                 uint32_t(header->unscheduledBytes),
                                 serverRpc->clientAddress,
-                                (uint32_t)header->totalLength,
+                                uint32_t(header->totalLength),
                                 static_cast<uint8_t>(FROM_CLIENT));
                     }
                     serverTimerList.push_back(*serverRpc);
@@ -1354,10 +1410,11 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->offset);
                 if ((serverRpc == NULL) || !serverRpc->sendingResponse) {
                     RAMCLOUD_LOG(WARNING, "unexpected GRANT from client %s, "
-                            "id (%lu,%lu), grantOffset %u",
+                            "id (%lu,%lu), grantOffset %u, serverRpc %s",
                             received->sender->toString().c_str(),
                             header->common.rpcId.clientId,
-                            header->common.rpcId.sequence, header->offset);
+                            header->common.rpcId.sequence, header->offset,
+                            serverRpc ? "receiving request" : "not found");
                     return;
                 }
                 if (header->offset > serverRpc->transmitLimit) {
@@ -1456,11 +1513,28 @@ BasicTransport::handlePacket(Driver::Received* received)
 
             // ABORT from client
             case PacketOpcode::ABORT: {
-                // Nothing to do.
                 timeTrace("server received ABORT, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
                 if (serverRpc != NULL) {
-                    deleteServerRpc(serverRpc);
+                    // Delete the ServerRpc if it is not being processed.
+                    // Otherwise, delay the deletion to sendReply().
+                    if (!serverRpc->requestComplete ||
+                            serverRpc->sendingResponse) {
+                        deleteServerRpc(serverRpc);
+                    } else {
+                        serverRpc->cancelled = true;
+                    }
+                }
+                return;
+            }
+
+            // PING from client
+            case PacketOpcode::PING: {
+                timeTrace("server received PING, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (serverRpc != NULL) {
+                    AckHeader ack(common->rpcId, FROM_SERVER);
+                    sendControlPacket(serverRpc->clientAddress, &ack);
                 }
                 return;
             }
@@ -1501,16 +1575,35 @@ BasicTransport::ServerRpc::getClientServiceLocator()
 void
 BasicTransport::ServerRpc::sendReply()
 {
+    uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
-            replyPayload.size(), t->outgoingResponses.size());
-    sendingResponse = true;
-    transmitLimit = t->roundTripBytes;
-    unscheduledBytes = t->roundTripBytes;
-    t->outgoingResponses.push_back(*this);
-    t->serverTimerList.push_back(*this);
-    t->updateTopOutgoingMessageSet(this, true);
-    uint32_t bytesSent = t->tryToTransmitData();
+            length, t->outgoingResponses.size());
+    if (cancelled) {
+        // TODO: when this method returns, the caller's handle to this
+        // ServerRpc may become invalid; however, this behavior is already
+        // possible since tryToTransmitData may also invoke deleteServerRpc.
+        t->deleteServerRpc(this);
+        return;
+    }
+    uint32_t bytesSent;
+    if (length < SMALL_MESSAGE_SIZE) {
+        AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
+        Buffer::Iterator iter(&replyPayload, 0, length);
+        timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
+                "priority %u", rpcId.clientId, rpcId.sequence, 0);
+        t->driver->sendPacket(clientAddress, &header, &iter, 0);
+//        transmitOffset = length;
+//        lastTransmitTime = t->driver->getLastTransmitTime();
+        t->deleteServerRpc(this);
+        bytesSent = length;
+    } else {
+        sendingResponse = true;
+        t->outgoingResponses.push_back(*this);
+        t->serverTimerList.push_back(*this);
+        t->updateTopOutgoingMessageSet(this, true);
+        bytesSent = t->tryToTransmitData();
+    }
     if (bytesSent > 0) {
         timeTrace("sendReply transmitted %u bytes", bytesSent);
     }
@@ -1525,15 +1618,24 @@ BasicTransport::ServerRpc::sendReply()
  *      The complete message will be assembled here; caller should ensure
  *      that this is initially empty. The caller owns the storage for this
  *      and must ensure that it persists as long as this object persists.
+ * \param totalLength
+ *      Length of the message.
  */
 BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
-        Buffer* buffer)
+        Buffer* buffer, uint32_t totalLength)
     : t(t)
+    // FIXME: avoid doing dynamic allocation? profile it first
     , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , fragments()
+    , packetLost(false)
 {
     assert(buffer->size() == 0);
+#define FRAGMENTS_HIGH_WATERMARK 64
+    int numPackets = totalLength / t->maxDataPerPacket +
+            (totalLength % t->maxDataPerPacket == 0 ? 0 : 1);
+    assembledPayloads->reserve(numPackets);
+    fragments.reserve(std::min(numPackets, FRAGMENTS_HIGH_WATERMARK));
 }
 
 /**
@@ -1574,73 +1676,55 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         uint32_t length)
 {
     length -= sizeof32(DataHeader);
+    assert((header->offset % t->maxDataPerPacket == 0) &&
+           ((length == t->maxDataPerPacket) ||
+           (header->offset + length >= header->totalLength)));
+
+    bool retainPacket;
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
         // data is missing. Save the packet for later.
-        if (fragments.find(header->offset) == fragments.end()) {
-            fragments[header->offset] = MessageFragment(header, length);
-            assert(buffer->size() < fragments.begin()->first);
-            return true;
-        } else {
-            return false;
+        FragmentMap::iterator iter;
+        std::tie(iter, retainPacket) = fragments.emplace(
+                uint32_t(header->offset), MessageFragment(header, length));
+        if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
+            packetLost = true;
+            // FIXME: investigate why W4/5 produces so many false(?) alarms
+//            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
+            timeTrace("Packet might be lost, offset %u", buffer->size());
         }
+        return retainPacket;
     }
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
-    bool result = appendFragment(header, length);
-    while (true) {
-        FragmentMap::iterator it = fragments.begin();
-        if (it == fragments.end()) {
-            break;
-        }
-        uint32_t offset = it->first;
-        if (offset > buffer->size()) {
-            break;
-        }
-        MessageFragment fragment = it->second;
-        if (!appendFragment(fragment.header, fragment.length)) {
-            t->driver->release(fragment.header);
-        };
-        fragments.erase(it);
-    }
-    if (!fragments.empty()) {
-        assert(buffer->size() < fragments.begin()->first);
-    }
-    return result;
-}
+    if (header->offset == buffer->size()) {
+        uint64_t numPayloads = assembledPayloads->size();
+        while (true) {
+            char* payload = reinterpret_cast<char*>(header);
+            buffer->appendExternal(payload + sizeof32(DataHeader), length);
+            assembledPayloads->push_back(payload);
 
-/**
- * This method is invoked to append a fragment to a partially-assembled
- * message. It handles the special cases where part or all of the
- * fragment is already in the assembled message.
- *
- * \param header
- *      Address of the first byte of a DATA packet.
- * \param length
- *      Size of the payload, in bytes.
- * \return
- *      True means that (some of) the data in this fragment was
- *      incorporated into the message buffer. False means that
- *      the data in this fragment is entirely redundant, so we
- *      didn't save any pointers to it (the caller may want to
- *      free this packet).
- */
-bool
-BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
-        uint32_t length)
-{
-    uint32_t bytesToSkip = buffer->size() - header->offset;
-    if (bytesToSkip >= length) {
-        // This entire fragment is redundant.
+            FragmentMap::iterator it = fragments.find(buffer->size());
+            if (it == fragments.end()) {
+                break;
+            }
+            MessageFragment fragment = it->second;
+            header = fragment.header;
+            length = fragment.length;
+            fragments.erase(it);
+        }
+        numPayloads = assembledPayloads->size() - numPayloads;
+        if (numPayloads > 1) {
+            timeTrace("addPacket assembled %u unappended fragments",
+                    numPayloads-1);
+        }
+        packetLost = false;
+        return true;
+    } else {
+        // This packet is redundant.
         return false;
     }
-
-    char* payload = reinterpret_cast<char*>(header);
-    buffer->appendExternal(payload + sizeof32(DataHeader) + bytesToSkip,
-            length - bytesToSkip);
-    assembledPayloads->push_back(payload);
-    return true;
 }
 
 /**
@@ -1656,7 +1740,7 @@ BasicTransport::MessageAccumulator::appendFragment(DataHeader *header,
  * \param grantOffset
  *      Largest grantOffset that we have sent for this message (i.e.
  *      this is how many total bytes we should have received already).
- *      May be 0 if the client never requested a grant (meaning that it
+ *      May be 0 if the sender never requested a grant (meaning that it
  *      planned to transmit the entire message unilaterally).
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that we are the client, or
@@ -1675,12 +1759,15 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         DIE("Bad fragment pointer: %p", &fragments);
     }
     uint32_t endOffset;
-    FragmentMap::iterator it = fragments.begin();
 
     // Compute the end of the retransmission range.
-    if (it != fragments.end()) {
+    if (!fragments.empty()) {
         // Retransmit the entire gap up to the first fragment.
-        endOffset = it->first;
+        endOffset = ~0u;
+        for (FragmentMap::iterator it = fragments.begin();
+                it != fragments.end(); it++) {
+            endOffset = std::min(endOffset, it->first);
+        }
     } else if (grantOffset > 0) {
         // Retransmit everything that we've asked the sender to send:
         // we don't seem to have received any of it.
@@ -1945,33 +2032,59 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
-        if (!clientRpc->accumulator) {
-            // We haven't received any part of the response message.
-            // Send occasional RESEND packets, which should produce some
-            // response from the server, so that we know it's still alive
-            // and working. Note: the wait time for this ping is longer
-            // than the server's wait time to request retransmission (first
-            // give the server a chance to handle the problem).
-            if ((clientRpc->silentIntervals % pingIntervals) == 0) {
-                timeTrace("client sending RESEND for clientId %u, sequence %u",
-                        clientId, sequence);
-                ResendHeader resend(RpcId(clientId, sequence), 0,
-                        roundTripBytes, FROM_CLIENT);
-                sendControlPacket(clientRpc->session->serverAddress, &resend);
-            }
-        } else if (clientRpc->silentIntervals >= 2) {
-            // We have received part of the response. If the server has gone
-            // silent, this must mean packets were lost, so request
-            // retransmission.
-            ScheduledMessage* scheduledMessage =
-                    clientRpc->scheduledMessage.get();
-            uint32_t grantOffset =
-                    scheduledMessage ? scheduledMessage->grantOffset : 0;
-            clientRpc->resendLimit =
+        if (clientRpc->silentIntervals >= 2) {
+            if (clientRpc->transmitPending) {
+                // We haven't finished transmitting the request.
+                if (clientRpc->transmitOffset == clientRpc->transmitLimit) {
+                    // The client has transmitted every granted byte. Poke the
+                    // server to see if it's still alive.
+                    PingHeader ping(clientRpc->rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress,
+                            &ping);
+                } else {
+                    clientRpc->silentIntervals = 0;
+                }
+            } else {
+                if (!clientRpc->accumulator) {
+                    // We haven't received any part of the response message.
+                    // Send occasional RESEND packets, which should produce
+                    // some response from the server, so that we know it's
+                    // still alive and working. Note: the wait time for this
+                    // ping is longer than the server's wait time to request
+                    // retransmission (first give the server a chance to handle
+                    // the problem).
+                    if ((clientRpc->silentIntervals % pingIntervals) == 0) {
+                        timeTrace("client sending RESEND for clientId %u, "
+                                "sequence %u", clientId, sequence);
+                        ResendHeader resend(RpcId(clientId, sequence), 0,
+                                roundTripBytes, FROM_CLIENT);
+                        sendControlPacket(clientRpc->session->serverAddress,
+                                &resend);
+                    }
+                } else {
+                    // We have received part of the response.
+                    ScheduledMessage* scheduledMessage =
+                            clientRpc->scheduledMessage.get();
+                    uint32_t grantOffset = scheduledMessage ?
+                            scheduledMessage->grantOffset : 0;
+                    if (scheduledMessage && (grantOffset ==
+                            clientRpc->accumulator->buffer->size())) {
+                        // The client has received every byte of the response it has
+                        // granted but hasn't got around to grant more because there
+                        // are higher priority responses.
+                        clientRpc->silentIntervals = 0;
+                        continue;
+                    }
+                    // The client expects to receive more bytes but the server
+                    // has gone silent, this must mean packets were lost,
+                    // grants were lost, or the server has preempted this
+                    // response for higher priority messages, so request
+                    // retransmission anyway.
                     clientRpc->accumulator->requestRetransmission(this,
-                    clientRpc->session->serverAddress,
-                    RpcId(clientId, sequence),
-                    grantOffset, FROM_CLIENT);
+                            clientRpc->session->serverAddress,
+                            RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
+                }
+            }
         }
     }
 
