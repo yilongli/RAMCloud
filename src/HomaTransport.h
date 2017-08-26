@@ -868,7 +868,7 @@ class HomaTransport : public Transport {
     /// If the number at index i is the first element that is larger than the
     /// size of a message, then the sender should use the (i+1)-th highest
     /// priority for the entire unscheduled portion of the message.
-    vector<uint32_t> unschedTrafficPrioBrackets;
+    vector<uint32_t> unschedPrioCutoffs;
 
     /// -----------------
     /// MESSAGE SCHEDULER

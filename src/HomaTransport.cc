@@ -116,7 +116,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // we don't want those delays to result in RPC timeouts.
     , timeoutIntervals(40)
     , pingIntervals(3)
-    , unschedTrafficPrioBrackets()
+    , unschedPrioCutoffs()
     , activeMessages()
     , inactiveMessages()
     , highestGrantedPrio(-1)
@@ -178,7 +178,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // propagation delay) in the unloaded case.
     uint32_t roundTripMicros = 8;
     if (params && params->hasOption("rttMicros")) {
-        value = downCast<uint32_t>(stoi(params->getOption("rttMicros")));
+        value = params->getOption<uint32_t>("rttMicros");
         if (value != 0) {
             roundTripMicros = value;
         } else {
@@ -193,7 +193,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     int numPrio = highestAvailPriority + 1;
     lowestUnschedPrio = highestAvailPriority;
     if (params && params->hasOption("unschedPrio")) {
-        value = downCast<uint32_t>(stoi(params->getOption("unschedPrio")));
+        value = params->getOption<uint32_t>("unschedPrio");
         if ((value > 0) && (value <= numPrio)) {
             lowestUnschedPrio = numPrio - value;
         } else {
@@ -209,7 +209,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     int numSchedPrio = highestSchedPriority + 1;
     maxGrantedMessages = downCast<uint32_t>(numSchedPrio);
     if (params && params->hasOption("degreeOC")) {
-        value = downCast<uint32_t>(stoi(params->getOption("degreeOC")));
+        value = params->getOption<uint32_t>("degreeOC");
         // FIXME: eventually, we would like to decouple # scheduled priorities
         // and the degree of over-commitment so that the former could be less
         // than the latter.
@@ -223,34 +223,40 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     }
 
     if (params && params->hasOption("dpdkPrio")) {
-        P = 8 / stoi(params->getOption("dpdkPrio"));
+        P = 8 / params->getOption<int>("dpdkPrio");
     }
 
-    // Set up the initial unscheduled traffic priority brackets for messages.
-    // TODO: better name for brackets; and better name for unschedTrafficPrioBrackets...
-    string brackets = "[0";
+    // Set unscheduled priority cutoffs.
+    string unschedMessageBrackets = "[0";
     int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
-    uint32_t nextCutoff = driver->getMaxPacketSize();
-    for (int i = 0; i < numUnschedPrio - 1; i++) {
-        unschedTrafficPrioBrackets.push_back(nextCutoff + 1);
-        brackets += format(", %u] [%u", nextCutoff, nextCutoff + 1);
-        nextCutoff <<= 1;
+    if (params && params->hasOption("unschedPrioCutoffs")) {
+        std::stringstream sstream(params->getOption("unschedPrioCutoffs"));
+        std::string cutoff;
+        while (std::getline(sstream, cutoff, '.')) {
+            value = downCast<uint32_t>(stoi(cutoff));
+            unschedPrioCutoffs.push_back(value + 1);
+            unschedMessageBrackets += format(", %u] [%u", value, value + 1);
+        }
     }
-    unschedTrafficPrioBrackets.push_back(~0u);
-    brackets += format(", %u]", ~0u);
+    if (unschedPrioCutoffs.size() + 1 != numUnschedPrio) {
+        LOG(ERROR, "Bad unscheduled priority cutoffs, %lu brackets specified "
+                "(expecting %u)", unschedPrioCutoffs.size()+1, numUnschedPrio);
+    }
+    unschedPrioCutoffs.push_back(~0u);
+    unschedMessageBrackets += format(", %u]", ~0u);
 
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
             "roundTripMicros %u, roundTripBytes %u, grantIncrement %u, "
             "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
             "monitorInterval %.2f ms, maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
-            "highestSchedPriority %d, unscheduledTrafficPrioBrackets %s",
+            "highestSchedPriority %d, unscheduedMessageBrackets %s",
             clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3,
             Cycles::toSeconds(monitorInterval)*1e3, maxGrantedMessages,
             highestAvailPriority, lowestUnschedPrio, highestSchedPriority,
-            brackets.c_str());
+            unschedMessageBrackets.c_str());
 }
 
 /**
@@ -417,7 +423,7 @@ uint8_t
 HomaTransport::getUnschedTrafficPrio(uint32_t messageSize) {
     int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
     for (int i = 0; i < numUnschedPrio - 1; i++) {
-        if (messageSize < unschedTrafficPrioBrackets[i]) {
+        if (messageSize < unschedPrioCutoffs[i]) {
             return downCast<uint8_t>(highestAvailPriority - i);
         }
     }

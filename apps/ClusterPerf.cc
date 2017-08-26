@@ -1348,12 +1348,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
     // Any more samples will simply overwrite old ones by wrapping around.
-    // FIXME: Can we set it to 10M w/o affecting the experiment? what's the limit?
-    const uint32_t MAX_SAMPLES = 1000000;
+    const uint32_t MAX_SAMPLES = 500000;
     roundTripTimes.assign(messageSizes.size(), {});
     vector<uint32_t> numSamples(messageSizes.size());
-    for (Samples& samples : roundTripTimes) {
-        samples.assign(MAX_SAMPLES, 0);
+    for (int i = 0; i < messageSizes.size(); i++) {
+        roundTripTimes[i].assign(MAX_SAMPLES, 0);
     }
 
     const uint32_t largestMessageSize = messageSizes.back();
@@ -1443,7 +1442,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     // Homa with 8 priorities. However, for Homa with no priority, it's harder
     // to simulate SRPT so the avg. # outstanding RPCs is larger; thus, setting
     // this parameter to 20 results in significant message drops.
-#define MAX_OUTSTANDING_RPCS 40
+#define MAX_OUTSTANDING_RPCS 50
     std::array<Tub<std::pair<uint32_t, EchoRpc*>>, MAX_OUTSTANDING_RPCS>
             outstandingRpcs = {};
     uint32_t numOutstandingRpcs = 0;
@@ -1514,7 +1513,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     / (timeLimit*bandwidthMbps*1e6);
             double droppedLoadFactor = static_cast<double>(totalBytesDropped)*8
                     / (timeLimit*bandwidthMbps*1e6);
-            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.05) {
+            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.02) {
                 LOG(ERROR, "Actual load factor %.3f, expecting %.3f, "
                         "dropping %.3f", actualLoadFactor, loadFactor,
                         droppedLoadFactor);
@@ -3305,7 +3304,7 @@ echo_workload()
     // single-packet messages.
     Logger::get().sync();
     for (uint i = 0; i < roundTripTrimes.size(); i++) {
-        printf("%d", messageSizes[i]);
+        printf("%u,%lu", messageSizes[i], results[i].numSamples);
         for (uint64_t cycles : roundTripTrimes[i]) {
             printf(",%.2f", Cycles::toSeconds(cycles) * 1.0e06);
         }
