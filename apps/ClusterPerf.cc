@@ -1514,7 +1514,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     / (timeLimit*bandwidthMbps*1e6);
             double droppedLoadFactor = static_cast<double>(totalBytesDropped)*8
                     / (timeLimit*bandwidthMbps*1e6);
-            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.05) {
+            if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.02) {
                 LOG(ERROR, "Actual load factor %.3f, expecting %.3f, "
                         "dropping %.3f", actualLoadFactor, loadFactor,
                         droppedLoadFactor);
