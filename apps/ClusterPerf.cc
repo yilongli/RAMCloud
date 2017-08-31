@@ -1356,8 +1356,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         samples.assign(MAX_SAMPLES, 0);
     }
 
-    const uint32_t largestMessageSize = messageSizes.back();
+    const uint32_t largestMessageSize = std::max(messageSizes.back(), 8*1024*1024);
     static const string message(largestMessageSize, 'x');
+    context->echoMessage = const_cast<char*>(message.data());
+    context->transportManager->registerMemory(
+            context->echoMessage, message.size());
 
     // TODO: construct message randomizer
     vector<double> discreteProbabilities;
@@ -1565,6 +1568,12 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 //            uint32_t messageId = preGeneratedMessageIds[kRandom];
             uint32_t length = messageSizes[messageId];
             nextMessageArrival += preGeneratedMessageIntervals[kRandom];
+            if (nextMessageArrival < currentTime) {
+                // This could happen when the message arrival time is simply
+                // too short or we just experienced some significant jitter.
+                nextMessageArrival =
+                        currentTime + preGeneratedMessageIntervals[kRandom];
+            }
             if (numOutstandingRpcs < MAX_OUTSTANDING_RPCS) {
                 uint64_t recipient = preGeneratedRecipients[kRandom];
                 TimeTrace::record("Start new RPC, %u outstanding RPCs",

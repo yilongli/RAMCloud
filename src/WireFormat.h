@@ -1291,6 +1291,8 @@ struct ReadTsc {
     static const ServiceType service = MASTER_SERVICE;
     struct Request {
         RequestCommon common;
+        char padding[8];              // Ensure Request and Response have
+                                      // the same size.
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;

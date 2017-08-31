@@ -82,6 +82,7 @@ Context::Context(bool hasDedicatedDispatchThread,
     , coordinatorSession(NULL)
     , cacheTrace(NULL)
     , objectFinder(NULL)
+    , echoMessage(NULL)
     , options(options)
     , workerManager(NULL)
     , externalStorage(NULL)

@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2016 Stanford University
+/* Copyright (c) 2010-2017 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -106,6 +106,25 @@
 
 namespace RAMCloud {
 
+// Change 0 -> 1 in the following line to compile detailed time tracing in
+// this transport.
+#define TIME_TRACE 1
+
+// Provides a cleaner way of invoking TimeTrace::record, with the code
+// conditionally compiled in or out by the TIME_TRACE #ifdef.
+namespace {
+    inline void
+    timeTrace(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+}
+
 //------------------------------
 // InfRcTransport class
 //------------------------------
@@ -119,10 +138,14 @@ namespace RAMCloud {
  *      The ServiceLocator describing which HCA to use and the IP/UDP
  *      address and port numbers to use for handshaking. If NULL,
  *      the transport will be configured for client use only.
+ * \param clientId
+ *      Identifier that identifies us in outgoing RPCs: must be unique across
+ *      all servers and clients.
  */
-InfRcTransport::InfRcTransport(Context* context,
-                                           const ServiceLocator *sl)
+InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
+        uint64_t clientId)
     : context(context)
+    , clientId(clientId)
     , realInfiniband()
     , infiniband()
     , rxBuffers()
@@ -298,6 +321,7 @@ InfRcTransport::InfRcTransport(Context* context,
                         uint32_t(MAX_TX_QUEUE_DEPTH));
     foreach (auto& bd, *txBuffers)
         freeTxBuffers.push_back(&bd);
+    LOG(NOTICE, "Registered %lu transmit buffers", freeTxBuffers.size());
 
     // create completion queues for server receive, client receive, and
     // server/client transmit
@@ -512,6 +536,12 @@ InfRcTransport::InfRcSession::getRpcInfo()
     result += serviceLocator;
     return result;
 }
+
+#define LOG_TIME_SYNC(prefix, length, nonce) \
+    if (length == sizeof(WireFormat::ReadTsc::Request)) { \
+        timeTrace(prefix" ALL_DATA, clientId %u, sequence %u", \
+                nonce >> 32, nonce); \
+    }
 
 // See Transport::Session::sendRequest for documentation.
 void
@@ -929,11 +959,15 @@ InfRcTransport::getTransmitBuffer()
                     }
                 }
             }
-            double waitMs = 1e03 * Cycles::toSeconds(Cycles::rdtsc() - start);
+            uint64_t waitCycles = Cycles::rdtsc() - start;
+            double waitMs = 1e03 * Cycles::toSeconds(waitCycles);
             if (waitMs > 5.0)  {
-                LOG(WARNING, "Long delay waiting for transmit buffers "
-                        "(%.1f ms elapsed, %lu buffers now free); deadlock "
-                        "or target crashed?", waitMs, freeTxBuffers.size());
+//                LOG(WARNING, "Long delay waiting for transmit buffers "
+//                        "(%.1f ms elapsed, %lu buffers now free); deadlock "
+//                        "or target crashed?", waitMs, freeTxBuffers.size());
+                timeTrace("long delay waiting for transmit buffers, "
+                        "elapsed time %u cyc, % buffers now free",
+                        waitCycles, freeTxBuffers.size());
             }
         }
     }
@@ -970,6 +1004,9 @@ InfRcTransport::reapTxBuffers()
                     getOpcodeFromBuffer(bd));
         }
         freeTxBuffers.push_back(bd);
+        const char* fmt = bd->response ? "sent response, nonce %u, length %u"
+                : "sent request, nonce %u, length %u";
+        timeTrace(fmt, bd->nonce, bd->messageBytes);
     }
 
     // Has TX just transitioned to idle?
@@ -1052,6 +1089,7 @@ InfRcTransport::sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp,
     BufferDescriptor* bd = getTransmitBuffer();
     bd->messageBytes = message->size();
     bd->remoteLid = qp->getRemoteLid();
+    bd->nonce = nonce;
     bd->response = response;
 
     // The variables below allow us to collect several chunks from the
@@ -1109,6 +1147,11 @@ InfRcTransport::sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp,
                 copyTicks(&metrics->transport.transmit.copyTicks);
             memcpy(unaddedEnd, it.getData(), it.getLength());
             unaddedEnd += it.getLength();
+#define LARGE_COPIED_BYTES 10000
+            if (it.getLength() > LARGE_COPIED_BYTES) {
+                LOG(WARNING, "zero-copy TX not applicable, copied %u bytes",
+                        it.getLength());
+            }
         }
         it.next();
         ++chunksUsed;
@@ -1145,6 +1188,15 @@ InfRcTransport::sendZeroCopy(uint64_t nonce, Buffer* message, QueuePair* qp,
     CycleCounter<RawMetric> _(&metrics->transport.transmit.ticks);
     ibv_send_wr* badTxWorkRequest;
     if (expect_true(!testingDontReallySend)) {
+        const char* fmt = response ?
+                "server sending response, nonce %u, length %u" :
+                "client sending request, nonce %u, length %u";
+        timeTrace(fmt, nonce, message->size());
+        if (response) {
+            LOG_TIME_SYNC("server sending", message->size(), nonce);
+        } else {
+            LOG_TIME_SYNC("client sending", message->size(), nonce);
+        }
         if (ibv_post_send(qp->qp, &txWorkRequest, &badTxWorkRequest)) {
             throw TransportException(HERE, "ibv_post_send failed");
         }
@@ -1290,7 +1342,8 @@ InfRcTransport::ClientRpc::ClientRpc(InfRcTransport* transport,
     , request(request)
     , response(response)
     , notifier(notifier)
-    , nonce(nonce)
+    , nonce((transport->clientId << 32) | (nonce >> 32))
+//    , nonce(nonce)
     , waitStart(0)
     , state(PENDING)
     , queueEntries()
@@ -1349,6 +1402,10 @@ InfRcTransport::Poller::poll()
     if (!t->outstandingRpcs.empty()) {
         int numResponses = t->infiniband->pollCompletionQueue(t->clientRxCq,
                 MAX_COMPLETIONS, wc);
+        if (numResponses > 0) {
+            timeTrace("polling iteration %u", owner->iteration);
+            timeTrace("%u responses arrive", uint32_t(numResponses));
+        }
         for (int i = 0; i < numResponses; i++) {
             foundWork = 1;
             ibv_wc* response = &wc[i];
@@ -1373,11 +1430,23 @@ InfRcTransport::Poller::poll()
                 t->outstandingRpcs.erase(t->outstandingRpcs.iterator_to(rpc));
                 rpc.session->sessionAlarm.rpcFinished();
                 uint32_t len = response->byte_len - sizeof32(header);
-                if (t->numUsedClientSrqBuffers >=
-                        MAX_SHARED_RX_QUEUE_DEPTH / 2) {
+                // Return the buffer descriptor if we are running low on
+                // Rx buffers or the response is pretty small.
+                uint32_t d = MAX_SHARED_RX_QUEUE_DEPTH / 4;
+                uint32_t numUsedBufDesc = t->numUsedClientSrqBuffers;
+                bool returnBufDesc =
+                        ((numUsedBufDesc >= d) && (len < 500)) ||
+                        ((numUsedBufDesc >= d*2) && (len < 1000)) ||
+                        ((numUsedBufDesc >= d*3));
+                if (returnBufDesc) {
                     // clientSrq is low on buffers, better return this one
                     rpc.response->appendCopy(bd->buffer + sizeof(header), len);
                     t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
+                    if (len > LARGE_COPIED_BYTES) {
+                        LOG(WARNING, "running low on client RX buffers, "
+                                "copied %u bytes, numUsedBufDesc %u",
+                                len, numUsedBufDesc);
+                    }
                 } else {
                     // rpc will hold one of clientSrq's buffers until
                     // rpc.response is destroyed
@@ -1389,6 +1458,12 @@ InfRcTransport::Poller::poll()
                         WireFormat::opcodeSymbol(rpc.request),
                         rpc.session->serviceLocator.c_str(),
                         rpc.response->size());
+                timeTrace("client received response, server addr %u, nonce %u,"
+                        " length %u", rpc.session->serverAddress.s_addr,
+                        rpc.nonce, rpc.response->size());
+                LOG_TIME_SYNC("client received", rpc.response->size(),
+                        rpc.nonce);
+
                 rpc.state = ClientRpc::RESPONSE_RECEIVED;
                 ++metrics->transport.receive.messageCount;
                 ++metrics->transport.receive.packetCount;
@@ -1422,7 +1497,7 @@ InfRcTransport::Poller::poll()
     if (t->serverSetupSocket >= 0) {
         CycleCounter<RawMetric> receiveTicks;
         int numRequests = t->infiniband->pollCompletionQueue(t->serverRxCq,
-                MAX_COMPLETIONS, wc);
+                                                             MAX_COMPLETIONS, wc);
         if ((t->numFreeServerSrqBuffers - numRequests) == 0) {
             // The receive buffer queue has run completely dry. This is bad
             // for performance: if any requests arrive while the queue is empty,
@@ -1431,6 +1506,12 @@ InfRcTransport::Poller::poll()
             RAMCLOUD_CLOG(WARNING, "Infiniband receive buffers ran out "
                     "(%d new requests arrived); could cause significant "
                     "delays", numRequests);
+        }
+        if (numRequests > 0) {
+            if (foundWork == 0) {
+                timeTrace("polling iteration %u", owner->iteration);
+            }
+            timeTrace("%u requests arrive", uint32_t(numRequests));
         }
         for (int i = 0; i < numRequests; i++) {
             foundWork = 1;
@@ -1473,9 +1554,20 @@ InfRcTransport::Poller::poll()
             // Measurements of the YCSB benchmarks in 7/2015 suggest that
             // a value of 4 is (barely) okay, but we now use 8 to provide a
             // larger margin of safety, even if a burst of packets arrives.
-            if (t->numFreeServerSrqBuffers < 8) {
+            uint32_t d = MAX_SHARED_RX_QUEUE_DEPTH / 4;
+            uint32_t numFreeBufDesc = t->numFreeServerSrqBuffers;
+            bool returnBufDesc =
+                    ((numFreeBufDesc < d*3) && (len < 500)) ||
+                    ((numFreeBufDesc < d*2) && (len < 1000)) ||
+                    ((numFreeBufDesc < d));
+            if (returnBufDesc) {
                 r->requestPayload.appendCopy(bd->buffer + sizeof(header), len);
                 t->postSrqReceiveAndKickTransmit(t->serverSrq, bd);
+                // FIXME: HOW TO DETERMINE THIS THRESHOLD
+                if (len > LARGE_COPIED_BYTES) {
+                    LOG(WARNING, "running low on server RX buffers, "
+                            "copied %u bytes", len);
+                }
             } else {
                 // Let the request use the NIC's buffer directly in order
                 // to avoid copying; it will be returned when the request
@@ -1484,6 +1576,10 @@ InfRcTransport::Poller::poll()
                     bd->buffer + sizeof32(header),
                     len, t, t->serverSrq, bd);
             }
+            timeTrace("server received request, client addr %u, nonce %u, "
+                    "length %u", qp->handshakeSin.sin_addr.s_addr,
+                    header.nonce, len);
+            LOG_TIME_SYNC("server received", len, header.nonce);
 
             port->portAlarm.requestArrived(); // Restarts the port watchdog
             interval.stop();
@@ -1514,6 +1610,9 @@ InfRcTransport::Poller::poll()
         if (t->freeTxBuffers.size() >= 3) {
             foundWork = 1;
         }
+    }
+    if (foundWork > 0) {
+        timeTrace("end of polling iteration %u", owner->iteration);
     }
     return foundWork;
 }

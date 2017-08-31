@@ -43,7 +43,9 @@ SegletAllocator::SegletAllocator(const ServerConfig* config)
       cleanerPoolReserve(0),
       defaultPool(),
       segletToSegmentTable(),
-      block(config->master.logBytes)
+//      block(config->master.logBytes)
+      // FIXME: append 10 MB tailroom to the end
+      block(config->master.logBytes + 10000000)
 {
     assert(BitOps::isPowerOfTwo(segletSize));
     uint8_t* segletBlock = block.get();

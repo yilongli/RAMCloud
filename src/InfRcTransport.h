@@ -64,7 +64,8 @@ class InfRcTransport : public Transport {
     typedef Infiniband::RegisteredBuffers RegisteredBuffers;
 
   public:
-    explicit InfRcTransport(Context* context, const ServiceLocator* sl = NULL);
+    explicit InfRcTransport(Context* context, const ServiceLocator* sl,
+            uint64_t clientId);
     ~InfRcTransport();
     SessionRef getSession(const ServiceLocator* sl, uint32_t timeoutMs = 0) {
         return new InfRcSession(this, sl, timeoutMs);
@@ -80,9 +81,8 @@ class InfRcTransport : public Transport {
      * After registration Buffer::Chunks sent in client RPC requests can
      * be given directly to the HCA without copying into a transmit
      * buffer first. Callers must collectively ensure this function is only
-     * once. It is possible to extend this function to support multiple
-     * regions, but for the moment we only use it to register the
-     * Log Seglets.
+     * called once. It is possible to extend this function to support multiple
+     * regions, but for the moment we only use it to register the Log Seglets.
      *
      * \param base
      *      Starting address of the region to be registered with the HCA.
@@ -91,7 +91,13 @@ class InfRcTransport : public Transport {
      */
     void registerMemory(void* base, size_t bytes)
     {
-        assert(logMemoryRegion == NULL);
+        if (logMemoryRegion != NULL) {
+            LOG(ERROR, "failed to register %Zd bytes at %p; previously "
+                    "registered region: %Zd bytes at %p",
+                    bytes, base, logMemoryBytes, logMemoryRegion);
+            throw TransportException(HERE,
+                    "registering multiple regions not supported yet");
+        }
         logMemoryRegion = ibv_reg_mr(infiniband->pd.pd, base, bytes,
             IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
         if (logMemoryRegion == NULL) {
@@ -101,6 +107,10 @@ class InfRcTransport : public Transport {
         }
         logMemoryBase = reinterpret_cast<uintptr_t>(base);
         logMemoryBytes = bytes;
+        if (context->echoMessage == NULL) {
+            context->echoMessage = static_cast<char*>(base) + bytes - 8*1024*1024;
+            memset(context->echoMessage, 'x', 8*1024*1024);
+        }
         RAMCLOUD_LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
     }
     static void setName(const char* name);
@@ -172,7 +182,9 @@ class InfRcTransport : public Transport {
         uint64_t nonce;
     };
 
-    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
+    // FIXME: Why can't we set this number as large as possible?
+    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 63;
+//    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 
     // Since we always use at most 1 SGE per receive request, there is no need
     // to set this parameter any higher. In fact, larger values for this
@@ -315,6 +327,10 @@ class InfRcTransport : public Transport {
 
     /// Shared RAMCloud information.
     Context* context;
+
+    /// Unique identifier for this client (used to provide unique
+    /// identification for RPCs).
+    uint64_t clientId;
 
     /// See #infiniband.
     Tub<Infiniband> realInfiniband;

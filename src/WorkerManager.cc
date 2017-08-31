@@ -197,13 +197,15 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         // The following code is copied from MasterService::echo
         constexpr uint32_t dummyBlockSize = 8 * 1024 * 1024;
         static const string dummyBlock(dummyBlockSize, ' ');
+        const char* data = context->echoMessage != NULL ?
+                context->echoMessage : dummyBlock.data();
         respHdr->length = reqHdr->echoLength;
         uint32_t bytesLeft = reqHdr->echoLength;
         while (bytesLeft > dummyBlockSize) {
             bytesLeft -= dummyBlockSize;
-            rpc->replyPayload.appendExternal(dummyBlock.data(), dummyBlockSize);
+            rpc->replyPayload.appendExternal(data, dummyBlockSize);
         }
-        rpc->replyPayload.appendExternal(dummyBlock.data(), bytesLeft);
+        rpc->replyPayload.appendExternal(data, bytesLeft);
         rpc->sendReply();
         return;
     } else if ((header->opcode == WireFormat::PING) ||

@@ -94,6 +94,8 @@ class Context {
     ObjectFinder* objectFinder; // On Client and Master, this locator tells
                                 // which master is the owner of an object.
 
+    char* echoMessage;
+
     // Holds command-line options, or NULL if no options are available.
     // Memory for this is managed by whoever created this object; we can
     // assume this is static.
