@@ -32,11 +32,9 @@
 namespace RAMCloud {
 
 /**
- * A simple transport mechanism based on MTCP/IP provided by the kernel.
+ * A simple transport mechanism based on mTCP, a user-level TCP implementation.
  * This implementation is unlikely to be fast enough for production use;
- * this class will be used primarily for development and as a baseline
- * for testing.  The goal is to provide an implementation that is about as
- * fast as possible, given its use of kernel-based MTCP/IP.
+ * this class will be used primarily as a baseline for testing.
  */
 class MTcpTransport : public Transport {
   public:
@@ -81,7 +79,7 @@ class MTcpTransport : public Transport {
         /// returned by the server in responses.  This field makes it
         /// possible for a client to have multiple outstanding RPCs to
         /// the same server.
-        uint64_t nonce;
+        uint64_t rpcId;
 
         /// The size in bytes of the payload (which follows immediately).
         /// Must be less than or equal to #MAX_RPC_LEN.
@@ -94,9 +92,9 @@ class MTcpTransport : public Transport {
      */
     class IncomingMessage {
       public:
-        IncomingMessage(Buffer* buffer, MTcpSession* session);
-        void cancel();
-        bool readMessage(int fd);
+        IncomingMessage(Buffer* buffer);
+        IncomingMessage(MTcpSession* session);
+        bool tryToReadMessage(int fd);
 
         Header header;
 
@@ -116,138 +114,115 @@ class MTcpTransport : public Transport {
         uint32_t messageLength;
 
         /// Buffer in which incoming message will be stored (not including
-        /// transport-specific header); NULL means we haven't yet started
-        /// reading the response, or else the RPC was canceled after we
-        /// started reading the response.
+        /// transport-specific header). May be NULL if this is a response
+        /// message and the client hasn't yet started reading the response,
+        /// or the RPC was canceled after we started reading the response.
         Buffer* buffer;
 
-        /// Session that will find the buffer to use for this message once
-        /// the header has arrived (or NULL).
+        /// Used by the client to find the buffer that stores this incoming
+        /// response once the header has arrived. NULL if this message is a
+        /// request.
         MTcpSession* session;
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
     };
 
     /**
-     * The MTCP implementation of Transport::ServerRpc.
+     * Holds server-side state for an RPC.
      */
-    class MTcpServerRpc : public Transport::ServerRpc {
+    class ServerRpc : public Transport::ServerRpc {
       public:
-        virtual ~MTcpServerRpc()
+        virtual ~ServerRpc()
         {
             RAMCLOUD_TEST_LOG("deleted");
         }
         void sendReply();
         string getClientServiceLocator();
 
-        MTcpServerRpc(Socket* socket, int fd, MTcpTransport* transport)
-            : fd(fd), socketId(socket->id), message(&requestPayload, NULL),
-            queueEntries(), transport(transport) { }
+        ServerRpc(int fd, MTcpTransport* transport)
+            : fd(fd)
+            , socketId(transport->serverSockets[fd]->id)
+            , request(&requestPayload)
+            , bytesSent(0)
+            , outgoingResponseLinks()
+            , transport(transport)
+        {}
 
-        int fd;                   /// File descriptor of the socket on
+        // FIXME: what is the difference between the fd of a socket
+        // and the id of a socket? I assume socket id identifies the connection
+        // so it can change when the same fd is reused for another connection?
+        const int fd;             /// File descriptor of the socket on
                                   /// which the request was received.
-        uint64_t socketId;        /// Uniquely identifies this connection;
+        const uint64_t socketId;  /// Uniquely identifies this connection;
                                   /// must match sockets[fd].id.  Allows us
                                   /// to detect if fd has been closed and
                                   /// reused for a different connection.
-        IncomingMessage message;  /// Records state of partially-received
+        IncomingMessage request;  /// Records state of partially-received
                                   /// request.
-        IntrusiveListHook queueEntries;
+
+        /// # bytes in the response message (including header) that have been
+        /// successfully transmitted.
+        uint32_t bytesSent;
+
+        IntrusiveListHook outgoingResponseLinks;
                                   /// Used to link this RPC onto the
-                                  /// rpcsWaitingToReply list of the Socket.
-        MTcpTransport* transport;  /// The parent MTcpTransport object.
+                                  /// outgoingResponses list of the Socket.
+        MTcpTransport* transport; /// The parent MTcpTransport object.
 
       PRIVATE:
-        DISALLOW_COPY_AND_ASSIGN(MTcpServerRpc);
+        DISALLOW_COPY_AND_ASSIGN(ServerRpc);
     };
 
     /**
-     * The MTCP implementation of Transport::ClientRpc.
+     * One object of this class exists for each outgoing RPC; it is used
+     * to track the RPC through to completion.
      */
-    class MTcpClientRpc {
+    class ClientRpc {
       public:
-        explicit MTcpClientRpc(Buffer* request, Buffer* response,
-                RpcNotifier* notifier, uint64_t nonce)
+        explicit ClientRpc(Buffer* request, Buffer* response,
+                RpcNotifier* notifier, uint64_t rpcId)
             : request(request)
             , response(response)
             , notifier(notifier)
-            , nonce(nonce)
-            , sent(false)
-            , queueEntries()
+            , rpcId(rpcId)
+            , transmitPending(true)
+            , bytesSent(0)
+            , outgoingRequestLinks()
         { }
 
         Buffer* request;          /// Request message for the RPC.
         Buffer* response;         /// Will eventually hold the response message.
         RpcNotifier* notifier;    /// Use this object to report completion.
-        uint64_t nonce;           /// Unique identifier for this RPC; used
+        uint64_t rpcId;           /// Unique identifier for this RPC; used
                                   /// to pair the RPC with its response.
-        bool sent;                /// True means the request has been sent
-                                  /// and we are waiting for the response;
-                                  /// false means this RPC is queued on
-                                  /// rpcsWaitingToSend.
-        IntrusiveListHook queueEntries;
-                                  /// Used to link this RPC onto the
-                                  /// rpcsWaitingToSend and
-                                  /// rpcsWaitingForResponse lists of session.
+
+        /// True means that the request message is in the process of being
+        /// transmitted (and this object is linked on outgoingRequests).
+        bool transmitPending;
+
+        /// # bytes in the request message (including header) that have been
+        /// successfully transmitted.
+        uint32_t bytesSent;
+
+        /// Used to link this RPC onto the outgoingRequests.
+        IntrusiveListHook outgoingRequestLinks;
 
       PRIVATE:
-        DISALLOW_COPY_AND_ASSIGN(MTcpClientRpc);
+        DISALLOW_COPY_AND_ASSIGN(ClientRpc);
     };
 
-    void closeSocket(int fd);
     ssize_t recvCarefully(int fd, char* buffer, size_t length,
             IncomingMessage* message);
-    int sendMessage(int fd, uint64_t nonce, Buffer* payload,
-            int bytesToSend);
+    uint32_t sendMessage(int fd, uint64_t rpcId, Buffer* payload,
+            uint32_t bytesSent);
+    void setEvents(int fd, uint32_t events);
 
-//    /**
-//     * An event handler that will accept connections on a socket.
-//     */
-//    class AcceptHandler : public Dispatch::File {
-//      public:
-//        AcceptHandler(int fd, MTcpTransport* transport);
-//        virtual void handleFileEvent(int events);
-//        // Transport that manages this socket.
-//        MTcpTransport* transport;
-//
-//      PRIVATE:
-//        DISALLOW_COPY_AND_ASSIGN(AcceptHandler);
-//    };
+    typedef std::unordered_map<uint64_t, ClientRpc*> ClientRpcMap;
 
     /**
-     * An event handler that moves bytes to and from a server's socket.
-     */
-    class ServerSocketHandler : public Dispatch::File {
-      public:
-        ServerSocketHandler(int fd, MTcpTransport* transport, Socket* socket);
-        virtual void handleFileEvent(int events);
-        // The following variables are just copies of constructor arguments.
-        int fd;
-        MTcpTransport* transport;
-        Socket* socket;
-
-      PRIVATE:
-        DISALLOW_COPY_AND_ASSIGN(ServerSocketHandler);
-    };
-
-    /**
-     * An event handler that moves bytes to and from a client-side sockes.
-     */
-    class ClientSocketHandler : public Dispatch::File {
-      public:
-        ClientSocketHandler(int fd, MTcpSession* session);
-        virtual void handleFileEvent(int events);
-        // The following variables are just copies of constructor arguments.
-        int fd;
-        MTcpSession* session;
-
-      PRIVATE:
-        DISALLOW_COPY_AND_ASSIGN(ClientSocketHandler);
-    };
-
-    /**
-     * The MTCP implementation of Sessions (stored on a client to manage its
-     * interactions with a particular server).
+     * This class represents the client side of the connection between a
+     * particular client and a particular server. Each session can have at
+     * most one incoming response at any given time.
      */
     class MTcpSession : public Session {
       public:
@@ -257,7 +232,6 @@ class MTcpTransport : public Transport {
         ~MTcpSession();
         virtual void abort();
         virtual void cancelRequest(RpcNotifier* notifier);
-        Buffer* findRpc(Header* header);
         virtual string getRpcInfo();
         virtual void sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier);
@@ -278,35 +252,61 @@ class MTcpTransport : public Transport {
                                   /// connects to address  -1 means no socket
                                   /// open (the socket was aborted because of
                                   /// an error).
-        uint64_t serial;          /// Used to generate nonces for RPCs: starts
+        uint64_t nextRpcId;       /// Used to generate nonces for RPCs: starts
                                   /// at 1 and increments for each RPC.
 
-        INTRUSIVE_LIST_TYPEDEF(MTcpClientRpc, queueEntries) ClientRpcList;
-        ClientRpcList rpcsWaitingToSend;
+        INTRUSIVE_LIST_TYPEDEF(ClientRpc, outgoingRequestLinks) ClientRpcList;
+        ClientRpcList outgoingRequests;
                                   /// RPCs whose request messages have not yet
                                   /// been transmitted.  The front RPC on this
                                   /// list is currently being transmitted.
-        int bytesLeftToSend;      /// The number of (trailing) bytes in the
-                                  /// first RPC on rpcsWaitingToSend that still
-                                  /// need to be transmitted, once fd becomes
-                                  /// writable again.  -1 or 0 means there
-                                  /// are no RPCs waiting to be transmitted.
-        ClientRpcList rpcsWaitingForResponse;
-                                  /// RPCs whose request messages have been
-                                  /// transmitted, but whose responses have
-                                  /// not yet been received.
-        MTcpClientRpc* current;    /// RPC for which we are currently receiving
-                                  /// a response (NULL if none).
-        Tub<IncomingMessage> message;
-                                  /// Records state of partially-received
-                                  /// reply for current.
-        Tub<ClientSocketHandler> clientIoHandler;
-                                  /// Used to get notified when response data
-                                  /// arrives.
+
+        /// Holds RPCs for which we are the client, and for which a
+        /// response has not yet been completely received (we have sent
+        /// at least part of the request, but not necessarily the entire
+        /// request yet). Keys are RPC identifiers.
+        ClientRpcMap outgoingRpcs;
+
+        /// Holds the partially-received response for currentRpc.
+        Tub<IncomingMessage> currentResponse;
+
+        /// RPC for which we are currently receiving a response. NULL until
+        /// the header of currentResponse is complete.
+        ClientRpc* currentRpc;
+
         SessionAlarm alarm;       /// Used to detect server timeouts.
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MTcpSession);
+    };
+
+    /**
+     * This class represents the server side of the connection between a
+     * particular server and a particular client. Each socket can have at
+     * most one incoming request at any given time.
+     */
+    class Socket {
+        // FIXME: RENAME TO ServerSocket
+      public:
+        Socket(int fd, MTcpTransport* transport, sockaddr_in* sin);
+        ~Socket();
+        MTcpTransport* transport; /// The parent MTcpTransport object.
+        int fd;
+        uint64_t id;              /// Unique identifier: no other Socket
+                                  /// for this transport instance will use
+                                  /// the same value.
+        ServerRpc* incomingRpc;   /// Incoming RPC that is in progress for
+                                  /// this fd, or NULL if none.
+        INTRUSIVE_LIST_TYPEDEF(ServerRpc, outgoingResponseLinks) ServerRpcList;
+        ServerRpcList outgoingResponses;
+                                  /// RPCs whose response messages have not yet
+                                  /// been transmitted.  The front RPC on this
+                                  /// list is currently being transmitted.
+        struct sockaddr_in sin;   /// sockaddr_in of the client host on the
+                                  /// other end of the socket. Used to
+                                  /// implement #getClientServiceLocator().
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(Socket);
     };
 
     static Syscall* sys;
@@ -333,48 +333,17 @@ class MTcpTransport : public Transport {
 #define EPOLL_EVENT_QUEUE_SIZE 100
     struct mtcp_epoll_event epollEvents[EPOLL_EVENT_QUEUE_SIZE];
 
-//    /// Used to wait for listenSocket to become readable.
-//    Tub<AcceptHandler> acceptHandler;
-
-    /// Used to hold information about a file descriptor associated with
-    /// a socket, on which RPC requests may arrive.
-    class Socket {
-      public:
-        Socket(int fd, MTcpTransport* transport, sockaddr_in& sin);
-        ~Socket();
-        MTcpTransport* transport;  /// The parent MTcpTransport object.
-        uint64_t id;              /// Unique identifier: no other Socket
-                                  /// for this transport instance will use
-                                  /// the same value.
-        MTcpServerRpc* rpc;        /// Incoming RPC that is in progress for
-                                  /// this fd, or NULL if none.
-        ServerSocketHandler ioHandler;
-                                  /// Used to get notified whenever data
-                                  /// arrives on this fd.
-        INTRUSIVE_LIST_TYPEDEF(MTcpServerRpc, queueEntries) ServerRpcList;
-        ServerRpcList rpcsWaitingToReply;
-                                  /// RPCs whose response messages have not yet
-                                  /// been transmitted.  The front RPC on this
-                                  /// list is currently being transmitted.
-        int bytesLeftToSend;      /// The number of (trailing) bytes in the
-                                  /// front RPC on rpcsWaitingToReply that still
-                                  /// need to be transmitted, once fd becomes
-                                  /// writable again.  -1 or 0 means there are
-                                  /// no RPCs waiting.
-        struct sockaddr_in sin;   /// sockaddr_in of the client host on the
-                                  /// other end of the socket. Used to
-                                  /// implement #getClientServiceLocator().
-      PRIVATE:
-        DISALLOW_COPY_AND_ASSIGN(Socket);
-    };
+    typedef std::unordered_map<int, MTcpSession*> ClientSessions;
+    ClientSessions clientSessions;
 
     /// Keeps track of all of our open client connections. Entry i has
     /// information about file descriptor i (NULL means no client
     /// is currently connected).
-    std::vector<Tub<Socket>> sockets;
+    typedef std::unordered_map<int, Tub<Socket>> ServerSockets;
+    ServerSockets serverSockets;
 
-    /// Used to assign increasing id values to Sockets.
-    uint64_t nextSocketId;
+    /// Used to assign increasing id values to ServerSockets.
+    uint64_t nextServerSocketId;
 
     /// Counts the number of nonzero-size partial messages sent by
     /// sendMessage (for testing only).
@@ -384,10 +353,10 @@ class MTcpTransport : public Transport {
     Poller poller;
 
     /// Pool allocator for our ServerRpc objects.
-    ServerRpcPool<MTcpServerRpc> serverRpcPool;
+    ServerRpcPool<ServerRpc> serverRpcPool;
 
-    /// Pool allocator for MTcpClientRpc objects.
-    ObjectPool<MTcpClientRpc> clientRpcPool;
+    /// Pool allocator for ClientRpc objects.
+    ObjectPool<ClientRpc> clientRpcPool;
 
     DISALLOW_COPY_AND_ASSIGN(MTcpTransport);
 };

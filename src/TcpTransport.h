@@ -123,6 +123,7 @@ class TcpTransport : public Transport {
         void sendReply();
         string getClientServiceLocator();
 
+        // FIXME: rename all transport to t (like Homa & Basic)?
         TcpServerRpc(int fd, TcpTransport* transport)
             : fd(fd)
             , socketId(transport->serverSockets[fd]->id)

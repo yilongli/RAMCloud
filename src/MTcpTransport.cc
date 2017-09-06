@@ -30,17 +30,6 @@ namespace RAMCloud {
 
 int MTcpTransport::messageChunks = 0;
 
-/**
- * Default object used to make system calls.
- */
-//static Syscall defaultSyscall;
-
-/**
- * Used by this class to make all system calls.  In normal production
- * use it points to defaultSyscall; for testing it points to a mock
- * object.
- */
-//Syscall* MTcpTransport::sys = &defaultSyscall;
 
 /**
  * Construct a MTcpTransport instance.
@@ -64,9 +53,9 @@ MTcpTransport::MTcpTransport(Context* context,
     , mctx()
     , epollId(-1)
     , epollEvents()
-//    , acceptHandler()
-    , sockets()
-    , nextSocketId(100)
+    , clientSessions()
+    , serverSockets()
+    , nextServerSocketId(100)
     , poller(context, this)
     , serverRpcPool()
     , clientRpcPool()
@@ -199,15 +188,14 @@ MTcpTransport::MTcpTransport(Context* context,
     // Arrange to be notified whenever anyone connects to listenSocket.
     struct mtcp_epoll_event event;
     event.data.sockid = listenSocket;
-    // FIXME: Level vs. edge? What about oneshot? Why does Dispatch:556 use oneshot?
-    event.events = MTCP_EPOLLIN;
+    // FIXME: I think this can be simply level-triggered and not one shot?
 //    event.events = MTCP_EPOLLIN | MTCP_EPOLLONESHOT;
+    event.events = MTCP_EPOLLIN;
     if (mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_ADD, listenSocket,
             &event) == -1) {
         throw TransportException(HERE,
                 "MTcpTransport couldn't set epoll event for listenSocket", errno);
     }
-//    acceptHandler.construct(listenSocket, this);
 }
 
 /**
@@ -218,29 +206,21 @@ MTcpTransport::~MTcpTransport()
 {
     if (listenSocket >= 0) {
         mtcp_close(mctx, listenSocket);
-        listenSocket = -1;
-    }
-    for (unsigned int i = 0; i < sockets.size(); i++) {
-        if (sockets[i]) {
-            closeSocket(i);
-        }
     }
     mtcp_destroy_context(mctx);
     mtcp_destroy();
 }
 
-/**
- * This private method is invoked to close the server's end of a
- * connection to a client and cleanup any related state.
- * \param fd
- *      File descriptor for the socket to be closed.
- */
 void
-MTcpTransport::closeSocket(int fd) {
-    sockets[fd].destroy();
-    mtcp_close(mctx, fd);
+MTcpTransport::setEvents(int fd, uint32_t events)
+{
+    // FIXME: do we have to initialize this event struct properly?
+    // FIXME: verify this struct is input only
+    struct mtcp_epoll_event event;
+    event.data.sockid = fd;
+    event.events = events;
+    mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_ADD, fd, &event);
 }
-
 
 /**
  * This method is invoked in the inner polling loop of the dispatcher;
@@ -252,250 +232,225 @@ MTcpTransport::closeSocket(int fd) {
 int
 MTcpTransport::Poller::poll()
 {
-    int result = 0;
+    int n = mtcp_epoll_wait(t->mctx, t->epollId, t->epollEvents,
+            arrayLength(t->epollEvents), 0);
+    for (int i = 0; i < n; i++) {
+        int fd = t->epollEvents[i].data.sockid;
+        uint32_t events = t->epollEvents[i].events;
+        if (fd == t->listenSocket) {
+            struct sockaddr_in sin;
+            socklen_t socklen = sizeof(sin);
 
-    while (true) {
-        int n = mtcp_epoll_wait(t->mctx, t->epollId, t->epollEvents,
-                arrayLength(t->epollEvents), 0);
-        for (int i = 0; i < n; i++) {
-            int sockid = t->epollEvents[i].data.sockid;
-            if (sockid == t->listenSocket) {
-                struct sockaddr_in sin;
-                socklen_t socklen = sizeof(sin);
+            int acceptedFd = mtcp_accept(t->mctx, t->listenSocket,
+                    reinterpret_cast<sockaddr*>(&sin), &socklen);
+            if (acceptedFd < 0) {
+                switch (errno) {
+                    // According to the man page for accept, you're
+                    // supposed to treat these as retry on Linux.
+                    case EHOSTDOWN:
+                    case EHOSTUNREACH:
+                    case ENETDOWN:
+                    case ENETUNREACH:
+                    case ENONET:
+                    case ENOPROTOOPT:
+                    case EOPNOTSUPP:
+                    case EPROTO:
+                        continue;
 
-                int acceptedFd = mtcp_accept(t->mctx, t->listenSocket,
-                        reinterpret_cast<sockaddr*>(&sin), &socklen);
-                if (acceptedFd < 0) {
-                    switch (errno) {
-                        // According to the man page for accept, you're
-                        // supposed to treat these as retry on Linux.
-                        case EHOSTDOWN:
-                        case EHOSTUNREACH:
-                        case ENETDOWN:
-                        case ENETUNREACH:
-                        case ENONET:
-                        case ENOPROTOOPT:
-                        case EOPNOTSUPP:
-                        case EPROTO:
-                            continue;
-
-                        // No incoming connections are currently available.
-                        case EAGAIN:
+                    // No incoming connections are currently available.
+                    case EAGAIN:
 #if EAGAIN != EWOULDBLOCK
-                        case EWOULDBLOCK:
+                    case EWOULDBLOCK:
 #endif
-                        default:
-                            continue;
-                    }
-
-                    // Unexpected error: log a message and then close the socket
-                    // (so we don't get repeated errors).
-                    LOG(ERROR, "error in MTcpTransport::AcceptHandler accepting "
-                            "connection for '%s': %s",
-                            t->locatorString.c_str(), strerror(errno));
-                    // FIXME: HOW TO IMPLEMENT setEvents(0)?
-//                    setEvents(0);
-
-                    mtcp_close(t->mctx, t->listenSocket);
-                    t->listenSocket = -1;
-                    continue;
+                        continue;
                 }
 
-                // At this point we have successfully opened a client connection.
-                // Save information about it and create a handler for incoming
-                // requests.
-                // FIXME: Does mTCP generates socket id like kernel tcp? How do
-                // we know sock fd starts from 0 (so that we can use array as
-                // opposed to map to store Sockets? Also eliminate the `new` eventually.
-                if (t->sockets.size() <=
-                        static_cast<unsigned int>(acceptedFd)) {
-                    t->sockets.resize(acceptedFd + 1);
-                }
-                t->sockets[acceptedFd].construct(acceptedFd, t, sin);
-            } else if (t->epollEvents[i].events == MTCP_EPOLLIN) {
-
-            } else if (t->epollEvents[i].events == MTCP_EPOLLOUT) {
-
+                // Unexpected error: log a message and then close the socket
+                // (so we don't get repeated errors).
+                LOG(ERROR, "error in MTcpTransport::AcceptHandler accepting "
+                        "connection for '%s': %s",
+                        t->locatorString.c_str(), strerror(errno));
+                // FIXME: WHY SET TO 0? This transport cannot be recovered anyway.
+                t->setEvents(fd, 0);
+                mtcp_close(t->mctx, t->listenSocket);
+                t->listenSocket = -1;
+                continue;
             }
 
+            // At this point we have successfully opened a client connection.
+            // Save information about it and create a handler for incoming
+            // requests.
+            // FIXME: Does mTCP generates socket id like kernel tcp? How do
+            // we know sock fd starts from 0 (so that we can use array as
+            // opposed to map to store Sockets? Also eliminate the `new` eventually.
+            t->serverSockets[acceptedFd].construct(acceptedFd, t, &sin);
+        } else if (t->clientSessions.find(fd) != t->clientSessions.end()) {
+            MTcpSession* session = t->clientSessions[fd];
+            try {
+                if (events & MTCP_EPOLLIN) {
+                    if (session->currentResponse->tryToReadMessage(fd)) {
+                        // This RPC is finished.
+                        ClientRpc* rpc = session->currentRpc;
+                        // FIXME: The only reason the following check may fail is because
+                        // the rpc might be cancelled?
+                        if (rpc != NULL) {
+                            session->outgoingRpcs.erase(rpc->rpcId);
+                            session->alarm.rpcFinished();
+                            rpc->notifier->completed();
+                            session->transport->clientRpcPool.destroy(rpc);
+                            session->currentRpc = NULL;
+                        }
+                        session->currentResponse.construct(session);
+                    }
+                }
+                if (events & MTCP_EPOLLOUT) {
+                    while (!session->outgoingRequests.empty()) {
+                        ClientRpc* rpc = &session->outgoingRequests.front();
+                        rpc->bytesSent = t->sendMessage(
+                                session->fd, rpc->rpcId, rpc->request,
+                                rpc->bytesSent);
+                        if (rpc->bytesSent <
+                                rpc->request->size() + sizeof32(Header)) {
+                            goto done;
+                        }
+                        // The current RPC request is finished; start the next one,
+                        // if there is one.
+                        session->outgoingRequests.pop_front();
+                        rpc->transmitPending = false;
+                    }
+                    // Optimization: No more outstanding requests, only notify me
+                    // when the socket becomes readable.
+                    t->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLONESHOT);
+                }
+            } catch (TransportException& e) {
+                session->abort();
+            }
+        } else if (t->serverSockets.find(fd) != t->serverSockets.end()) {
+            Socket* socket = t->serverSockets[fd].get();
+            MTcpTransport* transport = socket->transport;
+            try {
+                if (events & MTCP_EPOLLIN) {
+                    if (socket->incomingRpc == NULL) {
+                        socket->incomingRpc =
+                                transport->serverRpcPool.construct(fd, transport);
+                    }
+                    if (socket->incomingRpc->request.tryToReadMessage(fd)) {
+                        // The incoming request is complete; pass it off for servicing.
+                        transport->context->workerManager->handleRpc(
+                                socket->incomingRpc);
+                        socket->incomingRpc = NULL;
+                    }
+                }
+                if (events & MTCP_EPOLLOUT) {
+                    while (!socket->outgoingResponses.empty()) {
+                        ServerRpc* rpc = &socket->outgoingResponses.front();
+                        rpc->bytesSent = transport->sendMessage(fd,
+                                rpc->request.header.rpcId, &rpc->replyPayload,
+                                rpc->bytesSent);
+                        if (rpc->bytesSent <
+                                rpc->replyPayload.size() + sizeof32(Header)) {
+                            goto done;
+                        }
+                        // The current reply is finished; start the next one, if
+                        // there is one.
+                        socket->outgoingResponses.pop_front();
+                        transport->serverRpcPool.destroy(rpc);
+                    }
+                    // Optimization: no more outstanding responses, only notify me
+                    // when the socket becomes readable.
+                    t->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLONESHOT);
+                }
+            } catch (TransportException& e) {
+                // Close the server socket.
+                transport->serverSockets.erase(fd);
+            }
         }
+
+      done:
+        t->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLOUT | MTCP_EPOLLONESHOT);
     }
 
-    return result;
+    return n;
 }
 
 /**
  * Constructor for Sockets.
  */
-MTcpTransport::Socket::Socket(int fd, MTcpTransport* transport, sockaddr_in& sin)
+MTcpTransport::Socket::Socket(int fd, MTcpTransport* transport,
+        sockaddr_in* sin)
     : transport(transport)
-    , id(transport->nextSocketId)
-    , rpc(NULL)
-    , ioHandler(fd, transport, this)
-    , rpcsWaitingToReply()
-    , bytesLeftToSend(0)
-    , sin(sin)
+    , fd(fd)
+    , id(transport->nextServerSocketId)
+    , incomingRpc(NULL)
+    , outgoingResponses()
+    , sin(*sin)
 {
-    transport->nextSocketId++;
+    transport->nextServerSocketId++;
 }
 
 /**
  * Destructor for Sockets.
  */
 MTcpTransport::Socket::~Socket() {
-    if (rpc != NULL) {
+    if (incomingRpc != NULL) {
+        transport->serverRpcPool.destroy(incomingRpc);
+    }
+    while (!outgoingResponses.empty()) {
+        ServerRpc* rpc = &outgoingResponses.front();
+        outgoingResponses.pop_front();
         transport->serverRpcPool.destroy(rpc);
     }
-    while (!rpcsWaitingToReply.empty()) {
-        MTcpServerRpc& rpc = rpcsWaitingToReply.front();
-        rpcsWaitingToReply.pop_front();
-        transport->serverRpcPool.destroy(&rpc);
-    }
-}
 
-/**
- * Constructor for ServerSocketHandlers.
- *
- * \param fd
- *      File descriptor for a client socket on which RPC requests may arrive.
- * \param transport
- *      The MTcpTransport that manages this socket.
- * \param socket
- *      Socket object corresponding to fd.
- */
-MTcpTransport::ServerSocketHandler::ServerSocketHandler(int fd,
-                                                       MTcpTransport* transport,
-                                                       Socket* socket)
-    : Dispatch::File(transport->context->dispatch, fd,
-                     Dispatch::FileEvent::READABLE)
-    , fd(fd)
-    , transport(transport)
-    , socket(socket)
-{
-    // Empty constructor body.
-}
-
-/**
- * This method is invoked by Dispatch when a server's connection from a client
- * becomes readable or writable.  It attempts to read incoming messages from
- * the socket.  If a full message is available, a MTcpServerRpc object gets
- * queued for service.  It also attempts to write responses to the socket
- * (if there are responses waiting for transmission).
- *
- * \param events
- *      Indicates whether the socket was readable, writable, or both
- *      (OR-ed combination of Dispatch::FileEvent bits).
- */
-void
-MTcpTransport::ServerSocketHandler::handleFileEvent(int events)
-{
-    // The following variables are copies of data from this object;
-    // they are needed to safely detect socket closure below.
-    MTcpTransport* transport = this->transport;
-    int socketFd = fd;
-    Socket* socket = transport->sockets[socketFd].get();
-    assert(socket != NULL);
-    try {
-        if (events & Dispatch::FileEvent::READABLE) {
-            if (socket->rpc == NULL) {
-                socket->rpc = transport->serverRpcPool.construct(socket,
-                                                                 fd, transport);
-            }
-            if (socket->rpc->message.readMessage(fd)) {
-                // The incoming request is complete; pass it off for servicing.
-                MTcpServerRpc *rpc = socket->rpc;
-                socket->rpc = NULL;
-                transport->context->workerManager->handleRpc(rpc);
-            }
-        }
-        // Check to see if this socket got closed due to an error in the
-        // read handler; if so, it's neither necessary nor safe to continue
-        // in this method. Note: the check for closure must be done without
-        // accessing any fields in this object, since the object may have been
-        // destroyed and its memory recycled.
-        if (socket != transport->sockets[socketFd].get()) {
-            return;
-        }
-        if (events & Dispatch::FileEvent::WRITABLE) {
-            while (true) {
-                if (socket->rpcsWaitingToReply.empty()) {
-                    setEvents(Dispatch::FileEvent::READABLE);
-                    break;
-                }
-                MTcpServerRpc& rpc = socket->rpcsWaitingToReply.front();
-                socket->bytesLeftToSend = transport->sendMessage(fd,
-                        rpc.message.header.nonce, &rpc.replyPayload,
-                        socket->bytesLeftToSend);
-                if (socket->bytesLeftToSend != 0) {
-                    break;
-                }
-                // The current reply is finished; start the next one, if
-                // there is one.
-                socket->rpcsWaitingToReply.pop_front();
-                transport->serverRpcPool.destroy(&rpc);
-                socket->bytesLeftToSend = -1;
-            }
-        }
-    } catch (TransportException& e) {
-        transport->closeSocket(fd);
-    }
+    // No need to erase fd from transport->serverSockets because
+    // this destructor must have been triggered by that.
+    mtcp_close(transport->mctx, fd);
 }
 
 /**
  * Transmit an RPC request or response on a socket.  This method uses
- * a nonblocking approach: if the entire message cannot be transmitted,
- * it transmits as many bytes as possible and returns information about
- * how much more work is still left to do.
+ * a non-blocking approach: if the entire message cannot be transmitted,
+ * it transmits as many bytes as possible and returns how many bytes in
+ * the payload have been successfully transmitted.
  *
  * \param fd
  *      File descriptor to write.
- * \param nonce
+ * \param rpcId
  *      Unique identifier for the RPC; must never have been used
  *      before on this socket.
  * \param payload
  *      Message to transmit on fd; this method adds on a header.
- * \param bytesToSend
- *      -1 means the entire message must still be transmitted;
- *      Anything else means that part of the message was transmitted
- *      in a previous call, and the value of this parameter is the
- *      result returned by that call (always greater than 0).
- *
+ * \param bytesSent
+ *      # bytes in the payload that have been transmitted before
+ *      this method call.
  * \return
- *      The number of (trailing) bytes that could not be transmitted.
- *      0 means the entire message was sent successfully.
+ *      # bytes in the payload that have been transmitted after
+ *      this method returns.
  *
  * \throw TransportException
  *      An I/O error occurred.
  */
-int
-MTcpTransport::sendMessage(int fd, uint64_t nonce, Buffer* payload,
-        int bytesToSend)
+uint32_t
+MTcpTransport::sendMessage(int fd, uint64_t rpcId, Buffer* payload,
+        uint32_t bytesSent)
 {
     assert(fd >= 0);
-
-    Header header;
-    header.nonce = nonce;
-    header.len = payload->size();
-    int totalLength = downCast<int>(sizeof(header) + header.len);
-    if (bytesToSend < 0) {
-        bytesToSend = totalLength;
-    }
-    int alreadySent = totalLength - bytesToSend;
+    Header header = {rpcId, payload->size()};
 
     // Use an iovec to send everything in one kernel call: one iov
     // for header, the rest for payload.  Skip parts that have
     // already been sent.
-    struct iovec iov[payload->getNumberChunks()+1];
-    int offset;
-    int iovecIndex;
-    if (alreadySent < downCast<int>(sizeof(header))) {
-        iov[0].iov_base = reinterpret_cast<char*>(&header) + alreadySent;
-        iov[0].iov_len = sizeof(header) - alreadySent;
+    uint32_t iovecs = 1 + payload->getNumberChunks();
+    struct iovec iov[iovecs];
+    uint32_t offset;
+    size_t iovecIndex;
+    if (bytesSent < sizeof(Header)) {
+        iov[0].iov_base = reinterpret_cast<char*>(&header) + bytesSent;
+        iov[0].iov_len = sizeof(Header) - bytesSent;
         iovecIndex = 1;
         offset = 0;
     } else {
         iovecIndex = 0;
-        offset = alreadySent - downCast<int>(sizeof(header));
+        offset = bytesSent - sizeof(Header);
     }
     Buffer::Iterator iter(payload, offset, header.len - offset);
     while (!iter.isDone()) {
@@ -514,33 +469,24 @@ MTcpTransport::sendMessage(int fd, uint64_t nonce, Buffer* payload,
         iter.next();
     }
 
-//    struct msghdr msg;
-//    memset(&msg, 0, sizeof(msg));
-//    msg.msg_iov = iov;
-//    msg.msg_iovlen = iovecIndex;
-//
-//    int r = downCast<int>(sys->sendmsg(fd, &msg,
-//            MSG_NOSIGNAL|MSG_DONTWAIT));
     int r = mtcp_writev(mctx, fd, iov, iovecIndex);
-    if (r == bytesToSend) {
-        PerfStats::threadStats.networkOutputBytes += r;
-        return 0;
-    }
-#if TESTING
-    if ((r > 0) && (r < totalLength)) {
-        messageChunks++;
-    }
-#endif
-    if (r == -1) {
+    if (r < 0) {
         if ((errno != EAGAIN) && (errno != EWOULDBLOCK)) {
-            LOG(WARNING, "MTcpTransport sendmsg error: %s", strerror(errno));
-            throw TransportException(HERE, "MTcpTransport sendmsg error",
+            LOG(WARNING, "TcpTransport sendmsg error: %s", strerror(errno));
+            throw TransportException(HERE, "TcpTransport sendmsg error",
                     errno);
         }
-        r = 0;
+    } else {
+        bytesSent += downCast<uint32_t>(r);
+        PerfStats::threadStats.networkOutputBytes += r;
+#if TESTING
+        uint32_t totalLength = sizeof32(header) + header.len;
+        if ((r > 0) && (r < totalLength)) {
+            messageChunks++;
+        }
+#endif
     }
-    PerfStats::threadStats.networkOutputBytes += r;
-    return bytesToSend - r;
+    return bytesSent;
 }
 
 /**
@@ -581,42 +527,34 @@ MTcpTransport::recvCarefully(int fd, char* buffer, size_t length,
                 strerror(errno), message->headerBytesReceived);
     } else {
         LOG(WARNING, "MTcpTransport recv error: %s, message id %lu, length %u, "
-                "received %u", strerror(errno), message->header.nonce,
+                "received %u", strerror(errno), message->header.rpcId,
                 message->header.len, message->messageBytesReceived);
     }
     throw TransportException(HERE, "MTcpTransport recv error", errno);
 }
 
 /**
- * Constructor for IncomingMessages.
+ * Constructor for IncomingMessages that are requests.
  * \param buffer
- *      If non-NULL, specifies a buffer in which to place the body of
- *      the incoming message; the caller should ensure that the buffer
- *      is empty.  This parameter is used on servers, where the buffer
- *      is known before any part of the message has been received.
- * \param session
- *      If non-NULL, specifies a MTcpSession whose findRpc method should
- *      be invoked once the header for the message has been received.
- *      FindRpc will provide a buffer to use for the body of the message.
- *      This argument is typically used on clients.
+ *      Buffer in which to place the body of the incoming message;
+ *      the caller should ensure that the buffer is empty.
  */
-MTcpTransport::IncomingMessage::IncomingMessage(Buffer* buffer,
-        MTcpSession* session)
+MTcpTransport::IncomingMessage::IncomingMessage(Buffer* buffer)
     : header(), headerBytesReceived(0), messageBytesReceived(0),
-      messageLength(0), buffer(buffer), session(session)
+      messageLength(0), buffer(buffer), session(NULL)
 {
 }
 
 /**
- * This method is invoked to cancel the receipt of a message in progress.
- * Once this method returns, we will still finish reading the message
- * (don't want to leave unread bytes in the socket), but the contents
- * will be discarded.
+ * Constructor for IncomingMessages that are responses.
+ * \param session
+ *      The session through which the RPC request was sent. Used to
+ *      find the ClientRpc the response belongs to.
  */
-void
-MTcpTransport::IncomingMessage::cancel() {
-    buffer = NULL;
-    messageLength = 0;
+MTcpTransport::IncomingMessage::IncomingMessage(MTcpSession* session)
+    : header(), headerBytesReceived(0), messageBytesReceived(0),
+      messageLength(0), buffer(NULL), session(session)
+{
 }
 
 /**
@@ -632,9 +570,8 @@ MTcpTransport::IncomingMessage::cancel() {
  * \throw TransportException
  *      An I/O error occurred.
  */
-
 bool
-MTcpTransport::IncomingMessage::readMessage(int fd) {
+MTcpTransport::IncomingMessage::tryToReadMessage(int fd) {
     // First make sure we have received the header (it may arrive in
     // multiple chunks).
     if (headerBytesReceived < sizeof(Header)) {
@@ -655,7 +592,12 @@ MTcpTransport::IncomingMessage::readMessage(int fd) {
         }
 
         if ((buffer == NULL) && (session != NULL)) {
-            buffer = session->findRpc(&header);
+            ClientRpcMap::iterator it =
+                    session->outgoingRpcs.find(header.rpcId);
+            if (it != session->outgoingRpcs.end()) {
+                session->currentRpc = it->second;
+                buffer = it->second->response;
+            }
         }
         if (buffer == NULL)
             messageLength = 0;
@@ -715,13 +657,11 @@ MTcpTransport::MTcpSession::MTcpSession(MTcpTransport* transport,
     : Session(serviceLocator->getOriginalString())
     , transport(transport)
     , address(serviceLocator)
-    , fd(-1), serial(1)
-    , rpcsWaitingToSend()
-    , bytesLeftToSend(0)
-    , rpcsWaitingForResponse()
-    , current(NULL)
-    , message()
-    , clientIoHandler()
+    , fd(-1), nextRpcId(1)
+    , outgoingRequests()
+    , outgoingRpcs()
+    , currentResponse()
+    , currentRpc(NULL)
     , alarm(transport->context->sessionAlarmTimer, this,
             (timeoutMs != 0) ? timeoutMs : DEFAULT_TIMEOUT_MS)
 {
@@ -774,15 +714,12 @@ MTcpTransport::MTcpSession::MTcpSession(MTcpTransport* transport,
                 sourceIp.toString().c_str()));
     }
 
-    // Disable the hideous Nagle algorithm, which will delay sending small
-    // messages in some situations.
-//    int flag = 1;
-//    sys->setsockopt(fd, IPPROTO_MTCP, MTCP_NODELAY, &flag, sizeof(flag));
+    transport->clientSessions[fd] = this;
 
+    // FIXME: WHY LOCK?
     /// Arrange for notification whenever the server sends us data.
     Dispatch::Lock lock(transport->context->dispatch);
-    clientIoHandler.construct(fd, this);
-    message.construct(static_cast<Buffer*>(NULL), this);
+    currentResponse.construct(this);
 }
 
 /**
@@ -806,27 +743,26 @@ MTcpTransport::MTcpSession::cancelRequest(RpcNotifier* notifier)
 {
     // Search for an RPC that refers to this notifier; if one is
     // found then remove all state relating to it.
-    foreach (MTcpClientRpc& rpc, rpcsWaitingForResponse) {
-        if (rpc.notifier == notifier) {
-            rpcsWaitingForResponse.erase(
-                    rpcsWaitingForResponse.iterator_to(rpc));
-            transport->clientRpcPool.destroy(&rpc);
+    for (ClientRpcMap::iterator it = outgoingRpcs.begin();
+            it != outgoingRpcs.end(); it++) {
+        ClientRpc* rpc = it->second;
+        if (rpc->notifier == notifier) {
+            transport->clientRpcPool.destroy(rpc);
             alarm.rpcFinished();
 
             // If we have started reading the response message,
             // cancel that also.
-            if (&rpc == current) {
-                message->cancel();
-                current = NULL;
+            if (rpc == currentRpc) {
+                // Setting messageLength to 0 so that unread bytes in the
+                // socket will be properly discarded in #readMessage.
+                currentResponse->buffer = NULL;
+                currentResponse->messageLength = 0;
+                currentRpc = NULL;
             }
-            return;
-        }
-    }
-    foreach (MTcpClientRpc& rpc, rpcsWaitingToSend) {
-        if (rpc.notifier == notifier) {
-            rpcsWaitingToSend.erase(
-                    rpcsWaitingToSend.iterator_to(rpc));
-            transport->clientRpcPool.destroy(&rpc);
+            outgoingRpcs.erase(it);
+            if (rpc->transmitPending) {
+                erase(outgoingRequests, *rpc);
+            }
             return;
         }
     }
@@ -842,48 +778,15 @@ MTcpTransport::MTcpSession::close()
         mtcp_close(transport->mctx, fd);
         fd = -1;
     }
-    while (!rpcsWaitingForResponse.empty()) {
-        MTcpClientRpc& rpc = rpcsWaitingForResponse.front();
-        rpc.notifier->failed();
-        rpcsWaitingForResponse.pop_front();
-        transport->clientRpcPool.destroy(&rpc);
-
+    for (ClientRpcMap::iterator it = outgoingRpcs.begin();
+            it != outgoingRpcs.end(); it++) {
+        ClientRpc *rpc = it->second;
+        rpc->notifier->failed();
+        transport->clientRpcPool.destroy(rpc);
     }
-    while (!rpcsWaitingToSend.empty()) {
-        MTcpClientRpc& rpc = rpcsWaitingToSend.front();
-        rpc.notifier->failed();
-        rpcsWaitingToSend.pop_front();
-        transport->clientRpcPool.destroy(&rpc);
-    }
-    if (clientIoHandler) {
-        Dispatch::Lock lock(transport->context->dispatch);
-        clientIoHandler.destroy();
-    }
-}
-
-/**
- * This method is invoked once the header has been received for an RPC response.
- * It uses information in the header to locate the corresponding MTcpClientRpc
- * object, and returns the Buffer to use for the response.
- *
- * \param header
- *      The header from the incoming RPC.
- *
- * \return
- *      If the nonce in the header refers to an active RPC, then the return
- *      value is the reply payload for that RPC.  If no matching RPC can be
- *      found (perhaps the RPC was canceled?) then NULL is returned to indicate
- *      that the input message should be dropped.
- */
-Buffer*
-MTcpTransport::MTcpSession::findRpc(Header* header) {
-    foreach (MTcpClientRpc& rpc, rpcsWaitingForResponse) {
-        if (rpc.nonce == header->nonce) {
-            current = &rpc;
-            return rpc.response;
-        }
-    }
-    return NULL;
+    outgoingRpcs.clear();
+    outgoingRequests.clear();
+    transport->clientSessions.erase(fd);
 }
 
 // See Transport::Session::getRpcInfo for documentation.
@@ -892,14 +795,11 @@ MTcpTransport::MTcpSession::getRpcInfo()
 {
     const char* separator = "";
     string result;
-    foreach (MTcpClientRpc& rpc, rpcsWaitingForResponse) {
+    for (ClientRpcMap::iterator it = outgoingRpcs.begin();
+            it != outgoingRpcs.end(); it++) {
+        ClientRpc *rpc = it->second;
         result += separator;
-        result += WireFormat::opcodeSymbol(rpc.request);
-        separator = ", ";
-    }
-    foreach (MTcpClientRpc& rpc, rpcsWaitingToSend) {
-        result += separator;
-        result += WireFormat::opcodeSymbol(rpc.request);
+        result += WireFormat::opcodeSymbol(rpc->request);
         separator = ", ";
     }
     if (result.empty())
@@ -920,148 +820,80 @@ MTcpTransport::MTcpSession::sendRequest(Buffer* request, Buffer* response,
         return;
     }
     alarm.rpcStarted();
-    MTcpClientRpc* rpc = transport->clientRpcPool.construct(request, response,
-            notifier, serial);
-    serial++;
-    if (!rpcsWaitingToSend.empty()) {
+    ClientRpc* rpc = transport->clientRpcPool.construct(request, response,
+            notifier, nextRpcId);
+    nextRpcId++;
+    outgoingRpcs[rpc->rpcId] = rpc;
+    if (!outgoingRequests.empty()) {
         // Can't transmit this request yet; there are already other
         // requests that haven't yet been sent.
-        rpcsWaitingToSend.push_back(*rpc);
+        outgoingRequests.push_back(*rpc);
         return;
     }
 
     // Try to transmit the request.
     try {
-        bytesLeftToSend = transport->sendMessage(fd, rpc->nonce,
-                request, -1);
+        rpc->bytesSent = transport->sendMessage(fd, rpc->rpcId,
+                request, 0);
     } catch (TransportException& e) {
         abort();
         notifier->failed();
         return;
     }
-    if (bytesLeftToSend == 0) {
+    if (rpc->bytesSent >= request->size() + sizeof32(Header)) {
         // The whole request was sent immediately (this should be the
         // common case).
-        rpcsWaitingForResponse.push_back(*rpc);
-        rpc->sent = true;
+        rpc->transmitPending = false;
     } else {
-        rpcsWaitingToSend.push_back(*rpc);
-        clientIoHandler->setEvents(Dispatch::FileEvent::READABLE |
-                Dispatch::FileEvent::WRITABLE);
-    }
-}
-
-/**
- * Constructor for ClientSocketHandlers.
- *
- * \param fd
- *      File descriptor for a socket on which the the response for
- *      an RPC will arrive.
- * \param session
- *      The MTcpSession that is controlling this request and its response.
- */
-MTcpTransport::ClientSocketHandler::ClientSocketHandler(int fd,
-        MTcpSession* session)
-    : Dispatch::File(session->transport->context->dispatch, fd,
-                     Dispatch::FileEvent::READABLE)
-    , fd(fd)
-    , session(session)
-{
-    // Empty constructor body.
-}
-
-/**
- * This method is invoked when the socket connecting to a server becomes
- * readable or writable. This method reads or writes the socket as
- * appropriate.
- *
- * \param events
- *      Indicates whether the socket was readable, writable, or both
- *      (OR-ed combination of Dispatch::FileEvent bits).
- */
-void
-MTcpTransport::ClientSocketHandler::handleFileEvent(int events)
-{
-    try {
-        if (events & Dispatch::FileEvent::READABLE) {
-            if (session->message->readMessage(fd)) {
-                // This RPC is finished.
-                if (session->current != NULL) {
-                    session->rpcsWaitingForResponse.erase(
-                            session->rpcsWaitingForResponse.iterator_to(
-                            *session->current));
-                    session->alarm.rpcFinished();
-                    session->current->notifier->completed();
-                    session->transport->clientRpcPool.destroy(session->current);
-                    session->current = NULL;
-                }
-                session->message.construct(static_cast<Buffer*>(NULL), session);
-            }
-        }
-        if (events & Dispatch::FileEvent::WRITABLE) {
-            while (!session->rpcsWaitingToSend.empty()) {
-                MTcpClientRpc& rpc = session->rpcsWaitingToSend.front();
-                session->bytesLeftToSend = session->transport->sendMessage(
-                        session->fd, rpc.nonce, rpc.request,
-                        session->bytesLeftToSend);
-                if (session->bytesLeftToSend != 0) {
-                    return;
-                }
-                // The current RPC is finished; start the next one, if
-                // there is one.
-                session->rpcsWaitingToSend.pop_front();
-                session->rpcsWaitingForResponse.push_back(rpc);
-                rpc.sent = true;
-                session->bytesLeftToSend = -1;
-            }
-            setEvents(Dispatch::FileEvent::READABLE);
-        }
-    } catch (TransportException& e) {
-        session->abort();
+        outgoingRequests.push_back(*rpc);
+        transport->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLOUT | MTCP_EPOLLONESHOT);
     }
 }
 
 // See Transport::ServerRpc::sendReply for documentation.
 void
-MTcpTransport::MTcpServerRpc::sendReply()
+MTcpTransport::ServerRpc::sendReply()
 {
-    try {
-        Socket* socket = transport->sockets[fd].get();
+    Socket* socket = transport->serverSockets[fd].get();
 
-        // It's possible that our fd has been closed (or even reused for a
-        // new connection); if so, just discard the RPC without sending
-        // a response.
-        if ((socket != NULL) && (socket->id == socketId)) {
-            if (!socket->rpcsWaitingToReply.empty()) {
-                // Can't transmit the response yet; the socket is backed up.
-                socket->rpcsWaitingToReply.push_back(*this);
-                return;
-            }
-
-            // Try to transmit the response.
-            socket->bytesLeftToSend = transport->sendMessage(fd,
-                    message.header.nonce, &replyPayload, -1);
-            if (socket->bytesLeftToSend > 0) {
-                socket->rpcsWaitingToReply.push_back(*this);
-                socket->ioHandler.setEvents(Dispatch::FileEvent::READABLE |
-                        Dispatch::FileEvent::WRITABLE);
-                return;
-            }
+    // It's possible that our fd has been closed (or even reused for a
+    // new connection); if so, just discard the RPC without sending
+    // a response.
+    if ((socket != NULL) && (socket->id == socketId)) {
+        if (!socket->outgoingResponses.empty()) {
+            // Can't transmit the response yet; the socket is backed up.
+            socket->outgoingResponses.push_back(*this);
+            return;
         }
-    } catch (TransportException& e) {
-        transport->closeSocket(fd);
+
+        // Try to transmit the response.
+        bytesSent = transport->sendMessage(fd, request.header.rpcId,
+                &replyPayload, 0);
+        if (bytesSent < replyPayload.size() + sizeof32(Header)) {
+            socket->outgoingResponses.push_back(*this);
+            transport->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLOUT | MTCP_EPOLLONESHOT);
+            return;
+        }
     }
+//    } catch (TransportException& e) {
+//        transport->closeSocket(fd);
+//        // FIXME: the idea is to let the ServerSocketHandler::handleFileEvent to close the socket
+//        // But perhaps a even better idea is to also let it destroy this ServerRpc
+//        // so we don't even need a try-catch block in this method.
+//        transport->serverRpcPool.destroy(this);
+//        throw e;
+//    }
 
     // The whole response was sent immediately (this should be the
-    // common case).  Recycle the RPC object.
+    // common case) or our fd was closed.  Recycle the RPC object.
     transport->serverRpcPool.destroy(this);
 }
 
 // See Transport::ServerRpc::getclientServiceLocator for documentation.
 string
-MTcpTransport::MTcpServerRpc::getClientServiceLocator()
+MTcpTransport::ServerRpc::getClientServiceLocator()
 {
-    Socket* socket = transport->sockets[fd].get();
+    Socket* socket = transport->serverSockets[fd].get();
     return format("tcp:host=%s,port=%hu", inet_ntoa(socket->sin.sin_addr),
         NTOHS(socket->sin.sin_port));
 }
