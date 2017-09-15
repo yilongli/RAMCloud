@@ -578,6 +578,7 @@ EchoRpc::wait()
 {
     waitInternal(ramcloud->clientContext->dispatch);
     if (getState() != RpcState::FINISHED) {
+        LOG(ERROR, "EchoRpc call failed with status %d", getState());
         throw TransportException(HERE);
     }
 

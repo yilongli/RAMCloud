@@ -147,6 +147,24 @@ AbstractServerList::getSession(ServerId id)
         locator = details->serviceLocator;
     }
 
+    // FIXME: Stupid hack to work around the timing issue in
+    // AbstractServerList::getSession triggered by long MTcpTransport ctor time
+    // FIXME: This might not be necessary once we have AdminClient::getServerId fixed?
+    static bool mTcpInitialized = false;
+    static uint64_t mTcpInitTime = 0;
+    if (locator.find("mtcp") != string::npos) {
+        if (!mTcpInitialized) {
+            mTcpInitialized = true;
+            mTcpInitTime = Cycles::rdtsc();
+        } else {
+            while (Cycles::rdtsc() - mTcpInitTime < Cycles::fromSeconds(1.5)) {}
+            Lock _(mutex);
+            ServerDetails* details = iget(id);
+            if (details->session != NULL)
+                return details->session;
+        }
+    }
+
     // No cached session. Open a new session.
     Transport::SessionRef session =
             context->transportManager->openSession(locator);
@@ -159,7 +177,10 @@ AbstractServerList::getSession(ServerId id)
         while (1) {
             ServerId actualId;
             try {
+                uint64_t start = Cycles::rdtsc();
                 actualId = AdminClient::getServerId(context, session);
+                RAMCLOUD_LOG(WARNING, "AdminClient::getServerId RPC takes %.2f us",
+                             Cycles::toSeconds(Cycles::rdtsc() - start)*1e6);
             } catch (TransportException& e) {
                 // Can't even communicate with the server; fail the session.
                 RAMCLOUD_LOG(NOTICE,
@@ -196,6 +217,7 @@ AbstractServerList::getSession(ServerId id)
             return FailSession::get();
         if (details->session == NULL)
             details->session = session;
+        RAMCLOUD_LOG(ERROR, "Opened session for %s", locator.c_str());
         return details->session;
     }
 }

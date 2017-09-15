@@ -19,6 +19,7 @@
 #include <queue>
 #include <mtcp_api.h>
 #include <mtcp_epoll.h>
+#include <unordered_set>
 
 #include "BoostIntrusive.h"
 #include "Dispatch.h"
@@ -70,6 +71,12 @@ class MTcpTransport : public Transport {
     class Socket;
     class MTcpSession;
 
+    // FIXME
+    enum Event {
+        READABLE = MTCP_EPOLLIN,
+        WRITABLE = MTCP_EPOLLOUT
+    };
+
     /**
      * Header for request and response messages: precedes the actual data
      * of the message in all transmissions.
@@ -92,7 +99,7 @@ class MTcpTransport : public Transport {
      */
     class IncomingMessage {
       public:
-        IncomingMessage(Buffer* buffer);
+        IncomingMessage(Buffer* buffer, MTcpTransport* t);
         IncomingMessage(MTcpSession* session);
         bool tryToReadMessage(int fd);
 
@@ -123,6 +130,10 @@ class MTcpTransport : public Transport {
         /// response once the header has arrived. NULL if this message is a
         /// request.
         MTcpSession* session;
+
+        /// Transport that owns this message.
+        MTcpTransport* t;
+
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(IncomingMessage);
     };
@@ -142,7 +153,7 @@ class MTcpTransport : public Transport {
         ServerRpc(int fd, MTcpTransport* transport)
             : fd(fd)
             , socketId(transport->serverSockets[fd]->id)
-            , request(&requestPayload)
+            , request(&requestPayload, transport)
             , bytesSent(0)
             , outgoingResponseLinks()
             , transport(transport)
@@ -309,8 +320,6 @@ class MTcpTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(Socket);
     };
 
-    static Syscall* sys;
-
     /// Shared RAMCloud information.
     Context* context;
 
@@ -326,8 +335,13 @@ class MTcpTransport : public Transport {
     // FIXME: mMTCP thread per-core context
     mctx_t mctx;
 
+    // File descriptors currently monitored by epoll.
+    std::unordered_set<int> activeFds;
+
     // TODO
     int epollId;
+
+    uint32_t srcip;
 
     // TODO
 #define EPOLL_EVENT_QUEUE_SIZE 100

@@ -349,7 +349,8 @@ class Transport {
     /// to trigger retransmissions.  The current value for this was chosen
     /// somewhat subjectively in 11/2011, based on the presence of time gaps
     /// in the poller of as much as 250ms.
-    static const uint32_t DEFAULT_TIMEOUT_MS = 500;
+//    static const uint32_t DEFAULT_TIMEOUT_MS = 500;
+    static const uint32_t DEFAULT_TIMEOUT_MS = 2500;
 
     /**
      * One ServerPort instance is created for a listen port

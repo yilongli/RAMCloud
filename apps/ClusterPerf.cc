@@ -1301,6 +1301,7 @@ echoMessages(string receiver, uint32_t length,
                 echoLength, &buffer);
         rpc.wait();
         times.push_back(rpc.getCompletionTime());
+        LOG(NOTICE, "completion time %.2f us", Cycles::toSeconds(times.back())*1e6);
     }
     uint64_t totalCycles = Cycles::rdtsc() - startTime;
 
@@ -2999,11 +3000,11 @@ echo_basic()
     // Each iteration through the following loop measures the round-trip time
     // of a particular message size.
     for (uint i = 0; i < outgoingSizes.size(); i++) {
-        LOG(NOTICE, "Starting echo test for %d-byte reply messages",
-                incomingSizes[i]);
+        LOG(NOTICE, "Starting echo test for %d-byte request messages",
+                outgoingSizes[i]);
         cluster->logMessageAll(NOTICE,
-                "Starting echo test for %d-byte reply messages",
-                incomingSizes[i]);
+                "Starting echo test for %d-byte request messages",
+                outgoingSizes[i]);
         echoDists.push_back(echoMessages(receiverLocator, outgoingSizes[i],
                 incomingSizes[i], 1000, 10.0));
     }

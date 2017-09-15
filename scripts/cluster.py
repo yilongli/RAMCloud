@@ -259,6 +259,12 @@ class Cluster(object):
         self.coordinator_host = host
         self.coordinator_locator = coord_locator(self.transport,
                                                  self.coordinator_host)
+
+        # Adding redirection for stdout and stderr.
+        log_prefix = '%s/coordinator.%s' % (self.log_subdir, host[0])
+        stdout = open(log_prefix + '.out', 'w')
+        stderr = open(log_prefix + '.err', 'w')
+
         if not self.enable_logcabin:
             command = (
                 '%s %s -C %s -l %s --logFile %s/coordinator.%s.log %s' %
@@ -268,7 +274,7 @@ class Cluster(object):
                  self.coordinator_host[0], args))
 
             self.coordinator = self.sandbox.rsh(self.coordinator_host[0],
-                        command, bg=True, stderr=subprocess.STDOUT)
+                        command, bg=True, stdout=stdout, stderr=stderr)
         else:
             # currently hardcoding logcabin server because ankita's logcabin
             # scripts are not on git.
@@ -281,7 +287,7 @@ class Cluster(object):
                  self.coordinator_host[0], args))
 
             self.coordinator = self.sandbox.rsh(self.coordinator_host[0],
-                        command, bg=True, stderr=subprocess.STDOUT)
+                        command, bg=True, stdout=stdout, stderr=stderr)
 
             # just wait for coordinator to start
             time.sleep(1)
@@ -294,7 +300,7 @@ class Cluster(object):
 
             restarted_coord = self.sandbox.rsh(self.coordinator_host[0],
                         restart_command, kill_on_exit=True, bg=True,
-                        stderr=subprocess.STDOUT)
+                        stdout=stdout, stderr=stderr)
 
         self.ensure_servers(0, 0)
         if self.verbose:
@@ -460,6 +466,11 @@ class Cluster(object):
         client_args = ' '.join(args[1:])
         clients = []
         for i, client_host in enumerate(hosts):
+            # Adding redirection for stdout and stderr.
+            log_prefix = '%s/client%d.%s' % (
+                  self.log_subdir, self.next_client_id, client_host[0])
+            stdout = open(log_prefix + '.out', 'w')
+            stderr = open(log_prefix + '.err', 'w')
             command = ('%s %s -C %s --numClients %d --clientIndex %d '
                        '--logFile %s/client%d.%s.log %s' %
                        (prefix_command,
@@ -467,7 +478,8 @@ class Cluster(object):
                         i, self.log_subdir, self.next_client_id,
                         client_host[0], client_args))
             self.next_client_id += 1
-            clients.append(self.sandbox.rsh(client_host[0], command, bg=True))
+            clients.append(self.sandbox.rsh(client_host[0], command, bg=True,
+                    stdout=stdout, stderr=stderr))
             if self.verbose:
                 print('Client %d started on %s: %s' % (i, client_host[0],
                         command))

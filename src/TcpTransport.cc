@@ -161,6 +161,7 @@ TcpTransport::Socket::~Socket() {
 
     // No need to erase fd from transport->serverSockets because
     // this destructor must have been triggered by that.
+//    LOG(ERROR, "CLOSE SOCKET!!!");
     sys->close(ioHandler.fd);
 }
 
@@ -439,6 +440,7 @@ TcpTransport::sendMessage(int fd, uint64_t rpcId, Buffer* payload,
     if (r < 0) {
         if ((errno != EAGAIN) && (errno != EWOULDBLOCK)) {
             LOG(WARNING, "TcpTransport sendmsg error: %s", strerror(errno));
+//            DIE("Why broken pipe?");
             throw TransportException(HERE, "TcpTransport sendmsg error",
                     errno);
         }
@@ -734,6 +736,7 @@ TcpTransport::TcpSession::cancelRequest(RpcNotifier* notifier)
 void
 TcpTransport::TcpSession::close()
 {
+//    LOG(ERROR, "CLOSE CLIENT SOCKET");
     if (fd >= 0) {
         sys->close(fd);
         fd = -1;

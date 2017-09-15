@@ -25,11 +25,13 @@
 #include "OptionParser.h"
 #include "WorkerManager.h"
 #include "MacAddress.h"
+#include "Util.h"
 
 namespace RAMCloud {
 
 int MTcpTransport::messageChunks = 0;
 
+#define MESSAGE_HEADER_LEN static_cast<uint32_t>(sizeof(Header))
 
 /**
  * Construct a MTcpTransport instance.
@@ -51,7 +53,9 @@ MTcpTransport::MTcpTransport(Context* context,
     , locatorString()
     , listenSocket(-1)
     , mctx()
+    , activeFds()
     , epollId(-1)
+    , srcip(0)
     , epollEvents()
     , clientSessions()
     , serverSockets()
@@ -60,6 +64,8 @@ MTcpTransport::MTcpTransport(Context* context,
     , serverRpcPool()
     , clientRpcPool()
 {
+    uint64_t startTime = Cycles::rdtsc();
+
     // FIXME: how to avoid hardcode the config file path?
     if (mtcp_init("/shome/RAMCloud/config/mtcp.conf") == -1) {
         LOG(WARNING, "MTcpTransport couldn't initialize", strerror(errno));
@@ -70,7 +76,10 @@ MTcpTransport::MTcpTransport(Context* context,
     // FIXME: which cpu should I use? the same one as dispatch thread? or different one?
     // FIXME: there is a check "0 <= mctx->cpu < num_cpus" in api.c:GetMTCPManager that
     // I do not understand; so right now just use cpu 0 for best chance...
-    mctx = mtcp_create_context(0);
+    int cpu = 0;
+    mctx = mtcp_create_context(cpu);
+    // FIXME: Do we have to put dispatch thread and mtcp thread on the same core?
+//    Util::pinThreadToCore(cpu);
     if (NULL == mctx) {
         throw TransportException(HERE,
                 "MTcpTransport couldn't create mTCP context");
@@ -82,11 +91,11 @@ MTcpTransport::MTcpTransport(Context* context,
                 "MTcpTransport couldn't create epoll instance");
     }
 
-    if (serviceLocator == NULL) {
-        // The rest of the code is just creating the listener socket.
-        // No need to continue for client-side transport.
-        return;
-    }
+//    if (serviceLocator == NULL) {
+//        // The rest of the code is just creating the listener socket.
+//        // No need to continue for client-side transport.
+//        return;
+//    }
 
     // Get the host IP address based on the DPDK port id of the Ethernet
     // device. The IP address is then combined with the port info to build
@@ -135,6 +144,21 @@ MTcpTransport::MTcpTransport(Context* context,
         }
     }
 
+    if (serviceLocator == NULL) {
+        // The rest of the code is just creating the listener socket.
+        // No need to continue for client-side transport.
+        srcip = ((struct sockaddr_in*)ifa->ifa_addr)->sin_addr.s_addr;
+//        srcip = inet_addr(tcpAddr.substr(0, pos).c_str());
+//        LOG(NOTICE, "Local IP: %s", tcpAddr.substr(0, pos).c_str());
+        // FIXME: On the coordinator, this takes about 2000 ms and causes
+        // EnsureServers to close its client sockets due to transport timeout(?)
+        // That is why on the coordintor we saw broken pipe when trying to send
+        // out the reply of GET_SERVER_LIST RPC.
+        LOG(ERROR, "MTcpTransport ctor takes %.1f ms",
+                Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e3);
+        return;
+    }
+
     reinterpret_cast<sockaddr_in*>(ifa->ifa_addr)->sin_port =
             NTOHS(serviceLocator->getOption<uint16_t>("port"));
     IpAddress address(ifa->ifa_addr);
@@ -149,7 +173,7 @@ MTcpTransport::MTcpTransport(Context* context,
     // TODO: The file descriptor returned by mtcp lives in a different universe
     // than the OS descriptors right? So we can't reuse the Dispatch::File class right?
     // We need to write our own poller using mTcp epoll?
-    listenSocket = mtcp_socket(mctx, PF_INET, SOCK_STREAM, 0);
+    listenSocket = mtcp_socket(mctx, AF_INET, SOCK_STREAM, 0);
     if (listenSocket == -1) {
         LOG(WARNING, "MTcpTransport couldn't create listen socket: %s",
                 strerror(errno));
@@ -167,6 +191,13 @@ MTcpTransport::MTcpTransport(Context* context,
                 errno);
     }
 
+//    struct sockaddr_in saddr;
+//    saddr.sin_family = AF_INET;
+//    saddr.sin_addr.s_addr = INADDR_ANY;
+//    saddr.sin_port = HTONS(stoi(tcpAddr.substr(pos+1)));
+//    if (mtcp_bind(mctx, listenSocket, (struct sockaddr *)&saddr,
+//            sizeof(struct sockaddr_in)) == -1) {
+//    LOG(WARNING, "Binding to %s, listenSocket = %d", address.toString().c_str(), listenSocket);
     if (mtcp_bind(mctx, listenSocket, &address.address,
             sizeof(address.address)) == -1) {
         mtcp_close(mctx, listenSocket);
@@ -189,13 +220,17 @@ MTcpTransport::MTcpTransport(Context* context,
     struct mtcp_epoll_event event;
     event.data.sockid = listenSocket;
     // FIXME: I think this can be simply level-triggered and not one shot?
-//    event.events = MTCP_EPOLLIN | MTCP_EPOLLONESHOT;
-    event.events = MTCP_EPOLLIN;
+//    event.events = READABLE | MTCP_EPOLLONESHOT;
+    event.events = READABLE;
     if (mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_ADD, listenSocket,
             &event) == -1) {
         throw TransportException(HERE,
                 "MTcpTransport couldn't set epoll event for listenSocket", errno);
     }
+    activeFds.insert(listenSocket);
+
+    LOG(ERROR, "MTcpTransport ctor takes %.1f ms",
+            Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e3);
 }
 
 /**
@@ -205,6 +240,7 @@ MTcpTransport::MTcpTransport(Context* context,
 MTcpTransport::~MTcpTransport()
 {
     if (listenSocket >= 0) {
+        mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_DEL, listenSocket, NULL);
         mtcp_close(mctx, listenSocket);
     }
     mtcp_destroy_context(mctx);
@@ -218,8 +254,13 @@ MTcpTransport::setEvents(int fd, uint32_t events)
     // FIXME: verify this struct is input only
     struct mtcp_epoll_event event;
     event.data.sockid = fd;
-    event.events = events;
-    mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_ADD, fd, &event);
+    event.events = events | MTCP_EPOLLONESHOT;
+    if (activeFds.find(fd) == activeFds.end()) {
+        mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_ADD, fd, &event);
+        activeFds.insert(fd);
+    } else {
+        mtcp_epoll_ctl(mctx, epollId, MTCP_EPOLL_CTL_MOD, fd, &event);
+    }
 }
 
 /**
@@ -237,6 +278,7 @@ MTcpTransport::Poller::poll()
     for (int i = 0; i < n; i++) {
         int fd = t->epollEvents[i].data.sockid;
         uint32_t events = t->epollEvents[i].events;
+//        LOG(WARNING, "there are some events finally: %d", n);
         if (fd == t->listenSocket) {
             struct sockaddr_in sin;
             socklen_t socklen = sizeof(sin);
@@ -284,11 +326,21 @@ MTcpTransport::Poller::poll()
             // we know sock fd starts from 0 (so that we can use array as
             // opposed to map to store Sockets? Also eliminate the `new` eventually.
             t->serverSockets[acceptedFd].construct(acceptedFd, t, &sin);
+            t->setEvents(acceptedFd, READABLE);
+            LOG(NOTICE, "Accepted connection from %s",
+                    IpAddress((struct sockaddr*)&sin).toString().c_str());
         } else if (t->clientSessions.find(fd) != t->clientSessions.end()) {
             MTcpSession* session = t->clientSessions[fd];
             try {
-                if (events & MTCP_EPOLLIN) {
-                    if (session->currentResponse->tryToReadMessage(fd)) {
+                if (events & READABLE) {
+                    bool messageComplete =
+                            session->currentResponse->tryToReadMessage(fd);
+                    LOG(WARNING, "client receiving response, fd %d, "
+                            "rpcId %lu, length %u, received %u", fd,
+                            session->currentResponse->header.rpcId,
+                            session->currentResponse->header.len,
+                            session->currentResponse->messageBytesReceived);
+                    if (messageComplete) {
                         // This RPC is finished.
                         ClientRpc* rpc = session->currentRpc;
                         // FIXME: The only reason the following check may fail is because
@@ -303,14 +355,18 @@ MTcpTransport::Poller::poll()
                         session->currentResponse.construct(session);
                     }
                 }
-                if (events & MTCP_EPOLLOUT) {
+                if (events & WRITABLE) {
                     while (!session->outgoingRequests.empty()) {
                         ClientRpc* rpc = &session->outgoingRequests.front();
                         rpc->bytesSent = t->sendMessage(
                                 session->fd, rpc->rpcId, rpc->request,
                                 rpc->bytesSent);
+                        LOG(WARNING, "client sending request, fd %d, "
+                                "rpcId %lu, length %u, sent %u", fd,
+                                rpc->rpcId, rpc->request->size(),
+                                rpc->bytesSent - MESSAGE_HEADER_LEN);
                         if (rpc->bytesSent <
-                                rpc->request->size() + sizeof32(Header)) {
+                                rpc->request->size() + MESSAGE_HEADER_LEN) {
                             goto done;
                         }
                         // The current RPC request is finished; start the next one,
@@ -320,7 +376,8 @@ MTcpTransport::Poller::poll()
                     }
                     // Optimization: No more outstanding requests, only notify me
                     // when the socket becomes readable.
-                    t->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLONESHOT);
+                    t->setEvents(fd, READABLE);
+                    continue;
                 }
             } catch (TransportException& e) {
                 session->abort();
@@ -329,26 +386,38 @@ MTcpTransport::Poller::poll()
             Socket* socket = t->serverSockets[fd].get();
             MTcpTransport* transport = socket->transport;
             try {
-                if (events & MTCP_EPOLLIN) {
+                if (events & READABLE) {
                     if (socket->incomingRpc == NULL) {
                         socket->incomingRpc =
                                 transport->serverRpcPool.construct(fd, transport);
                     }
-                    if (socket->incomingRpc->request.tryToReadMessage(fd)) {
+                    IncomingMessage* request = &socket->incomingRpc->request;
+                    bool messageComplete = request->tryToReadMessage(fd);
+                    if (messageComplete) {
                         // The incoming request is complete; pass it off for servicing.
                         transport->context->workerManager->handleRpc(
                                 socket->incomingRpc);
                         socket->incomingRpc = NULL;
                     }
+                    // FIXME: change to timeTrace
+                    LOG(WARNING, "server receiving request, fd %d, rpcId %lu, "
+                            "length %u, received %u", fd,
+                            request->header.rpcId, request->header.len,
+                            request->messageBytesReceived);
                 }
-                if (events & MTCP_EPOLLOUT) {
+                if (events & WRITABLE) {
                     while (!socket->outgoingResponses.empty()) {
                         ServerRpc* rpc = &socket->outgoingResponses.front();
                         rpc->bytesSent = transport->sendMessage(fd,
                                 rpc->request.header.rpcId, &rpc->replyPayload,
                                 rpc->bytesSent);
+                        LOG(WARNING, "server sending response, fd %d, "
+                                "rpcId %lu, length %u, sent %u", fd,
+                                rpc->request.header.rpcId,
+                                rpc->replyPayload.size(),
+                                rpc->bytesSent - MESSAGE_HEADER_LEN);
                         if (rpc->bytesSent <
-                                rpc->replyPayload.size() + sizeof32(Header)) {
+                                rpc->replyPayload.size() + MESSAGE_HEADER_LEN) {
                             goto done;
                         }
                         // The current reply is finished; start the next one, if
@@ -358,16 +427,20 @@ MTcpTransport::Poller::poll()
                     }
                     // Optimization: no more outstanding responses, only notify me
                     // when the socket becomes readable.
-                    t->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLONESHOT);
+                    t->setEvents(fd, READABLE);
+                    continue;
                 }
             } catch (TransportException& e) {
                 // Close the server socket.
+                LOG(WARNING, "close server socket %d: %s", fd, e.what());
                 transport->serverSockets.erase(fd);
             }
+        } else {
+            LOG(ERROR, "Unexpected event, fd %d, event bitmask %u", fd, events);
         }
 
       done:
-        t->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLOUT | MTCP_EPOLLONESHOT);
+        t->setEvents(fd, READABLE | WRITABLE);
     }
 
     return n;
@@ -401,6 +474,9 @@ MTcpTransport::Socket::~Socket() {
         transport->serverRpcPool.destroy(rpc);
     }
 
+    mtcp_epoll_ctl(transport->mctx, transport->epollId,
+            MTCP_EPOLL_CTL_DEL, fd, NULL);
+    transport->activeFds.erase(fd);
     // No need to erase fd from transport->serverSockets because
     // this destructor must have been triggered by that.
     mtcp_close(transport->mctx, fd);
@@ -442,7 +518,7 @@ MTcpTransport::sendMessage(int fd, uint64_t rpcId, Buffer* payload,
     uint32_t iovecs = 1 + payload->getNumberChunks();
     struct iovec iov[iovecs];
     uint32_t offset;
-    size_t iovecIndex;
+    int iovecIndex;
     if (bytesSent < sizeof(Header)) {
         iov[0].iov_base = reinterpret_cast<char*>(&header) + bytesSent;
         iov[0].iov_len = sizeof(Header) - bytesSent;
@@ -511,7 +587,9 @@ MTcpTransport::sendMessage(int fd, uint64_t rpcId, Buffer* payload,
 ssize_t
 MTcpTransport::recvCarefully(int fd, char* buffer, size_t length,
         IncomingMessage* message) {
-    ssize_t actual = mtcp_recv(mctx, fd, buffer, length, MSG_DONTWAIT);
+    ssize_t actual = mtcp_recv(mctx, fd, buffer, length, 0);
+    // FIXME: man mtcp_recv says the current implementation only supports 0 or MSG_PEEK
+//    ssize_t actual = mtcp_recv(mctx, fd, buffer, length, MSG_DONTWAIT);
     if (actual > 0) {
         PerfStats::threadStats.networkInputBytes += actual;
         return actual;
@@ -539,9 +617,10 @@ MTcpTransport::recvCarefully(int fd, char* buffer, size_t length,
  *      Buffer in which to place the body of the incoming message;
  *      the caller should ensure that the buffer is empty.
  */
-MTcpTransport::IncomingMessage::IncomingMessage(Buffer* buffer)
+MTcpTransport::IncomingMessage::IncomingMessage(Buffer* buffer,
+        MTcpTransport* t)
     : header(), headerBytesReceived(0), messageBytesReceived(0),
-      messageLength(0), buffer(buffer), session(NULL)
+      messageLength(0), buffer(buffer), session(NULL), t(t)
 {
 }
 
@@ -553,7 +632,7 @@ MTcpTransport::IncomingMessage::IncomingMessage(Buffer* buffer)
  */
 MTcpTransport::IncomingMessage::IncomingMessage(MTcpSession* session)
     : header(), headerBytesReceived(0), messageBytesReceived(0),
-      messageLength(0), buffer(NULL), session(session)
+      messageLength(0), buffer(NULL), session(session), t(session->transport)
 {
 }
 
@@ -575,7 +654,7 @@ MTcpTransport::IncomingMessage::tryToReadMessage(int fd) {
     // First make sure we have received the header (it may arrive in
     // multiple chunks).
     if (headerBytesReceived < sizeof(Header)) {
-        ssize_t len = session->transport->recvCarefully(fd,
+        ssize_t len = t->recvCarefully(fd,
                 reinterpret_cast<char*>(&header) + headerBytesReceived,
                 sizeof(header) - headerBytesReceived, this);
         headerBytesReceived += downCast<uint32_t>(len);
@@ -612,9 +691,11 @@ MTcpTransport::IncomingMessage::tryToReadMessage(int fd) {
         } else {
             buffer->peek(messageBytesReceived, &dest);
         }
-        ssize_t len = session->transport->recvCarefully(fd,
-                static_cast<char*>(dest),
+        ssize_t len = t->recvCarefully(fd, static_cast<char*>(dest),
                 messageLength - messageBytesReceived, this);
+        if (unlikely(len == 0)) {
+            LOG(ERROR, "Failed to read anything from a readable socket?");
+        }
         messageBytesReceived += downCast<uint32_t>(len);
         if (messageBytesReceived < messageLength)
             return false;
@@ -627,8 +708,7 @@ MTcpTransport::IncomingMessage::tryToReadMessage(int fd) {
         uint32_t maxLength = header.len - messageBytesReceived;
         if (maxLength > sizeof(buffer))
             maxLength = sizeof(buffer);
-        ssize_t len = session->transport->recvCarefully(fd, buffer, maxLength,
-                this);
+        ssize_t len = t->recvCarefully(fd, buffer, maxLength, this);
         messageBytesReceived += downCast<uint32_t>(len);
         if (messageBytesReceived < header.len)
             return false;
@@ -673,6 +753,24 @@ MTcpTransport::MTcpSession::MTcpSession(MTcpTransport* transport,
                 "MTcpTransport couldn't open socket for session", errno);
     }
 
+    int w = mtcp_init_rss(transport->mctx, transport->srcip, 1,
+                  ((struct sockaddr_in *)&address.address)->sin_addr.s_addr,
+                  ((struct sockaddr_in *)&address.address)->sin_port);
+    if (w < 0) {
+        LOG(WARNING, "mtcp_init_rss failed: %s", strerror(errno));
+    }
+
+    // FIXME: without this, mtcp_connect could block and multiple threads could
+    // deadlock at TransportManager::openSession
+//    mtcp_setsock_nonblock(transport->mctx, fd);
+
+//    struct sockaddr_in saddr;
+//    saddr.sin_family = AF_INET;
+//    saddr.sin_addr.s_addr = inet_addr("10.1.1.3");
+//    saddr.sin_family = HTONS(12247);
+//
+//    int r = mtcp_connect(transport->mctx, fd, (struct sockaddr *)&saddr,
+//            sizeof(struct sockaddr_in));
     int r = mtcp_connect(transport->mctx, fd, &address.address,
             sizeof(address.address));
     if (r == -1) {
@@ -680,10 +778,12 @@ MTcpTransport::MTcpSession::MTcpSession(MTcpTransport* transport,
         fd = -1;
         LOG(WARNING, "MTcpTransport couldn't connect to %s: %s",
             this->serviceLocator.c_str(), strerror(errno));
+//        DIE("JUST CAN'T CONNECT?!");
         throw TransportException(HERE, format(
                 "MTcpTransport couldn't connect to %s",
                 this->serviceLocator.c_str()), errno);
     }
+    LOG(NOTICE, "Session connect to %s", this->serviceLocator.c_str());
 
     // Check to see if we accidentally connected to ourself. This can
     // happen if the target server is on the same machine and has
@@ -719,6 +819,7 @@ MTcpTransport::MTcpSession::MTcpSession(MTcpTransport* transport,
     // FIXME: WHY LOCK?
     /// Arrange for notification whenever the server sends us data.
     Dispatch::Lock lock(transport->context->dispatch);
+    transport->setEvents(fd, READABLE);
     currentResponse.construct(this);
 }
 
@@ -754,7 +855,7 @@ MTcpTransport::MTcpSession::cancelRequest(RpcNotifier* notifier)
             // cancel that also.
             if (rpc == currentRpc) {
                 // Setting messageLength to 0 so that unread bytes in the
-                // socket will be properly discarded in #readMessage.
+                // socket will be properly discarded in #tryToReadMessage.
                 currentResponse->buffer = NULL;
                 currentResponse->messageLength = 0;
                 currentRpc = NULL;
@@ -778,6 +879,7 @@ MTcpTransport::MTcpSession::close()
         mtcp_close(transport->mctx, fd);
         fd = -1;
     }
+    outgoingRequests.clear();
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
             it != outgoingRpcs.end(); it++) {
         ClientRpc *rpc = it->second;
@@ -785,8 +887,10 @@ MTcpTransport::MTcpSession::close()
         transport->clientRpcPool.destroy(rpc);
     }
     outgoingRpcs.clear();
-    outgoingRequests.clear();
     transport->clientSessions.erase(fd);
+    mtcp_epoll_ctl(transport->mctx, transport->epollId,
+            MTCP_EPOLL_CTL_DEL, fd, NULL);
+    transport->activeFds.erase(fd);
 }
 
 // See Transport::Session::getRpcInfo for documentation.
@@ -835,18 +939,22 @@ MTcpTransport::MTcpSession::sendRequest(Buffer* request, Buffer* response,
     try {
         rpc->bytesSent = transport->sendMessage(fd, rpc->rpcId,
                 request, 0);
+        LOG(WARNING, "client sending request, fd %d, rpcId %lu, "
+                "length %u, sent %u", fd, rpc->rpcId,
+                rpc->request->size(), rpc->bytesSent - MESSAGE_HEADER_LEN);
     } catch (TransportException& e) {
         abort();
         notifier->failed();
         return;
     }
-    if (rpc->bytesSent >= request->size() + sizeof32(Header)) {
+    if (rpc->bytesSent >= request->size() + MESSAGE_HEADER_LEN) {
         // The whole request was sent immediately (this should be the
         // common case).
         rpc->transmitPending = false;
     } else {
+        LOG(WARNING, "session %p", transport->clientSessions[fd]);
         outgoingRequests.push_back(*rpc);
-        transport->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLOUT | MTCP_EPOLLONESHOT);
+        transport->setEvents(fd, READABLE | WRITABLE);
     }
 }
 
@@ -869,9 +977,9 @@ MTcpTransport::ServerRpc::sendReply()
         // Try to transmit the response.
         bytesSent = transport->sendMessage(fd, request.header.rpcId,
                 &replyPayload, 0);
-        if (bytesSent < replyPayload.size() + sizeof32(Header)) {
+        if (bytesSent < replyPayload.size() + MESSAGE_HEADER_LEN) {
             socket->outgoingResponses.push_back(*this);
-            transport->setEvents(fd, MTCP_EPOLLIN | MTCP_EPOLLOUT | MTCP_EPOLLONESHOT);
+            transport->setEvents(fd, READABLE | WRITABLE);
             return;
         }
     }
