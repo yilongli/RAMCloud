@@ -1340,10 +1340,16 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         uint64_t iteration, double timeLimit, vector<Samples>& roundTripTimes)
 {
     // FIXME: Performance hack: precompute session handles
-    vector<Transport::SessionRef> sessionRefs = {};
-    for (string serviceLocator : receivers) {
-        sessionRefs.push_back(cluster->clientContext->
-                transportManager->getSession(serviceLocator));
+//    vector<Transport::SessionRef> sessionRefs = {};
+//    for (string serviceLocator : receivers) {
+//        sessionRefs.push_back(cluster->clientContext->
+//                transportManager->getSession(serviceLocator));
+//    }
+
+    vector<Tub<TransportManager::Trans>> freeTrans;
+    for (int i = 0; i < 2; i++) {
+        freeTrans[i].construct(cluster->clientContext->transportManager,
+                receivers);
     }
 
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
@@ -1578,9 +1584,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 uint64_t recipient = preGeneratedRecipients[kRandom];
                 TimeTrace::record("Start new RPC, %u outstanding RPCs",
                         (uint32_t)numOutstandingRpcs);
-                EchoRpc* echo = echoRpcPool.construct(cluster,
-                        sessionRefs[recipient], message.c_str(), length,
-                        length);
+//                Transport::SessionRef session = sessionRefs[recipient];
+                Transport::SessionRef session =
+                        freeTrans[length < 1000 ? 0 : 1]->sessionRefs[recipient];
+                EchoRpc* echo = echoRpcPool.construct(cluster, session,
+                        message.c_str(), length, length);
 //                EchoRpc* echo = echoRpcPool.construct(cluster, receivers[recipient].c_str(),
 //                        message.c_str(), length, length);
                 while (true) {

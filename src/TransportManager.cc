@@ -509,6 +509,35 @@ TransportManager::openSessionInternal(const string& serviceLocator)
     return FailSession::get();
 }
 
+Transport*
+TransportManager::createTransport(const string& serviceLocator)
+{
+    // Iterate over all of the sub-locators, looking for a transport that
+    // can handle its protocol.
+    vector<ServiceLocator> locators =
+            ServiceLocator::parseServiceLocators(serviceLocator);
+    foreach (ServiceLocator& locator, locators) {
+        for (uint32_t i = 0; i < transportFactories.size(); i++) {
+            TransportFactory* factory = transportFactories[i];
+            if (!factory->supports(locator.getProtocol().c_str())) {
+                continue;
+            }
+
+            try {
+                Dispatch::Lock lock(context->dispatch);
+                Transport* t = factory->createTransport(context, NULL);
+                for (uint32_t j = 0; j < registeredBases.size(); j++) {
+                    transports[i]->registerMemory(registeredBases[j],
+                                                  registeredSizes[j]);
+                }
+            } catch (TransportException &e) {
+                continue;
+            }
+        }
+    }
+    return NULL;
+}
+
 /**
  * See #Transport::registerMemory.
  */

@@ -50,6 +50,7 @@ class TransportManager {
     void initialize(const char* serviceLocator);
     void flushSession(const string& serviceLocator);
     Transport::SessionRef getSession(const string& serviceLocator);
+    Transport* createTransport(const string& serviceLocator);
     string getListeningLocatorsString();
     Transport::SessionRef openSession(const string& serviceLocator);
     void registerMemory(void* base, size_t bytes);
@@ -57,6 +58,30 @@ class TransportManager {
     void dumpTransportFactories();
     void setSessionTimeout(uint32_t timeoutMs);
     uint32_t getSessionTimeout() const;
+
+    struct Trans {
+
+        Transport* t;
+
+        vector<Transport::SessionRef> sessionRefs;
+
+        Trans(TransportManager* transportManager,
+                const vector<string>& serviceLocators)
+            : t(transportManager->createTransport(serviceLocators[0]))
+            , sessionRefs()
+        {
+            for (string sl : serviceLocators) {
+                ServiceLocator serviceLocator(sl);
+                sessionRefs.push_back(t->getSession(&serviceLocator));
+            }
+        }
+
+        ~Trans() {
+            if (t != NULL) {
+                delete t;
+            }
+        }
+    };
 
 #if TESTING
     /**
