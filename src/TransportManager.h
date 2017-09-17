@@ -59,30 +59,6 @@ class TransportManager {
     void setSessionTimeout(uint32_t timeoutMs);
     uint32_t getSessionTimeout() const;
 
-    struct Trans {
-
-        Transport* t;
-
-        vector<Transport::SessionRef> sessionRefs;
-
-        Trans(TransportManager* transportManager,
-                const vector<string>& serviceLocators)
-            : t(transportManager->createTransport(serviceLocators[0]))
-            , sessionRefs()
-        {
-            for (string sl : serviceLocators) {
-                ServiceLocator serviceLocator(sl);
-                sessionRefs.push_back(t->getSession(&serviceLocator));
-            }
-        }
-
-        ~Trans() {
-            if (t != NULL) {
-                delete t;
-            }
-        }
-    };
-
 #if TESTING
     /**
      * Register a mock transport instance for unit testing.

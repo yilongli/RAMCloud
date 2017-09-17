@@ -245,7 +245,7 @@ class RpcWrapper : public Transport::RpcNotifier {
     /// code running in the dispatch thread (transports can only invoke the
     /// completed and failed methods).
     std::atomic<RpcState> state;
-
+  public:
     /// Session on which RPC has been sent, or NULL if none.
     Transport::SessionRef session;
 

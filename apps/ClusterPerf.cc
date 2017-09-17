@@ -49,6 +49,7 @@
 namespace po = boost::program_options;
 
 #include "BasicTransport.h"
+#include "InfRcTransport.h"
 #include "btreeRamCloud/Btree.h"
 #include "ClientLeaseAgent.h"
 #include "IndexLookup.h"
@@ -1282,7 +1283,15 @@ echoMessages(string receiver, uint32_t length,
     std::vector<uint64_t> times = {};
     times.reserve(100000);
 
-    const string message(length, 'x');
+//    const string message(length, 'x');
+    static const string message(29400000, 'x');
+    static bool registerMemory = false;
+    if (!registerMemory) {
+        context->echoMessage = const_cast<char*>(message.data());
+        context->transportManager->registerMemory(
+                context->echoMessage, message.size());
+        registerMemory = true;
+    }
     Buffer buffer;
 
     // Each iteration of the following loop invokes an Echo RPC and records
@@ -1313,6 +1322,38 @@ echoMessages(string receiver, uint32_t length,
 
 using Samples = vector<uint64_t>;
 
+class TransportProxy {
+  public:
+    Transport* t;
+
+    vector<Transport::SessionRef> sessionRefs;
+
+    TransportProxy(TransportManager* transportManager,
+            const vector<string>& serviceLocators)
+        : t(transportManager->createTransport(serviceLocators[0]))
+        , sessionRefs()
+    {
+        if (NULL == t) {
+            throw TransportException(HERE, format(
+                    "failed to create TransportProxy for %s",
+                    serviceLocators[0].c_str()));
+        }
+        for (string sl : serviceLocators) {
+            ServiceLocator serviceLocator(sl);
+            sessionRefs.push_back(t->getSession(&serviceLocator));
+            sessionRefs.back().get()->transportProxy = (void*)this;
+        }
+    }
+
+    ~TransportProxy() {
+        if (t != NULL) {
+            delete t;
+        }
+    }
+
+    DISALLOW_COPY_AND_ASSIGN(TransportProxy);
+};
+
 /**
  * Send and receive messages of given sizes, return information about the
  * distribution of message round-trip times and network bandwidth.
@@ -1340,16 +1381,10 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         uint64_t iteration, double timeLimit, vector<Samples>& roundTripTimes)
 {
     // FIXME: Performance hack: precompute session handles
-//    vector<Transport::SessionRef> sessionRefs = {};
-//    for (string serviceLocator : receivers) {
-//        sessionRefs.push_back(cluster->clientContext->
-//                transportManager->getSession(serviceLocator));
-//    }
-
-    vector<Tub<TransportManager::Trans>> freeTrans;
-    for (int i = 0; i < 2; i++) {
-        freeTrans[i].construct(cluster->clientContext->transportManager,
-                receivers);
+    vector<Transport::SessionRef> sessionRefs = {};
+    for (string serviceLocator : receivers) {
+        sessionRefs.push_back(cluster->clientContext->
+                transportManager->getSession(serviceLocator));
     }
 
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
@@ -1362,11 +1397,19 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
         samples.assign(MAX_SAMPLES, 0);
     }
 
-    const uint32_t largestMessageSize = std::max(messageSizes.back(), 8*1024*1024);
+    const uint32_t largestMessageSize = std::max(messageSizes.back(), uint32_t(8*1024*1024));
     static const string message(largestMessageSize, 'x');
     context->echoMessage = const_cast<char*>(message.data());
     context->transportManager->registerMemory(
             context->echoMessage, message.size());
+
+#define MAX_TRANSPORTS InfRcTransport::MAX_TRANSPORTS
+    std::vector<TransportProxy*> freeTransports(MAX_TRANSPORTS);
+    for (int i = 0; i < MAX_TRANSPORTS; i++) {
+        LOG(NOTICE, "creating TransportProxy %d", i);
+        freeTransports[i] = new TransportProxy(
+                cluster->clientContext->transportManager, receivers);
+    }
 
     // TODO: construct message randomizer
     vector<double> discreteProbabilities;
@@ -1454,7 +1497,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     // this parameter to 20 results in significant message drops.
 #define MAX_OUTSTANDING_RPCS 40
     std::array<Tub<std::pair<uint32_t, EchoRpc*>>, MAX_OUTSTANDING_RPCS>
-            outstandingRpcs = {};
+            outstandingRpcs;
     uint32_t numOutstandingRpcs = 0;
     uint32_t nextSlotToCheck = 0;
     uint32_t nextSlotToInsert = 0;
@@ -1507,6 +1550,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     }
                     // TODO: It appears that sometimes ~RpcWrapper is quite expensive (200ns ~ 1us); why?
 //                    TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
+                    if (MAX_TRANSPORTS >= 40) {
+                        freeTransports.push_back(
+                                reinterpret_cast<TransportProxy*>(
+                                echo->session.get()->transportProxy));
+                    }
                     echoRpcPool.destroy(echo);
 //                    TimeTrace::record("Cperf destroyed EchoRpc");
                     outstandingRpc.destroy();
@@ -1584,13 +1632,25 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                 uint64_t recipient = preGeneratedRecipients[kRandom];
                 TimeTrace::record("Start new RPC, %u outstanding RPCs",
                         (uint32_t)numOutstandingRpcs);
-//                Transport::SessionRef session = sessionRefs[recipient];
-                Transport::SessionRef session =
-                        freeTrans[length < 1000 ? 0 : 1]->sessionRefs[recipient];
+                Transport::SessionRef session = NULL;
+                if (MAX_TRANSPORTS >= 40) {
+                    session = freeTransports.back()->sessionRefs[recipient];
+                    freeTransports.pop_back();
+                } else {
+                    if ((length < 315) || (MAX_TRANSPORTS == 0)) {
+                        session = sessionRefs[recipient];
+                    } else if ((length <= 10290) && (MAX_TRANSPORTS > 1)) {
+                        session = freeTransports[0]->sessionRefs[recipient];
+                    } else if ((length <= 1000000) && (MAX_TRANSPORTS > 2)) {
+                        session = freeTransports[1]->sessionRefs[recipient];
+                    } else if ((length <= 4000000) && (MAX_TRANSPORTS > 3)) {
+                        session = freeTransports[2]->sessionRefs[recipient];
+                    } else {
+                        session = freeTransports.back()->sessionRefs[recipient];
+                    }
+                }
                 EchoRpc* echo = echoRpcPool.construct(cluster, session,
                         message.c_str(), length, length);
-//                EchoRpc* echo = echoRpcPool.construct(cluster, receivers[recipient].c_str(),
-//                        message.c_str(), length, length);
                 while (true) {
                     int i = nextSlotToInsert;
                     nextSlotToInsert = (nextSlotToInsert + 1) % MAX_OUTSTANDING_RPCS;

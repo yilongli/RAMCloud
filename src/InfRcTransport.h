@@ -51,6 +51,10 @@ namespace RAMCloud {
  * Transport mechanism that uses Infiniband reliable queue pairs.
  */
 class InfRcTransport : public Transport {
+
+  public:
+    static int MAX_TRANSPORTS;
+
     typedef RAMCloud::Perf::ReadRequestHandle_MetricSet
         ReadRequestHandle_MetricSet;
     // forward declarations
@@ -91,6 +95,8 @@ class InfRcTransport : public Transport {
      */
     void registerMemory(void* base, size_t bytes)
     {
+        LOG(NOTICE, "registerMemory invoked, transport = %p, "
+                "base = %p, bytes = %lu", this, base, bytes);
         if (logMemoryRegion != NULL) {
             LOG(ERROR, "failed to register %Zd bytes at %p; previously "
                     "registered region: %Zd bytes at %p",
@@ -111,7 +117,7 @@ class InfRcTransport : public Transport {
             context->echoMessage = static_cast<char*>(base) + bytes - 8*1024*1024;
             memset(context->echoMessage, 'x', 8*1024*1024);
         }
-        RAMCLOUD_LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
+        LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
     }
     static void setName(const char* name);
 
@@ -185,6 +191,9 @@ class InfRcTransport : public Transport {
     // FIXME: Why can't we set this number as large as possible?
     static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 63;
 //    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
+
+    static uint32_t SHARED_RX_QUEUE_DEPTH;
+    static uint32_t TX_QUEUE_DEPTH;
 
     // Since we always use at most 1 SGE per receive request, there is no need
     // to set this parameter any higher. In fact, larger values for this

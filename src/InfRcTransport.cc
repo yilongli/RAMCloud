@@ -80,6 +80,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fstream>
 
 #include "Common.h"
 #include "CycleCounter.h"
@@ -108,7 +109,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef.
@@ -128,6 +129,10 @@ namespace {
 //------------------------------
 // InfRcTransport class
 //------------------------------
+
+int InfRcTransport::MAX_TRANSPORTS = -1;
+uint32_t InfRcTransport::SHARED_RX_QUEUE_DEPTH = 0;
+uint32_t InfRcTransport::TX_QUEUE_DEPTH = 0;
 
 /**
  * Construct a InfRcTransport.
@@ -180,6 +185,30 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
     , testingDontReallySend(false)
 {
     const char *ibDeviceName = NULL;
+
+    // FIXME: Hack to support multiple transports on client-side
+    if (MAX_TRANSPORTS < 0) {
+        std::ifstream configFile("/home/yilongl/RAMCloud/config/MAX_TRANSPORTS.txt");
+        if (configFile.is_open()) {
+            string line;
+            std::getline(configFile, line);
+            MAX_TRANSPORTS = stoi(line);
+        } else {
+            MAX_TRANSPORTS = 40;
+        }
+        LOG(NOTICE, "MAX_TRANSPORTS = %d", MAX_TRANSPORTS);
+    }
+    if (MAX_TRANSPORTS <= 3) {
+        SHARED_RX_QUEUE_DEPTH = MAX_SHARED_RX_QUEUE_DEPTH;
+        TX_QUEUE_DEPTH = sl ? 64 : 16;
+    } else if (MAX_TRANSPORTS >= 40) {
+        SHARED_RX_QUEUE_DEPTH = sl ? MAX_SHARED_RX_QUEUE_DEPTH : 2;
+        TX_QUEUE_DEPTH = sl ? MAX_TX_QUEUE_DEPTH : 2;
+    } else {
+        SHARED_RX_QUEUE_DEPTH = sl ? MAX_SHARED_RX_QUEUE_DEPTH : 16;
+        TX_QUEUE_DEPTH = sl ? MAX_TX_QUEUE_DEPTH : 4;
+    }
+    numUsedClientSrqBuffers = SHARED_RX_QUEUE_DEPTH;
 
     if (sl != NULL) {
         locatorString = sl->getOriginalString();
@@ -285,11 +314,11 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
     // to these queues only. the motiviation is to avoid having to post at
     // least one buffer to every single queue pair (we may have thousands of
     // them with megabyte buffers).
-    serverSrq = infiniband->createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
+    serverSrq = infiniband->createSharedReceiveQueue(SHARED_RX_QUEUE_DEPTH,
                                                      MAX_SHARED_RX_SGE_COUNT);
     check_error_null(serverSrq,
                      "failed to create server shared receive queue");
-    clientSrq = infiniband->createSharedReceiveQueue(MAX_SHARED_RX_QUEUE_DEPTH,
+    clientSrq = infiniband->createSharedReceiveQueue(SHARED_RX_QUEUE_DEPTH,
                                                      MAX_SHARED_RX_SGE_COUNT);
     check_error_null(clientSrq,
                      "failed to create client shared receive queue");
@@ -303,12 +332,10 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
     // but it will work for now.
     uint32_t bufferSize = (getMaxRpcSize() + 4095) & ~0xfff;
 
-    rxBuffers.construct(infiniband->pd,
-                        bufferSize,
-                        uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
+    rxBuffers.construct(infiniband->pd, bufferSize, 2*SHARED_RX_QUEUE_DEPTH);
     uint32_t i = 0;
     foreach (auto& bd, *rxBuffers) {
-        if (i < MAX_SHARED_RX_QUEUE_DEPTH)
+        if (i < SHARED_RX_QUEUE_DEPTH)
             postSrqReceiveAndKickTransmit(serverSrq, &bd);
         else
             postSrqReceiveAndKickTransmit(clientSrq, &bd);
@@ -318,22 +345,25 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
 
     txBuffers.construct(infiniband->pd,
                         bufferSize,
-                        uint32_t(MAX_TX_QUEUE_DEPTH));
+                        uint32_t(TX_QUEUE_DEPTH));
     foreach (auto& bd, *txBuffers)
         freeTxBuffers.push_back(&bd);
-    LOG(NOTICE, "Registered %lu transmit buffers", freeTxBuffers.size());
+    LOG(NOTICE, "Registered %u receive buffers, %u transmit buffers, "
+            "bufferSize %u, consumed memory %lu MB",
+            2*SHARED_RX_QUEUE_DEPTH, TX_QUEUE_DEPTH, bufferSize,
+            (2ul*SHARED_RX_QUEUE_DEPTH + TX_QUEUE_DEPTH)*bufferSize >> 20);
 
     // create completion queues for server receive, client receive, and
     // server/client transmit
-    serverRxCq = infiniband->createCompletionQueue(MAX_SHARED_RX_QUEUE_DEPTH);
+    serverRxCq = infiniband->createCompletionQueue(SHARED_RX_QUEUE_DEPTH);
     check_error_null(serverRxCq,
                      "failed to create server receive completion queue");
 
-    clientRxCq = infiniband->createCompletionQueue(MAX_SHARED_RX_QUEUE_DEPTH);
+    clientRxCq = infiniband->createCompletionQueue(SHARED_RX_QUEUE_DEPTH);
     check_error_null(clientRxCq,
                      "failed to create client receive completion queue");
 
-    commonTxCq = infiniband->createCompletionQueue(MAX_TX_QUEUE_DEPTH);
+    commonTxCq = infiniband->createCompletionQueue(TX_QUEUE_DEPTH);
     check_error_null(commonTxCq,
                      "failed to create transmit completion queue");
 }
@@ -492,7 +522,7 @@ InfRcTransport::InfRcSession::cancelRequest(
             // So, try to wait for completion, but give up after 1ms if it
             // doesn't complete.
             uint64_t start = Cycles::rdtsc();
-            while (transport->freeTxBuffers.size() != MAX_TX_QUEUE_DEPTH) {
+            while (transport->freeTxBuffers.size() != TX_QUEUE_DEPTH) {
                 transport->reapTxBuffers();
                 // Must invoke the poller to process incoming requests,
                 // in order to handle occasional situations where all of the
@@ -739,8 +769,8 @@ InfRcTransport::clientTrySetupQueuePair(IpAddress& address)
     QueuePair *qp = infiniband->createQueuePair(IBV_QPT_RC,
                                                 ibPhysicalPort, clientSrq,
                                                 commonTxCq, clientRxCq,
-                                                MAX_TX_QUEUE_DEPTH,
-                                                MAX_SHARED_RX_QUEUE_DEPTH);
+                                                TX_QUEUE_DEPTH,
+                                                SHARED_RX_QUEUE_DEPTH);
     uint64_t nonce = generateRandom();
     LOG(DEBUG, "starting to connect to %s via local port %d, nonce 0x%lx",
             inet_ntoa(sin->sin_addr), clientPort, nonce);
@@ -834,8 +864,8 @@ InfRcTransport::ServerConnectHandler::handleFileEvent(int events)
             transport->serverSrq,
             transport->commonTxCq,
             transport->serverRxCq,
-            MAX_TX_QUEUE_DEPTH,
-            MAX_SHARED_RX_QUEUE_DEPTH);
+            TX_QUEUE_DEPTH,
+            SHARED_RX_QUEUE_DEPTH);
     qp->plumb(&incomingQpt);
     qp->setPeerName(incomingQpt.getPeerName());
     LOG(DEBUG, "New queue pair for %s:%u, nonce 0x%lx (total creates "
@@ -962,9 +992,9 @@ InfRcTransport::getTransmitBuffer()
             uint64_t waitCycles = Cycles::rdtsc() - start;
             double waitMs = 1e03 * Cycles::toSeconds(waitCycles);
             if (waitMs > 5.0)  {
-//                LOG(WARNING, "Long delay waiting for transmit buffers "
-//                        "(%.1f ms elapsed, %lu buffers now free); deadlock "
-//                        "or target crashed?", waitMs, freeTxBuffers.size());
+                LOG(WARNING, "Long delay waiting for transmit buffers "
+                        "(%.1f ms elapsed, %lu buffers now free); deadlock "
+                        "or target crashed?", waitMs, freeTxBuffers.size());
                 timeTrace("long delay waiting for transmit buffers, "
                         "elapsed time %u cyc, % buffers now free",
                         waitCycles, freeTxBuffers.size());
@@ -987,9 +1017,9 @@ InfRcTransport::getTransmitBuffer()
 int
 InfRcTransport::reapTxBuffers()
 {
-    ibv_wc retArray[MAX_TX_QUEUE_DEPTH];
+    ibv_wc retArray[TX_QUEUE_DEPTH];
     int n = infiniband->pollCompletionQueue(commonTxCq,
-                                            MAX_TX_QUEUE_DEPTH,
+                                            TX_QUEUE_DEPTH,
                                             retArray);
 
     for (int i = 0; i < n; i++) {
@@ -1010,7 +1040,7 @@ InfRcTransport::reapTxBuffers()
     }
 
     // Has TX just transitioned to idle?
-    if (n > 0 && freeTxBuffers.size() == MAX_TX_QUEUE_DEPTH) {
+    if (n > 0 && freeTxBuffers.size() == TX_QUEUE_DEPTH) {
         // It's now safe to delete queue pairs (see comment by declaration
         // for deadQueuePairs).
         while (!deadQueuePairs.empty()) {
@@ -1360,7 +1390,7 @@ InfRcTransport::ClientRpc::sendOrQueue()
 {
     assert(state == PENDING);
     InfRcTransport* const t = transport;
-    if (t->numUsedClientSrqBuffers < MAX_SHARED_RX_QUEUE_DEPTH) {
+    if (t->numUsedClientSrqBuffers < SHARED_RX_QUEUE_DEPTH) {
         // send out the request
         if (t->outstandingRpcs.empty()) {
             t->clientRpcsActiveTime.construct(
@@ -1432,13 +1462,16 @@ InfRcTransport::Poller::poll()
                 uint32_t len = response->byte_len - sizeof32(header);
                 // Return the buffer descriptor if we are running low on
                 // Rx buffers or the response is pretty small.
-                uint32_t d = MAX_SHARED_RX_QUEUE_DEPTH / 4;
+                uint32_t d = SHARED_RX_QUEUE_DEPTH / 4;
                 uint32_t numUsedBufDesc = t->numUsedClientSrqBuffers;
                 bool returnBufDesc =
                         ((numUsedBufDesc >= d) && (len < 500)) ||
                         ((numUsedBufDesc >= d*2) && (len < 1000)) ||
                         ((numUsedBufDesc >= d*3));
-                if (returnBufDesc) {
+                // FIXME: SHARED_RX_QUEUE_DEPTH < 4 means we are using one
+                // transport per RPC request on clients
+                if (returnBufDesc && (d > 0)) {
+//                if (returnBufDesc) {
                     // clientSrq is low on buffers, better return this one
                     rpc.response->appendCopy(bd->buffer + sizeof(header), len);
                     t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
@@ -1554,7 +1587,7 @@ InfRcTransport::Poller::poll()
             // Measurements of the YCSB benchmarks in 7/2015 suggest that
             // a value of 4 is (barely) okay, but we now use 8 to provide a
             // larger margin of safety, even if a burst of packets arrives.
-            uint32_t d = MAX_SHARED_RX_QUEUE_DEPTH / 4;
+            uint32_t d = SHARED_RX_QUEUE_DEPTH / 4;
             uint32_t numFreeBufDesc = t->numFreeServerSrqBuffers;
             bool returnBufDesc =
                     ((numFreeBufDesc < d*3) && (len < 500)) ||

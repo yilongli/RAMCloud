@@ -527,9 +527,9 @@ TransportManager::createTransport(const string& serviceLocator)
                 Dispatch::Lock lock(context->dispatch);
                 Transport* t = factory->createTransport(context, NULL);
                 for (uint32_t j = 0; j < registeredBases.size(); j++) {
-                    transports[i]->registerMemory(registeredBases[j],
-                                                  registeredSizes[j]);
+                    t->registerMemory(registeredBases[j], registeredSizes[j]);
                 }
+                return t;
             } catch (TransportException &e) {
                 continue;
             }
