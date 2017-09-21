@@ -1326,11 +1326,14 @@ class TransportProxy {
   public:
     Transport* t;
 
+    int numRpcs;
+
     vector<Transport::SessionRef> sessionRefs;
 
     TransportProxy(TransportManager* transportManager,
             const vector<string>& serviceLocators)
         : t(transportManager->createTransport(serviceLocators[0]))
+        , numRpcs(0)
         , sessionRefs()
     {
         if (NULL == t) {
@@ -1389,12 +1392,11 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
     // Collect at most MAX_NUM_SAMPLE samples for each type of message.
     // Any more samples will simply overwrite old ones by wrapping around.
-    // FIXME: Can we set it to 10M w/o affecting the experiment? what's the limit?
-    const uint32_t MAX_SAMPLES = 1000000;
+    const uint32_t MAX_SAMPLES = 500000;
     roundTripTimes.assign(messageSizes.size(), {});
     vector<uint32_t> numSamples(messageSizes.size());
-    for (Samples& samples : roundTripTimes) {
-        samples.assign(MAX_SAMPLES, 0);
+    for (unsigned i = 0; i < messageSizes.size(); i++) {
+        roundTripTimes[i].assign(MAX_SAMPLES, 0);
     }
 
     const uint32_t largestMessageSize = std::max(messageSizes.back(), uint32_t(8*1024*1024));
@@ -1404,12 +1406,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             context->echoMessage, message.size());
 
 #define MAX_TRANSPORTS InfRcTransport::MAX_TRANSPORTS
-    std::vector<TransportProxy*> freeTransports(MAX_TRANSPORTS);
-    for (int i = 0; i < MAX_TRANSPORTS; i++) {
-        LOG(NOTICE, "creating TransportProxy %d", i);
-        freeTransports[i] = new TransportProxy(
-                cluster->clientContext->transportManager, receivers);
-    }
+    uint32_t numTransports = 1;
+    std::vector<TransportProxy*> transports;
+//    for (int i = 0; i < MAX_TRANSPORTS; i++) {
+//        LOG(NOTICE, "creating TransportProxy %d", numTransports);
+//        numTransports++;
+//        transports.push_back(new TransportProxy(
+//                cluster->clientContext->transportManager, receivers));
+//    }
 
     // TODO: construct message randomizer
     vector<double> discreteProbabilities;
@@ -1488,19 +1492,22 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
     }
 
     uint64_t totalCycles = 0;
-    // FIXME: compute deadline due cycles
-//    uint64_t missedDeadlineCycles = 0;
     ObjectPool<EchoRpc> echoRpcPool;
+    using ReadyQueue = RpcWrapper::ReadyQueue;
+    ReadyQueue readyQueue;
     // FIXME: How to choose the following parameter? 20 is usually enough for
     // Homa with 8 priorities. However, for Homa with no priority, it's harder
     // to simulate SRPT so the avg. # outstanding RPCs is larger; thus, setting
     // this parameter to 20 results in significant message drops.
-#define MAX_OUTSTANDING_RPCS 40
+    // FIXME: infrc handles queueing pretty well, do not throttle at app level
+    // FIXME: What about multi-infrc? We can't have so many transports.
+#define MAX_OUTSTANDING_RPCS 10000
+    // FIXME: We would like to eliminate MAX_OUTSTANDING_RPCS eventually and
+    // turn the following into a deque
     std::array<Tub<std::pair<uint32_t, EchoRpc*>>, MAX_OUTSTANDING_RPCS>
             outstandingRpcs;
-    uint32_t numOutstandingRpcs = 0;
-    uint32_t nextSlotToCheck = 0;
     uint32_t nextSlotToInsert = 0;
+    uint32_t numOutstandingRpcs = 0;
 
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = ~0lu;
@@ -1526,41 +1533,45 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 
         // As of 08/2017, it takes ~120ns to reclaim an RPC object;
         // out of which calling RpcWrapper::isReady only takes 10-20 ns.
-        for (int i = 0; i < 1; i++) {
-            Tub<std::pair<uint32_t, EchoRpc*>>& outstandingRpc =
-                    outstandingRpcs[nextSlotToCheck];
-            nextSlotToCheck++;
-            if (nextSlotToCheck == outstandingRpcs.size()) {
-                nextSlotToCheck = 0;
-                break;
-            }
-
+        // FIXME: step = 1 works well for Homa/Basic where # outstanding RPCs
+        // is relatively small; however, in infrc, HOL blocking could result
+        // in a large number (e.g. > 2000) of outstanding RPCs. We need to
+        // sweep faster in this case.
+        // FIXME: This step thing is unlikely to work well for infrc no matter how I tune it.
+        // Need to register a completion queue with each EchoRpc
+        while (!readyQueue.empty()) {
+            int fd = readyQueue.back();
+            readyQueue.pop_back();
+            std::pair<uint32_t, EchoRpc*>* outstandingRpc =
+                    outstandingRpcs[fd].get();
             if (outstandingRpc) {
-                EchoRpc* echo = outstandingRpc.get()->second;
+                EchoRpc* echo = outstandingRpc->second;
                 // Before changing to std::atomic, invoking isReady 10 times
                 // takes about 1000 cycles; now it is 200~350 cycles.
-                if (echo->isReady()) {
-                    if (count > 0) {
-                        uint32_t id = outstandingRpc.get()->first;
-                        uint64_t completionTime = echo->getCompletionTime();
-                        totalBytesSent += messageSizes[id];
-                        roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
-                                completionTime;
-                        numSamples[id]++;
-                    }
-                    // TODO: It appears that sometimes ~RpcWrapper is quite expensive (200ns ~ 1us); why?
-//                    TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
-                    if (MAX_TRANSPORTS >= 40) {
-                        freeTransports.push_back(
-                                reinterpret_cast<TransportProxy*>(
-                                echo->session.get()->transportProxy));
-                    }
-                    echoRpcPool.destroy(echo);
-//                    TimeTrace::record("Cperf destroyed EchoRpc");
-                    outstandingRpc.destroy();
-                    numOutstandingRpcs--;
-                    break;
+                if (!echo->isReady()) {
+                    DIE("fd %d must be ready!", fd);
                 }
+                if (count > 0) {
+                    uint32_t id = outstandingRpc->first;
+                    uint64_t completionTime = echo->getCompletionTime();
+                    totalBytesSent += messageSizes[id];
+                    roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
+                            completionTime;
+                    numSamples[id]++;
+                }
+                // TODO: It appears that sometimes ~RpcWrapper is quite expensive (200ns ~ 1us); why?
+//                    TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
+                if (MAX_TRANSPORTS < 0) {
+                    TransportProxy* proxy = reinterpret_cast<TransportProxy*>(
+                            echo->session.get()->transportProxy);
+                    if (proxy != NULL) {
+                        proxy->numRpcs--;
+                    }
+                }
+                echoRpcPool.destroy(echo);
+//                    TimeTrace::record("Cperf destroyed EchoRpc");
+                outstandingRpcs[fd].destroy();
+                numOutstandingRpcs--;
             }
         }
 //        TimeTrace::record("Cperf finished checking isReady");
@@ -1622,33 +1633,82 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
 //            uint32_t messageId = preGeneratedMessageIds[kRandom];
             uint32_t length = messageSizes[messageId];
             nextMessageArrival += preGeneratedMessageIntervals[kRandom];
-            if (nextMessageArrival < currentTime) {
-                // This could happen when the message arrival time is simply
-                // too short or we just experienced some significant jitter.
-                nextMessageArrival =
-                        currentTime + preGeneratedMessageIntervals[kRandom];
-            }
-            if (numOutstandingRpcs < MAX_OUTSTANDING_RPCS) {
+            if (numOutstandingRpcs < uint32_t(MAX_OUTSTANDING_RPCS)) {
                 uint64_t recipient = preGeneratedRecipients[kRandom];
                 TimeTrace::record("Start new RPC, %u outstanding RPCs",
                         (uint32_t)numOutstandingRpcs);
                 Transport::SessionRef session = NULL;
-                if (MAX_TRANSPORTS >= 40) {
-                    session = freeTransports.back()->sessionRefs[recipient];
-                    freeTransports.pop_back();
+                if (MAX_TRANSPORTS < 0) {
+                    // FIXME: Special hack for W3.
+                    static bool runningW3 = messageSizeCdfFilePath.find("w3_cdf") != string::npos;
+                    if ((runningW3) && (length > 16384)) {
+                        session = sessionRefs[recipient];
+                        goto startRpc;
+                    }
+
+                    TransportProxy* t = NULL;
+                    TransportProxy* backup = NULL;
+                    int minNumRpcs = -1;
+                    for (TransportProxy* proxy : transports) {
+                        if (proxy->numRpcs == 0) {
+                            t = proxy;
+                            break;
+                        } else if ((minNumRpcs < 0) || (proxy->numRpcs < minNumRpcs)) {
+                            minNumRpcs = proxy->numRpcs;
+                            backup = t;
+                        }
+                        // FIXME: The following policy leads to much better median and latency
+                        // (20 us and 140 us, respectively) but the workload generator somehow
+                        // can't keep up; not sure why this would make a difference in the
+                        // performance?
+//                        } else if ((NULL == backup) &&
+//                                !proxy->t->hasQueuedRequests()) {
+//                            backup = proxy;
+//                        }
+                    }
+
+                    if (NULL == t) {
+                        if (numTransports < 8) {
+                            LOG(NOTICE, "creating TransportProxy %u",
+                                    numTransports);
+                            numTransports++;
+                            transports.push_back(new TransportProxy(
+                                    cluster->clientContext->transportManager,
+                                    receivers));
+                            t = transports.back();
+                        } else if (backup != NULL) {
+                            t = backup;
+                        } else {
+                            t = transports[kRandom % transports.size()];
+                        }
+                    }
+                    t->numRpcs++;
+                    session = t->sessionRefs[recipient];
+
+////                    session = transports[0]->sessionRefs[recipient];
+////                    transports.pop_front();
+//                    // FIXME: Looks like for infrc, it's better to use
+//                    // as little active connections as possible; perhaps
+//                    // there is some significant overhead involved in
+//                    // switching between connections
+//                    session = transports.back().sessionRefs[recipient];
+//                    transports.pop_back();
+                } else if (MAX_TRANSPORTS == 0) {
+                    session = sessionRefs[recipient];
                 } else {
-                    if ((length < 315) || (MAX_TRANSPORTS == 0)) {
+                    if (length < 315) {
                         session = sessionRefs[recipient];
                     } else if ((length <= 10290) && (MAX_TRANSPORTS > 1)) {
-                        session = freeTransports[0]->sessionRefs[recipient];
+                        session = transports[0]->sessionRefs[recipient];
                     } else if ((length <= 1000000) && (MAX_TRANSPORTS > 2)) {
-                        session = freeTransports[1]->sessionRefs[recipient];
+                        session = transports[1]->sessionRefs[recipient];
                     } else if ((length <= 4000000) && (MAX_TRANSPORTS > 3)) {
-                        session = freeTransports[2]->sessionRefs[recipient];
+                        session = transports[2]->sessionRefs[recipient];
                     } else {
-                        session = freeTransports.back()->sessionRefs[recipient];
+                        session = transports.back()->sessionRefs[recipient];
                     }
                 }
+              startRpc:
                 EchoRpc* echo = echoRpcPool.construct(cluster, session,
                         message.c_str(), length, length);
                 while (true) {
@@ -1656,6 +1716,7 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
                     nextSlotToInsert = (nextSlotToInsert + 1) % MAX_OUTSTANDING_RPCS;
                     if (!outstandingRpcs[i]) {
                         outstandingRpcs[i].construct(messageId, echo);
+                        echo->addToReadyQueue(&readyQueue, i);
                         break;
                     }
                 }
@@ -1666,7 +1727,14 @@ echoMessages2(const vector<string>& receivers, double averageMessageSize,
             }
         }
     }
-    totalCycles = Cycles::rdtsc() - startTime;
+    uint64_t endTime = Cycles::rdtsc();
+    totalCycles = endTime - startTime;
+    uint64_t lostCycles = endTime > nextMessageArrival ?
+            endTime - nextMessageArrival : 0;
+    if (lostCycles*1000 > totalCycles) {
+        LOG(WARNING, "Load generator failed to keep up; lost %.2f seconds",
+                Cycles::toSeconds(lostCycles));
+    }
     LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));
 
     // Cancel outstanding RPCs
@@ -3332,11 +3400,11 @@ echo_workload()
             averageMessageSize, messageSizes, cumulativeProbabilities, ~0u,
             seconds, roundTripTrimes);
 
-// TODO: DON'T NEED IT FOR NOW SINCE I AM DEBUGGING SINGLE PACKET MSG
-//    if (clientIndex == 0) {
-//        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
-//                &statsAfter);
-//
+    // TODO: DON'T NEED IT FOR NOW SINCE I AM DEBUGGING SINGLE PACKET MSG
+    if (clientIndex == 0) {
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsAfter);
+
 //        Logger::get().sync();
 //        char name[50], description[50];
 //        for (uint i = 0; i < results.size(); i++) {
@@ -3371,9 +3439,9 @@ echo_workload()
 //                     "bandwidth receiving %uB messages", messageSizes[i]);
 //            printBandwidth("recvBw", dist->bandwidth, description);
 //        }
-//
-//        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
-//    }
+
+        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
+    }
 
     // TODO: KEEP THE FOLLOWING OUTPUT ONLY; MODIFY IT TO BE:
     // MSG_SIZE,TIME0,TIME1,TIME2, ...
@@ -3382,7 +3450,7 @@ echo_workload()
     // single-packet messages.
     Logger::get().sync();
     for (uint i = 0; i < roundTripTrimes.size(); i++) {
-        printf("%d", messageSizes[i]);
+        printf("%u,%lu", messageSizes[i], results[i].numSamples);
         for (uint64_t cycles : roundTripTrimes[i]) {
             printf(",%.2f", Cycles::toSeconds(cycles) * 1.0e06);
         }

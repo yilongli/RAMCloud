@@ -1,0 +1,13 @@
+infrc:numRC=-1,clientTxBuf=4,clientRxBuf=4,serverTxBuf=128,serverRxBuf=125,maxRpcSize=33554632
+
+# Single reliable connections: for W3
+infrc:numRC=0,clientTxBuf=16,clientRxBuf=64,serverTxBuf=128,serverRxBuf=125,maxRpcSize=16777416
+
+# Unlimited reliable connections: for W3
+infrc:numRC=-1,clientTxBuf=4,clientRxBuf=4,serverTxBuf=128,serverRxBuf=125,maxRpcSize=33554632
+
+# Single reliable connections: for W4/5
+infrc:numRC=0,clientTxBuf=16,clientRxBuf=32,serverTxBuf=16,serverRxBuf=63,maxRpcSize=33554632
+
+# Unlimited reliable connections: for W4/5
+infrc:numRC=-1,clientTxBuf=2,clientRxBuf=2,serverTxBuf=16,serverRxBuf=32,maxRpcSize=33554632

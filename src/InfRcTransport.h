@@ -71,6 +71,7 @@ class InfRcTransport : public Transport {
     explicit InfRcTransport(Context* context, const ServiceLocator* sl,
             uint64_t clientId);
     ~InfRcTransport();
+    bool hasQueuedRequests();
     SessionRef getSession(const ServiceLocator* sl, uint32_t timeoutMs = 0) {
         return new InfRcSession(this, sl, timeoutMs);
     }
@@ -189,8 +190,7 @@ class InfRcTransport : public Transport {
     };
 
     // FIXME: Why can't we set this number as large as possible?
-    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 63;
-//    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
+    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 
     static uint32_t SHARED_RX_QUEUE_DEPTH;
     static uint32_t TX_QUEUE_DEPTH;
@@ -358,6 +358,7 @@ class InfRcTransport : public Transport {
     Tub<RegisteredBuffers> txBuffers;
     vector<BufferDescriptor*> freeTxBuffers;
 
+    // FIXME: Why two SRQs?
     ibv_srq*     serverSrq;         // shared receive work queue for server
     ibv_srq*     clientSrq;         // shared receive work queue for client
     ibv_cq*      serverRxCq;        // completion queue for incoming requests

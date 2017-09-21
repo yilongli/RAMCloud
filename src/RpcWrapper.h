@@ -65,6 +65,9 @@ class RpcWrapper : public Transport::RpcNotifier {
     virtual void failed();
     virtual bool isReady();
 
+    typedef std::vector<int> ReadyQueue;
+    void addToReadyQueue(ReadyQueue* readyQueue, int fd);
+
   PROTECTED:
     /// Possible states for an RPC.
     enum RpcState {
@@ -239,6 +242,10 @@ class RpcWrapper : public Transport::RpcNotifier {
     /// Storage to use for response if constructor was not given an explicit
     /// response buffer.
     Tub<Buffer> defaultResponse;
+
+    int fd;
+
+    ReadyQueue* readyQueue;
 
     /// Current state of processing this RPC. This variable may be accessed
     /// concurrently by wrapper methods running in one thread and transport

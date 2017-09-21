@@ -56,10 +56,15 @@ class Transport {
   public:
     class RpcNotifier;
 
+    // FIXME: I don't think this is the right place to define this flag.
+#define TESTING_TRANSPORT true
       /// Maximum allowable size for an RPC request or response message: must
       /// be large enough to hold an 8MB segment plus header information.
-      static const uint32_t MAX_RPC_LEN = (1 << 25);
-//      static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
+#if TESTING_TRANSPORT
+      static const uint32_t MAX_RPC_LEN = ((1 << 25) + 200);
+#else
+      static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
+#endif
 
     /**
      * An RPC request that has been received and is either being serviced or
@@ -288,6 +293,8 @@ class Transport {
      * Destructor for Transport.
      */
     virtual ~Transport() {}
+
+    virtual bool hasQueuedRequests() { return false; }
 
     /**
      * Return a session that will communicate with the given service locator.
