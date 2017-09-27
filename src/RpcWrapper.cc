@@ -41,6 +41,8 @@ RpcWrapper::RpcWrapper(uint32_t responseHeaderLength, Buffer* response)
     : request()
     , response(response)
     , defaultResponse()
+    , fd(-1)
+    , readyQueue(NULL)
     , state(NOT_STARTED)
     , session(NULL)
     , retryTime(0)
@@ -59,6 +61,13 @@ RpcWrapper::RpcWrapper(uint32_t responseHeaderLength, Buffer* response)
   */
 RpcWrapper::~RpcWrapper() {
     cancel();
+}
+
+void
+RpcWrapper::addToReadyQueue(ReadyQueue* readyQueue, int fd)
+{
+    this->readyQueue = readyQueue;
+    this->fd = fd;
 }
 
 /**
@@ -102,6 +111,14 @@ RpcWrapper::checkStatus()
 // See Transport::Notifier for documentation.
 void
 RpcWrapper::completed() {
+    // FIXME: WHAT ABOUT SYNCHRONIZATION? ALSO THIS SHOULD BE MOVED
+    // BEFORE STORE? WHAT THREADS CAN ACCESS RpcWrapper CONCURRENTLY?
+    if (readyQueue) {
+        assert(fd >= 0);
+        readyQueue->push_back(fd);
+        readyQueue = NULL;
+    }
+
     // Since this method can be invoked concurrently with other
     // methods, it's important that it does nothing except modify
     // state. Don't add any more functionality to this method

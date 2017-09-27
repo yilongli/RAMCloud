@@ -363,6 +363,8 @@ def run_test(
         client_args['--seconds'] = options.seconds
     if options.calibrateTscFreq:
         client_args['--calibrateTscFreq'] = ''
+    if options.maxSessions:
+        client_args['--maxSessions'] = options.maxSessions
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -1029,6 +1031,10 @@ if __name__ == '__main__':
             help='Start the cluster and clients as superuser')
     parser.add_option('--calibrateTscFreq', action='store_true', default=False,
             help='Calibrate TSC clock frequencies of servers against clients')
+    parser.add_option('--maxSessions', type=int, default=1,
+            help='Maximum number of sessions opened between each client-server'
+                 ' pair. This is useful to reduce head-of-line blocking in '
+                 'stream-based transports (e.g., tcp, infrc)')
     (options, args) = parser.parse_args()
 
     if options.parse:

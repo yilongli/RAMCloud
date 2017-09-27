@@ -58,7 +58,7 @@ class Transport {
 
       /// Maximum allowable size for an RPC request or response message: must
       /// be large enough to hold an 8MB segment plus header information.
-      static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
+      static const uint32_t MAX_RPC_LEN = ((1 << 25) + 200);
 
     /**
      * An RPC request that has been received and is either being serviced or
@@ -242,6 +242,9 @@ class Transport {
       public:
         /// The service locator this Session is connected to.
         const string serviceLocator;
+
+        // FIXME: Hack for multi-connection transports.
+        void* transportProxy = NULL;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(Session);

@@ -592,19 +592,33 @@ try {
 #define MAX_EVENTS 10
     struct epoll_event events[MAX_EVENTS];
     while (true) {
-        int count = sys->epoll_wait(owner->epollFd, events, MAX_EVENTS, -1);
-        if (count <= 0) {
-            if (count == 0) {
-                LOG(WARNING, "epoll_wait returned no events in "
-                    "Dispatch::epollThread");
+//        int count = sys->epoll_wait(owner->epollFd, events, MAX_EVENTS, -1);
+//        if (count <= 0) {
+//            if (count == 0) {
+//                LOG(WARNING, "epoll_wait returned no events in "
+//                    "Dispatch::epollThread");
+//                continue;
+//            } else {
+//                if (errno == EINTR)
+//                    continue;
+//                LOG(ERROR, "epoll_wait failed in Dispatch::epollThread: %s",
+//                        strerror(errno));
+//                return;
+//            }
+//        }
+
+        // FIXME: Running epoll_wait with timeout = 0 reduces the cost of
+        // context switching; this brings the latency of short messages from
+        // 20 us to 16 us. However, this does require burning an extra core
+        // besides the dispatcher. Right now, this is entirely for the sake
+        // of running Homa workloads using TCP.
+        int count = sys->epoll_wait(owner->epollFd, events, MAX_EVENTS, 0);
+        if (count < 0) {
+            if (errno == EINTR)
                 continue;
-            } else {
-                if (errno == EINTR)
-                    continue;
-                LOG(ERROR, "epoll_wait failed in Dispatch::epollThread: %s",
-                        strerror(errno));
-                return;
-            }
+            LOG(ERROR, "epoll_wait failed in Dispatch::epollThread: %s",
+                    strerror(errno));
+            return;
         }
 
         // Signal all of the ready file descriptors back to the main
