@@ -107,11 +107,7 @@ class InfRcTransport : public Transport {
         }
         logMemoryBase = reinterpret_cast<uintptr_t>(base);
         logMemoryBytes = bytes;
-        if (context->echoMessage == NULL) {
-            context->echoMessage = static_cast<char*>(base) + bytes - 8*1024*1024;
-            memset(context->echoMessage, 'x', 8*1024*1024);
-        }
-        RAMCLOUD_LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
+        LOG(NOTICE, "Registered %Zd bytes at %p", bytes, base);
     }
     static void setName(const char* name);
 
@@ -182,9 +178,7 @@ class InfRcTransport : public Transport {
         uint64_t nonce;
     };
 
-    // FIXME: Why can't we set this number as large as possible?
-    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 63;
-//    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
+    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 
     // Since we always use at most 1 SGE per receive request, there is no need
     // to set this parameter any higher. In fact, larger values for this

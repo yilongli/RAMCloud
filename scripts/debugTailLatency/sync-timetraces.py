@@ -30,6 +30,7 @@ CALIBR_TSC_MSG_REGEX = re.compile(".*TSC_Freq\((.*)\) \* (.*) = TSC_Freq")
 #ALLDATA_MSG_REGEX = re.compile("^.*: (.*) ns .*(client|server) (sending|received) ALL_DATA.*clientId (\d+), sequence (\d+)")
 ALLDATA_MSG_REGEX = re.compile("^.*: (.*) cyc .*(client|server) (sending|received) ALL_DATA.*clientId (\d+), sequence (\d+)")
 cyclesPerMicros = 1995.379 # TODO
+cyclesPerMicros = 2933.410
 
 #
 hosts = sorted(set([x.split('.')[1] for x in glob.glob('*.log')]))

@@ -96,6 +96,7 @@ def get_client_log(
 def printXXX():
     # Read the log file into an array of numbers.
     messages = collections.OrderedDict()
+    messageCount = {}
     globResult = glob.glob('%s/latest/client*.log' % options.log_dir)
     if len(globResult) == 0:
         raise Exception("couldn't find log files for clients")
@@ -107,6 +108,7 @@ def printXXX():
                 continue
             if not re.match('([0-9]+\.[0-9]+) ', line):
                 numbers = None
+                count = None
                 for value in line.split(","):
                     try:
                         if numbers is None:
@@ -114,6 +116,11 @@ def printXXX():
                             if size not in messages:
                                 messages[size] = []
                             numbers = messages[size]
+                        elif count is None:
+                            count = int(value)
+                            if size not in messageCount:
+                                messageCount[size] = 0
+                            messageCount[size] += count
                         else:
                             numbers.append(float(value))
                     except ValueError, e:
@@ -128,7 +135,7 @@ def printXXX():
             continue
         print("%8d  %8d  %8.1f  %8.1f  %8.1f  %8.1f  %8.1f  %8.1f" % (
                 size,
-                numSamples,
+                messageCount[size],
                 numbers[0],
                 numbers[int(numSamples * .5)],
                 numbers[int(numSamples * .9)] if numSamples >= 10 else .0,
@@ -356,6 +363,8 @@ def run_test(
         client_args['--seconds'] = options.seconds
     if options.calibrateTscFreq:
         client_args['--calibrateTscFreq'] = ''
+    if options.multiSession:
+        client_args['--multiSession'] = ''
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -1022,6 +1031,9 @@ if __name__ == '__main__':
             help='Start the cluster and clients as superuser')
     parser.add_option('--calibrateTscFreq', action='store_true', default=False,
             help='Calibrate TSC clock frequencies of servers against clients')
+    parser.add_option('--multiSession', action='store_true', default=False,
+            help='Open multiple sessions to each server to reduce head-of-line '
+                 'blocking in stream-based transports (e.g., tcp, infrc)')
     (options, args) = parser.parse_args()
 
     if options.parse:

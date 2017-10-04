@@ -94,8 +94,6 @@ class Context {
     ObjectFinder* objectFinder; // On Client and Master, this locator tells
                                 // which master is the owner of an object.
 
-    char* echoMessage;
-
     // Holds command-line options, or NULL if no options are available.
     // Memory for this is managed by whoever created this object; we can
     // assume this is static.
@@ -139,6 +137,11 @@ class Context {
     // NULL except on coordinators. Owned elsewhere;
     // not freed by this class.
     MasterRecoveryManager* recoveryManager;
+
+    // On Master, set by SegmentManager to point to SegletAllocator::block.
+    // It's only used by MasterService::echo to enable zero-copy transmit
+    // of the reply message in infrc when benchmarking transport performance.
+    const void* segletMemoryRegion;
 
     /**
      * Returns the BackupService associated with this context, if

@@ -197,8 +197,11 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         // The following code is copied from MasterService::echo
         constexpr uint32_t dummyBlockSize = 8 * 1024 * 1024;
         static const string dummyBlock(dummyBlockSize, ' ');
-        const char* data = context->echoMessage != NULL ?
-                context->echoMessage : dummyBlock.data();
+#ifdef TESTING_TRANSPORT
+        const void* data = context->segletMemoryRegion;
+#else
+        const char* data = dummyBlock.data();
+#endif
         respHdr->length = reqHdr->echoLength;
         uint32_t bytesLeft = reqHdr->echoLength;
         while (bytesLeft > dummyBlockSize) {

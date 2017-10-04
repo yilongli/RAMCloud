@@ -104,6 +104,9 @@ SegmentManager::SegmentManager(Context* context,
     for (uint32_t i = emergencyHeadSlotsReserved; i < maxSegments; i++)
         freeSlots.push_back(i);
 
+#ifdef TESTING_TRANSPORT
+    context->segletMemoryRegion = allocator.getBaseAddress();
+#endif
     context->transportManager->registerMemory(
         const_cast<void*>(allocator.getBaseAddress()),
         allocator.getTotalBytes());

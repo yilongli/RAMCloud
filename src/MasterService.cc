@@ -412,16 +412,23 @@ MasterService::echo(const WireFormat::Echo::Request* reqHdr,
     // Pre-allocate static dummy data for use in the echoed message. The size
     // is chosen to be 8MB since it is the largest object size in RAMCloud.
     const uint32_t dummyBlockSize = 8 * 1024 * 1024;
+#ifdef TESTING_TRANSPORT
+    // We are borrowing the memory of SegletAllocator::block
+    // since it's not used anyway.
+    const void* data = context->segletMemoryRegion;
+#else
     static const string dummyBlock(dummyBlockSize, ' ');
+    const char* data = dummyBlock.data();
+#endif
 
     respHdr->length = reqHdr->echoLength;
     // Fill in the reply buffer with the dummy data.
     uint32_t bytesLeft = reqHdr->echoLength;
     while (bytesLeft > dummyBlockSize) {
         bytesLeft -= dummyBlockSize;
-        rpc->replyPayload->appendExternal(dummyBlock.data(), dummyBlockSize);
+        rpc->replyPayload->appendExternal(data, dummyBlockSize);
     }
-    rpc->replyPayload->appendExternal(dummyBlock.data(), bytesLeft);
+    rpc->replyPayload->appendExternal(data, bytesLeft);
 }
 
 /**

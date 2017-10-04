@@ -82,7 +82,6 @@ Context::Context(bool hasDedicatedDispatchThread,
     , coordinatorSession(NULL)
     , cacheTrace(NULL)
     , objectFinder(NULL)
-    , echoMessage(NULL)
     , options(options)
     , workerManager(NULL)
     , externalStorage(NULL)
@@ -90,6 +89,7 @@ Context::Context(bool hasDedicatedDispatchThread,
     , coordinatorServerList(NULL)
     , tableManager(NULL)
     , recoveryManager(NULL)
+    , segletMemoryRegion(NULL)
 {
     try {
         Cycles::init();

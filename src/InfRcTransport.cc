@@ -80,6 +80,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fstream>
 
 #include "Common.h"
 #include "CycleCounter.h"
@@ -120,6 +121,17 @@ namespace {
     {
 #if TIME_TRACE
         TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+
+    inline void
+    timeTrace(uint64_t timestamp, const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(timestamp, format, uint32_t(arg0), uint32_t(arg1),
                 uint32_t(arg2), uint32_t(arg3));
 #endif
     }
@@ -180,6 +192,40 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
     , testingDontReallySend(false)
 {
     const char *ibDeviceName = NULL;
+
+    // FIXME: Hack to support multiple transports on client-side
+    static bool initConfig = false;
+    if (!initConfig) {
+        initConfig = true;
+        std::ifstream configFile("/home/yilongl/RAMCloud/config/infrc.txt");
+        Tub<ServiceLocator> params;
+        if (configFile.is_open()) {
+            string line;
+            std::getline(configFile, line);
+            params.construct(line);
+
+            if (NULL == sl) {
+                if (params->hasOption("clientTxBuf")) {
+                    MAX_TX_QUEUE_DEPTH =
+                            params->getOption<uint32_t>("clientTxBuf");
+                }
+                if (params->hasOption("clientRxBuf")) {
+                    MAX_SHARED_RX_QUEUE_DEPTH =
+                            params->getOption<uint32_t>("clientRxBuf");
+                }
+            } else {
+                if (params->hasOption("serverTxBuf")) {
+                    MAX_TX_QUEUE_DEPTH =
+                            params->getOption<uint32_t>("serverTxBuf");
+                }
+                if (params->hasOption("serverRxBuf")) {
+                    MAX_SHARED_RX_QUEUE_DEPTH =
+                            params->getOption<uint32_t>("serverRxBuf");
+                }
+            }
+        }
+    }
+    numUsedClientSrqBuffers = MAX_SHARED_RX_QUEUE_DEPTH;
 
     if (sl != NULL) {
         locatorString = sl->getOriginalString();
@@ -895,9 +941,18 @@ InfRcTransport::postSrqReceiveAndKickTransmit(ibv_srq* srq,
             ClientRpc& rpc = clientSendQueue.front();
             clientSendQueue.pop_front();
             rpc.sendOrQueue();
-            double waitTime = Cycles::toSeconds(Cycles::rdtsc()
-                    - rpc.waitStart);
-            if (waitTime > 1e-03) {
+            uint64_t waitCycles = Cycles::rdtsc() - rpc.waitStart;
+            if (waitCycles > Cycles::fromMicroseconds(5)) {
+                // This is not really the client's problem: we are waiting
+                // for responses to finish so that we could refill our RX
+                // buffers. Maybe consider increasing MAX_SHARED_RX_QUEUE_DEPTH?
+                timeTrace("outgoing request delayed for %u us because of "
+                        "insufficient RX buffer, nonce %u, length %u",
+                        Cycles::toMicroseconds(waitCycles), rpc.nonce,
+                        rpc.request->size());
+            }
+            double waitTime = Cycles::toSeconds(waitCycles);
+            if (waitTime > 1e-04) {
                 LOG(DEBUG, "Outgoing %s RPC delayed for %.2f ms because "
                         "of insufficient receive buffers",
                         WireFormat::opcodeSymbol(rpc.request),
@@ -937,7 +992,7 @@ InfRcTransport::getTransmitBuffer()
             while (freeTxBuffers.empty()) {
                 // Give the poller a chance to execute. Otherwise, it's
                 // possible for us to deadlock with all transmit buffers
-                // in use sending messages to ourself.
+                // in use sending messages to ourselves.
                 poller.poll();
                 reapTxBuffers();
                 uint64_t now = Cycles::rdtsc();
@@ -961,10 +1016,22 @@ InfRcTransport::getTransmitBuffer()
             }
             uint64_t waitCycles = Cycles::rdtsc() - start;
             double waitMs = 1e03 * Cycles::toSeconds(waitCycles);
-            if (waitMs > 5.0)  {
-//                LOG(WARNING, "Long delay waiting for transmit buffers "
-//                        "(%.1f ms elapsed, %lu buffers now free); deadlock "
-//                        "or target crashed?", waitMs, freeTxBuffers.size());
+            // FIXME: increasing MAX_MAX_TX_QUEUE_DEPTH to a really large number
+            // is merely hiding the problem a bit: the messages are still
+            // queued behind the elephant message that's being transmitted.
+            // FIXME: The above is not absolutely right I think. Messages
+            // that belong to different QPs do not get stuck behind each
+            // other but unfortunately infrc doesn't have any mechanism to
+            // manage how many TX buffers are assigned to each QP; so
+            // increasing the # TX buffers does help alleviate the case where
+            // one QP has a huge message followed by a bunch of smaller
+            // messages while another QP has smaller messages to send but
+            // couldn't find a free TX buffer.
+//            if (waitMs > 5.0)  {
+            if (waitMs > 10.0)  {
+                LOG(WARNING, "Long delay waiting for transmit buffers "
+                        "(%.1f ms elapsed, %lu buffers now free); deadlock "
+                        "or target crashed?", waitMs, freeTxBuffers.size());
                 timeTrace("long delay waiting for transmit buffers, "
                         "elapsed time %u cyc, % buffers now free",
                         waitCycles, freeTxBuffers.size());
@@ -1004,9 +1071,14 @@ InfRcTransport::reapTxBuffers()
                     getOpcodeFromBuffer(bd));
         }
         freeTxBuffers.push_back(bd);
+        // FIXME: I don't think the following time trace is really useful
+        // as we currently try to reap TX buffers in really large batch
         const char* fmt = bd->response ? "sent response, nonce %u, length %u"
                 : "sent request, nonce %u, length %u";
         timeTrace(fmt, bd->nonce, bd->messageBytes);
+    }
+    if (n > 0) {
+        timeTrace("reclaimed %u TX buffers", (uint32_t)n);
     }
 
     // Has TX just transitioned to idle?
@@ -1430,22 +1502,38 @@ InfRcTransport::Poller::poll()
                 t->outstandingRpcs.erase(t->outstandingRpcs.iterator_to(rpc));
                 rpc.session->sessionAlarm.rpcFinished();
                 uint32_t len = response->byte_len - sizeof32(header);
+                uint32_t numUsedBufDesc = t->numUsedClientSrqBuffers;
+#if TESTING_TRANSPORT
+                // When we are testing the transport layer, the client workload
+                // generator should be able to destroy the finished RPCs
+                // immediately; no need to copy the RX buffer.
+                bool returnBufDesc = false;
+#else
                 // Return the buffer descriptor if we are running low on
                 // Rx buffers or the response is pretty small.
                 uint32_t d = MAX_SHARED_RX_QUEUE_DEPTH / 4;
-                uint32_t numUsedBufDesc = t->numUsedClientSrqBuffers;
                 bool returnBufDesc =
                         ((numUsedBufDesc >= d) && (len < 500)) ||
                         ((numUsedBufDesc >= d*2) && (len < 1000)) ||
                         ((numUsedBufDesc >= d*3));
+#endif
                 if (returnBufDesc) {
                     // clientSrq is low on buffers, better return this one
+                    uint64_t start =
+                            (len > LARGE_COPIED_BYTES) ? Cycles::rdtsc() : 0;
                     rpc.response->appendCopy(bd->buffer + sizeof(header), len);
                     t->postSrqReceiveAndKickTransmit(t->clientSrq, bd);
                     if (len > LARGE_COPIED_BYTES) {
-                        LOG(WARNING, "running low on client RX buffers, "
+                        LOG(DEBUG, "running low on client RX buffers, "
                                 "copied %u bytes, numUsedBufDesc %u",
                                 len, numUsedBufDesc);
+                        uint64_t stop = Cycles::rdtsc();
+                        timeTrace(stop, "running low on client RX buffers, "
+                                "copied %u bytes, took %u us, "
+                                "numUsedBufDesc %u, %u outstanding RPCs",
+                                len, Cycles::toMicroseconds(stop-start),
+                                numUsedBufDesc, t->clientSendQueue.size()
+                                + t->outstandingRpcs.size());
                     }
                 } else {
                     // rpc will hold one of clientSrq's buffers until
@@ -1605,9 +1693,10 @@ InfRcTransport::Poller::poll()
     // until buffers are running low before trying to reclaim.  This
     // optimization improves the throughput of "clusterperf readThroughput"
     // by about 5% (as of 7/2015).
+    uint64_t numFreeTxBuffers = t->freeTxBuffers.size();
     if (t->freeTxBuffers.size() < 3) {
         t->reapTxBuffers();
-        if (t->freeTxBuffers.size() >= 3) {
+        if (t->freeTxBuffers.size() > numFreeTxBuffers) {
             foundWork = 1;
         }
     }

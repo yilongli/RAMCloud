@@ -1,9 +1,8 @@
 #!/bin/bash
 HOMA_EVAL=homa_eval
-WORKLOAD_TYPE=w4
-WORKLOAD=${WORKLOAD_TYPE}_cdf.txt
-scripts/clusterperf.py --superuser --dpdkPort 1 --replicas 0 --disjunct --transport basic+dpdk --servers 1 --clients 1 --messageSizeCdfFile $WORKLOAD --timeout 10000 --verbose echo_basic
-grep "minimum" logs/latest/client1.*.log > ${HOMA_EVAL}/basic_${WORKLOAD_TYPE}_baseline.txt
-scripts/clusterperf.py --superuser --dpdkPort 1 --replicas 0 --disjunct --transport homa+dpdk --servers 1 --clients 1 --messageSizeCdfFile $WORKLOAD --timeout 10000 --verbose echo_basic
-grep "minimum" logs/latest/client1.*.log > ${HOMA_EVAL}/homa_${WORKLOAD_TYPE}_baseline.txt
-diff -y *_baseline.txt > ${WORKLOAD_TYPE}_baseline.txt
+scripts/clusterperf.py --replicas 0 --disjunct --transport infrc --servers 1 --clients 1 --messageSizeCdfFile w3_cdf.txt --timeout 10000 --verbose echo_basic
+grep "minimum" logs/latest/client1.*.log > ${HOMA_EVAL}/infrc_w3_baseline.txt
+scripts/clusterperf.py --replicas 0 --disjunct --transport infrc --servers 1 --clients 1 --messageSizeCdfFile w4_cdf.txt --timeout 10000 --verbose echo_basic
+grep "minimum" logs/latest/client1.*.log > ${HOMA_EVAL}/infrc_w4_baseline.txt
+scripts/clusterperf.py --replicas 0 --disjunct --transport infrc --servers 1 --clients 1 --messageSizeCdfFile w5_cdf.txt --timeout 10000 --verbose echo_basic
+grep "minimum" logs/latest/client1.*.log > ${HOMA_EVAL}/infrc_w5_baseline.txt
