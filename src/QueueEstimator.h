@@ -34,6 +34,23 @@ class QueueEstimator {
   PUBLIC:
 
     /**
+     * Describes the state of the NIC's transmit queue. A pointer to this
+     * struct can be passed to #Driver::sendPacket by a transport, indicating
+     * that it is interested in the state of the transmit queue when the
+     * packet is handed to the NIC; QueueEstimator is then responsible for
+     * filling out this structure. Mainly used for performance debugging.
+     */
+    struct TransmitQueueState {
+        /// # rdtsc ticks for which the transmit queue has been empty.
+        /// Must be 0 if #outstandingBytes > 0.
+        uint64_t idleTime;
+
+        /// # bytes waiting to be sent at the transmit queue. Must be
+        /// 0 if #idleTime > 0.
+        uint32_t outstandingBytes;
+    };
+
+    /**
      * Construct a QueueEstimator; the NIC is assumed to be idle when
      * this method is invoked.
      * \param mBitsPerSecond
@@ -42,6 +59,7 @@ class QueueEstimator {
     explicit QueueEstimator(uint32_t mBitsPerSecond = 10000)
         : bandwidth()
         , currentTime(0)
+        , idleSince(0)
         , queueSize(0)
     {
         bandwidth = (static_cast<double>(mBitsPerSecond)*1e06/8.0)
@@ -56,11 +74,21 @@ class QueueEstimator {
      *      NIC's queue.
      * \param transmitTime
      *      Time when the packet was queued in the NIC, in Cycles::rdtsc ticks.
+     * \param[out] txQueueState
+     *      Used to retrieve state of the NIC's transmit queue when this packet
+     *      was added to the NIC. NULL means the caller doesn't care about
+     *      this value.
      */
     void
-    packetQueued(uint32_t length, uint64_t transmitTime)
+    packetQueued(uint32_t length, uint64_t transmitTime,
+            TransmitQueueState* txQueueState = NULL)
     {
         getQueueSize(transmitTime);
+        if (txQueueState != NULL) {
+            txQueueState->idleTime =
+                    (queueSize > 0) ? 0 : transmitTime - idleSince;
+            txQueueState->outstandingBytes = queueSize;
+        }
         queueSize += length;
     }
 
@@ -78,8 +106,14 @@ class QueueEstimator {
         if (time > currentTime) {
             double newSize = queueSize
                     - static_cast<double>(time - currentTime) * bandwidth;
+            uint32_t oldQueueSize = queueSize;
             queueSize = (newSize < 0) ? 0 : static_cast<uint32_t>(newSize);
             currentTime = time;
+            if ((oldQueueSize > 0) && (queueSize == 0)) {
+                // The transmit queue became empty at some point between
+                // `currentTime` and `time`.
+                idleSince = time - (uint64_t)(-newSize / bandwidth);
+            }
         }
         return queueSize;
     }
@@ -119,6 +153,11 @@ class QueueEstimator {
     /// A Cycles::rdtsc ticks value indicating the latest time when queueSize
     /// was calculated.
     uint64_t currentTime;
+
+    /// A Cycles::rdtsc ticks value indicating the time since when the
+    /// transmit queue has been empty, only defined when the transmit queue
+    /// is empty at currentTime (i.e. queueSize == 0).
+    uint64_t idleSince;
 
     /// The number of bytes in the transmit queue at currentTime.
     uint32_t queueSize;

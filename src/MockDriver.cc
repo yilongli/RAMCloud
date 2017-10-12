@@ -82,7 +82,8 @@ MockDriver::sendPacket(const Address* addr,
                        const void* header,
                        uint32_t headerLen,
                        Buffer::Iterator* payload,
-                       int priority)
+                       int priority,
+                       TransmitQueueState* txQueueState)
 {
     sendPacketCount++;
     uint32_t bytesSent = headerLen;

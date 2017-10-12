@@ -62,15 +62,17 @@ class DpdkDriver : public Driver
     virtual int getHighestPacketPriority();
     virtual uint32_t getMaxPacketSize();
     virtual uint32_t getBandwidth();
-    virtual int getTransmitQueueSpace(uint64_t currentTime);
+    virtual uint32_t getPacketOverhead();
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
+    virtual bool releaseHwPacketBuf(Driver::Received* received);
     virtual void sendPacket(const Address* addr,
                             const void* header,
                             uint32_t headerLen,
                             Buffer::Iterator* payload,
-                            int priority = 0);
+                            int priority = 0,
+                            TransmitQueueState* txQueueState = NULL);
     virtual string getServiceLocator();
 
     virtual Address* newAddress(const ServiceLocator* serviceLocator)
@@ -84,6 +86,9 @@ class DpdkDriver : public Driver
     // payload.
     static const uint32_t MAX_PAYLOAD_SIZE = 1500;
 
+    // Size of packet buffer metadata (used to store PacketBufType), in bytes.
+    static const uint32_t METADATA_SIZE = 1;
+
     /// Size of VLAN tag, in bytes. We are using the PCP (Priority Code Point)
     /// field defined in the VLAN tag to specify the packet priority.
     static const uint32_t VLAN_TAG_LEN = 4;
@@ -91,13 +96,33 @@ class DpdkDriver : public Driver
     /// Size of Ethernet header including VLAN tag, in bytes.
     static const uint32_t ETHER_VLAN_HDR_LEN = 14 + VLAN_TAG_LEN;
 
+    /// Overhead of a physical layer Ethernet packet, in bytes, which includes
+    /// the preamble (7 bytes), the start of frame delimiter (1 byte), the
+    /// frame checking sequence (4 bytes) and the interpacket gap (12 bytes).
+    static const uint32_t ETHER_PACKET_OVERHEAD = 24;
+
     /// Map from priority levels to values of the PCP field. Note that PCP = 1
     /// is actually the lowest priority, while PCP = 0 is the second lowest.
     static constexpr uint16_t PRIORITY_TO_PCP[8] =
             {1 << 13, 0 << 13, 2 << 13, 3 << 13, 4 << 13, 5 << 13, 6 << 13,
              7 << 13};
 
-    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE> PacketBuf;
+    /// See docs in Driver class. Furthermore, it defines a uniform layout for
+    /// DpdkDriver-specific packet buffers regardless of their backing memory.
+    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE, METADATA_SIZE>
+            PacketBuf;
+
+    /**
+     * This enum defines the types of memory backing DpdkDriver-specific
+     * packet buffers (i.e., DpdkDriver::PacketBuf).
+     */
+    enum PacketBufType {
+        /// The memory is allocated from `mbufPool`, a DPDK rte_mempool.
+        DPDK_MBUF,
+        /// The memory is allocated from `packetBufPool`, an RAMCloud
+        /// ObjectPool.
+        RAMCLOUD_PACKET_BUF
+    };
 
     Context* context;
 
@@ -120,11 +145,11 @@ class DpdkDriver : public Driver
 
     /// Holds packet buffers that are dequeued from the NIC's HW queues
     /// via DPDK.
-    struct rte_mempool *packetPool;
+    struct rte_mempool* mbufPool;
 
     /// Holds packets that are addressed to localhost instead of going through
     /// the HW queues.
-    struct rte_ring *loopbackRing;
+    struct rte_ring* loopbackRing;
 
     /// Hardware packet filter is provided by the NIC
     bool hasHardwareFilter;
@@ -141,13 +166,6 @@ class DpdkDriver : public Driver
     /// Note: the highest packet priority presented to the transport level will
     /// be `highestPriorityAvail - lowestPriorityAvail + 1`.
     int lowestPriorityAvail;
-
-    /// Used to estimate # bytes outstanding in the NIC's transmit queue.
-    QueueEstimator queueEstimator;
-
-    /// Upper limit on how many bytes should be queued for transmission
-    /// at any given time.
-    uint32_t maxTransmitQueueSize;
 
     /// Used to redirect log entries from the DPDK log into the RAMCloud log.
     FileLogger fileLogger;

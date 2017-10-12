@@ -21,6 +21,7 @@
 
 #include "Common.h"
 #include "Buffer.h"
+#include "QueueEstimator.h"
 
 #undef CURRENT_LOG_MODULE
 #define CURRENT_LOG_MODULE RAMCloud::TRANSPORT_MODULE
@@ -71,7 +72,7 @@ class Driver {
      * \tparam N
      *      the maximum size of the payload
      */
-    template<typename T, uint32_t N>
+    template<typename T, uint32_t N, uint32_t M=0>
     struct PacketBuf {
         PacketBuf()
             : sender()
@@ -82,6 +83,9 @@ class Driver {
 
         /// Address of sender (used to send reply).
         Tub<T> sender;
+
+        /// Optional small headroom space (used to embed extra metadata).
+        char headroom[M];
 
         /// Packet data (may not fill all of the allocated space).
         char payload[N];
@@ -150,7 +154,7 @@ class Driver {
         /// to by this pointer will be stable as long as the packet data
         /// is stable (i.e., if steal() is invoked, then the Address will
         /// live until release is invoked).
-        const Address* const sender;
+        const Address* sender;
 
         /// Driver the packet came from, where resources should be returned.
         Driver* const driver;
@@ -205,10 +209,31 @@ class Driver {
         DISALLOW_COPY_AND_ASSIGN(PayloadChunk);
     };
 
+    /// Create a protected short alias to be used in Driver subclasses.
+    using TransmitQueueState = QueueEstimator::TransmitQueueState;
+
+    explicit Driver()
+        : lastTransmitTime(0)
+        , maxTransmitQueueSize(0)
+        , queueEstimator(0)
+    {
+        // Default: no throttling of transmissions (probably not a good idea).
+        maxTransmitQueueSize = 10000000;
+    }
+
     virtual ~Driver() {};
 
     /// \copydoc Transport::dumpStats
     virtual void dumpStats() {}
+
+    /**
+     * Check if the transmit queue has run dry (resulting in unused network
+     * bandwidth). Mainly used for performance debugging.
+     */
+    bool isTransmitQueueEmpty()
+    {
+        return queueEstimator.getQueueSize(Cycles::rdtsc()) == 0;
+    }
 
     /**
      * Returns the highest packet priority level this Driver supports (0 is
@@ -256,11 +281,34 @@ class Driver {
      *      if transport has ignored this method and transmitted too
      *      many bytes.
      */
-    virtual int getTransmitQueueSpace(uint64_t currentTime)
+    VIRTUAL_FOR_TESTING int
+    getTransmitQueueSpace(uint64_t currentTime)
     {
-        // Default: no throttling of transmissions (probably not a good
-        // idea).
-        return 10000000;
+        return static_cast<int>(maxTransmitQueueSize) -
+                queueEstimator.getQueueSize(currentTime);
+    }
+
+    /**
+     * The most recent time that the driver handed a packet to the NIC.
+     * Mainly used for performance debugging.
+     *
+     * \return
+     *      Last transmit time, in Cycles::rdtsc ticks
+     */
+    uint64_t getLastTransmitTime()
+    {
+        return lastTransmitTime;
+    }
+
+    /**
+     * Returns the total protocol overhead (down to the physical layer)
+     * involved in transmitting one packet, in bytes. 0 means this feature
+     * has not been implemented by the driver.
+     */
+    virtual uint32_t getPacketOverhead()
+    {
+        // Default: not implemented
+        return 0;
     }
 
     /**
@@ -280,6 +328,28 @@ class Driver {
     template<typename T>
     void release(T* payload) {
         release(reinterpret_cast<char*>(payload));
+    }
+
+    /**
+     * Invoked by a transport to return the ownership of a NIC packet buffer
+     * to the driver, provided that the driver can provide a driver-specific
+     * software buffer (i.e. Driver::PacketBuf) with the same content as
+     * a replacement.
+     *
+     * \param received
+     *      The incoming packet whose backing packet buffer might be
+     *      silently replaced.
+     * \return
+     *      True, if the underlying NIC packet buffer has been released;
+     *      false, if the underlying packet buffer is not a hardware packet
+     *      buffer or the driver decides not to replace it.
+     */
+    virtual bool releaseHwPacketBuf(Driver::Received* received)
+    {
+        // The default implementation does nothing. It can be used by
+        // drivers that don't support zero-copy RX or have sufficient
+        // NIC packet buffers.
+        return false;
     }
 
     /**
@@ -354,12 +424,17 @@ class Driver {
      *      since the data may not yet have been transmitted.
      * \param priority
      *      The priority level of this packet. 0 is the lowest priority.
+     * \param[out] txQueueState
+     *      Used to retrieve state of the NIC's transmit queue when this packet
+     *      was handed to the NIC. NULL means the caller doesn't care about
+     *      this value.
      */
     virtual void sendPacket(const Address* recipient,
                             const void* header,
                             uint32_t headerLen,
                             Buffer::Iterator* payload,
-                            int priority = 0) = 0;
+                            int priority = 0,
+                            TransmitQueueState* txQueueState = NULL) = 0;
 
     /**
      * Alternate form of sendPacket.
@@ -379,14 +454,20 @@ class Driver {
      *      since the data may not yet have been transmitted.
      * \param priority
      *      The priority level of this packet. 0 is the lowest priority.
+     * \param[out] txQueueState
+     *      Used to retrieve state of the NIC's transmit queue when this packet
+     *      was handed to the NIC. NULL means the caller doesn't care about
+     *      this value.
      */
     template<typename T>
     void sendPacket(const Address* recipient,
                     const T* header,
                     Buffer::Iterator* payload,
-                    int priority = 0)
+                    int priority = 0,
+                    TransmitQueueState* txQueueState = NULL)
     {
-        sendPacket(recipient, header, sizeof(T), payload, priority);
+        sendPacket(recipient, header, sizeof(T), payload, priority,
+                txQueueState);
     }
 
     /**
@@ -408,6 +489,18 @@ class Driver {
      * nanoseconds.
      */
     static const uint32_t MAX_DRAIN_TIME = 2000;
+
+  PROTECTED:
+    /// The most recent time that the driver handed a packet to the NIC,
+    /// in rdtsc ticks.
+    uint64_t lastTransmitTime;
+
+    /// Upper limit on how many bytes should be queued for transmission
+    /// at any given time.
+    uint32_t maxTransmitQueueSize;
+
+    /// Used to estimate # bytes outstanding in the NIC's transmit queue.
+    QueueEstimator queueEstimator;
 };
 
 /**
