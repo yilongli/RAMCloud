@@ -1,1 +1,0 @@
-scripts/clusterperf.py --dpdkPort 1 --superuser --transport basic+dpdk --servers 16 --clients 16 --replicas 0 --disjunct --seconds 60 --messageSizeCdfFile ReadDistRandom.txt --loadFactor 0.4 --verbose echo_workload
