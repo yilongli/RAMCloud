@@ -71,6 +71,8 @@ class Driver {
      *      type of the sender's address
      * \tparam N
      *      the maximum size of the payload
+     * \tparam M
+     *      the maximum size of the headroom space
      */
     template<typename T, uint32_t N, uint32_t M=0>
     struct PacketBuf {

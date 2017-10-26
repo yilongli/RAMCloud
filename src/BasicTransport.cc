@@ -81,7 +81,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , nextServerSequenceNumber(1)
     , receivedPackets()
     , grantRecipients()
-    , messageBuffers()
+    , messagesToRelease()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
@@ -104,26 +104,6 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // we don't want those delays to result in RPC timeouts.
     , timeoutIntervals(40)
     , pingIntervals(3)
-//    , lastMeasureTime(0)
-//    , lastDispatchActiveCycles(0)
-//    , lastTimeGrantRunDry(0)
-//    , monitorInterval()
-//    , monitorMillis()
-//    , numPacketsReceived(0)
-//    , numDataPacketsReceived(0)
-//    , numControlPacketsSent(0)
-//    , numDataPacketsSent(0)
-//    , numTimesGrantRunDry(0)
-//    , outputControlBytes(0)
-//    , outputDataBytes(0)
-//    , outputResentBytes(0)
-//    , perfMonitorIntervals(0)
-//    , processPacketCycles(0)
-//    , timeoutCheckCycles(0)
-//    , transmitDataCycles(0)
-//    , transmitGrantCycles(0)
-//    , tryToTransmitDataCacheMisses(0)
-//    , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -169,8 +149,8 @@ BasicTransport::~BasicTransport()
     }
 
     // Release all retained payloads after reclaiming all RPC objects.
-    for (MessageAccumulator::MessageBuffer* messageBuffer : messageBuffers) {
-        for (char* payload : *messageBuffer) {
+    for (MessageAccumulator::ReceivedPackets* message : messagesToRelease) {
+        for (char* payload : *message) {
             driver->release(payload);
         }
     }
@@ -224,7 +204,6 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
-    // TODO: Profile how long it takes; might have to optimize it
     incomingRpcs.erase(serverRpc->rpcId);
     if (serverRpc->sendingResponse) {
         erase(outgoingResponses, *serverRpc);
@@ -1463,7 +1442,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                // TODO: document why pass the bytes directly to NIC
                 sendBytes(serverRpc->clientAddress,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
@@ -1601,18 +1579,14 @@ BasicTransport::ServerRpc::sendReply()
 BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
         Buffer* buffer, uint32_t totalLength)
     : t(t)
-    // FIXME: avoid doing dynamic allocation? profile it first
-    , assembledPayloads(new MessageBuffer())
+    , assembledPayloads(new ReceivedPackets())
     , buffer(buffer)
     , fragments()
-    , packetLost(false)
 {
     assert(buffer->size() == 0);
-#define FRAGMENTS_HIGH_WATERMARK 64
     int numPackets = totalLength / t->maxDataPerPacket +
             (totalLength % t->maxDataPerPacket == 0 ? 0 : 1);
     assembledPayloads->reserve(numPackets);
-    fragments.reserve(std::min(numPackets, FRAGMENTS_HIGH_WATERMARK));
 }
 
 /**
@@ -1628,7 +1602,7 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->release(fragment.header);
     }
     fragments.clear();
-    t->messageBuffers.push_back(assembledPayloads);
+    t->messagesToRelease.push_back(assembledPayloads);
 }
 
 /**
@@ -1664,12 +1638,6 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         FragmentMap::iterator iter;
         std::tie(iter, retainPacket) = fragments.emplace(
                 uint32_t(header->offset), MessageFragment(header, length));
-        if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
-            packetLost = true;
-            // FIXME: investigate why W4/5 produces so many false(?) alarms
-//            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
-            timeTrace("Packet might be lost, offset %u", buffer->size());
-        }
         return retainPacket;
     }
 
@@ -1696,7 +1664,6 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
             timeTrace("addPacket assembled %u unappended fragments",
                     numPayloads-1);
         }
-        packetLost = false;
         return true;
     } else {
         // This packet is redundant.
@@ -1903,20 +1870,20 @@ BasicTransport::Poller::poll()
     // useful to do in this method uptill now, try to release more payloads.
     const uint32_t maxRelease = result ? 2 : 5;
     uint32_t releaseCount = 0;
-    while (!t->messageBuffers.empty()) {
-        MessageAccumulator::MessageBuffer* messageBuffer =
-                t->messageBuffers.back();
-        while (!messageBuffer->empty() && (releaseCount < maxRelease)) {
-            char* payload = messageBuffer->back();
-            messageBuffer->pop_back();
+    while (!t->messagesToRelease.empty()) {
+        MessageAccumulator::ReceivedPackets* message =
+                t->messagesToRelease.back();
+        while (!message->empty() && (releaseCount < maxRelease)) {
+            char* payload = message->back();
+            message->pop_back();
             t->driver->release(payload);
             releaseCount++;
             result = 1;
         }
 
-        if (messageBuffer->empty()) {
-            t->messageBuffers.pop_back();
-            delete messageBuffer;
+        if (message->empty()) {
+            t->messagesToRelease.pop_back();
+            delete message;
         } else {
             break;
         }

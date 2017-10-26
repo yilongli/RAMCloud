@@ -23,7 +23,6 @@
 #include "flat_hash_map.h"
 #pragma GCC diagnostic warning "-Wconversion"
 #pragma GCC diagnostic warning "-Weffc++"
-#include "flat_hash_map.h"
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -158,8 +157,10 @@ class BasicTransport : public Transport {
         /// Transport that is managing this object.
         BasicTransport* t;
 
-        using MessageBuffer = std::vector<char*>;
-        MessageBuffer* assembledPayloads;
+        /// Holds all of the packets that have been received for the message
+        /// so far in order, up to the first packet that has not been received.
+        using ReceivedPackets = std::vector<char*>;
+        ReceivedPackets* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -239,7 +240,10 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
     };
 
-    // TODO
+    /**
+     * An outgoing message that is either the request of a ClientRpc or the
+     * response of a ServerRpc.
+     */
     class OutgoingMessage {
       public:
         /// Holds the contents of the message.
@@ -295,6 +299,7 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(OutgoingMessage);
     };
 
+    // FIXME: ClientRpc is not an OutoingMessage; it contains an outgoing message.
     /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
@@ -672,7 +677,9 @@ class BasicTransport : public Transport {
     /// Maximum # bytes of message data that can fit in one packet.
     const uint32_t maxDataPerPacket;
 
-    /// Maximum # bytes of message that we support zero-copy reception.
+    /// Maximum # bytes of message that we desire to receive in a zero-copy
+    /// fashion; this only makes a difference if zero-copy RX is also supported
+    /// by the underlying driver.
     const uint32_t maxZeroCopyMessage;
 
     /// Unique identifier for this client (used to provide unique
@@ -698,12 +705,11 @@ class BasicTransport : public Transport {
     /// when the poll method is receiving and processing incoming packets.
     std::vector<ScheduledMessage*> grantRecipients;
 
-    /// Holds message buffers that are consist of payloads that are retained
-    /// and assembled by the MessageAccumulator. These retained payloads are
-    /// gradually released in the poll method so that the MessageAccumulator
-    /// doesn't have to release all its payloads at one shot in the destructor
-    /// and cause significant jitter.
-    std::vector<MessageAccumulator::MessageBuffer*> messageBuffers;
+    /// Holds multi-packet messages assembled by the MessageAccumulator. The
+    /// received packets are gradually released in the poll method because
+    /// releasing all packets of a large message at one shot in the destructor
+    /// of MessageAccumulator can cause significant jitter.
+    std::vector<MessageAccumulator::ReceivedPackets*> messagesToRelease;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
@@ -717,9 +723,6 @@ class BasicTransport : public Transport {
     /// request yet). Keys are RPC sequence numbers.
     typedef ska::flat_hash_map<uint64_t, ClientRpc*> ClientRpcMap;
     ClientRpcMap outgoingRpcs;
-    // TODO: The way we are uing this map is quite inefficient!!!
-    // (e.g. frequently iterating the entire map) especially when there is
-    // a large number of outstanding RPCs
 
     /// Holds RPCs for which we are the client, and for which the
     /// request message has not yet been completely transmitted (once
@@ -808,76 +811,6 @@ class BasicTransport : public Transport {
     /// any packets from the server for particular RPC, then it sends a
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
-
-//    //--------------------
-//    // Performance Monitor
-//    //--------------------
-//
-//    /// The beginning of the current monitoring interval, in units of
-//    /// rdtsc ticks.
-//    uint64_t lastMeasureTime;
-//
-//    /// The value of `PerfStats::activeDispatchCycles` at `lastMeasureTime`.
-//    uint64_t lastDispatchActiveCycles;
-//
-//    /// The start time of the last call to Dispatch::poll where
-//    /// `numTimesGrantRunDry` increments.
-//    uint64_t lastTimeGrantRunDry;
-//
-//    /// `monitorMillis` in units of rdtsc ticks.
-//    uint64_t monitorInterval;
-//
-//    /// Specifies the period over which to log the performance metrics,
-//    /// in milliseconds.
-//    uint32_t monitorMillis;
-//
-//    /// # total packets received and processed in the current interval.
-//    uint32_t numPacketsReceived;
-//
-//    /// # data packets received and processed in the current interval.
-//    uint32_t numDataPacketsReceived;
-//
-//    /// # total control packets transmitted in the current interval.
-//    uint32_t numControlPacketsSent;
-//
-//    /// # data packets transmitted in the current interval.
-//    uint32_t numDataPacketsSent;
-//
-//    /// # times, in the current interval, we cannot transmit any message
-//    /// because we are waiting for GRANTs and the transmit queue has run
-//    /// dry.
-//    uint32_t numTimesGrantRunDry;
-//
-//    /// Total # control bytes transmitted in the current interval.
-//    uint32_t outputControlBytes;
-//
-//    /// Total # data bytes (excluding packet headers) transmitted in the
-//    /// current interval.
-//    uint32_t outputDataBytes;
-//
-//    /// Total # retransmitted data bytes (excluding packet headers) in the
-//    /// current interval.
-//    uint32_t outputResentBytes;
-//
-//    /// # performance monitor intervals we have experienced.
-//    uint64_t perfMonitorIntervals;
-//
-//    // TODO
-//    uint64_t processPacketCycles;
-//
-//    uint64_t timeoutCheckCycles;
-//
-//    uint64_t transmitDataCycles;
-//
-//    uint64_t transmitGrantCycles;
-//
-//    /// # times we have to look outside of t->topOutgoingMessages in order to
-//    /// find a message to transmit in #tryToTransmitData.
-//    uint32_t tryToTransmitDataCacheMisses;
-//
-//    /// Total # idle rdtsc ticks of the NIC's transmit queue in the
-//    /// current interval.
-//    uint64_t unusedBandwidth;
 
     DISALLOW_COPY_AND_ASSIGN(BasicTransport);
 };
