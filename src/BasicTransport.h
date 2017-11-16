@@ -44,7 +44,7 @@ class BasicTransport : public Transport {
 
   public:
     explicit BasicTransport(Context* context, const ServiceLocator* locator,
-            Driver* driver, uint64_t clientId);
+            Driver* driver, bool driverOwner, uint64_t clientId);
     ~BasicTransport();
 
     string getServiceLocator();
@@ -614,13 +614,14 @@ class BasicTransport : public Transport {
 
     /**
      * Describes the wire format for PING packets. These packets are used
-     * to check if a client or server is still alive.
+     * by the client to check if the server is still alive and processing
+     * the RPC sent by the client.
      */
     struct PingHeader {
         CommonHeader common;         // Common header fields.
 
-        explicit PingHeader(RpcId rpcId, uint8_t flags)
-            : common(PacketOpcode::PING, rpcId, flags) {}
+        explicit PingHeader(RpcId rpcId)
+            : common(PacketOpcode::PING, rpcId, FROM_CLIENT) {}
     } __attribute__((packed));
 
     /**
@@ -667,6 +668,10 @@ class BasicTransport : public Transport {
 
     /// The Driver used to send and receive packets.
     Driver* driver;
+
+    /// Is this transport the owner of #driver? If yes, free the driver upon
+    /// destruction.
+    bool driverOwner;
 
     /// Service locator string of this transport.
     string locatorString;
@@ -745,9 +750,11 @@ class BasicTransport : public Transport {
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;
 
-    /// False means we know that no message outside t->topOutgoingMessages
-    /// has grants available and there is no need to take the slow path in
-    /// #tryToTransmitData.
+    /// Do we have to consider the slow path when transmitting data? That is,
+    /// iterating over all outgoing messages to find the message with fewest
+    /// remaining bytes and grants available. False if we know that no message
+    /// outside t->topOutgoingMessages has grants available, so there is no
+    /// need to look elsewhere.
     bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,

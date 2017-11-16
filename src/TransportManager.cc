@@ -57,7 +57,7 @@ static struct BasicUdpTransportFactory : public TransportFactory {
     Transport* createTransport(Context* context,
             const ServiceLocator* localServiceLocator) {
         return new BasicTransport(context, localServiceLocator,
-                new UdpDriver(context, localServiceLocator),
+                new UdpDriver(context, localServiceLocator), true,
                 generateRandom());
     }
 } basicUdpTransportFactory;
@@ -69,7 +69,7 @@ static struct BasicSolarFlareTransportFactory : public TransportFactory {
     Transport* createTransport(Context* context,
             const ServiceLocator* localServiceLocator) {
         return new BasicTransport(context, localServiceLocator,
-                new SolarFlareDriver(context, localServiceLocator),
+                new SolarFlareDriver(context, localServiceLocator), true,
                 generateRandom());
     }
 } basicSolarFlareTransportFactory;
@@ -82,7 +82,7 @@ static struct BasicInfUdTransportFactory : public TransportFactory {
     Transport* createTransport(Context* context,
             const ServiceLocator* localServiceLocator) {
         return new BasicTransport(context, localServiceLocator,
-                new InfUdDriver(context, localServiceLocator, false),
+                new InfUdDriver(context, localServiceLocator, false), true,
                 generateRandom());
     }
 } basicInfUdTransportFactory;
@@ -110,8 +110,8 @@ struct BasicDpdkTransportFactory : public TransportFactory {
                     "command-line option?)");
             throw TransportException(HERE, "DPDK is not enabled");
         }
-        return new BasicTransport(context, localServiceLocator,
-                driver, generateRandom());
+        return new BasicTransport(context, localServiceLocator, driver, false,
+                generateRandom());
     }
     void setDpdkDriver(DpdkDriver* driver) {
         this->driver = driver;

@@ -61,20 +61,28 @@ namespace {
  *      NULL means this transport is created on the client-side to handle
  *      outgoing requests.
  * \param driver
- *      Used to send and receive packets. This transport becomes owner
- *      of the driver and will free it in when this object is deleted.
+ *      Used to send and receive packets.
+ * \param driverOwner
+ *      True if this transport becomes owner of the driver and will free it
+ *      when this object is deleted.
  * \param clientId
  *      Identifier that identifies us in outgoing RPCs: must be unique across
  *      all servers and clients.
  */
 BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
-        Driver* driver, uint64_t clientId)
+        Driver* driver, bool driverOwner, uint64_t clientId)
     : context(context)
     , driver(driver)
+    , driverOwner(driverOwner)
     , locatorString("basic+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
-    // TODO: document the choice of this parameter
+
+    // If this parameter is set too large, we may run out of hardware packet
+    // buffers in the driver and stop receiving messages. As of 09/2017,
+    // with this value set to 100*maxDataPerPacket, we have not observed
+    // any message drop due to packet buffer exhaustion when running workloads
+    // W3, W4 and W5 that are used in the Homa paper evaluation.
     , maxZeroCopyMessage(100*maxDataPerPacket)
     , clientId(clientId)
     , nextClientSequenceNumber(1)
@@ -153,6 +161,10 @@ BasicTransport::~BasicTransport()
         for (char* payload : *message) {
             driver->release(payload);
         }
+    }
+
+    if (driverOwner) {
+        delete driver;
     }
 }
 
@@ -234,10 +246,11 @@ uint32_t
 BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
 {
     uint32_t gBitsPerSec = 0;
-    // TODO: The RTT in the m510 cluster is more like 8us (5 us of data packet
-    // propagation delay plus 1 us of service time plus 1 us of grant packet
-    // propagation delay) in the unloaded case. Figure out how to set
-    // "rttMicros" from command line.
+    // To be precise, the RTT includes the one-way delay of a data packet,
+    // the server processing time and the one-way delay of a grant packet.
+    // As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of data
+    // packet one-way delay plus 1 us of server processing time plus 2 us
+    // of grant packet one-way delay).
     uint32_t roundTripMicros = 8;
 
     if (locator != NULL) {
@@ -391,14 +404,11 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         }
         if (txQueueState.outstandingBytes > 0) {
             timeTrace(driver->getLastTransmitTime(),
-                    "sent data, clientId %u, sequence %u, offset %u, "
-                    "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
-                    curOffset, txQueueState.outstandingBytes);
+                    "sent data, %u bytes queued ahead",
+                    txQueueState.outstandingBytes);
         } else {
             timeTrace(driver->getLastTransmitTime(),
-                    "sent data, clientId %u, sequence %u, offset %u, "
-                    "0 bytes queued ahead, idle time %u cyc",
-                    rpcId.clientId, rpcId.sequence, curOffset,
+                    "sent data, tx queue idle time %u cyc",
                     txQueueState.idleTime);
         }
         bytesSent += bytesThisPacket;
@@ -409,7 +419,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
 }
 
 /**
- * Send out a single control packet.
+ * Send a control packet.
  *
  * \param recipient
  *      Where to send the packet.
@@ -423,25 +433,9 @@ BasicTransport::sendControlPacket(const Driver::Address* recipient,
 {
     QueueEstimator::TransmitQueueState txQueueState;
     driver->sendPacket(recipient, packet, NULL, 0, &txQueueState);
-    if (std::is_same<T, GrantHeader>::value) {
-        const GrantHeader* grant = reinterpret_cast<const GrantHeader*>(packet);
-        const RpcId* rpcId = &grant->common.rpcId;
-        if (txQueueState.outstandingBytes > 0) {
-            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
-                    "%u bytes queued ahead, idle time 0 cyc",
-                    rpcId->clientId, rpcId->sequence, grant->offset,
-                    txQueueState.outstandingBytes);
-        } else {
-            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
-                    "0 bytes queued ahead, idle time %u cyc",
-                    rpcId->clientId, rpcId->sequence, grant->offset,
-                    txQueueState.idleTime);
-        }
-    } else {
-        timeTrace("sent control packet, %u bytes queued ahead, "
-                "idle time %u cyc", txQueueState.outstandingBytes,
-                txQueueState.idleTime);
-    }
+    timeTrace("sent control packet, opcode %u, %u bytes queued ahead, "
+            "tx queue idle time %u cyc", packet->common.opcode,
+            txQueueState.outstandingBytes, txQueueState.idleTime);
 }
 
 /**
@@ -1166,17 +1160,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                 // Nothing to do.
                 timeTrace("client received ACK, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
-                return;
-            }
-
-            // PING from server
-            case PacketOpcode::PING: {
-                timeTrace("client received PING, clientId %u, sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
-                if (clientRpc != NULL) {
-                    AckHeader ack(common->rpcId, FROM_CLIENT);
-                    sendControlPacket(clientRpc->session->serverAddress, &ack);
-                }
                 return;
             }
 
@@ -1947,7 +1930,7 @@ BasicTransport::checkTimeouts()
                 if (clientRpc->transmitOffset == clientRpc->transmitLimit) {
                     // The client has transmitted every granted byte. Poke the
                     // server to see if it's still alive.
-                    PingHeader ping(clientRpc->rpcId, FROM_CLIENT);
+                    PingHeader ping(clientRpc->rpcId);
                     sendControlPacket(clientRpc->session->serverAddress,
                             &ping);
                 } else {
