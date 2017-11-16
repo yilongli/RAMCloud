@@ -159,8 +159,8 @@ class BasicTransport : public Transport {
 
         /// Holds all of the packets that have been received for the message
         /// so far in order, up to the first packet that has not been received.
-        using ReceivedPackets = std::vector<char*>;
-        ReceivedPackets* assembledPayloads;
+        using Payloads = std::vector<char*>;
+        Payloads* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -338,7 +338,7 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
 
-        /// Holds state of response messages that require scheduling.
+        /// Holds state of the response message that requires scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->outgoingRequests.
@@ -413,7 +413,7 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
-        /// Holds state of request messages that require scheduling.
+        /// Holds state of the request message that requires scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->serverTimerList.
@@ -714,7 +714,7 @@ class BasicTransport : public Transport {
     /// received packets are gradually released in the poll method because
     /// releasing all packets of a large message at one shot in the destructor
     /// of MessageAccumulator can cause significant jitter.
-    std::vector<MessageAccumulator::ReceivedPackets*> messagesToRelease;
+    std::vector<MessageAccumulator::Payloads*> messagesToRelease;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
