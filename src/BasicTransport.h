@@ -738,23 +738,20 @@ class BasicTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    /// A relatively small set of the sender's top K outgoing messages with
-    /// fewest bytes left. We keep this as a separate set so that the sender
-    /// doesn't have to consider all the outgoing messages in the common case.
-    /// K is dynamically adjusted based on the workload. The overall goal is
-    /// to keep K as small as possible while still ensuring that the sender
-    /// doesn't have to look outside this set when picking the next message
-    /// to transmit. Every time the sender decides to transmit a message
-    /// outside this set, we increment K by one.
+    /// Holds the sender's top K outgoing messages with fewest bytes left.
+    /// K is bounded to a relatively small number so that this list cannot
+    /// grow too large. We keep this as a separate list from the outgoing
+    /// requests/responses so that the sender doesn't have to consider all
+    /// the outgoing messages in the common case of transmitting a message.
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;
 
     /// Do we have to consider the slow path when transmitting data? That is,
     /// iterating over all outgoing messages to find the message with fewest
-    /// remaining bytes and grants available. False if we know that no message
-    /// outside t->topOutgoingMessages has grants available, so there is no
-    /// need to look elsewhere.
+    /// remaining bytes and ready to transmit. This question is essentially
+    /// equivalent to if any message outside t->topOutgoingMessages has grants
+    /// or unscheduled bytes available.
     bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,

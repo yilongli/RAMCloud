@@ -403,13 +403,11 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             driver->sendPacket(address, &header, &iter, 0, &txQueueState);
         }
         if (txQueueState.outstandingBytes > 0) {
-            timeTrace(driver->getLastTransmitTime(),
-                    "sent data, %u bytes queued ahead",
-                    txQueueState.outstandingBytes);
+            timeTrace(driver->getLastTransmitTime(), "sent data, "
+                    "%u bytes queued ahead", txQueueState.outstandingBytes);
         } else {
-            timeTrace(driver->getLastTransmitTime(),
-                    "sent data, tx queue idle time %u cyc",
-                    txQueueState.idleTime);
+            timeTrace(driver->getLastTransmitTime(), "sent data, "
+                    "tx queue idle time %u cyc", txQueueState.idleTime);
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
@@ -572,12 +570,6 @@ BasicTransport::tryToTransmitData()
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
     while (transmitQueueSpace > 0) {
-        uint64_t numOutgoingMessages =
-                outgoingRequests.size() + outgoingResponses.size();
-        if (numOutgoingMessages == 0) {
-            break;
-        }
-
         // Find an outgoing request or response that is ready to transmit.
         // The policy here is "shortest remaining processing time" (SRPT).
 
@@ -603,20 +595,18 @@ BasicTransport::tryToTransmitData()
             }
         }
 
-        if (expect_false((NULL == message) && transmitDataSlowPath
-                && (numOutgoingMessages > topOutgoingMessages.size()))) {
+        // Couldn't find a message to transmit from our top outgoing message
+        // set; take the slow path
+        if (expect_false((NULL == message) && transmitDataSlowPath)) {
             timeTrace("slow path taken, iterating over %u outgoing messages",
                     outgoingRequests.size() + outgoingResponses.size());
 
-            uint32_t outsideMinBytesLeft = ~0u;
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                         it != outgoingRequests.end(); it++) {
                 ClientRpc* rpc = &(*it);
                 if (!rpc->topChoice) {
                     uint32_t bytesLeft =
                             rpc->request->size() - rpc->transmitOffset;
-                    outsideMinBytesLeft =
-                            std::min(bytesLeft, outsideMinBytesLeft);
                     if (rpc->transmitLimit <= rpc->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -634,8 +624,6 @@ BasicTransport::tryToTransmitData()
                 if (!rpc->topChoice) {
                     uint32_t bytesLeft = rpc->replyPayload.size() -
                             rpc->transmitOffset;
-                    outsideMinBytesLeft =
-                            std::min(bytesLeft, outsideMinBytesLeft);
                     if (rpc->transmitLimit <= rpc->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -648,14 +636,8 @@ BasicTransport::tryToTransmitData()
             }
 
             if (message == NULL) {
+                // Can't find one outgoing message that is ready to transmit.
                 transmitDataSlowPath = false;
-            } else if (minBytesLeft == outsideMinBytesLeft) {
-                // TODO: rephrase it
-                // Expand the top outgoing message set only if the message
-                // has the fewest bytes left among outgoing messages not in
-                // this set.
-                message->topChoice = true;
-                topOutgoingMessages.push_back(*message);
             }
         }
 
@@ -693,6 +675,7 @@ BasicTransport::tryToTransmitData()
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             if (message->transmitOffset >= message->buffer->size()) {
+                // We have transmitted the last byte of the message.
                 if (clientRpc) {
                     erase(outgoingRequests, *clientRpc);
                     clientRpc->transmitPending = false;
@@ -710,6 +693,9 @@ BasicTransport::tryToTransmitData()
                     deleteServerRpc(serverRpc);
                 }
             } else if (!message->topChoice) {
+                // This message is taken from the slow path; see if we should
+                // include it to topOutgoingMessages so that we may avoid the
+                // slow path next time.
                 updateTopOutgoingMessageSet(message, false);
             }
         } else {
@@ -777,6 +763,8 @@ BasicTransport::Session::cancelRequest(RpcNotifier* notifier)
             it != t->outgoingRpcs.end(); it++) {
         ClientRpc* clientRpc = it->second;
         if (clientRpc->notifier == notifier) {
+            // Notify the server about the aborted RPCs to avoid spurious
+            // warning messages in the log.
             AbortHeader abort(clientRpc->rpcId);
             t->sendControlPacket(this->serverAddress, &abort);
             t->deleteClientRpc(clientRpc);
@@ -812,12 +800,12 @@ BasicTransport::Session::getRpcInfo()
 }
 
 /**
- * Implements the logic of updating the top outgoing message set, if
- * appropriate, when a new message arrives or we transmit a few more bytes
+ * This method decides if we should update the top outgoing message set;
+ * invoked when a new message arrives or we just transmited a few more bytes
  * of an existing message outside this set.
  *
  * \param candidate
- *      A message that might be included in the top outgoing message set.
+ *      A message that might be added to the top outgoing message set.
  * \param newMessage
  *      True means this message was just included in the outgoing
  *      request/response set; false means the message was already in the
@@ -828,8 +816,11 @@ BasicTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
         bool newMessage)
 {
     assert(!candidate->topChoice);
-#define LOW_WATERMARK 4
-    if (topOutgoingMessages.size() < LOW_WATERMARK) {
+    // As of 09/2017, the maximum size of the top outgoing message set is
+    // bounded to 4. During evaluation, we found that this value is large
+    // enough to ensure that the sender doesn't have to look outside this
+    // set when picking the next message to transmit.
+    if (topOutgoingMessages.size() < 4) {
         candidate->topChoice = true;
         topOutgoingMessages.push_back(*candidate);
     } else {
@@ -853,7 +844,7 @@ BasicTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
             candidate->topChoice = true;
             topOutgoingMessages.push_back(*candidate);
         }
-        if (newMessage) {
+        if (newMessage && !candidate->topChoice) {
             transmitDataSlowPath = true;
         }
     }
