@@ -1586,14 +1586,21 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         uint32_t length)
 {
     length -= sizeof32(DataHeader);
-    assert((header->offset % t->maxDataPerPacket == 0) &&
-           ((length == t->maxDataPerPacket) ||
-           (header->offset + length >= header->totalLength)));
+
+    // These should not happen normally.
+    if (header->offset % t->maxDataPerPacket != 0) {
+        // Unexpected packet offset
+        return false;
+    } else if ((length != t->maxDataPerPacket) &&
+            (header->offset + length < header->totalLength)) {
+        // Unexpected packet size
+        return false;
+    }
 
     bool retainPacket;
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
-        // data is missing. Save the packet for later.
+        // data is missing. Save the packet for later, if it's not redundant.
         FragmentMap::iterator iter;
         std::tie(iter, retainPacket) = fragments.emplace(
                 uint32_t(header->offset), MessageFragment(header, length));
@@ -1603,27 +1610,23 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
     if (header->offset == buffer->size()) {
-        uint64_t numPayloads = assembledPayloads->size();
-        while (true) {
-            char* payload = reinterpret_cast<char*>(header);
-            buffer->appendExternal(payload + sizeof32(DataHeader), length);
+        // Each iteration of the following loop appends one fragment to
+        // the buffer.
+        MessageFragment fragment(header, length);
+        do {
+            char* payload = reinterpret_cast<char*>(fragment.header);
+            buffer->appendExternal(payload + sizeof32(DataHeader),
+                    fragment.length);
             assembledPayloads->push_back(payload);
 
             FragmentMap::iterator it = fragments.find(buffer->size());
             if (it == fragments.end()) {
-                break;
+                return true;
+            } else {
+                fragment = it->second;
+                fragments.erase(it);
             }
-            MessageFragment fragment = it->second;
-            header = fragment.header;
-            length = fragment.length;
-            fragments.erase(it);
-        }
-        numPayloads = assembledPayloads->size() - numPayloads;
-        if (numPayloads > 1) {
-            timeTrace("addPacket assembled %u unappended fragments",
-                    numPayloads-1);
-        }
-        return true;
+        } while (true);
     } else {
         // This packet is redundant.
         return false;
