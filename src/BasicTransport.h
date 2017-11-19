@@ -456,8 +456,7 @@ class BasicTransport : public Transport {
         RESEND                 = 24,
         ACK                    = 25,
         ABORT                  = 26,
-        PING                   = 27,
-        BOGUS                  = 28,      // Used only in unit tests.
+        BOGUS                  = 27,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -610,18 +609,6 @@ class BasicTransport : public Transport {
 
         explicit AbortHeader(RpcId rpcId)
             : common(PacketOpcode::ABORT, rpcId, FROM_CLIENT) {}
-    } __attribute__((packed));
-
-    /**
-     * Describes the wire format for PING packets. These packets are used
-     * by the client to check if the server is still alive and processing
-     * the RPC sent by the client.
-     */
-    struct PingHeader {
-        CommonHeader common;         // Common header fields.
-
-        explicit PingHeader(RpcId rpcId)
-            : common(PacketOpcode::PING, rpcId, FROM_CLIENT) {}
     } __attribute__((packed));
 
     /**

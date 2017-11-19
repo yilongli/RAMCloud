@@ -318,8 +318,6 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
             return "ACK";
         case BasicTransport::PacketOpcode::ABORT:
             return "ABORT";
-        case BasicTransport::PacketOpcode::PING:
-            return "PING";
     }
 
     return format("%d", opcode);
@@ -523,13 +521,6 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
         }
         case BasicTransport::PacketOpcode::ABORT: {
             headerLength = sizeof32(BasicTransport::AbortHeader);
-            if (packetLength < headerLength) {
-                goto packetTooShort;
-            }
-            break;
-        }
-        case BasicTransport::PacketOpcode::PING: {
-            headerLength = sizeof32(BasicTransport::PingHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -1440,17 +1431,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
-            // PING from client
-            case PacketOpcode::PING: {
-                timeTrace("server received PING, clientId %u, sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
-                if (serverRpc != NULL) {
-                    AckHeader ack(common->rpcId, FROM_SERVER);
-                    sendControlPacket(serverRpc->clientAddress, &ack);
-                }
-                return;
-            }
-
             default:
                 RAMCLOUD_CLOG(WARNING,
                         "unexpected opcode %s received from client %s",
@@ -1748,7 +1728,8 @@ BasicTransport::Poller::poll()
     uint64_t startTime = Cycles::rdtsc();
 #endif
 
-    // Process any available incoming packets.
+    // Process any available incoming packets. Try to receive MAX_PACKETS
+    // packets at a time; continue until we have received all the packets.
 #define MAX_PACKETS 4
     uint32_t numPackets;
     uint32_t totalPackets = 0;
@@ -1775,9 +1756,7 @@ BasicTransport::Poller::poll()
     } while (numPackets == MAX_PACKETS);
     result |= totalPackets;
 
-    // Send out GRANTs that are produced in the previous processing step
-    // in a batch.
-    // TODO: should I do a bucket sort or something to rank them by priorities?
+    // Send out GRANTs that are produced when handling DATA packets.
     for (ScheduledMessage* recipient : t->grantRecipients) {
         uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
                 FROM_SERVER : FROM_CLIENT;
@@ -1787,7 +1766,6 @@ BasicTransport::Poller::poll()
                 "server sending GRANT, clientId %u, sequence %u, offset %u";
         timeTrace(fmt, recipient->rpcId.clientId, recipient->rpcId.sequence,
                 grant.offset);
-
         t->sendControlPacket(recipient->senderAddress, &grant);
     }
     t->grantRecipients.clear();
@@ -1829,8 +1807,8 @@ BasicTransport::Poller::poll()
 
     // Release a few retained payloads to the driver. As of 02/2017, releasing
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
-    // useful to do in this method uptill now, try to release more payloads.
-    const uint32_t maxRelease = result ? 2 : 5;
+    // useful to do in this method up till now, try to release more payloads.
+    const uint32_t maxRelease = result ? 1 : 5;
     uint32_t releaseCount = 0;
     while (!t->messagesToRelease.empty()) {
         MessageAccumulator::Payloads* message = t->messagesToRelease.back();
@@ -1867,10 +1845,10 @@ BasicTransport::Poller::poll()
 void
 BasicTransport::checkTimeouts()
 {
-    // Scan all of the ClientRpc objects.
-    timeTrace("checkTimeouts invoked, %u outgoing RPCs, "
-            "%u incomplete incoming requests",
+    timeTrace("checkTimeouts invoked, %u client RPCs, %u server RPCs",
             outgoingRpcs.size(), serverTimerList.size());
+
+    // Scan all of the ClientRpc objects.
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
             it != outgoingRpcs.end(); ) {
         uint64_t sequence = it->first;
@@ -1902,57 +1880,60 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->silentIntervals >= 2) {
+        if (clientRpc->response->size() == 0) {
+            // We haven't received any part of the response message.
             if (clientRpc->transmitPending) {
-                // We haven't finished transmitting the request.
-                if (clientRpc->transmitOffset == clientRpc->transmitLimit) {
-                    // The client has transmitted every granted byte. Poke the
-                    // server to see if it's still alive.
-                    PingHeader ping(clientRpc->rpcId);
-                    sendControlPacket(clientRpc->session->serverAddress,
-                            &ping);
-                } else {
-                    clientRpc->silentIntervals = 0;
-                }
+                // We haven't finished transmitting the request. There are
+                // two cases. (1) We haven't transmitted every byte we can:
+                // probably too busy transmitting messages with higher
+                // priority. (2) This request is waiting for grants: the
+                // request might be lost, the grant might be lost, or the
+                // server hasn't got around to grant us more bytes. In either
+                // case, just reset the timer and let the server deal with it.
+                clientRpc->silentIntervals = 0;
             } else {
-                if (!clientRpc->accumulator) {
-                    // We haven't received any part of the response message.
-                    // Send occasional RESEND packets, which should produce
-                    // some response from the server, so that we know it's
-                    // still alive and working. Note: the wait time for this
-                    // ping is longer than the server's wait time to request
-                    // retransmission (first give the server a chance to handle
-                    // the problem).
-                    if ((clientRpc->silentIntervals % pingIntervals) == 0) {
-                        timeTrace("client sending RESEND for clientId %u, "
-                                "sequence %u", clientId, sequence);
-                        ResendHeader resend(RpcId(clientId, sequence), 0,
-                                roundTripBytes, FROM_CLIENT);
-                        sendControlPacket(clientRpc->session->serverAddress,
-                                &resend);
-                    }
-                } else {
-                    // We have received part of the response.
-                    ScheduledMessage* scheduledMessage =
-                            clientRpc->scheduledMessage.get();
-                    uint32_t grantOffset = scheduledMessage ?
-                            scheduledMessage->grantOffset : 0;
-                    if (scheduledMessage && (grantOffset ==
-                            clientRpc->accumulator->buffer->size())) {
-                        // The client has received every byte of the response it has
-                        // granted but hasn't got around to grant more because there
-                        // are higher priority responses.
-                        clientRpc->silentIntervals = 0;
-                        continue;
-                    }
-                    // The client expects to receive more bytes but the server
-                    // has gone silent, this must mean packets were lost,
-                    // grants were lost, or the server has preempted this
-                    // response for higher priority messages, so request
-                    // retransmission anyway.
+                // Send occasional RESEND packets, which should produce
+                // some response from the server, so that we know it's
+                // still alive and working. Note: the wait time for this
+                // ping is longer than the server's wait time to request
+                // retransmission (first give the server a chance to handle
+                // the problem).
+                if (clientRpc->silentIntervals % pingIntervals == 0) {
+                    timeTrace("client sending RESEND for clientId %u, "
+                            "sequence %u", clientId, sequence);
+                    ResendHeader resend(RpcId(clientId, sequence), 0,
+                            roundTripBytes, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress,
+                            &resend);
+                }
+            }
+        } else {
+            // We have received part of the response.
+            assert(clientRpc->accumulator);
+            ScheduledMessage* scheduledMessage =
+                    clientRpc->scheduledMessage.get();
+            uint32_t grantOffset = scheduledMessage ?
+                    scheduledMessage->grantOffset : 0;
+            if (grantOffset == clientRpc->response->size()) {
+                // TODO: This branch is only used in Homa; Basic issues grants aggressively
+                // The client has received every granted byte but hasn't got
+                // around to grant more because there are higher priority
+                // responses.
+                assert(scheduledMessage);
+                clientRpc->silentIntervals = 0;
+            } else {
+                // The client expects to receive more but the server
+                // has gone silent, this must mean packets were lost,
+                // grants were lost, or the server has preempted this
+                // response for higher priority messages, so request
+                // retransmission anyway.
+                // TODO: why >= 2
+                if (clientRpc->silentIntervals >= 2) {
+//                if (clientRpc->silentIntervals % pingIntervals == 0) {
                     clientRpc->accumulator->requestRetransmission(this,
                             clientRpc->session->serverAddress,
-                            RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
+                            RpcId(clientId, sequence), grantOffset,
+                            FROM_CLIENT);
                 }
             }
         }
@@ -2000,10 +1981,18 @@ BasicTransport::checkTimeouts()
                     serverRpc->scheduledMessage.get();
             uint32_t grantOffset =
                     scheduledMessage ? scheduledMessage->grantOffset : 0;
-            serverRpc->resendLimit =
-                    serverRpc->accumulator->requestRetransmission(this,
-                    serverRpc->clientAddress, serverRpc->rpcId,
-                    grantOffset, FROM_SERVER);
+            if (scheduledMessage &&
+                    (grantOffset == serverRpc->requestPayload.size())) {
+                // The server has received every granted byte but hasn't got
+                // around to grant more because there are higher priority
+                // responses.
+                serverRpc->silentIntervals = 0;
+            } else {
+                serverRpc->resendLimit =
+                        serverRpc->accumulator->requestRetransmission(this,
+                        serverRpc->clientAddress, serverRpc->rpcId,
+                        grantOffset, FROM_SERVER);
+            }
         }
     }
 }
