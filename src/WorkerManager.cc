@@ -149,10 +149,9 @@ void
 WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 {
     // Find the service for this RPC.
-    WireFormat::RequestCommon* header =
-            rpc->requestPayload.getStart<WireFormat::RequestCommon>();
-    if (expect_false((header == NULL) ||
-            (header->opcode >= WireFormat::ILLEGAL_RPC_TYPE))) {
+    const WireFormat::RequestCommon* header;
+    header = rpc->requestPayload.getStart<WireFormat::RequestCommon>();
+    if ((header == NULL) || (header->opcode >= WireFormat::ILLEGAL_RPC_TYPE)) {
 #if TESTING
         if (testingSaveRpcs) {
             // Special case for testing.
@@ -175,40 +174,26 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         return;
     }
 
-    // Handle ping requests inline so that high server load can never cause a
-    // server to appear offline.
-    if (header->opcode == WireFormat::ECHO) {
-//        Service::Rpc serviceRpc(NULL, &rpc->requestPayload, &rpc->replyPayload);
-//        assert(header->service == WireFormat::MASTER_SERVICE);
-//        MasterService* service = static_cast<MasterService*>(
-//                context->services[WireFormat::MASTER_SERVICE]);
-//        service->callHandler?
-//        service->echo(reqHdr, respHdr, &serviceRpc);
-//        rpc->sendReply();
-//        return;
-
-        // FIXME: had to inline MasterService::echo, otherwise link-time errors
-        // The following code is copied from Service::callHandler
-        WireFormat::Echo::Request* reqHdr =
-            rpc->requestPayload.getStart<WireFormat::Echo::Request>();
-        WireFormat::Echo::Response* respHdr =
-            rpc->replyPayload.emplaceAppend<WireFormat::Echo::Response>();
-        memset(respHdr, 0, sizeof(*respHdr));
-        // The following code is copied from MasterService::echo
-        constexpr uint32_t dummyBlockSize = 8 * 1024 * 1024;
-        static const string dummyBlock(dummyBlockSize, ' ');
-        respHdr->length = reqHdr->echoLength;
-        uint32_t bytesLeft = reqHdr->echoLength;
-        while (bytesLeft > dummyBlockSize) {
-            bytesLeft -= dummyBlockSize;
-            rpc->replyPayload.appendExternal(dummyBlock.data(), dummyBlockSize);
+    // Some requests are better handled inside the dispatch thread.
+    // For instance, echo requests are so trivial to process that
+    // it's not worth passing them to worker threads. Also, handle
+    // ping requests inline so that high server load can never cause
+    // a server to appear offline.
+    if ((header->opcode == WireFormat::ECHO) ||
+            (header->opcode == WireFormat::PING)) {
+        Service::Rpc serviceRpc(NULL, &rpc->requestPayload,
+                &rpc->replyPayload);
+#if HOMA_BENCHMARK
+        // As of 2017/10, bypassing Service::handleRpc reduces ~400(!) ns
+        // for short echo requests.
+        if (header->opcode == WireFormat::ECHO) {
+            MasterService* master = static_cast<MasterService*>(
+                    context->services[WireFormat::MASTER_SERVICE]);
+            master->dispatch(WireFormat::ECHO, &serviceRpc);
+            rpc->sendReply();
+            return;
         }
-        rpc->replyPayload.appendExternal(dummyBlock.data(), bytesLeft);
-        rpc->sendReply();
-        return;
-    } else if ((header->opcode == WireFormat::PING) ||
-            (header->opcode == WireFormat::READ_TSC)) {
-        Service::Rpc serviceRpc(NULL, &rpc->requestPayload, &rpc->replyPayload);
+#endif
         Service::handleRpc(context, &serviceRpc);
         rpc->sendReply();
         return;

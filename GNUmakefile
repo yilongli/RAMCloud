@@ -126,6 +126,8 @@ COMFLAGS += -DENABLE_ZOOKEEPER
 endif
 TEST_INSTALL_FLAGS =
 
+COMFLAGS += -DHOMA_BENCHMARK
+
 COMWARNS := -Wall -Wformat=2 -Wextra \
             -Wwrite-strings -Wno-unused-parameter -Wmissing-format-attribute
 CWARNS   := $(COMWARNS) -Wmissing-prototypes -Wmissing-declarations -Wshadow \
@@ -136,6 +138,7 @@ CXXWARNS := $(COMWARNS) -Wno-non-template-friend -Woverloaded-virtual \
 ifeq ($(COMPILER),gnu)
 CXXWARNS += -Weffc++
 endif
+CXXWARNS += -w
 # Too many false positives list:
 # -Wunreachable-code
 # Failed deconstructor inlines are generating noise

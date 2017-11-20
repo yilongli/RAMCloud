@@ -111,6 +111,9 @@ static int warmupCount;
 // run to provide load on the system.
 static string workload;     // NOLINT
 
+// See docs for option '--maxSessions'.
+static unsigned maxSessions;
+
 // TODO
 static string messageSizeCdfFilePath;
 
@@ -7548,11 +7551,16 @@ try
         ("workload", po::value<string>(&workload)->default_value("YCSB-A"),
                 "Workload of additional load generating clients"
                 "(YCSB-A, YCSB-B, YCSB-C)")
-        ("messageSizeCdfFile", po::value<string>(&messageSizeCdfFilePath)->
+        ("messageSizeCDF", po::value<string>(&messageSizeCdfFilePath)->
                 default_value(""),
          // TODO: BETTER DESC.
                 "File to read message size distribution in CDF format. ")
-        ("loadFactor", po::value<double>(&loadFactor)->
+        ("maxSessions", po::value<unsigned>(&maxSessions)->default_value(1),
+                "For each server, create at most this number of sessions and "
+                "try to use different sessions for different RPCs to reduce "
+                "head-of-line blocking in stream-based transports "
+                "(e.g., tcp, infrc)")
+        ("targetTput", po::value<double>(&loadFactor)->
                 default_value(0.1),
          // TODO: BETTER DESC.
                 "Network load factor attributed to message bytes. ")

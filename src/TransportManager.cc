@@ -59,7 +59,7 @@ static struct BasicUdpTransportFactory : public TransportFactory {
             const ServiceLocator* localServiceLocator) {
         return new BasicTransport(context, localServiceLocator,
                 new UdpDriver(context, localServiceLocator),
-                generateRandom());
+                false, generateRandom());
     }
 } basicUdpTransportFactory;
 
@@ -106,7 +106,7 @@ static struct BasicInfUdTransportFactory : public TransportFactory {
             const ServiceLocator* localServiceLocator) {
         return new BasicTransport(context, localServiceLocator,
                 new InfUdDriver(context, localServiceLocator, false),
-                generateRandom());
+                false, generateRandom());
     }
 } basicInfUdTransportFactory;
 
@@ -144,7 +144,7 @@ struct BasicDpdkTransportFactory : public TransportFactory {
             throw TransportException(HERE, "DPDK is not enabled");
         }
         return new BasicTransport(context, localServiceLocator,
-                driver, generateRandom());
+                driver, false, generateRandom());
     }
     void setDpdkDriver(DpdkDriver* driver) {
         this->driver = driver;
@@ -587,3 +587,4 @@ TransportManager::dumpTransportFactories()
 }
 
 } // namespace RAMCloud
+

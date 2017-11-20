@@ -18,7 +18,11 @@
 
 #include <deque>
 
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Weffc++"
 #include "flat_hash_map.h"
+#pragma GCC diagnostic warning "-Wconversion"
+#pragma GCC diagnostic warning "-Weffc++"
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -40,7 +44,7 @@ class BasicTransport : public Transport {
 
   public:
     explicit BasicTransport(Context* context, const ServiceLocator* locator,
-            Driver* driver, uint64_t clientId);
+            Driver* driver, bool driverOwner, uint64_t clientId);
     ~BasicTransport();
 
     string getServiceLocator();
@@ -153,8 +157,10 @@ class BasicTransport : public Transport {
         /// Transport that is managing this object.
         BasicTransport* t;
 
-        using MessageBuffer = std::vector<char*>;
-        MessageBuffer* assembledPayloads;
+        /// Holds all of the packets that have been received for the message
+        /// so far in order, up to the first packet that has not been received.
+        using Payloads = std::vector<char*>;
+        Payloads* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -185,10 +191,6 @@ class BasicTransport : public Transport {
         /// corresponding fragment, which is a stolen Driver::Received.
         typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
-
-        // True if a packet might be lost (which prevents many message
-        // fragments from being assembled to the buffer).
-        bool packetLost;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
@@ -234,15 +236,24 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
     };
 
-    // TODO
+    class ClientRpc;
+    class ServerRpc;
+    /**
+     * An outgoing message that is either the request of a ClientRpc or the
+     * response of a ServerRpc.
+     */
     class OutgoingMessage {
       public:
         /// Holds the contents of the message.
         Buffer* buffer;
 
-        /// True means this message is the request of a ClientRpc; false means
-        /// it is the response of a ServerRpc.
-        const bool isRequest;
+        /// The ClientRpc of which this message is the request. NULL means this
+        /// message belongs to a ServerRpc.
+        ClientRpc* clientRpc;
+
+        /// The ServerRpc of which this message is the response. NULL means this
+        /// message belongs to a ClientRpc.
+        ServerRpc* serverRpc;
 
         /// Where to send the message.
         const Driver::Address* recipient;
@@ -268,14 +279,15 @@ class BasicTransport : public Transport {
         /// Used to link this object into t->topOutgoingMessages.
         IntrusiveListHook outgoingMessageLinks;
 
-        // TODO: doc. dynamic throttling
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
-        OutgoingMessage(bool isRequest, BasicTransport* t, Buffer* buffer,
+        OutgoingMessage(ClientRpc* clientRpc, ServerRpc* serverRpc,
+                BasicTransport* t, Buffer* buffer,
                 const Driver::Address* recipient)
             : buffer(buffer)
-            , isRequest(isRequest)
+            , clientRpc(clientRpc)
+            , serverRpc(serverRpc)
             , recipient(recipient)
             , transmitOffset(0)
             , transmitLimit(t->roundTripBytes)
@@ -295,13 +307,13 @@ class BasicTransport : public Transport {
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    class ClientRpc : public OutgoingMessage {
+    class ClientRpc {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
 
         /// Request message for the RPC.
-        Buffer* request;
+        OutgoingMessage request;
 
         /// Will eventually hold the response for the RPC.
         Buffer* response;
@@ -329,7 +341,7 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
 
-        /// Holds state of response messages that require scheduling.
+        /// Holds state of the response message that requires scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->outgoingRequests.
@@ -337,10 +349,8 @@ class BasicTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : OutgoingMessage(true, session->t, request,
-                    session->serverAddress)
-            , session(session)
-            , request(request)
+            : session(session)
+            , request(this, NULL, session->t, request, session->serverAddress)
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
@@ -359,7 +369,7 @@ class BasicTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc, public OutgoingMessage {
+    class ServerRpc : public Transport::ServerRpc {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -375,10 +385,6 @@ class BasicTransport : public Transport {
 
         /// True if the RPC has been cancelled by the client.
         bool cancelled;
-
-        // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
-        /// Where to send the response once the RPC has executed.
-        const Driver::Address* clientAddress;
 
         /// Unique identifier for this RPC.
         RpcId rpcId;
@@ -404,7 +410,10 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
-        /// Holds state of request messages that require scheduling.
+        /// Response message for the RPC.
+        OutgoingMessage response;
+
+        /// Holds state of the request message that requires scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->serverTimerList.
@@ -415,17 +424,16 @@ class BasicTransport : public Transport {
 
         ServerRpc(BasicTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : OutgoingMessage(false, transport, &replyPayload, clientAddress)
-            , t(transport)
+            : t(transport)
             , sequence(sequence)
             , cancelled(false)
-            , clientAddress(clientAddress)
             , rpcId(rpcId)
             , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
             , accumulator()
+            , response(NULL, this, transport, &replyPayload, clientAddress)
             , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
@@ -447,8 +455,7 @@ class BasicTransport : public Transport {
         RESEND                 = 24,
         ACK                    = 25,
         ABORT                  = 26,
-        PING                   = 27,
-        BOGUS                  = 28,      // Used only in unit tests.
+        BOGUS                  = 27,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -604,17 +611,6 @@ class BasicTransport : public Transport {
     } __attribute__((packed));
 
     /**
-     * Describes the wire format for PING packets. These packets are used
-     * to check if a client or server is still alive.
-     */
-    struct PingHeader {
-        CommonHeader common;         // Common header fields.
-
-        explicit PingHeader(RpcId rpcId, uint8_t flags)
-            : common(PacketOpcode::PING, rpcId, flags) {}
-    } __attribute__((packed));
-
-    /**
      * Causes BasicTransport to be invoked during each iteration through
      * the dispatch poller loop.
      */
@@ -623,11 +619,16 @@ class BasicTransport : public Transport {
         explicit Poller(Context* context, BasicTransport* t)
             : Dispatch::Poller(context->dispatch, "BasicTransport(" +
                     t->driver->getServiceLocator() + ")::Poller")
-            , t(t) { }
+            , t(t)
+            , lastPollTime(0) { }
         virtual int poll();
       private:
-        // Transport on whose behalf this poller operates.
+        /// Transport on whose behalf this poller operates.
         BasicTransport* t;
+
+        /// The most recent time that we retrieved all incoming packets
+        /// from the NIC, in rdtsc ticks.
+        uint64_t lastPollTime;
         DISALLOW_COPY_AND_ASSIGN(Poller);
     };
 
@@ -654,6 +655,10 @@ class BasicTransport : public Transport {
     /// The Driver used to send and receive packets.
     Driver* driver;
 
+    /// Is this transport the owner of #driver? If yes, free the driver upon
+    /// destruction.
+    bool driverOwner;
+
     /// Service locator string of this transport.
     string locatorString;
 
@@ -663,7 +668,9 @@ class BasicTransport : public Transport {
     /// Maximum # bytes of message data that can fit in one packet.
     const uint32_t maxDataPerPacket;
 
-    /// Maximum # bytes of message that we support zero-copy reception.
+    /// Maximum # bytes of message that we desire to receive in a zero-copy
+    /// fashion; this only makes a difference if zero-copy RX is also supported
+    /// by the underlying driver.
     const uint32_t maxZeroCopyMessage;
 
     /// Unique identifier for this client (used to provide unique
@@ -689,12 +696,11 @@ class BasicTransport : public Transport {
     /// when the poll method is receiving and processing incoming packets.
     std::vector<ScheduledMessage*> grantRecipients;
 
-    /// Holds message buffers that are consist of payloads that are retained
-    /// and assembled by the MessageAccumulator. These retained payloads are
-    /// gradually released in the poll method so that the MessageAccumulator
-    /// doesn't have to release all its payloads at one shot in the destructor
-    /// and cause significant jitter.
-    std::vector<MessageAccumulator::MessageBuffer*> messageBuffers;
+    /// Holds multi-packet messages assembled by the MessageAccumulator. The
+    /// received packets are gradually released in the poll method because
+    /// releasing all packets of a large message at one shot in the destructor
+    /// of MessageAccumulator can cause significant jitter.
+    std::vector<MessageAccumulator::Payloads*> messagesToRelease;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
@@ -708,9 +714,6 @@ class BasicTransport : public Transport {
     /// request yet). Keys are RPC sequence numbers.
     typedef ska::flat_hash_map<uint64_t, ClientRpc*> ClientRpcMap;
     ClientRpcMap outgoingRpcs;
-    // TODO: The way we are uing this map is quite inefficient!!!
-    // (e.g. frequently iterating the entire map) especially when there is
-    // a large number of outstanding RPCs
 
     /// Holds RPCs for which we are the client, and for which the
     /// request message has not yet been completely transmitted (once
@@ -721,21 +724,20 @@ class BasicTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    /// A relatively small set of the sender's top K outgoing messages with
-    /// fewest bytes left. We keep this as a separate set so that the sender
-    /// doesn't have to consider all the outgoing messages in the common case.
-    /// K is dynamically adjusted based on the workload. The overall goal is
-    /// to keep K as small as possible while still ensuring that the sender
-    /// doesn't have to look outside this set when picking the next message
-    /// to transmit. Every time the sender decides to transmit a message
-    /// outside this set, we increment K by one.
+    /// Holds the sender's top K outgoing messages with fewest bytes left.
+    /// K is bounded to a relatively small number so that this list cannot
+    /// grow too large. We keep this as a separate list from the outgoing
+    /// requests/responses so that the sender doesn't have to consider all
+    /// the outgoing messages in the common case of transmitting a message.
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;
 
-    /// False means we know that no message outside t->topOutgoingMessages
-    /// has grants available and there is no need to take the slow path in
-    /// #tryToTransmitData.
+    /// Do we have to consider the slow path when transmitting data? That is,
+    /// iterating over all outgoing messages to find the message with fewest
+    /// remaining bytes and ready to transmit. This question is essentially
+    /// equivalent to if any message outside t->topOutgoingMessages has grants
+    /// or unscheduled bytes available.
     bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,
@@ -770,7 +772,6 @@ class BasicTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
-    // TODO: need to clean up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
@@ -799,76 +800,6 @@ class BasicTransport : public Transport {
     /// any packets from the server for particular RPC, then it sends a
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
-
-    //--------------------
-    // Performance Monitor
-    //--------------------
-
-    /// The beginning of the current monitoring interval, in units of
-    /// rdtsc ticks.
-    uint64_t lastMeasureTime;
-
-    /// The value of `PerfStats::activeDispatchCycles` at `lastMeasureTime`.
-    uint64_t lastDispatchActiveCycles;
-
-    /// The start time of the last call to Dispatch::poll where
-    /// `numTimesGrantRunDry` increments.
-    uint64_t lastTimeGrantRunDry;
-
-    /// `monitorMillis` in units of rdtsc ticks.
-    uint64_t monitorInterval;
-
-    /// Specifies the period over which to log the performance metrics,
-    /// in milliseconds.
-    uint32_t monitorMillis;
-
-    /// # total packets received and processed in the current interval.
-    uint32_t numPacketsReceived;
-
-    /// # data packets received and processed in the current interval.
-    uint32_t numDataPacketsReceived;
-
-    /// # total control packets transmitted in the current interval.
-    uint32_t numControlPacketsSent;
-
-    /// # data packets transmitted in the current interval.
-    uint32_t numDataPacketsSent;
-
-    /// # times, in the current interval, we cannot transmit any message
-    /// because we are waiting for GRANTs and the transmit queue has run
-    /// dry.
-    uint32_t numTimesGrantRunDry;
-
-    /// Total # control bytes transmitted in the current interval.
-    uint32_t outputControlBytes;
-
-    /// Total # data bytes (excluding packet headers) transmitted in the
-    /// current interval.
-    uint32_t outputDataBytes;
-
-    /// Total # retransmitted data bytes (excluding packet headers) in the
-    /// current interval.
-    uint32_t outputResentBytes;
-
-    /// # performance monitor intervals we have experienced.
-    uint64_t perfMonitorIntervals;
-
-    // TODO
-    uint64_t processPacketCycles;
-
-    uint64_t timeoutCheckCycles;
-
-    uint64_t transmitDataCycles;
-
-    uint64_t transmitGrantCycles;
-
-    /// # times we have to look outside of t->topOutgoingMessages in order to
-    /// find a message to transmit in #tryToTransmitData.
-    uint32_t tryToTransmitDataCacheMisses;
-
-    /// Total # idle rdtsc ticks of the NIC's transmit queue in the
-    /// current interval.
-    uint64_t unusedBandwidth;
 
     DISALLOW_COPY_AND_ASSIGN(BasicTransport);
 };
