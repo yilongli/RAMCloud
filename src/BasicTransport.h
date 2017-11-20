@@ -192,10 +192,6 @@ class BasicTransport : public Transport {
         typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
 
-        // True if a packet might be lost (which prevents many message
-        // fragments from being assembled to the buffer).
-        bool packetLost;
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
@@ -240,6 +236,8 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
     };
 
+    class ClientRpc;
+    class ServerRpc;
     /**
      * An outgoing message that is either the request of a ClientRpc or the
      * response of a ServerRpc.
@@ -249,9 +247,13 @@ class BasicTransport : public Transport {
         /// Holds the contents of the message.
         Buffer* buffer;
 
-        /// True means this message is the request of a ClientRpc; false means
-        /// it is the response of a ServerRpc.
-        const bool isRequest;
+        /// The ClientRpc of which this message is the request. NULL means this
+        /// message belongs to a ServerRpc.
+        ClientRpc* clientRpc;
+
+        /// The ServerRpc of which this message is the response. NULL means this
+        /// message belongs to a ClientRpc.
+        ServerRpc* serverRpc;
 
         /// Where to send the message.
         const Driver::Address* recipient;
@@ -280,10 +282,12 @@ class BasicTransport : public Transport {
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
-        OutgoingMessage(bool isRequest, BasicTransport* t, Buffer* buffer,
+        OutgoingMessage(ClientRpc* clientRpc, ServerRpc* serverRpc,
+                BasicTransport* t, Buffer* buffer,
                 const Driver::Address* recipient)
             : buffer(buffer)
-            , isRequest(isRequest)
+            , clientRpc(clientRpc)
+            , serverRpc(serverRpc)
             , recipient(recipient)
             , transmitOffset(0)
             , transmitLimit(t->roundTripBytes)
@@ -299,18 +303,17 @@ class BasicTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(OutgoingMessage);
     };
 
-    // FIXME: ClientRpc is not an OutoingMessage; it contains an outgoing message.
     /**
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    class ClientRpc : public OutgoingMessage {
+    class ClientRpc {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
 
         /// Request message for the RPC.
-        Buffer* request;
+        OutgoingMessage request;
 
         /// Will eventually hold the response for the RPC.
         Buffer* response;
@@ -346,10 +349,8 @@ class BasicTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : OutgoingMessage(true, session->t, request,
-                    session->serverAddress)
-            , session(session)
-            , request(request)
+            : session(session)
+            , request(this, NULL, session->t, request, session->serverAddress)
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
@@ -368,7 +369,7 @@ class BasicTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc, public OutgoingMessage {
+    class ServerRpc : public Transport::ServerRpc {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -384,10 +385,6 @@ class BasicTransport : public Transport {
 
         /// True if the RPC has been cancelled by the client.
         bool cancelled;
-
-        // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
-        /// Where to send the response once the RPC has executed.
-        const Driver::Address* clientAddress;
 
         /// Unique identifier for this RPC.
         RpcId rpcId;
@@ -413,6 +410,9 @@ class BasicTransport : public Transport {
         /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
+        /// Response message for the RPC.
+        OutgoingMessage response;
+
         /// Holds state of the request message that requires scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
@@ -424,17 +424,16 @@ class BasicTransport : public Transport {
 
         ServerRpc(BasicTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : OutgoingMessage(false, transport, &replyPayload, clientAddress)
-            , t(transport)
+            : t(transport)
             , sequence(sequence)
             , cancelled(false)
-            , clientAddress(clientAddress)
             , rpcId(rpcId)
             , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
             , accumulator()
+            , response(NULL, this, transport, &replyPayload, clientAddress)
             , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
@@ -773,7 +772,6 @@ class BasicTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
-    // TODO: need to clean up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
