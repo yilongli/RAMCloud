@@ -458,20 +458,17 @@ DropIndexRpc::DropIndexRpc(RamCloud* ramcloud, uint64_t tableId,
  *      Size of the original message, in bytes.
  * \param echoLength
  *      Size of the message to be echoed, in bytes.
- * \param[out] echo
- *      After a successful return, this Buffer will hold the echoed message,
- *      which contains all whitespaces. NULL means the client doesn't care
- *      about the result.
+ * \param[out] reply
+ *      After a successful return, this Buffer will hold the echoed message.
+ *      NULL means the client doesn't care about the result.
  */
 void
 RamCloud::echo(const char* serviceLocator, const void* message,
-        uint32_t length, uint32_t echoLength, Buffer* echo)
+        uint32_t length, uint32_t echoLength, Buffer* reply)
 {
-    EchoRpc rpc(this, serviceLocator, message, length, echoLength, echo);
+    EchoRpc rpc(this, serviceLocator, message, length, echoLength, reply);
     rpc.wait();
 }
-
-#define DEBUG_BAD_TAIL 1
 
 /**
  * Constructor for EchoRpc: initiates an RPC in the same way as
@@ -489,19 +486,18 @@ RamCloud::echo(const char* serviceLocator, const void* message,
  *      Size of the original message, in bytes.
  * \param echoLength
  *      Size of the message to be echoed, in bytes.
- * \param[out] echo
- *      After a successful return, this Buffer will hold the echoed message,
- *      which contains all whitespaces. NULL means the client doesn't care
- *      about the result.
+ * \param[out] reply
+ *      After a successful return, this Buffer will hold the echoed message.
+ *      NULL means the client doesn't care about the result.
  */
 EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
         const void* message, uint32_t length, uint32_t echoLength,
-        Buffer* echo)
-    : RpcWrapper(sizeof(WireFormat::Echo::Response), echo)
-    , ramcloud(ramcloud)
-    , startTime(0)
+        Buffer* reply)
+    : RpcWrapper(sizeof(WireFormat::Echo::Response), reply)
+    , callback(NULL)
+    , startTime(Cycles::rdtsc())
     , endTime(~0u)
-    , length(length)
+    , ramcloud(ramcloud)
 {
     try {
         session = ramcloud->clientContext->transportManager->getSession(
@@ -513,47 +509,74 @@ EchoRpc::EchoRpc(RamCloud* ramcloud, const char* serviceLocator,
     reqHdr->length = length;
     reqHdr->echoLength = echoLength;
     request.appendExternal(message, length);
-    startTime = Cycles::rdtsc();
     send();
 }
 
+/**
+ * Similar to above, except that the session used to send the RPC is provided
+ * explicitly. This method is mostly used in performance testing to avoid the
+ * overhead of retrieving the session based on a service locator string.
+ */
 EchoRpc::EchoRpc(RamCloud* ramcloud, Transport::SessionRef session,
         const void* message, uint32_t length, uint32_t echoLength,
-        Buffer* echo)
-    : RpcWrapper(sizeof(WireFormat::Echo::Response), echo)
-    , ramcloud(ramcloud)
-    , startTime(0)
+        Buffer* reply, Callback* callback, uint64_t startTime)
+    : RpcWrapper(sizeof(WireFormat::Echo::Response), reply)
+    , callback(callback)
+    , startTime(startTime == 0 ? Cycles::rdtsc() : startTime)
     , endTime(~0u)
-    , length(length)
+    , ramcloud(ramcloud)
 {
-//    TimeTrace::record("EchoRpc invoked");
     this->session = session;
-//    TimeTrace::record("Got a session!");
     WireFormat::Echo::Request* reqHdr(allocHeader<WireFormat::Echo>());
     reqHdr->length = length;
     reqHdr->echoLength = echoLength;
     request.appendExternal(message, length);
-    startTime = Cycles::rdtsc();
     send();
 }
+
+/// Destructor of EchoRpc.
+EchoRpc::~EchoRpc()
+{
+    if (callback) {
+        delete callback;
+    }
+}
+
+/// Destructor of EchoRpc::Callback.
+EchoRpc::Callback::~Callback()
+{}
 
 // See Transport::Notifier for documentation.
 void
 EchoRpc::completed() {
     RpcWrapper::completed();
     endTime = Cycles::rdtsc();
-#if DEBUG_BAD_TAIL
-    uint64_t roundTripTime = endTime - startTime;
-    static uint64_t threshold = Cycles::fromMicroseconds(10);
-    const WireFormat::Echo::Request* reqHdr = getRequestHeader<WireFormat::Echo>();
-    assert(reqHdr->length == length);
-    if (reqHdr->length < 1400 && roundTripTime > threshold) {
-        double us = Cycles::toSeconds(roundTripTime) * 1e6;
-        uint32_t integral = uint32_t(us);
-        uint32_t frac = uint32_t((us - integral) * 100);
-        TimeTrace::record(endTime, "BAD TAIL LATENCY %u.%u us", integral, frac);
+    if (callback) {
+        callback->rpcFinished();
+    }
+    // Change 0 to 1 to enable code for debugging bad tail latencies of
+    // short messages.
+#if 0
+    uint64_t rttCycles = endTime - startTime;
+#define BAD_TAIL_LATENCY (Cycles::fromMicroseconds(100))
+#define SHORT_MESSAGE_LENGTH 100
+    const WireFormat::Echo::Request* reqHdr =
+            getRequestHeader<WireFormat::Echo>();
+    if ((reqHdr->length < SHORT_MESSAGE_LENGTH) &&
+            (rttCycles > BAD_TAIL_LATENCY)) {
+        uint32_t rttMicros = uint32_t(Cycles::toMicroseconds(rttCycles));
+        TimeTrace::record(endTime, "Bad tail latency %u us", rttMicros);
     }
 #endif
+}
+
+// See Transport::Notifier for documentation.
+void
+EchoRpc::failed() {
+    RpcWrapper::failed();
+    if (callback) {
+        callback->rpcFinished();
+    }
 }
 
 /**
@@ -563,6 +586,14 @@ EchoRpc::completed() {
 uint64_t
 EchoRpc::getCompletionTime() {
     return endTime == ~0u ? ~0u : endTime - startTime;
+}
+
+/**
+ * Return the size of the outgoing message, in bytes.
+ */
+uint32_t
+EchoRpc::getLength() {
+    return getRequestHeader<WireFormat::Echo>()->length;
 }
 
 /**
@@ -1975,13 +2006,17 @@ RamCloud::multiWrite(MultiWriteObject* requests[], uint32_t numRequests)
  *      should be aborted with an error.
  * \param[out] version
  *      If non-NULL, the version number of the object is returned here.
+ * \param[out] objectExists
+ *      If non-NULL, the ObjectDoesntExistException is not thrown and a flag
+ *      indicating the existence of the object is returned here.
  */
 void
 RamCloud::read(uint64_t tableId, const void* key, uint16_t keyLength,
-        Buffer* value, const RejectRules* rejectRules, uint64_t* version)
+        Buffer* value, const RejectRules* rejectRules, uint64_t* version,
+        bool* objectExists)
 {
     ReadRpc rpc(this, tableId, key, keyLength, value, rejectRules);
-    rpc.wait(version);
+    rpc.wait(version, objectExists);
 }
 
 /**
@@ -2005,14 +2040,17 @@ RamCloud::read(uint64_t tableId, const void* key, uint16_t keyLength,
  *      should be aborted with an error.
  * \param[out] version
  *      If non-NULL, the version number of the object is returned here.
+ * \param[out] objectExists
+ *      If non-NULL, the ObjectDoesntExistException is not thrown and a flag
+ *      indicating the existence of the object is returned here.
  */
 void
 RamCloud::readKeysAndValue(uint64_t tableId, const void* key,
         uint16_t keyLength, ObjectBuffer* value,
-        const RejectRules* rejectRules, uint64_t* version)
+        const RejectRules* rejectRules, uint64_t* version, bool* objectExists)
 {
     ReadKeysAndValueRpc rpc(this, tableId, key, keyLength, value, rejectRules);
-    rpc.wait(version);
+    rpc.wait(version, objectExists);
 }
 
 /**
@@ -2060,18 +2098,30 @@ ReadRpc::ReadRpc(RamCloud* ramcloud, uint64_t tableId,
  *
  * \param[out] version
  *      If non-NULL, the version number of the object is returned here.
+ * \param[out] objectExists
+ *      If non-NULL, the ObjectDoesntExistException is not thrown and a flag
+ *      indicating the existence of the object is returned here.
  */
 void
-ReadRpc::wait(uint64_t* version)
+ReadRpc::wait(uint64_t* version, bool* objectExists)
 {
+    if (objectExists != NULL)
+        *objectExists = true;
+
     waitInternal(context->dispatch);
     const WireFormat::Read::Response* respHdr(
             getResponseHeader<WireFormat::Read>());
     if (version != NULL)
         *version = respHdr->version;
 
-    if (respHdr->common.status != STATUS_OK)
-        ClientException::throwException(HERE, respHdr->common.status);
+    if (respHdr->common.status != STATUS_OK) {
+        if (objectExists != NULL &&
+                respHdr->common.status == STATUS_OBJECT_DOESNT_EXIST) {
+            *objectExists = false;
+        } else {
+            ClientException::throwException(HERE, respHdr->common.status);
+        }
+    }
 
     // Truncate the response Buffer so that it consists of nothing
     // but the object data.
@@ -2126,87 +2176,35 @@ ReadKeysAndValueRpc::ReadKeysAndValueRpc(RamCloud* ramcloud, uint64_t tableId,
  *
  * \param[out] version
  *      If non-NULL, the version number of the object is returned here.
+ * \param[out] objectExists
+ *      If non-NULL, the ObjectDoesntExistException is not thrown and a flag
+ *      indicating the existence of the object is returned here.
  */
 void
-ReadKeysAndValueRpc::wait(uint64_t* version)
+ReadKeysAndValueRpc::wait(uint64_t* version, bool* objectExists)
 {
+    if (objectExists != NULL)
+        *objectExists = true;
+
     waitInternal(context->dispatch);
     const WireFormat::ReadKeysAndValue::Response* respHdr(
             getResponseHeader<WireFormat::ReadKeysAndValue>());
     if (version != NULL)
         *version = respHdr->version;
 
-    if (respHdr->common.status != STATUS_OK)
-        ClientException::throwException(HERE, respHdr->common.status);
+    if (respHdr->common.status != STATUS_OK) {
+        if (objectExists != NULL &&
+                respHdr->common.status == STATUS_OBJECT_DOESNT_EXIST) {
+            *objectExists = false;
+        } else {
+            ClientException::throwException(HERE, respHdr->common.status);
+        }
+    }
 
     // Truncate the response Buffer so that it consists of nothing
     // but the object data.
     response->truncateFront(sizeof(*respHdr));
     assert(respHdr->length == response->size());
-}
-
-/**
- * Read the TSC value of a given server.
- *
- * \param serviceLocator
- *      Selects the server, whose TSC value should be read.
- * \return
- *      The TSC value read from the server when it starts processing this
- *      RPC.
- */
-uint64_t
-RamCloud::readTsc(const char* serviceLocator)
-{
-    ReadTscRpc rpc(this, serviceLocator);
-    return rpc.wait();
-}
-
-/**
- * Constructor for ReadTscRpc: initiates an RPC in the same way as
- * #RamCloud::readTsc, but returns once the RPC has been initiated, without
- * waiting for it to complete.
- *
- * \param ramcloud
- *      The RAMCloud object that governs this RPC.
- * \param serviceLocator
- *      Selects the server, whose TSC value should be read.
- */
-ReadTscRpc::ReadTscRpc(RamCloud *ramcloud, const char *serviceLocator)
-    : RpcWrapper(sizeof(WireFormat::ReadTsc::Response))
-    , ramcloud(ramcloud)
-{
-    try {
-        session = ramcloud->clientContext->transportManager->getSession(
-                serviceLocator);
-    } catch (const TransportException& e) {
-        session = FailSession::get();
-    }
-    allocHeader<WireFormat::ReadTsc>();
-    send();
-}
-
-/**
- * Wait for the RPC to complete, and return the same results as
- * #RamCloud::readTsc.
- *
- * \throw TransportException
- *       Thrown if an unrecoverable error occurred while communicating with
- *       the target server.
- */
-uint64_t
-ReadTscRpc::wait()
-{
-    waitInternal(ramcloud->clientContext->dispatch);
-    if (getState() != RpcState::FINISHED) {
-        throw TransportException(HERE);
-    }
-
-    const WireFormat::ReadTsc::Response* respHdr(
-            getResponseHeader<WireFormat::ReadTsc>());
-
-    if (respHdr->common.status != STATUS_OK)
-        ClientException::throwException(HERE, respHdr->common.status);
-    return respHdr->tsc;
 }
 
 /**

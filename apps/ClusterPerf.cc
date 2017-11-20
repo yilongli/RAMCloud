@@ -39,12 +39,12 @@
 //  4. Add code for this test to clusterperf.py, following the instructions
 //     in that file.
 
+#include <random>
 #include <boost/program_options.hpp>
 #include <boost/version.hpp>
 #include <algorithm>
 #include <fstream>
 #include <iostream>
-#include <random>
 #include <unordered_set>
 namespace po = boost::program_options;
 
@@ -111,19 +111,19 @@ static int warmupCount;
 // run to provide load on the system.
 static string workload;     // NOLINT
 
+// See docs for option "--messageSizeCDF".
+static string messageSizeCDF;   // NOLINT
+
 // See docs for option '--maxSessions'.
 static unsigned maxSessions;
-
-// TODO
-static string messageSizeCdfFilePath;
-
-// TODO:
-static double loadFactor;
 
 // Value of the "--targetOps" command-line option: used by some tests
 // to specify the operations per second each load generating client
 // should try to achieve.
 static int targetOps;
+
+// See docs for option "--targetTput".
+static double targetTputGbps;
 
 // Value of the "--txSpan" command-line option: used by some tests
 // the server span of a transaction.
@@ -158,10 +158,6 @@ int seconds = 10;
 // for each sample along with its duration.
 bool fullSamples = false;
 
-// If true calibrate the frequencies of server TSC clocks against the client
-// and print results to the client log.
-bool calibrateTscFreq = false;
-
 #define MAX_METRICS 8
 
 // The following type holds metrics for all the clients.  Each inner vector
@@ -183,7 +179,6 @@ struct TimeDist {
                                   // or 0 if no such measurement.
     double bandwidth;             // Average throughput in bytes/sec., or 0
                                   // if no such measurement.
-    uint64_t numSamples;          // # samples collected in the measurement.
 };
 
 // Forward declarations:
@@ -230,7 +225,6 @@ string formatTime(double seconds)
 void getDist(std::vector<uint64_t>& times, TimeDist* dist)
 {
     dist->bandwidth = 0;
-    dist->numSamples = times.size();
     int count = downCast<int>(times.size());
     std::sort(times.begin(), times.end());
     dist->min = Cycles::toSeconds(times[0]);
@@ -609,145 +603,6 @@ struct VirtualClient {
     DISALLOW_COPY_AND_ASSIGN(VirtualClient);
 };
 
-
-/**
- * Utility class that helps calibrating TSC clock frequencies on remote servers
- * in the cluster. This class automatically starts the calibration process on
- * construction and automatically finishes it on destruction.
- */
-class TscFrequencyCalibrator {
-
-    /// Holds the starting TSC and the result of a fast ReadTsc RPC, filled in
-    /// by getMinRoundTripTime().
-    struct ReadTscResult {
-        uint64_t clientTsc;
-        uint64_t serverTsc;
-        uint64_t roundTripTime;
-    };
-
-    /// Holds information about a server and intermediate data collected from
-    /// the experiment that are necessary to calibrate the server TSC clock.
-    struct ServerState {
-        /// Unique identifier of the server.
-        uint64_t serverId;
-
-        /// Service locator used to contact the server.
-        std::string serviceLocator;
-
-        /// Holds the result of the first call to getMinRoundTripTime().
-        ReadTscResult result;
-
-        explicit ServerState(uint64_t serverId, std::string serviceLocator)
-            : serverId(serverId), serviceLocator(serviceLocator), result()
-        {}
-    };
-
-  public:
-    /**
-     * Constructor for the TSC frequency calibrator.
-     */
-    explicit TscFrequencyCalibrator()
-        : serverStates()
-    {
-        // Retrieve ServerList from the coordinator and fill out the server
-        // information.
-        using ServerMap = std::map<uint64_t, std::pair<string, ServiceMask>>;
-        ServerMap servers;
-        getServerList(&servers);
-        ServerMap::iterator mapIt;
-        for (mapIt = servers.begin(); mapIt != servers.end(); mapIt++) {
-            if (mapIt->second.second.has(WireFormat::MASTER_SERVICE)) {
-                serverStates.emplace_back(mapIt->first, mapIt->second.first);
-            }
-        }
-
-        // Shift the order of the servers in the list based on the client Id;
-        // reduce the chance of multiple clients hitting the same server.
-        std::rotate(serverStates.begin(),
-                serverStates.begin() + clientIndex % serverStates.size(),
-                serverStates.end());
-
-        std::vector<ServerState>::iterator it;
-        for (it = serverStates.begin(); it != serverStates.end(); it++) {
-            ReadTscResult* result = &it->result;
-            result->roundTripTime = getMinRoundTripTime(
-                    it->serviceLocator.c_str(), &result->clientTsc,
-                    &result->serverTsc);
-        }
-    }
-
-    /**
-     * Destructor for the TSC frequency calibrator.
-     */
-    ~TscFrequencyCalibrator() {
-        std::vector<ServerState>::iterator it;
-        for (it = serverStates.begin(); it != serverStates.end(); it++) {
-            ReadTscResult r1 = it->result;
-            ReadTscResult r2 = {0, 0, 0};
-            r2.roundTripTime = getMinRoundTripTime(it->serviceLocator.c_str(),
-                    &r2.clientTsc, &r2.serverTsc, r1.roundTripTime);
-
-            // Compute the server TSC frequency scalar relative to the client.
-            double scalar = static_cast<double>(r2.clientTsc - r1.clientTsc)
-                    / static_cast<double>(r2.serverTsc - r1.serverTsc);
-            LOG(NOTICE, "TSC_Freq(server%lu) * %.15f = TSC_Freq(client%d), "
-                    "computed with two ReadTscRpc's that are %.2f s apart, "
-                    "1st RPC took %lu cycles, 2nd RPC took %lu cycles",
-                    it->serverId, scalar, clientIndex + 1,
-                    Cycles::toSeconds(r2.clientTsc - r1.clientTsc),
-                    r1.roundTripTime, r2.roundTripTime);
-        }
-    }
-
-  private:
-    /**
-     * Measures the minimum round-trip time between the calling client and
-     * a given server using the ReadTsc RPC.
-     *
-     * \param serviceLocator
-     *      Selects the server to communicate.
-     * \param clientTsc[out]
-     *      Records the TSC value on the client side right before invoking the
-     *      RPC.
-     * \param serverTsc[out]
-     *      Records the TSC value on the server side when it starts processing
-     *      the RPC.
-     * \param exptectRTT
-     *      TODO.
-     * \param runs
-     *      The number of times the experiment must be repeated before
-     *      concluding the minimum round-trip time.
-     * \return
-     *      The minimum round-trip time, in TSC cycles, observed in all runs.
-     */
-    static uint64_t
-    getMinRoundTripTime(const char* serviceLocator, uint64_t* clientTsc,
-            uint64_t* serverTsc, uint64_t expectedRTT = 0,
-            uint32_t runs = 5000)
-    {
-        uint64_t minElapsedTime = ~0ul;
-        for (unsigned i = 0; i < runs; i++) {
-            uint64_t startTime = Cycles::rdtsc();
-            uint64_t tsc = cluster->readTsc(serviceLocator);
-            uint64_t elapsedTime = Cycles::rdtsc() - startTime;
-            if (elapsedTime < minElapsedTime) {
-                minElapsedTime = elapsedTime;
-                *clientTsc = startTime;
-                *serverTsc = tsc;
-                if ((elapsedTime < expectedRTT) ||
-                        ((elapsedTime-expectedRTT)*100 < elapsedTime)) {
-                    return minElapsedTime;
-                }
-            }
-        }
-        return minElapsedTime;
-    }
-
-    /// List of servers whose TSC clocks need to be calibrated against the
-    /// local clock of this client.
-    std::vector<ServerState> serverStates;
-};
-
 /**
  * Given an integer value, generate a key of a given length
  * that corresponds to that value.
@@ -1064,7 +919,9 @@ timeIndexedRead(uint64_t tableId, uint8_t indexId, uint64_t expectedFirstPkHash,
                     tableId, numHashes, &(*it), &readObjects, &numObjects);
             readHashTime += Cycles::rdtsc() - start;
 
-            assert(numReturnedHashes == numHashes); // else collision
+            if (numReturnedHashes != numHashes) {
+                assert(numReturnedHashes == numHashes); // else collision
+            }
             totalNumObjects += numObjects;
         }
         if (!warmup)
@@ -1260,13 +1117,17 @@ readObject(uint64_t tableId, const void* key, uint16_t keyLength,
 }
 
 /**
- * Send and receive messages of given sizes, return information about the
- * distribution of message round-trip times and network bandwidth.
+ * Send and receive fixed-size messages to a server back-to-back,
+ * return information about the distribution of message round-trip times
+ * and network bandwidth.
  *
  * \param receiver
  *      Service locator of the recipient.
+ * \param message
+ *      Address of the first byte of the message to be sent; must contain at
+ *      least length bytes.
  * \param length
- *      Size of the message being sent, in bytes.
+ *      Size of the message to be sent, in bytes.
  * \param echoLength
  *      Size of the message to be echoed, in bytes.
  * \param iteration
@@ -1279,17 +1140,17 @@ readObject(uint64_t tableId, const void* key, uint16_t keyLength,
  *      Information about how long the echos took.
  */
 TimeDist
-echoMessages(string receiver, uint32_t length,
+echoMessage(string receiver, const char* message, uint32_t length,
         uint32_t echoLength, uint32_t iteration, double timeLimit)
 {
-    std::vector<uint64_t> times = {};
+    std::vector<uint64_t> times;
     times.reserve(100000);
-
-    const string message(length, 'x');
     Buffer buffer;
 
     // Each iteration of the following loop invokes an Echo RPC and records
     // its completion time.
+    Transport::SessionRef session =
+            context->transportManager->getSession(receiver);
     uint64_t startTime = Cycles::rdtsc();
     uint64_t deadline = startTime + Cycles::fromSeconds(timeLimit);
     uint64_t count;
@@ -1300,8 +1161,7 @@ echoMessages(string receiver, uint32_t length,
             break;
         }
 
-        EchoRpc rpc(cluster, receiver.c_str(), message.c_str(), length,
-                echoLength, &buffer);
+        EchoRpc rpc(cluster, session, message, length, echoLength, &buffer);
         rpc.wait();
         times.push_back(rpc.getCompletionTime());
     }
@@ -1309,313 +1169,439 @@ echoMessages(string receiver, uint32_t length,
 
     TimeDist result;
     getDist(times, &result);
-    double totalRxBytes = echoLength * static_cast<double>(count);
-    result.bandwidth = totalRxBytes/Cycles::toSeconds(totalCycles);
+    double totalTxBytes = length * static_cast<double>(count);
+    result.bandwidth = totalTxBytes/Cycles::toSeconds(totalCycles);
     return result;
 }
 
-using Samples = vector<uint64_t>;
+/**
+ * Holds a set of opened sessions to a server. For stream-based transports
+ * like TCP and InfRC, each session represents a connection in which RPCs
+ * are serialized. For connection-less transports, there is exactly one
+ * session.
+ */
+struct MultiConnection {
+
+    /// # outgoing message bytes of all outstanding RPCs in each of
+    /// the connection.
+    vector<uint64_t> headOfLineBytes;
+
+    /// Service locator of the server.
+    string server;
+
+    /// Opened connections to the server.
+    vector<Transport::SessionRef> sessions;
+
+    /// Used to open new connections.
+    TransportManager* transportManager;
+
+    MultiConnection(string serviceLocator,
+            TransportManager* transportManager)
+        : headOfLineBytes()
+        , server(serviceLocator)
+        , sessions()
+        , transportManager(transportManager)
+    {
+        // We need at least one session.
+        sessions.emplace_back(transportManager->getSession(server));
+        headOfLineBytes.push_back(0);
+    }
+
+    Transport::SessionRef
+    openSession()
+    {
+        sessions.emplace_back(transportManager->openSession(server));
+        headOfLineBytes.push_back(0);
+        return sessions.back();
+    }
+
+    ~MultiConnection() {}
+
+    DISALLOW_COPY_AND_ASSIGN(MultiConnection);
+};
 
 /**
- * Send and receive messages of given sizes, return information about the
- * distribution of message round-trip times and network bandwidth.
+ * Invoke symmetric Echo RPCs asynchronously according to a given workload,
+ * return the recorded round-trip times for each message type.
  *
  * \param receivers
  *      Service locators of master servers that are receivers of the messages.
- * \param outgoingMessageSize
- *      Cumulative distribution function of the size of the outgoing messages.
- * \param incomingMessageSize
- *      Cumulative distribution function of the size of the incoming messages.
- * \param echoLength
- *      Size of the message to be echoed, in bytes.
- * \param iteration
- *      Send this many messages.
+ * \param message
+ *      Address of the first byte of the message to be sent; must contain at
+ *      least max{messageSizes} bytes.
+ * \param averageMessageSize
+ *      Average size of the echo messages, in bytes.
+ * \param messageSizes
+ *      All message sizes, in bytes, that appear in the workload.
+ * \param cdf
+ *      The cumulative distribution function of the message size. cdf[i]
+ *      specifies the probability (<= 1) for messages that are less than
+ *      or equal to messageSizes[i] bytes.
  * \param timeLimit
- *      Maximum time (in seconds) to spend on this test: if this much
- *      time elapses, then less iterations will be run.
- *
- * \return
- *      Information about how long the echos took.
+ *      Maximum time to spend on this test, in seconds.
+ * \param[out] numMessages
+ *      # messages that are generated for each message size in messageSizes
+ *      in the entire experiment. That is, message of size messageSizes[i]
+ *      are generated numMessages[i] times.
+ * \param[out] roundTripTimes
+ *      Message RTTs, in rdtsc ticks, recorded for each message size in
+ *      messageSizes. roundTripTimes[i] contains RTTs recorded for message
+ *      of size messageSizes[i]. Note that we cannot record the RTT of every
+ *      generated message, so roundTripTimes[i].size() <= numMessages[i].
  */
-vector<TimeDist>
-echoMessages2(const vector<string>& receivers, double averageMessageSize,
-        vector<uint32_t>& messageSizes, vector<double>& cumulativeProbabilities,
-        uint64_t iteration, double timeLimit, vector<Samples>& roundTripTimes)
+void
+echoMessageAsync(const vector<string> receivers, const char* message,
+        double averageMessageSize, vector<uint32_t> messageSizes,
+        vector<double> cdf, double timeLimit, vector<uint64_t>& numMessages,
+        vector<vector<uint64_t>>& roundTripTimes)
 {
-    // FIXME: Performance hack: precompute session handles
-    vector<Transport::SessionRef> sessionRefs = {};
-    for (string serviceLocator : receivers) {
-        sessionRefs.push_back(cluster->clientContext->
-                transportManager->getSession(serviceLocator));
-    }
+    using ReadyQueue = std::vector<int>;
+    /// Put an Echo RPC to a queue when its response has been received.
+    class Callback : public EchoRpc::Callback {
+      public:
+        explicit Callback(int id, ReadyQueue* readyQueue)
+            : id(id), readyQueue(readyQueue) {}
 
-    // Collect at most MAX_NUM_SAMPLE samples for each type of message.
-    // Any more samples will simply overwrite old ones by wrapping around.
+        virtual void rpcFinished() { readyQueue->push_back(id); }
+
+        /// Used to find the Echo RPC this callback is registered to.
+        int id;
+        /// Stores Echo RPCs that are completed or failed.
+        ReadyQueue* readyQueue;
+        DISALLOW_COPY_AND_ASSIGN(Callback);
+    };
+
+    // Preallocate space for the samples to be collected. Record at most
+    // MAX_SAMPLES samples for each type of message. Any more samples
+    // will simply overwrite old ones by wrapping around.
     const uint32_t MAX_SAMPLES = 500000;
     roundTripTimes.assign(messageSizes.size(), {});
-    vector<uint32_t> numSamples(messageSizes.size());
-    for (int i = 0; i < messageSizes.size(); i++) {
+    numMessages.reserve(messageSizes.size());
+    for (unsigned i = 0; i < messageSizes.size(); i++) {
+        numMessages[i] = 0;
         roundTripTimes[i].assign(MAX_SAMPLES, 0);
     }
 
-    const uint32_t largestMessageSize = messageSizes.back();
-    static const string message(largestMessageSize, 'x');
-
-    // TODO: construct message randomizer
-    vector<double> discreteProbabilities;
+    // Generate pseduo-random message recipients and arrival interval in
+    // advance. As of 2017/8, generating these numbers on-the-fly could take
+    // a few hundred nanoseconds.
+    // Note: we cannot also generate the list of random message sizes in
+    // advance because some message has extremely low probability. This adds
+    // about 80 ns overhead per RPC.
+    vector<double> messageProb;
     double p = 0.0;
-    for (double x : cumulativeProbabilities) {
-        discreteProbabilities.push_back(x - p);
+    for (double x : cdf) {
+        messageProb.push_back(x - p);
         p = x;
     }
-    std::random_device rd;
-    std::mt19937 gen(rd());
     std::discrete_distribution<uint> messageSizeDist(
-            discreteProbabilities.begin(), discreteProbabilities.end());
+            messageProb.begin(), messageProb.end());
 
-#if 0
-    // Test distribution of generated messages.
-    uint64_t totalMessageSize = 0;
-    uint64_t numGeneratedMsgs = 10000000;
-    uint64_t now = Cycles::rdtsc();
-    for (uint i = 0; i < numGeneratedMsgs; i++) {
-        totalMessageSize += messageSizes[messageSizeDist(gen)];
-    }
-    LOG(ERROR, "theoretical average message size %.1f, "
-            "generated %lu messages, average message size %lu,"
-            "spent %.1f us",
-            averageMessageSize, numGeneratedMsgs,
-            totalMessageSize / numGeneratedMsgs,
-            Cycles::toSeconds(Cycles::rdtsc() - now) * 1e6);
-#endif
-
-    // Work out 1) the average message arrival interval, in rdtsc ticks;
-    // 2) how many packets are generated per second; 3) the corresponding
-    // raw network load (including packet header overhead).
     double bandwidthMbps = 10000; // 10Gbps
+    double loadFactor = targetTputGbps*1e3/bandwidthMbps;
     uint64_t averageArrivalInterval = Cycles::fromSeconds(
             averageMessageSize*8 / (bandwidthMbps*1e6*loadFactor));
+    std::poisson_distribution<uint64_t> messageIntervalDist(
+            static_cast<double>(averageArrivalInterval));
+
+    std::array<uint64_t, 1000> randomMessageIntervals;
+    std::array<uint32_t, 1000> randomRecipients;
+    std::mt19937 gen(generateRandom());
+    for (unsigned i = 0; i < randomRecipients.size(); i++) {
+        randomMessageIntervals[i] = messageIntervalDist(gen);
+        randomRecipients[i] = downCast<uint32_t>(
+                generateRandom() % receivers.size());
+    }
+
+    // Compute a few more workload metrics for debugging.
     double averagePacketsPerMessage = 0;
     double averageRawBytesPerMessage = 0;
-    for (unsigned i = 0; i < messageSizes.size(); i++) {
-        double numPackets = std::ceil(messageSizes[i] / 1470.0);
-        averagePacketsPerMessage += numPackets * discreteProbabilities[i];
-        // TODO: per-packet overhead is 72 bytes in Homa + Ethernet
-        averageRawBytesPerMessage += (numPackets * 72 + messageSizes[i])
-            * discreteProbabilities[i];
+    if (receivers.front().find("homa+dpdk") != string::npos ||
+            receivers.front().find("basic+dpdk") != string::npos) {
+        // For now, we only compute the protocol overhead of homa/basic+dpdk.
+        // The per-packet overhead of homa+dpdk is 72 bytes, so the
+        // maximum payload size is 1542 (i.e. MTU) - 72 = 1470 bytes.
+        for (unsigned i = 0; i < messageSizes.size(); i++) {
+            double numPackets = std::ceil(messageSizes[i] / 1470.0);
+            averagePacketsPerMessage += numPackets * messageProb[i];
+            averageRawBytesPerMessage += (numPackets * 72 + messageSizes[i])
+                * messageProb[i];
+        }
+    } else {
+        averagePacketsPerMessage = std::numeric_limits<double>::quiet_NaN();
+        averageRawBytesPerMessage = std::numeric_limits<double>::quiet_NaN();
     }
     double averageMessagesPerSecond = static_cast<double>(
             Cycles::fromSeconds(1.0) / averageArrivalInterval);
     double packetsPerSecond = averagePacketsPerMessage*averageMessagesPerSecond;
     double rawLoadFactor = averageRawBytesPerMessage*8
             * averageMessagesPerSecond / (bandwidthMbps*1e6);
-
     LOG(NOTICE, "Average message size %.2f (%.2f raw bytes), "
             "average packets per message %.2f, "
             "average arrival interval %.2f us, "
-            "packet generation rate %.0f pps, raw network load %.2f",
+            "packet generation rate %.0f pps, raw network load %.2f "
+            "(nan indicates the metric is unsupported for the given protocol)",
             averageMessageSize, averageRawBytesPerMessage,
             averagePacketsPerMessage,
             Cycles::toSeconds(averageArrivalInterval)*1e6,
             packetsPerSecond, rawLoadFactor);
-    std::poisson_distribution<uint64_t> messageIntervalDist(
-            static_cast<double>(averageArrivalInterval));
 
-    // Generate pseduo-random message recipients, size and arrival interval
-    // in advance. As of 2017/8, generating these three numbers could take
-    // a few hundred nanoseconds.
-    // TODO: we cannot simply pre-generate a relatively short list of the
-    // message sizes because some message has extremely low probability.
-    // This adds about 80 ns overhead per RPC.
-    const int PRE_GEN_LIST_SIZE = 1000;
-//    std::array<uint32_t, PRE_GEN_LIST_SIZE> preGeneratedMessageIds;
-    std::array<uint64_t, PRE_GEN_LIST_SIZE> preGeneratedMessageIntervals;
-    std::array<uint64_t, PRE_GEN_LIST_SIZE> preGeneratedRecipients;
-    for (int i = 0; i < PRE_GEN_LIST_SIZE; i++) {
-//        preGeneratedMessageIds[i] = messageSizeDist(gen);
-        preGeneratedMessageIntervals[i] = messageIntervalDist(gen);
-        preGeneratedRecipients[i] = generateRandom() % receivers.size();
+    // Precompute sessions to avoid the cost of overhead of
+    // Transport::getSession for each Echo RPC.
+    vector<MultiConnection*> servers;
+    for (string serviceLocator : receivers) {
+        servers.push_back(new MultiConnection(serviceLocator,
+                cluster->clientContext->transportManager));
     }
 
-    uint64_t totalCycles = 0;
-    // FIXME: compute deadline due cycles
-//    uint64_t missedDeadlineCycles = 0;
-    ObjectPool<EchoRpc> echoRpcPool;
-    // FIXME: How to choose the following parameter? 20 is usually enough for
-    // Homa with 8 priorities. However, for Homa with no priority, it's harder
-    // to simulate SRPT so the avg. # outstanding RPCs is larger; thus, setting
-    // this parameter to 20 results in significant message drops.
-#define MAX_OUTSTANDING_RPCS 50
-    std::array<Tub<std::pair<uint32_t, EchoRpc*>>, MAX_OUTSTANDING_RPCS>
-            outstandingRpcs = {};
-    uint32_t numOutstandingRpcs = 0;
-    uint32_t nextSlotToCheck = 0;
+    // Max # concurrent RPCs sent to the transport sub-system. This is
+    // necessary because the performance of many transport implementations
+    // degrade significantly when # outstanding RPCs becomes too large.
+    const uint32_t MAX_OUTSTANDING_RPCS = 50;
+    // An array of tuples representing outstanding RPCs. Each outstanding
+    // RPC is described by its message typeid, target server, sessionId
+    // and a pointer to the RPC object.
+    Tub<std::tuple<uint32_t, MultiConnection*, int, EchoRpc*>>
+            outstandingRpcs[MAX_OUTSTANDING_RPCS];
     uint32_t nextSlotToInsert = 0;
+    uint32_t numOutstandingRpcs = 0;
+    // Holds information about the messages that are delayed because
+    // we have too many outstanding RPCs. Each delayed message is
+    // charaterized by its message# and actual arrival time.
+    std::list<std::pair<uint64_t, uint64_t>> delayedMessages;
 
+    ObjectPool<EchoRpc> echoRpcPool;
+    ReadyQueue readyQueue;
     uint64_t startTime = Cycles::rdtsc();
     uint64_t stopTime = ~0lu;
     uint64_t nextMessageArrival = startTime + messageIntervalDist(gen);
     uint64_t totalBytesSent = 0;
-    uint64_t totalBytesDropped = 0;
-    uint64_t warmupCount = 100;
-    uint64_t count;
     PerfStats::registerStats(&PerfStats::threadStats);
     uint64_t prevDispatchTime = startTime;
-    int prevResult = 0;
-    for (count = 0; count < iteration;) {
+    int prevPollResult = 0;
+    uint64_t messageNum = 0;
+    while (true) {
         // Invoke the main polling function.
         int r = context->dispatch->poll();
         uint64_t currentTime = context->dispatch->currentTime;
-        if (prevResult > 0) {
+        if (prevPollResult > 0) {
             PerfStats::threadStats.dispatchActiveCycles +=
                     currentTime - prevDispatchTime;
         }
-        prevResult = r;
+        prevPollResult = r;
         prevDispatchTime = currentTime;
-//        TimeTrace::record("Cperf finished polling");
 
         // As of 08/2017, it takes ~120ns to reclaim an RPC object;
         // out of which calling RpcWrapper::isReady only takes 10-20 ns.
-        for (int i = 0; i < 1; i++) {
-            Tub<std::pair<uint32_t, EchoRpc*>>& outstandingRpc =
-                    outstandingRpcs[nextSlotToCheck];
-            nextSlotToCheck++;
-            if (nextSlotToCheck == outstandingRpcs.size()) {
-                nextSlotToCheck = 0;
-                break;
-            }
-
+        // Before changing to std::atomic, invoking isReady 10 times
+        // takes about 1000 cycles; now it is 200~350 cycles.
+        while (!readyQueue.empty()) {
+            int k = readyQueue.back();
+            readyQueue.pop_back();
+            std::tuple<uint32_t, MultiConnection*, int, EchoRpc*>*
+                    outstandingRpc = outstandingRpcs[k].get();
             if (outstandingRpc) {
-                EchoRpc* echo = outstandingRpc.get()->second;
-                // Before changing to std::atomic, invoking isReady 10 times
-                // takes about 1000 cycles; now it is 200~350 cycles.
-                if (echo->isReady()) {
-                    if (count > 0) {
-                        uint32_t id = outstandingRpc.get()->first;
-                        uint64_t completionTime = echo->getCompletionTime();
-                        totalBytesSent += messageSizes[id];
-                        roundTripTimes[id][numSamples[id] % MAX_SAMPLES] =
-                                completionTime;
-                        numSamples[id]++;
-                    }
-                    // TODO: It appears that sometimes ~RpcWrapper is quite expensive (200ns ~ 1us); why?
-//                    TimeTrace::record("Cperf about to destroy EchoRpc, i = %u", i);
-                    echoRpcPool.destroy(echo);
-//                    TimeTrace::record("Cperf destroyed EchoRpc");
-                    outstandingRpc.destroy();
-                    numOutstandingRpcs--;
-                    break;
+                EchoRpc* echo = std::get<3>(*outstandingRpc);
+                if (!echo->isReady()) {
+                    continue;
                 }
+                if (downCast<int>(messageNum) > warmupCount) {
+                    if (stopTime == ~0lu) {
+                        // Officially start the experiment.
+                        startTime = Cycles::rdtsc();
+                        stopTime = startTime + Cycles::fromSeconds(timeLimit);
+                        nextMessageArrival =
+                                startTime + messageIntervalDist(gen);
+                    }
+
+                    uint32_t id = std::get<0>(*outstandingRpc);
+                    uint64_t completionTime = echo->getCompletionTime();
+                    totalBytesSent += messageSizes[id];
+                    roundTripTimes[id][numMessages[id] % MAX_SAMPLES] =
+                            completionTime;
+                    numMessages[id]++;
+                }
+
+                if (maxSessions > 1) {
+                    MultiConnection* multiConn = std::get<1>(*outstandingRpc);
+                    int sessionId = std::get<2>(*outstandingRpc);
+                    multiConn->headOfLineBytes[sessionId] -= echo->getLength();
+                }
+                echoRpcPool.destroy(echo);
+                outstandingRpcs[k].destroy();
+                numOutstandingRpcs--;
             }
         }
-//        TimeTrace::record("Cperf finished checking isReady");
 
-        if (expect_false(currentTime >= stopTime)) {
-            LOG(NOTICE, "time expired after %lu iterations", count);
+        // See if it's time to stop the experiment.
+        if (currentTime >= stopTime) {
             double actualLoadFactor = static_cast<double>(totalBytesSent)*8
                     / (timeLimit*bandwidthMbps*1e6);
-            double droppedLoadFactor = static_cast<double>(totalBytesDropped)*8
+            double throttledLoadFactor = averageMessageSize*8
+                    * static_cast<double>(delayedMessages.size())
                     / (timeLimit*bandwidthMbps*1e6);
             if (std::abs(actualLoadFactor - loadFactor)/loadFactor > 0.02) {
                 LOG(ERROR, "Actual load factor %.3f, expecting %.3f, "
-                        "dropping %.3f", actualLoadFactor, loadFactor,
-                        droppedLoadFactor);
+                        "throttled %.3f", actualLoadFactor, loadFactor,
+                        throttledLoadFactor);
             } else {
                 LOG(NOTICE, "Generated load factor %.3f", actualLoadFactor);
             }
             break;
         }
 
-        // TODO: I don't think throttling the number of oustanding RPCs is fair
-        // to the experiment because we are not using the "real" start time
-        // (i.e. the message arrival time) of an RPC to compute its completion
-        // time.
-
-        // See if it's time to send another message.
-        if (currentTime > nextMessageArrival) {
-//            missedDeadlineCycles += currentTime - nextMessageArrival;
-
-            // Index into the pre-generated random list.
-            uint64_t kRandom;
-            if (warmupCount > 0) {
-                warmupCount--;
-                if (warmupCount == 0) {
-                    // Cancel warmup RPCs.
-//                    for (OutstandingRpcs::value_type p : outstandingRpcs) {
-//                        echoRpcPool.destroy(p.second);
-//                    }
-//                    outstandingRpcs.clear();
-//                    it = outstandingRpcs.begin();
-                    // TODO: WE CAN'T JUST CANCEL WARMUP RPCs, SOMEHOW
-                    // THE CLIENTS WILL NOT BE ABLE TO MAKE ANY PROGRESS BEYOND
-                    // UNSCHED BYTES?
-
-                    // Start the experiment officially in 10 ms (i.e., 500 us
-                    // multiplied by at most 20 oustanding RPCs).
-                    startTime = Cycles::rdtsc() + Cycles::fromSeconds(0.01);
-                    stopTime = startTime + Cycles::fromSeconds(timeLimit);
-                    nextMessageArrival = startTime + messageIntervalDist(gen);
-                    continue;
-                }
-                kRandom = warmupCount % PRE_GEN_LIST_SIZE;
+        // See if it's time to send (or buffer) another message. There are two
+        // possibilities: 1) a new message just arrives or 2) # outstanding
+        // RPCs drops below the limit and we have a delayed message
+        // ready to be sent.
+        bool tooManyOutstandingRpcs =
+                numOutstandingRpcs >= MAX_OUTSTANDING_RPCS;
+        bool newMessageArrives = currentTime > nextMessageArrival;
+        bool sendDelayedMessage =
+                !tooManyOutstandingRpcs && !delayedMessages.empty();
+        if (newMessageArrives || sendDelayedMessage) {
+            // Index into the pre-computed random list.
+            uint64_t idx;
+            if (newMessageArrives) {
+                messageNum++;
+                idx = messageNum % randomRecipients.size();
+                nextMessageArrival += randomMessageIntervals[idx];
             } else {
-                count++;
-                kRandom = count % PRE_GEN_LIST_SIZE;
+                idx = delayedMessages.front().first % randomRecipients.size();
             }
 
-            uint32_t messageId = messageSizeDist(gen);
-//            uint32_t messageId = preGeneratedMessageIds[kRandom];
-            uint32_t length = messageSizes[messageId];
-            nextMessageArrival += preGeneratedMessageIntervals[kRandom];
-            if (numOutstandingRpcs < MAX_OUTSTANDING_RPCS) {
-                uint64_t recipient = preGeneratedRecipients[kRandom];
-                TimeTrace::record("Start new RPC, %u outstanding RPCs",
-                        (uint32_t)numOutstandingRpcs);
-                EchoRpc* echo = echoRpcPool.construct(cluster,
-                        sessionRefs[recipient], message.c_str(), length,
-                        length);
-//                EchoRpc* echo = echoRpcPool.construct(cluster, receivers[recipient].c_str(),
-//                        message.c_str(), length, length);
+            if (newMessageArrives && tooManyOutstandingRpcs) {
+                delayedMessages.emplace_back(messageNum, Cycles::rdtsc());
+            } else {
+                uint32_t messageId = messageSizeDist(gen);
+                uint32_t length = messageSizes[messageId];
+                uint32_t recipient = randomRecipients[idx];
+                MultiConnection* multiConn = servers[recipient];
+                int sessionId = -1;
+                if (maxSessions == 1) {
+                    sessionId = 0;
+                } else {
+                    unsigned sid = 0;
+
+                    // The following code dedicate the first session to all
+                    // messages larger than a given size to avoid blocking
+                    // shorter messages. This is necessary to achieve
+                    // reasonably small 99%-tile slowdown for short messages
+                    // when running infrc or tcp for W3 and W5 in the Homa
+                    // paper.
+#if 0
+                    if (maxSessions == 1) {
+                        LOG(ERROR, "maxSessions must be >= 2");
+                        return;
+                    }
+                    if (length > 16384) {
+                        sessionId = 0;
+                    }
+                    sid = 1;
+#endif
+
+                    // See if we can find an idle session. If not, find the
+                    // session with minimum head-of-line blocking.
+                    uint64_t numSessions = multiConn->headOfLineBytes.size();
+                    int backupSessionId = -1;
+                    if (sessionId < 0) {
+                        uint64_t minHOLBytes = ~0lu;
+                        for (; sid < numSessions; sid++) {
+                            uint64_t holBytes =
+                                    multiConn->headOfLineBytes[sid];
+                            if (holBytes == 0) {
+                                sessionId = sid;
+                                break;
+                            } else if (holBytes < minHOLBytes) {
+                                minHOLBytes = holBytes;
+                                backupSessionId = sid;
+                            }
+                        }
+                    }
+                    // If there is no idle session, see if we can open a new
+                    // session. If we have reached our session limit, just use
+                    // the session with minimum head-of-line blocking.
+                    if (sessionId < 0) {
+                        if (numSessions < maxSessions) {
+                            multiConn->openSession();
+                            sessionId = static_cast<int>(numSessions);
+                        } else {
+                            sessionId = backupSessionId;
+                        }
+                    }
+                }
+                LOG(DEBUG, "Start new RPC to server %u, len %u, sessionId %d, "
+                        "headOfLineBytes %lu", recipient, sessionId, length,
+                        multiConn->headOfLineBytes[sessionId]);
+                multiConn->headOfLineBytes[sessionId] += length;
+                Transport::SessionRef session = multiConn->sessions[sessionId];
+
+                // Find a slot to keep the state of this new RPC.
+                int emptySlot;
                 while (true) {
                     int i = nextSlotToInsert;
-                    nextSlotToInsert = (nextSlotToInsert + 1) % MAX_OUTSTANDING_RPCS;
+                    nextSlotToInsert =
+                            (nextSlotToInsert + 1) % MAX_OUTSTANDING_RPCS;
                     if (!outstandingRpcs[i]) {
-                        outstandingRpcs[i].construct(messageId, echo);
+                        emptySlot = i;
                         break;
                     }
                 }
+
+                // If the message was delayed due to throttling, we need to
+                // set its start time to when the message actually arrived.
+                uint64_t rpcStartTime = 0;
+                if (sendDelayedMessage) {
+                    rpcStartTime = delayedMessages.front().second;
+                    LOG(DEBUG, "RPC was delayed %.2f us", Cycles::toSeconds(
+                            Cycles::rdtsc() - rpcStartTime)*1e6);
+                    delayedMessages.pop_front();
+                }
+
+                EchoRpc* echo = echoRpcPool.construct(cluster, session,
+                        message, length, length, static_cast<Buffer*>(NULL),
+                        new Callback(emptySlot, &readyQueue), rpcStartTime);
+                outstandingRpcs[emptySlot].construct(messageId, multiConn,
+                        sessionId, echo);
                 numOutstandingRpcs++;
-            } else {
-                totalBytesDropped += length;
-                TimeTrace::record("Drop %u-byte message", length);
+
             }
         }
     }
-    totalCycles = Cycles::rdtsc() - startTime;
-    LOG(NOTICE, "Experiment runs for %.2f secs", Cycles::toSeconds(totalCycles));
+    uint64_t endTime = Cycles::rdtsc();
+    uint64_t totalCycles = endTime - startTime;
+    uint64_t lostCycles = endTime > nextMessageArrival ?
+            endTime - nextMessageArrival : 0;
+    if (lostCycles*1000 > totalCycles) {
+        LOG(WARNING, "Load generator failed to keep up; lost %.2f seconds",
+                Cycles::toSeconds(lostCycles));
+    }
+    LOG(NOTICE, "Experiment runs for %.2f secs",
+            Cycles::toSeconds(totalCycles));
+    if (maxSessions > 1) {
+        for (unsigned i = 0; i < servers.size(); i++) {
+            MultiConnection* mc = servers[i];
+            if (mc->sessions.size() > 1) {
+                LOG(NOTICE, "Opened %lu connections to server %s",
+                        mc->sessions.size(), mc->server.c_str());
+            }
+            delete mc;
+        }
+    }
 
-    // Cancel outstanding RPCs
+    // Cancel outstanding RPCs to avoid warnings during object destruction.
     LOG(NOTICE, "Destroying %u outstanding RPCs", numOutstandingRpcs);
-    for (int i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
+    for (unsigned i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
         if (outstandingRpcs[i]) {
-            echoRpcPool.destroy((*outstandingRpcs[i]).second);
+            echoRpcPool.destroy(std::get<3>(*outstandingRpcs[i]));
         }
     }
 
-    // Aggregate the results into TimeDist format.
-    vector<TimeDist> results(messageSizes.size());
-    for (uint i = 0; i < messageSizes.size(); i++) {
-        if (numSamples[i] <= MAX_SAMPLES) {
-            roundTripTimes[i].resize(numSamples[i]);
+    for (unsigned i = 0; i < messageSizes.size(); i++) {
+        if (numMessages[i] <= MAX_SAMPLES) {
+            roundTripTimes[i].resize(numMessages[i]);
         }
-
-        getDist(roundTripTimes[i], &results[i]);
-        double totalRxBytes = messageSizes[i] *
-                static_cast<double>(numSamples[i]);
-        results[i].bandwidth = totalRxBytes/Cycles::toSeconds(totalCycles);
-        results[i].numSamples = numSamples[i];
     }
-    return results;
 }
 
 /**
@@ -2947,11 +2933,14 @@ doMultiReadColocation(
     }
 }
 
-
 // Measure round-trip time for messages of different sizes.
 void
 echo_basic()
 {
+#if !HOMA_BENCHMARK
+    LOG(WARNING, "To achieve best performance, compile ClusterPerf "
+            "and RAMCloud with -DHOMA_BENCHMARK");
+#endif
     if (clientIndex != 0)
         return;
     vector<uint32_t> outgoingSizes;
@@ -2961,22 +2950,21 @@ echo_basic()
     char name[50], description[50];
 
     // Read message sizes from the CDF file if provided.
-    if (!messageSizeCdfFilePath.empty()) {
-        double averageMessageSize;
-        std::ifstream inFile(messageSizeCdfFilePath);
-        inFile >> averageMessageSize;
-
+    if (!messageSizeCDF.empty()) {
+        std::ifstream inFile(messageSizeCDF);
+        double avgMessageSize;
         uint32_t size;
         double probability;
+        inFile >> avgMessageSize;
         while (inFile >> size >> probability) {
             outgoingSizes.push_back(size);
             incomingSizes.push_back(size);
             ids.push_back(std::to_string(size));
         }
     } else {
-        outgoingSizes = {100, 1000, 10000, 100000, 1000000};
-        incomingSizes = {30, 30, 30, 30, 30};
-        ids = {"100", "1K", "10K", "100K", "1M"};
+        outgoingSizes = {0, 100, 1000, 10000, 100000, 1000000};
+        incomingSizes = {0, 0, 0, 0, 0, 0};
+        ids = {"0", "100", "1K", "10K", "100K", "1M"};
     }
 
     // Choose the first master server in the server list as the receiver.
@@ -2999,16 +2987,24 @@ echo_basic()
         return;
     }
 
+    // Allocate and register memory for the request messages to enable
+    // zero-copy TX if possible.
+    uint32_t largestSize =
+            *std::max_element(outgoingSizes.begin(), outgoingSizes.end());
+    const string message(largestSize, 'x');
+    context->transportManager->registerMemory(
+            const_cast<char*>(message.data()), message.length());
+
     // Each iteration through the following loop measures the round-trip time
     // of a particular message size.
     for (uint i = 0; i < outgoingSizes.size(); i++) {
-        LOG(NOTICE, "Starting echo test for %d-byte reply messages",
-                incomingSizes[i]);
+        LOG(NOTICE, "Starting echo test for %d-byte reuqest messages",
+                outgoingSizes[i]);
         cluster->logMessageAll(NOTICE,
-                "Starting echo test for %d-byte reply messages",
-                incomingSizes[i]);
-        echoDists.push_back(echoMessages(receiverLocator, outgoingSizes[i],
-                incomingSizes[i], 1000, 10.0));
+                "Starting echo test for %d-byte request messages",
+                outgoingSizes[i]);
+        echoDists.push_back(echoMessage(receiverLocator, message.data(),
+                outgoingSizes[i], incomingSizes[i], 1000, 10.0));
     }
     Logger::get().sync();
 
@@ -3039,173 +3035,22 @@ echo_basic()
         }
         snprintf(name, sizeof(name), "echoBw%s", ids[i].c_str());
         snprintf(description, sizeof(description),
-                "bandwidth receiving %sB messages", ids[i].c_str());
+                "bandwidth sending %sB messages", ids[i].c_str());
         printBandwidth(name, dist->bandwidth, description);
     }
 }
 
-// This benchmark measures the latency of sending and receiving small messages
-// in the presence of large messages, when there are multiple senders but only
-// one receiver.
-void
-echo_incast()
-{
-    // Define parameters that control the experiment.
-#define LONG_MESSAGE_SIZE 9000
-#define SHORT_MESSAGE_SIZE 30
-    const uint32_t echoSize = 1;
-    const double masterRunningSecs = seconds;
-    const double slaveWarmupSecs = 1.0;
-    const double slaveRunningSecs = masterRunningSecs + 2.0;
-    const uint32_t messageSize = (clientIndex == 0) ?
-            SHORT_MESSAGE_SIZE : LONG_MESSAGE_SIZE;
-    double echoRatio = 1.0 * echoSize / messageSize;
-
-    string receiverLocator;
-    TimeDist dist[1];
-    if (clientIndex == 0) {
-        // Master client chooses the first master server in the server list as
-        // the receiver.
-        using ServerMap = std::map<uint64_t, std::pair<string, ServiceMask>>;
-        ServerMap servers;
-        getServerList(&servers);
-        ServerMap::iterator it;
-        for (it = servers.begin(); it != servers.end(); it++) {
-            if (it->second.second.has(WireFormat::MASTER_SERVICE)) {
-                break;
-            }
-        }
-        if (it != servers.end()) {
-            receiverLocator = it->second.first;
-            LOG(NOTICE, "Choose server %lu at %s as the receiver", it->first,
-                    receiverLocator.c_str());
-        } else {
-            LOG(ERROR, "No master server available");
-            return;
-        }
-
-        // Inform slave clients about the decision and wait until all of them
-        // have started.
-        sendCommand(receiverLocator.c_str(), "running", 1, numClients-1);
-
-        // Run experiment and collect server performance statistics.
-        LOG(NOTICE, "Send %uB messages, receive %uB messages", messageSize,
-                echoSize);
-        Buffer statsBefore, statsAfter;
-        cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
-        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
-                &statsBefore);
-        dist[0] = echoMessages(receiverLocator, messageSize, echoSize, ~0u,
-                masterRunningSecs);
-        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
-                &statsAfter);
-
-        // Raise a warning if any slave client may have finished before us.
-        for (int i = 1; i < numClients; i++) {
-            string state = getSlaveState(i);
-            if (state.compare("running") != 0) {
-                LOG(ERROR, "Slave client %d may have finished before "
-                        "the master client", i);
-            }
-        }
-
-        // Print echo completion time distribution.
-        Logger::get().sync();
-        char name[50], description[50];
-        printf("===client 0===\n");
-        snprintf(description, sizeof(description),
-                "send %uB message, receive %uB message", messageSize, echoSize);
-        snprintf(name, sizeof(name), "echo");
-        printf("%-20s %s     %s median\n", name, formatTime(dist->p50).c_str(),
-                description);
-        snprintf(name, sizeof(name), "echo.min");
-        printf("%-20s %s     %s minimum\n", name, formatTime(dist->min).c_str(),
-                description);
-        snprintf(name, sizeof(name), "echo.9");
-        printf("%-20s %s     %s 90%%\n", name, formatTime(dist->p90).c_str(),
-                description);
-        if (dist->p99 != 0) {
-            snprintf(name, sizeof(name), "echo.99");
-            printf("%-20s %s     %s 99%%\n", name,
-                    formatTime(dist->p99).c_str(), description);
-        }
-        if (dist->p999 != 0) {
-            snprintf(name, sizeof(name), "echo.999");
-            printf("%-20s %s     %s 99.9%%\n", name,
-                    formatTime(dist->p999).c_str(), description);
-        }
-        snprintf(description, sizeof(description),
-                 "bandwidth sending %uB messages", SHORT_MESSAGE_SIZE);
-        printBandwidth("sendBw", dist->bandwidth / echoRatio, description);
-        snprintf(description, sizeof(description),
-                 "bandwidth receiving %uB messages", echoSize);
-        printBandwidth("recvBw", dist->bandwidth, description);
-
-        // Print slave clients throughput information.
-        ClientMetrics clientMetrics;
-        sendMetrics(0, 0);
-        getMetrics(clientMetrics, numClients);
-        for (int slave = 1; slave < numClients; slave++) {
-            printf("===client %d===\n", slave);
-            snprintf(description, sizeof(description),
-                     "bandwidth sending %uB messages", LONG_MESSAGE_SIZE);
-            printBandwidth("sendBw", clientMetrics[0][slave], description);
-            snprintf(description, sizeof(description),
-                     "bandwidth receiving %uB messages", echoSize);
-            printBandwidth("recvBw", clientMetrics[1][slave], description);
-        }
-
-        // Print server network bandwidth information.
-        PerfStats::Diff diff;
-        PerfStats::clusterDiff(&statsBefore, &statsAfter, &diff);
-//        for (uint32_t i = 0; i < diff["serverId"].size(); i++) {
-        double elapsedTime = diff["collectionTime"][0] /
-                diff["cyclesPerSecond"][0];
-        double sendBw = diff["networkOutputBytes"][0] / elapsedTime;
-        double recvBw = diff["networkInputBytes"][0] / elapsedTime;
-
-        printf("===server %.0f===\n", diff["serverId"][0]);
-        printf("%-20s  %.1f s\n", "elapsedTime", elapsedTime);
-        snprintf(description, sizeof(description),
-                 "bandwidth sending bytes");
-        printBandwidth("sendBw", sendBw, description);
-        snprintf(description, sizeof(description),
-                 "bandwidth receiving bytes");
-        printBandwidth("recvBw", recvBw, description);
-//        }
-
-        // TODO: EXTRA STUFF
-        printf("!!! %s, %d, %.2f, %.2f, %.2f, %.0f\n",
-               receiverLocator.find("homa") != string::npos ? "Homa" : "Basic",
-               numClients-1,
-               dist->min * 1e6,
-               dist->p50 * 1e6,
-               dist->p99 * 1e6,
-               recvBw);
-    } else {
-        // Slave client obtains the receiver's service locator from the master
-        // client.
-        char command[50];
-        receiverLocator = getCommand(command, sizeof(command));
-        LOG(NOTICE, "Send %uB messages to server at %s, receive %uB messages",
-                messageSize, receiverLocator.c_str(), echoSize);
-
-        // Do some warmup before setting its state to "running".
-        echoMessages(receiverLocator, messageSize, echoSize, ~0u,
-               slaveWarmupSecs);
-        setSlaveState("running");
-        dist[0] = echoMessages(receiverLocator, messageSize, echoSize, ~0u,
-               slaveRunningSecs);
-        setSlaveState("done");
-
-        // Send metrics `sendBw` and `recvBw` to the master client.
-        sendMetrics(dist->bandwidth / echoRatio, dist->bandwidth);
-    }
-}
-
+// Generate a series of echo RPCs and measure their completion times.
+// RPC sizes are chosen pseudo-randomly, with Poisson arrivals, to match
+// the given message distribution and target network throughput.
+// The server for each RPC is also chosen at random.
 void
 echo_workload()
 {
+#if !HOMA_BENCHMARK
+    LOG(WARNING, "To achieve best performance, compile ClusterPerf "
+            "and RAMCloud with -DHOMA_BENCHMARK");
+#endif
     // Get all servers available in the cluster.
     vector<string> serverLocators;
     using ServerMap = std::map<uint64_t, std::pair<string, ServiceMask>>;
@@ -3222,21 +3067,20 @@ echo_workload()
     // Read in the cumulative distribution function of the message size.
     double averageMessageSize = 0;
     vector<uint32_t> messageSizes;
-    vector<double> cumulativeProbabilities;
-    if (!messageSizeCdfFilePath.empty()) {
-        std::ifstream inFile(messageSizeCdfFilePath);
-//        inFile >> averageMessageSize;
-        inFile.ignore(256, '\n');
-
+    vector<double> cdf;
+    if (!messageSizeCDF.empty()) {
+        std::ifstream inFile(messageSizeCDF);
+        double avgMessageSize;
         uint32_t size;
         double cp;
+        inFile >> avgMessageSize;
         while (inFile >> size >> cp) {
             double probability = cp;
-            if (!cumulativeProbabilities.empty()) {
-                probability -= cumulativeProbabilities.back();
+            if (!cdf.empty()) {
+                probability -= cdf.back();
             }
             messageSizes.push_back(size);
-            cumulativeProbabilities.push_back(cp);
+            cdf.push_back(cp);
             averageMessageSize += size * probability;
         }
     } else {
@@ -3244,7 +3088,6 @@ echo_workload()
         return;
     }
 
-    //
     Buffer statsBefore, statsAfter;
     if (clientIndex == 0) {
         cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
@@ -3252,62 +3095,32 @@ echo_workload()
                 &statsBefore);
     }
 
-    vector<Samples> roundTripTrimes;
-    vector<TimeDist> results = echoMessages2(serverLocators,
-            averageMessageSize, messageSizes, cumulativeProbabilities, ~0u,
-            seconds, roundTripTrimes);
+    // Allocate and register memory for the request messages to enable
+    // zero-copy TX if possible.
+    uint32_t largestSize =
+            *std::max_element(messageSizes.begin(), messageSizes.end());
+    const string message(largestSize, 'x');
+    context->transportManager->registerMemory(
+            const_cast<char*>(message.data()), message.length());
 
-// TODO: DON'T NEED IT FOR NOW SINCE I AM DEBUGGING SINGLE PACKET MSG
-//    if (clientIndex == 0) {
-//        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
-//                &statsAfter);
-//
-//        Logger::get().sync();
-//        char name[50], description[50];
-//        for (uint i = 0; i < results.size(); i++) {
-//            TimeDist* dist = &results[i];
-//            snprintf(description, sizeof(description),
-//                    "send %uB message, receive %uB message",
-//                     messageSizes[i], messageSizes[i]);
-//            printf("%-20s %lu\n", "#samples", dist->numSamples);
-//            snprintf(name, sizeof(name), "echo");
-//            printf("%-20s %s     %s median\n", name, formatTime(dist->p50).c_str(),
-//                    description);
-//            snprintf(name, sizeof(name), "echo.min");
-//            printf("%-20s %s     %s minimum\n", name, formatTime(dist->min).c_str(),
-//                    description);
-//            snprintf(name, sizeof(name), "echo.9");
-//            printf("%-20s %s     %s 90%%\n", name, formatTime(dist->p90).c_str(),
-//                    description);
-//            if (dist->p99 != 0) {
-//                snprintf(name, sizeof(name), "echo.99");
-//                printf("%-20s %s     %s 99%%\n", name,
-//                        formatTime(dist->p99).c_str(), description);
-//            }
-//            if (dist->p999 != 0) {
-//                snprintf(name, sizeof(name), "echo.999");
-//                printf("%-20s %s     %s 99.9%%\n", name,
-//                        formatTime(dist->p999).c_str(), description);
-//            }
-//            snprintf(description, sizeof(description),
-//                     "bandwidth sending %uB messages", messageSizes[i]);
-//            printBandwidth("sendBw", dist->bandwidth, description);
-//            snprintf(description, sizeof(description),
-//                     "bandwidth receiving %uB messages", messageSizes[i]);
-//            printBandwidth("recvBw", dist->bandwidth, description);
-//        }
-//
-//        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter).c_str());
-//    }
+    vector<uint64_t> numMessages;
+    vector<vector<uint64_t>> roundTripTrimes;
+    echoMessageAsync(serverLocators, message.data(), averageMessageSize,
+            messageSizes, cdf, seconds, numMessages, roundTripTrimes);
 
-    // TODO: KEEP THE FOLLOWING OUTPUT ONLY; MODIFY IT TO BE:
-    // MSG_SIZE,TIME0,TIME1,TIME2, ...
+    if (clientIndex == 0) {
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsAfter);
+        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
+                .c_str());
+    }
 
     // Output the times (several comma-separated values on each line) for
     // single-packet messages.
     Logger::get().sync();
     for (uint i = 0; i < roundTripTrimes.size(); i++) {
-        printf("%u,%lu", messageSizes[i], results[i].numSamples);
+        printf("%u,%lu", messageSizes[i], numMessages[i]);
+        std::sort(roundTripTrimes[i].begin(), roundTripTrimes[i].end());
         for (uint64_t cycles : roundTripTrimes[i]) {
             printf(",%.2f", Cycles::toSeconds(cycles) * 1.0e06);
         }
@@ -3770,7 +3583,9 @@ indexBasic()
             start = Cycles::rdtsc();
             uint32_t numReturnedHashes = cluster->readHashes(
                 dataTable, numHashes, &readHashBuff, &readValBuff, &numObjects);
-            assert(numReturnedHashes == numHashes); // else collision
+            if (numReturnedHashes != numHashes) {
+                assert(numReturnedHashes == numHashes); // else collision
+            }
             stop = Cycles::rdtsc();
             timeLookupAndReads.at(i) = timeHashLookups.at(i) +
                         Cycles::toSeconds(stop - start);
@@ -4213,9 +4028,13 @@ indexRange() {
             hashLookupTimes.at(i) = Cycles::toSeconds(hashLookupTime);
 
             assert(totalNumHashes == lookupRange);
-            assert(expectedFirstPkHash ==
+            if (expectedFirstPkHash !=
                     *pkHashBuffs.front()->getOffset<uint64_t>(
-                            sizeof32(WireFormat::LookupIndexKeys::Response)));
+                    sizeof32(WireFormat::LookupIndexKeys::Response))) {
+                assert(expectedFirstPkHash ==
+                        *pkHashBuffs.front()->getOffset<uint64_t>(
+                        sizeof32(WireFormat::LookupIndexKeys::Response)));
+            }
 
             // Read Hashes
             uint32_t numObjectsInRead;
@@ -4234,7 +4053,9 @@ indexRange() {
                                             &readObject, &numObjectsInRead);
                 readHashTime += Cycles::rdtsc() - start;
 
-                assert(numReturnedHashes == numHashes); // else collision
+                if (numReturnedHashes != numHashes) {
+                    assert(numReturnedHashes == numHashes); // else collision
+                }
                 totalNumObjects += numObjectsInRead;
             }
             assert(totalNumObjects == lookupRange);
@@ -4404,8 +4225,11 @@ indexMultiple()
                         &nextKeyLength, &nextKeyHash);
 
                 assert(1 == numHashes);
-                assert(pkey.getHash()==
-                        *lookupResp.getOffset<uint64_t>(lookupOffset));
+                if (pkey.getHash() !=
+                        *lookupResp.getOffset<uint64_t>(lookupOffset)) {
+                    assert(pkey.getHash()==
+                            *lookupResp.getOffset<uint64_t>(lookupOffset));
+                }
             }
         }
 
@@ -4746,8 +4570,11 @@ indexScalability()
                     &nextKeyHash);
 
             assert(numHashes == 1);
-            assert(pk.getHash() ==
-                    *lookupResp.getOffset<uint64_t>(lookupOffset));
+            if (pk.getHash() !=
+                    *lookupResp.getOffset<uint64_t>(lookupOffset)) {
+                assert(pk.getHash() ==
+                        *lookupResp.getOffset<uint64_t>(lookupOffset));
+            }
         }
     }
 
@@ -7474,7 +7301,6 @@ TestInfo tests[] = {
     {"basic", basic},
     {"broadcast", broadcast},
     {"echo_basic", echo_basic},
-    {"echo_incast", echo_incast},
     {"echo_workload", echo_workload},
     {"indexBasic", indexBasic},
     {"indexRange", indexRange},
@@ -7551,22 +7377,26 @@ try
         ("workload", po::value<string>(&workload)->default_value("YCSB-A"),
                 "Workload of additional load generating clients"
                 "(YCSB-A, YCSB-B, YCSB-C)")
-        ("messageSizeCDF", po::value<string>(&messageSizeCdfFilePath)->
+        ("messageSizeCDF", po::value<string>(&messageSizeCDF)->
                 default_value(""),
-         // TODO: BETTER DESC.
-                "File to read message size distribution in CDF format. ")
+                "Path to the message size CDF file. The first line of the "
+                "file contains the average message size. After that, each "
+                "line of the file consists of two numbers x and y separated "
+                "by whitespace(s), meaning that the probability of messages "
+                "that are less than or equal to x bytes is y (y <= 1). All "
+                "lines must be sorted by the second number and the last line "
+                "must have y = 1.")
         ("maxSessions", po::value<unsigned>(&maxSessions)->default_value(1),
                 "For each server, create at most this number of sessions and "
                 "try to use different sessions for different RPCs to reduce "
                 "head-of-line blocking in stream-based transports "
                 "(e.g., tcp, infrc)")
-        ("targetTput", po::value<double>(&loadFactor)->
-                default_value(0.1),
-         // TODO: BETTER DESC.
-                "Network load factor attributed to message bytes. ")
         ("targetOps", po::value<int>(&targetOps)->default_value(0),
                 "Operations per second that each load generating client"
                 "will try to achieve (0 means run as fast as possible)")
+        ("targetTput", po::value<double>(&targetTputGbps)->default_value(.0),
+                "Network throughput, in Gbps, that each load generating "
+                "client will try to achieve. ")
         ("txSpan", po::value<int>(&txSpan)->default_value(1),
                 "Number of servers that each transaction should span")
         ("numIndexlet", po::value<int>(&numIndexlet)->default_value(1),
@@ -7589,10 +7419,7 @@ try
                 "only applies to doWorkload based experiments.")
         ("fullSamples", po::bool_switch(&fullSamples),
                 "Print alternate format for latency samples that includes "
-                "timestamps for each of the samples.")
-        ("calibrateTscFreq", po::bool_switch(&calibrateTscFreq),
-                "For each client, compute the relative scalar of its TSC "
-                "clock frequency compared to those of the servers");
+                "timestamps for each of the samples.");
 
     po::positional_options_description pos_desc;
     pos_desc.add("testName", -1);
@@ -7609,13 +7436,6 @@ try
     cluster->createTable("control");
     controlTable = cluster->getTableId("control");
 
-    // TODO: PIN MEMORY AFTER INITIALIZATION?
-    pinAllMemory();
-
-    Tub<TscFrequencyCalibrator> tscFreqCalibrator;
-    if (calibrateTscFreq) {
-        tscFreqCalibrator.construct();
-    }
     if (testNames.size() == 0) {
         // No test names specified; run all tests.
         for (TestInfo& info : tests) {
@@ -7637,11 +7457,6 @@ try
             }
         }
     }
-    if (clientIndex == 0) {
-        LOG(NOTICE, "End of ClusterPerf experiment at TSC %lu",
-                Cycles::rdtsc());
-    }
-    tscFreqCalibrator.destroy();
 
     // Flush printout of all data before timetrace gets dumped.
     fflush(stdout);
@@ -7654,5 +7469,6 @@ try
 }
 catch (std::exception& e) {
     RAMCLOUD_LOG(ERROR, "%s", e.what());
+    Logger::get().sync();
     exit(1);
 }
