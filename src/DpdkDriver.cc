@@ -234,8 +234,11 @@ DpdkDriver::DpdkDriver(Context* context, int port)
                 "Failed to detect a link on Ethernet port %u", portId));
     }
     if (link.link_speed != ETH_SPEED_NUM_NONE) {
-        // Be conservative about the link speed to avoid continuously queueing
-        // packets faster than the NIC can consume under high load.
+        // Be conservative about the link speed. We use bandwidth in
+        // QueueEstimator to estimate # bytes outstanding in the NIC's
+        // TX queue. If we overestimate the bandwidth, under high load,
+        // we may keep queueing packets faster than the NIC can consume,
+        // and build up a queue in the TX queue.
         bandwidthMbps = (uint32_t) (link.link_speed * 0.98);
     } else {
         LOG(WARNING, "Can't retrieve network bandwidth from DPDK; "
@@ -482,6 +485,7 @@ DpdkDriver::sendPacket(const Address* addr,
                 "Failed to allocate a packet buffer; dropping packet; "
                 "%u mbufs available, %u mbufs in use",
                 numMbufsAvail, numMbufsInUse);
+        return;
     }
 
 #if TESTING
@@ -494,6 +498,7 @@ DpdkDriver::sendPacket(const Address* addr,
         RAMCLOUD_CLOG(NOTICE,
                 "rte_pktmbuf_append call failed; dropping packet");
         rte_pktmbuf_free(mbuf);
+        return;
     }
 
     // Fill out the destination and source MAC addresses plus the Ethernet

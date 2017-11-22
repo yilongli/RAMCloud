@@ -34,19 +34,17 @@ class QueueEstimator {
   PUBLIC:
 
     /**
-     * Describes the state of the NIC's transmit queue. A pointer to this
-     * struct can be passed to #Driver::sendPacket by a transport, indicating
-     * that it is interested in the state of the transmit queue when the
-     * packet is handed to the NIC; QueueEstimator is then responsible for
-     * filling out this structure. Mainly used for performance debugging.
+     * Describes the state of the NIC's transmit queue; used to export this
+     * information from drivers up to transports. Mainly used for performance
+     * debugging.
      */
     struct TransmitQueueState {
         /// # rdtsc ticks for which the transmit queue has been empty.
         /// Must be 0 if #outstandingBytes > 0.
         uint64_t idleTime;
 
-        /// # bytes waiting to be sent at the transmit queue. Must be
-        /// 0 if #idleTime > 0.
+        /// Estimate of # bytes waiting to be sent at the transmit queue.
+        /// Must be 0 if #idleTime > 0.
         uint32_t outstandingBytes;
     };
 
@@ -75,9 +73,9 @@ class QueueEstimator {
      * \param transmitTime
      *      Time when the packet was queued in the NIC, in Cycles::rdtsc ticks.
      * \param[out] txQueueState
-     *      Used to retrieve state of the NIC's transmit queue when this packet
-     *      was added to the NIC. NULL means the caller doesn't care about
-     *      this value.
+     *      Used to retrieve state of the NIC's transmit queue just before
+     *      this packet was added to the NIC. NULL means the caller doesn't
+     *      care about this value.
      */
     void
     packetQueued(uint32_t length, uint64_t transmitTime,

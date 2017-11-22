@@ -229,15 +229,6 @@ class Driver {
     virtual void dumpStats() {}
 
     /**
-     * Check if the transmit queue has run dry (resulting in unused network
-     * bandwidth). Mainly used for performance debugging.
-     */
-    bool isTransmitQueueEmpty()
-    {
-        return queueEstimator.getQueueSize(Cycles::rdtsc()) == 0;
-    }
-
-    /**
      * Returns the highest packet priority level this Driver supports (0 is
      * the lowest priority level). The larger the number, the more priority
      * levels are available. For example, if the highest priority level is 7
@@ -303,9 +294,11 @@ class Driver {
     }
 
     /**
-     * Returns the total protocol overhead (down to the physical layer)
-     * involved in transmitting one packet, in bytes. 0 means this feature
-     * has not been implemented by the driver.
+     * Returns the total protocol overhead involved in transmitting one
+     * packet, in bytes. This is equal to # bytes in the physical layer
+     * data packet on the wire (e.g., preamble, inter-packet gaps,etc.)
+     * minus the size of the payload passed to the #sendPacket method.
+     * 0 means this feature has not been implemented by the driver.
      */
     virtual uint32_t getPacketOverhead()
     {
@@ -427,9 +420,9 @@ class Driver {
      * \param priority
      *      The priority level of this packet. 0 is the lowest priority.
      * \param[out] txQueueState
-     *      Used to retrieve state of the NIC's transmit queue when this packet
-     *      was handed to the NIC. NULL means the caller doesn't care about
-     *      this value.
+     *      Used to retrieve state of the NIC's transmit queue just before
+     *      this packet was handed to the NIC. NULL means the caller doesn't
+     *      care about this value.
      */
     virtual void sendPacket(const Address* recipient,
                             const void* header,
@@ -457,9 +450,9 @@ class Driver {
      * \param priority
      *      The priority level of this packet. 0 is the lowest priority.
      * \param[out] txQueueState
-     *      Used to retrieve state of the NIC's transmit queue when this packet
-     *      was handed to the NIC. NULL means the caller doesn't care about
-     *      this value.
+     *      Used to retrieve state of the NIC's transmit queue just before
+     *      this packet was handed to the NIC. NULL means the caller doesn't
+     *      care about this value.
      */
     template<typename T>
     void sendPacket(const Address* recipient,

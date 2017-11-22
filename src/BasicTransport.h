@@ -59,6 +59,14 @@ class BasicTransport : public Transport {
     }
 
   PRIVATE:
+    // FIXME: define "small" to be scheduling cost > transmit time?
+    // As of 09/2017, we consider messages smaller than 300 bytes (which takes
+    // 240ns to transmit on a 10Gbps network) are small; this value is chosen
+    // experimentally so that we can run W3 in Homa paper at 80% load on a
+    // 10Gbps network and that no significant queueing delay at the TX queue
+    // is observed.
+    static const uint32_t SMALL_MESSAGE_SIZE = 300;
+
     /**
      * A unique identifier for an RPC.
      */
@@ -184,6 +192,7 @@ class BasicTransport : public Transport {
             {}
         };
 
+        // TODO: document the cost of insert/delete of this map vs. std::unordered_map
         /// This map stores information about packets that have been
         /// received but cannot yet be added to buffer because one or
         /// more preceding packets have not yet been received. Each
@@ -197,10 +206,10 @@ class BasicTransport : public Transport {
     };
 
     /**
-     * An object of this class stores the state for a scheduled message for
-     * for which at least one packet has been received. It is used both for
-     * request messages on the server and for response messages on the client.
-     * Not used for messages that can be sent unilaterally.
+     * An object of this class stores the state for an incoming message that
+     * requires scheduling. It is used both for request messages on the server
+     * and for response messages on the client. Not used for messages that can
+     * be sent unilaterally.
      */
     class ScheduledMessage {
       public:
@@ -247,12 +256,10 @@ class BasicTransport : public Transport {
         /// Holds the contents of the message.
         Buffer* buffer;
 
-        /// The ClientRpc of which this message is the request. NULL means this
-        /// message belongs to a ServerRpc.
+        /// This message is part of either a request or a response. Exactly
+        /// one of the two variables below will be non-NULL; it refers to data
+        /// about the containing RPC.
         ClientRpc* clientRpc;
-
-        /// The ServerRpc of which this message is the response. NULL means this
-        /// message belongs to a ClientRpc.
         ServerRpc* serverRpc;
 
         /// Where to send the message.
@@ -383,7 +390,10 @@ class BasicTransport : public Transport {
         /// sequence number is in rpcId.
         uint64_t sequence;
 
-        /// True if the RPC has been cancelled by the client.
+        /// True if the RPC has been cancelled by the client. This is only
+        /// neccessary for cases where an RPC cannot be deleted immediately
+        /// (e.g., it's being executed); we use this flag to indicate that
+        /// this RPC should be removed at the server's earliest convenience.
         bool cancelled;
 
         /// Unique identifier for this RPC.
@@ -601,7 +611,8 @@ class BasicTransport : public Transport {
 
     /**
      * Describes the wire format for ABORT packets. These packets are used
-     * to let the server know that the client has cancelled the RPC.
+     * to let the server know that the client has cancelled the RPC. They
+     * are neccessary to avoid spurious warning messages in the log.
      */
     struct AbortHeader {
         CommonHeader common;         // Common header fields.
@@ -626,8 +637,8 @@ class BasicTransport : public Transport {
         /// Transport on whose behalf this poller operates.
         BasicTransport* t;
 
-        /// The most recent time that we retrieved all incoming packets
-        /// from the NIC, in rdtsc ticks.
+        /// The most recent time that we polled the receive queue of the NIC,
+        /// in rdtsc ticks. Only used for diagnostic time tracing.
         uint64_t lastPollTime;
         DISALLOW_COPY_AND_ASSIGN(Poller);
     };
@@ -668,9 +679,11 @@ class BasicTransport : public Transport {
     /// Maximum # bytes of message data that can fit in one packet.
     const uint32_t maxDataPerPacket;
 
+    // FIXME
     /// Maximum # bytes of message that we desire to receive in a zero-copy
     /// fashion; this only makes a difference if zero-copy RX is also supported
-    /// by the underlying driver.
+    /// by the underlying driver. If this parameter is set too large, we may run out of hardware packet
+    // buffers in the driver and stop receiving messages
     const uint32_t maxZeroCopyMessage;
 
     /// Unique identifier for this client (used to provide unique
@@ -694,12 +707,12 @@ class BasicTransport : public Transport {
 
     /// Holds incoming messages we are about to grant. Always empty, except
     /// when the poll method is receiving and processing incoming packets.
-    std::vector<ScheduledMessage*> grantRecipients;
+    std::vector<ScheduledMessage*> messagesToGrant;
 
-    /// Holds multi-packet messages assembled by the MessageAccumulator. The
-    /// received packets are gradually released in the poll method because
-    /// releasing all packets of a large message at one shot in the destructor
-    /// of MessageAccumulator can cause significant jitter.
+    /// Holds multi-packet messages that are in the process of being deleted.
+    /// A multi-packet message was released inside ~MessageAccumulator at one
+    /// shot, but that caused significant jitters when the message is large.
+    /// Now the packets are gradually released in the poll method.
     std::vector<MessageAccumulator::Payloads*> messagesToRelease;
 
     /// Pool allocator for our ServerRpc objects.
@@ -724,11 +737,12 @@ class BasicTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    /// Holds the sender's top K outgoing messages with fewest bytes left.
-    /// K is bounded to a relatively small number so that this list cannot
-    /// grow too large. We keep this as a separate list from the outgoing
-    /// requests/responses so that the sender doesn't have to consider all
-    /// the outgoing messages in the common case of transmitting a message.
+    /// Holds the sender's top K outgoing messages with the fewest bytes
+    /// remaining to be transmitted. We choose K to be a small constant
+    /// so that this list cannot grow too large. We keep this as a separate
+    /// list from the outgoing requests/responses so that the sender doesn't
+    /// have to consider all the outgoing messages in the common case of
+    /// transmitting a message.
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;

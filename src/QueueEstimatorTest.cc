@@ -65,7 +65,8 @@ TEST_F(QueueEstimatorTest, getQueueSize) {
     EXPECT_EQ(1500u, estimator.getQueueSize(100000u));
 
     // The 1500 bytes in the queue should drain in 3000 cycles.
-    EXPECT_EQ(0u, estimator.getQueueSize(104000));
+    EXPECT_EQ(0u, estimator.getQueueSize(105000));
+    EXPECT_EQ(104000u, estimator.idleSince);
     Cycles::mockTscValue = 0;
 }
 
