@@ -26,6 +26,7 @@
 namespace RAMCloud {
 
 // Change 1 -> 0 in the following line to disable time tracing globally.
+// Used only in debugging.
 #define ENABLE_TIME_TRACE 1
 
 /**

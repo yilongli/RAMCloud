@@ -70,7 +70,7 @@ namespace {
 
 // Short-hand to obtain a reference to the metadata storage space that we
 // used to store the PacketBufType.
-#define packet_buf_type(payload) *(payload - METADATA_SIZE)
+#define packet_buf_type(payload) *(payload - PACKETBUF_TYPE_SIZE)
 
 // Short-hand to obtain the starting address of a DPDK rte_mbuf based on its
 // payload address.
@@ -418,9 +418,6 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
 void
 DpdkDriver::release(char *payload)
 {
-    // FIXME: I don't understand how Driver::release can be called from worker
-    // threads; seems like a violation to RAMCloud's threading architecture
-
     // Must sync with the dispatch thread, since this method could potentially
     // be invoked in a worker.
     Dispatch::Lock _(context->dispatch);

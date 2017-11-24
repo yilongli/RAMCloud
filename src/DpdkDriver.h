@@ -81,13 +81,13 @@ class DpdkDriver : public Driver
     }
 
   PRIVATE:
-    // The MTU (Maximum Transmission Unit) size of an Ethernet frame, which
-    // is the maximum size of the packet an Ethernet frame can carry in its
-    // payload.
+    /// The MTU (Maximum Transmission Unit) size of an Ethernet frame, which
+    /// is the maximum size of the packet an Ethernet frame can carry in its
+    /// payload.
     static const uint32_t MAX_PAYLOAD_SIZE = 1500;
 
-    // Size of packet buffer metadata (used to store PacketBufType), in bytes.
-    static const uint32_t METADATA_SIZE = 1;
+    /// Size of the space used to store PacketBufType, in bytes.
+    static const uint32_t PACKETBUF_TYPE_SIZE = 1;
 
     /// Size of VLAN tag, in bytes. We are using the PCP (Priority Code Point)
     /// field defined in the VLAN tag to specify the packet priority.
@@ -99,6 +99,8 @@ class DpdkDriver : public Driver
     /// Overhead of a physical layer Ethernet packet, in bytes, which includes
     /// the preamble (7 bytes), the start of frame delimiter (1 byte), the
     /// frame checking sequence (4 bytes) and the interpacket gap (12 bytes).
+    /// Note: it doesn't include anything inside the Ethernet frame (e.g.,
+    /// ETHER_VLAN_HDR_LEN).
     static const uint32_t ETHER_PACKET_OVERHEAD = 24;
 
     /// Map from priority levels to values of the PCP field. Note that PCP = 1
@@ -107,20 +109,21 @@ class DpdkDriver : public Driver
             {1 << 13, 0 << 13, 2 << 13, 3 << 13, 4 << 13, 5 << 13, 6 << 13,
              7 << 13};
 
-    /// See docs in Driver class. Furthermore, it defines a uniform layout for
-    /// DpdkDriver-specific packet buffers regardless of their backing memory.
-    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE, METADATA_SIZE>
-            PacketBuf;
+    /// See docs in Driver class. The additional headroom space is used to
+    /// store the type of the packet buf.
+    typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE,
+            PACKETBUF_TYPE_SIZE> PacketBuf;
 
     /**
-     * This enum defines the types of memory backing DpdkDriver-specific
-     * packet buffers (i.e., DpdkDriver::PacketBuf).
+     * This enum defines two types of DpdkDriver::PacketBuf that differ on
+     * their backing memory. Used to implement the zero-copy RX mechanism.
      */
     enum PacketBufType {
-        /// The memory is allocated from `mbufPool`, a DPDK rte_mempool.
+        /// The memory is allocated from #mbufPool and the packet buf is
+        /// constructed in a zero-copy fashion.
         DPDK_MBUF,
-        /// The memory is allocated from `packetBufPool`, an RAMCloud
-        /// ObjectPool.
+        /// The memory is allocated from #packetBufPool and the packet buf is
+        /// constructed in a copy-out fashion.
         RAMCLOUD_PACKET_BUF
     };
 

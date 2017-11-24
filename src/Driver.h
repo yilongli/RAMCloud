@@ -326,10 +326,12 @@ class Driver {
     }
 
     /**
-     * Invoked by a transport to return the ownership of a NIC packet buffer
-     * to the driver, provided that the driver can provide a driver-specific
-     * software buffer (i.e. Driver::PacketBuf) with the same content as
-     * a replacement.
+     * Replace the underlying hardware packet buffer with a software packet
+     * buffer (i.e., Driver::PacketBuf) that has the same content. The
+     * ownership of the hardware packet buffer is returned to the driver.
+     *
+     * This method does nothing if the underlying packet buffer is not a
+     * hardware packet buffer, or the driver decides not to replace it.
      *
      * \param received
      *      The incoming packet whose backing packet buffer might be

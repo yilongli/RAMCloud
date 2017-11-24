@@ -74,7 +74,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // observed any message drop due to driver packet buffer exhaustion when
     // running workloads W3, W4 and W5 that are used in the HomaTransport paper
     // evaluation.
-    , maxZeroCopyMessage(100*maxDataPerPacket)
+    , messageZeroCopyThreshold(100*maxDataPerPacket)
     , clientId(clientId)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
@@ -644,8 +644,8 @@ BasicTransport::tryToTransmitData()
                     message->buffer, message->transmitOffset, maxBytes,
                     message->unscheduledBytes, whoFrom);
             if (bytesSent == 0) {
-                // We can't transmit any more data because the queue space
-                // is too small.
+                // We can't transmit any more data because the remaining queue
+                // space is too small.
                 break;
             }
 
@@ -817,7 +817,8 @@ BasicTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
         if (messageToReplace != NULL) {
             messageToReplace->topChoice = false;
             erase(topOutgoingMessages, *messageToReplace);
-            transmitDataSlowPath = true;
+            transmitDataSlowPath |= messageToReplace->transmitOffset
+                    < messageToReplace->transmitLimit;
             candidate->topChoice = true;
             topOutgoingMessages.push_back(*candidate);
         }
@@ -860,12 +861,6 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     // then just transmitting the packet. In order to be efficient on workloads
     // with lots of short messages, we only use tryToTransmitData for messages
     // of nontrivial length.
-    // TODO: what to do with the following comment?
-    // As of 09/2017, we consider messages smaller than 300 bytes (which takes
-    // 240ns to transmit on a 10Gbps network) are small; this value is chosen
-    // experimentally so that we can run W3 in Homa paper at 80% load on a
-    // 10Gbps network and that no significant queueing delay at the TX queue
-    // is observed.
     if (length < SMALL_MESSAGE_SIZE) {
         RpcId rpcId = clientRpc->rpcId;
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
@@ -973,7 +968,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
-                if (header->totalLength > maxZeroCopyMessage) {
+                if (header->totalLength > messageZeroCopyThreshold) {
                     // For relatively long messages, it's possible we need to
                     // retain their packets for quite some time; give the
                     // driver a chance to copy out the contents of the
@@ -1212,7 +1207,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
-                if (header->totalLength > maxZeroCopyMessage) {
+                if (header->totalLength > messageZeroCopyThreshold) {
                     // For relatively long messages, it's possible we need to
                     // retain their packets for quite some time; give the
                     // driver a chance to copy out the contents of the
@@ -1745,9 +1740,13 @@ BasicTransport::Poller::poll()
         t->receivedPackets.clear();
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
-    result |= totalPackets;
+    result = totalPackets > 0 ? 1 : result;
 
-    // See if we should send out new GRANT packets.
+    // See if we should send out new GRANT packets. Grants are sent here as
+    // opposed to inside #handlePacket because we would like to coalesse
+    // GRANT packets to the same message whenever possible. Besides,
+    // structuring code this way seems to improve the overall performance,
+    // potentially by being more cache-friendly.
     for (ScheduledMessage* recipient : t->messagesToGrant) {
         uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
                 FROM_SERVER : FROM_CLIENT;
@@ -1881,6 +1880,11 @@ BasicTransport::checkTimeouts()
                 // request might be lost, the grant might be lost, or the
                 // server hasn't got around to grant us more bytes. In either
                 // case, just reset the timer and let the server deal with it.
+                // FIXME: 1. If we entirely rely on the receiver to detect
+                // and handle the case, the receiver (i.e., server) needs to
+                // be at least aware of this RPC.
+                // 2. What if the receiver crashed? We can't just set silentIntervals to 0
+                // forever!
                 clientRpc->silentIntervals = 0;
             } else {
                 // Send occasional RESEND packets, which should produce
@@ -1906,7 +1910,6 @@ BasicTransport::checkTimeouts()
             uint32_t grantOffset = scheduledMessage ?
                     scheduledMessage->grantOffset : 0;
             if (grantOffset == clientRpc->response->size()) {
-                // TODO: This branch is only used in Homa; Basic issues grants aggressively
                 // The client has received every granted byte but hasn't got
                 // around to grant more because there are higher priority
                 // responses.
@@ -1918,9 +1921,7 @@ BasicTransport::checkTimeouts()
                 // grants were lost, or the server has preempted this
                 // response for higher priority messages, so request
                 // retransmission anyway.
-                // TODO: why >= 2
-                if (clientRpc->silentIntervals >= 2) {
-//                if (clientRpc->silentIntervals % pingIntervals == 0) {
+                if (clientRpc->silentIntervals % pingIntervals == 0) {
                     clientRpc->accumulator->requestRetransmission(this,
                             clientRpc->session->serverAddress,
                             RpcId(clientId, sequence), grantOffset,

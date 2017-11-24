@@ -59,13 +59,19 @@ class BasicTransport : public Transport {
     }
 
   PRIVATE:
-    // FIXME: define "small" to be scheduling cost > transmit time?
-    // As of 09/2017, we consider messages smaller than 300 bytes (which takes
-    // 240ns to transmit on a 10Gbps network) are small; this value is chosen
-    // experimentally so that we can run W3 in Homa paper at 80% load on a
-    // 10Gbps network and that no significant queueing delay at the TX queue
-    // is observed.
+    /// The maximum size of a message, in bytes, that we consider as small.
+    /// As of 09/2017, we set this number to 300 bytes (which takes 240 ns
+    /// to transmit on a 10Gbps network). This value is chosen experimentally
+    /// so that we can run W3 in Homa paper at 80% load on a 10Gbps network
+    /// and that no significant queueing delay at the TX queue is observed.
     static const uint32_t SMALL_MESSAGE_SIZE = 300;
+
+    // FIXME:
+    /// As of 08/17, std::unordered_map is considerably slower than XXX.
+    // TODO: Add some perf numbers here.
+    template<typename K, typename V, typename H = std::hash<K>>
+    using HashMap = std::unordered_map<K, V, H>;
+//    using HashMap = ska::flat_hash_map<K, V, H>;
 
     /**
      * A unique identifier for an RPC.
@@ -167,6 +173,8 @@ class BasicTransport : public Transport {
 
         /// Holds all of the packets that have been received for the message
         /// so far in order, up to the first packet that has not been received.
+        /// Upon destruction, these packets are passed to t->messagesToRelease,
+        /// and incrementally deleted in the polling loop to avoid jitters.
         using Payloads = std::vector<char*>;
         Payloads* assembledPayloads;
 
@@ -192,13 +200,12 @@ class BasicTransport : public Transport {
             {}
         };
 
-        // TODO: document the cost of insert/delete of this map vs. std::unordered_map
         /// This map stores information about packets that have been
         /// received but cannot yet be added to buffer because one or
         /// more preceding packets have not yet been received. Each
         /// key is an offset in the message; each value describes the
         /// corresponding fragment, which is a stolen Driver::Received.
-        typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
+        typedef HashMap<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
 
       PRIVATE:
@@ -345,10 +352,12 @@ class BasicTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
-        /// Holds state of partially-received multi-packet responses.
+        /// Holds state of partially-received multi-packet responses. Empty
+        /// if the response is single-packet.
         Tub<MessageAccumulator> accumulator;
 
-        /// Holds state of the response message that requires scheduling.
+        /// Holds state of response messages that require scheduling. Empty
+        /// if the response is unscheduled.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->outgoingRequests.
@@ -417,13 +426,15 @@ class BasicTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
-        /// Holds state of partially-received multi-packet requests.
+        /// Holds state of partially-received multi-packet requests. Empty if
+        /// the request is single-packet.
         Tub<MessageAccumulator> accumulator;
 
         /// Response message for the RPC.
         OutgoingMessage response;
 
-        /// Holds state of the request message that requires scheduling.
+        /// Holds state of the request message that requires scheduling. Empty
+        /// if the request is unscheduled.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->serverTimerList.
@@ -679,12 +690,15 @@ class BasicTransport : public Transport {
     /// Maximum # bytes of message data that can fit in one packet.
     const uint32_t maxDataPerPacket;
 
-    // FIXME
     /// Maximum # bytes of message that we desire to receive in a zero-copy
-    /// fashion; this only makes a difference if zero-copy RX is also supported
-    /// by the underlying driver. If this parameter is set too large, we may run out of hardware packet
-    // buffers in the driver and stop receiving messages
-    const uint32_t maxZeroCopyMessage;
+    /// fashion; this only makes a difference if zero-copy RX is supported
+    /// by the underlying driver. The larger this number is set, the more
+    /// hardware packet buffers we will likely retain at any given time,
+    /// and the more we deviate from the SRPT policy. If this number is set
+    /// too large, we may run out of hardware packet buffers and have to stop
+    /// receiving packets (even worse, we can't complete any message to free
+    /// up the hardware packet buffers; thus, a deadlock!).
+    const uint32_t messageZeroCopyThreshold;
 
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
@@ -725,7 +739,7 @@ class BasicTransport : public Transport {
     /// response has not yet been completely received (we have sent
     /// at least part of the request, but not necessarily the entire
     /// request yet). Keys are RPC sequence numbers.
-    typedef ska::flat_hash_map<uint64_t, ClientRpc*> ClientRpcMap;
+    typedef HashMap<uint64_t, ClientRpc*> ClientRpcMap;
     ClientRpcMap outgoingRpcs;
 
     /// Holds RPCs for which we are the client, and for which the
@@ -739,19 +753,19 @@ class BasicTransport : public Transport {
 
     /// Holds the sender's top K outgoing messages with the fewest bytes
     /// remaining to be transmitted. We choose K to be a small constant
-    /// so that this list cannot grow too large. We keep this as a separate
-    /// list from the outgoing requests/responses so that the sender doesn't
-    /// have to consider all the outgoing messages in the common case of
-    /// transmitting a message.
+    /// so that scanning the list is efficient. This is used to handle
+    /// situations where there are very large numbers of outgoing messages:
+    /// the sender only needs to scan this list in the common case of
+    /// transmitting a message (i.e., at least one message in this list has
+    /// bytes ready to transmit).
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;
 
-    /// Do we have to consider the slow path when transmitting data? That is,
-    /// iterating over all outgoing messages to find the message with fewest
-    /// remaining bytes and ready to transmit. This question is essentially
-    /// equivalent to if any message outside t->topOutgoingMessages has grants
-    /// or unscheduled bytes available.
+    /// Is there any message outside t->topOutgoingMessages that has bytes
+    /// ready to be transmitted? If yes, when all messages in our top outgoing
+    /// message set are waiting for grants, we have to scan all outgoing
+    /// messages to find the next message to transmit.
     bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,
@@ -760,7 +774,7 @@ class BasicTransport : public Transport {
     /// to the driver.  Note: this map could get large if the server gets
     /// backed up, so that there are a large number of RPCs that have been
     /// received but haven't yet been assigned to worker threads.
-    typedef ska::flat_hash_map<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
+    typedef HashMap<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
     ServerRpcMap incomingRpcs;
 
     /// Holds RPCs for which we are the server, and whose response is
