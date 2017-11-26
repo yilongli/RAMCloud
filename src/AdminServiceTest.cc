@@ -563,14 +563,16 @@ TEST_F(AdminServiceTest, serverControl_logTimeTrace) {
     Buffer output;
 
     Cycles::mockTscValue = 100;
+    Cycles::mockCyclesPerSec = 2000000000;
     TimeTrace::reset();
     TimeTrace::record("sample");
     AdminClient::serverControl(&context, serverId, WireFormat::LOG_TIME_TRACE,
                 "abc", 3, &output);
-    EXPECT_EQ("printInternal: Starting TSC 100 | "
+    EXPECT_EQ("printInternal: Starting TSC 100, cyclesPerSec 2000000000 | "
             "printInternal:      0.0 ns (+   0.0 ns): sample",
             TestLog::get());
     Cycles::mockTscValue = 0;
+    Cycles::mockCyclesPerSec = 0;
 }
 
 TEST_F(AdminServiceTest, serverControl_getCacheTrace) {

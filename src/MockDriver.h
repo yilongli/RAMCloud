@@ -137,7 +137,7 @@ class MockDriver : public Driver {
     std::vector<PacketBuf*> incomingPackets;
 
     // Returned as the result of getTransmitQueueSpace.
-    uint32_t transmitQueueSpace;
+    int transmitQueueSpace;
 
     DISALLOW_COPY_AND_ASSIGN(MockDriver);
 };

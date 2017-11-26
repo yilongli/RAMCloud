@@ -75,6 +75,13 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // running workloads W3, W4 and W5 that are used in the HomaTransport paper
     // evaluation.
     , messageZeroCopyThreshold(100*maxDataPerPacket)
+
+    // As of 09/2017, we consider messages less than 300 bytes as small (which
+    // takes at most 240 ns to transmit on a 10Gbps network). This value is
+    // chosen experimentally so that we can run W3 in Homa paper at 80% load on
+    // a 10Gbps network/ and that no significant queueing delay at the TX queue
+    // is observed.
+    , smallMessageThreshold(300)
     , clientId(clientId)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
@@ -857,11 +864,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     t->nextClientSequenceNumber++;
 
     uint32_t bytesSent;
-    // For small messages, the tryToTransmitData mechanism takes more time
-    // then just transmitting the packet. In order to be efficient on workloads
-    // with lots of short messages, we only use tryToTransmitData for messages
-    // of nontrivial length.
-    if (length < SMALL_MESSAGE_SIZE) {
+    if (length < t->smallMessageThreshold) {
         RpcId rpcId = clientRpc->rpcId;
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
         Buffer::Iterator iter(request, 0, length);
@@ -916,9 +919,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "server %s for (unknown) sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
-                        "sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
+                TimeTrace::record("client received LOG_TIME_TRACE for "
+                        "clientId %u, sequence %u",
+                        (uint32_t)common->rpcId.clientId,
+                        (uint32_t)common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
             }
             TEST_LOG("Discarding unknown packet, sequence %lu",
@@ -1051,9 +1055,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "server %s for clientId %lu, sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.clientId, common->rpcId.sequence);
-                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
-                        "sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
+                TimeTrace::record("client received LOG_TIME_TRACE for "
+                        "clientId %u, sequence %u",
+                        (uint32_t)common->rpcId.clientId,
+                        (uint32_t)common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1073,7 +1078,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                     clientRpc->response->reset();
                     request->transmitOffset = 0;
                     request->transmitLimit = header->length;
-                    clientRpc->resendLimit = 0;
                     clientRpc->accumulator.destroy();
                     clientRpc->scheduledMessage.destroy();
                     if (!clientRpc->transmitPending) {
@@ -1322,9 +1326,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "client %s for sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                timeTrace("server received LOG_TIME_TRACE for clientId %u, "
-                        "sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
+                TimeTrace::record("server received LOG_TIME_TRACE for "
+                        "clientId %u, sequence %u",
+                        (uint32_t)common->rpcId.clientId,
+                        (uint32_t)common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1469,7 +1474,7 @@ BasicTransport::ServerRpc::sendReply()
     }
 
     uint32_t bytesSent;
-    if (length < SMALL_MESSAGE_SIZE) {
+    if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
         timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
@@ -1981,8 +1986,7 @@ BasicTransport::checkTimeouts()
                 // responses.
                 serverRpc->silentIntervals = 0;
             } else {
-                serverRpc->resendLimit =
-                        serverRpc->accumulator->requestRetransmission(this,
+                serverRpc->accumulator->requestRetransmission(this,
                         serverRpc->response.recipient, serverRpc->rpcId,
                         grantOffset, FROM_SERVER);
             }

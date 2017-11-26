@@ -338,12 +338,6 @@ class BasicTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// The sum of the offset and length fields from the most recent
-        /// RESEND we have sent, 0 if no RESEND has been sent for this
-        /// RPC. Used to detect unnecessary RESENDs (because the original
-        /// data eventually arrives).
-        uint32_t resendLimit;
-
         /// Number of times that the transport timer has fired since we
         /// received any packets from the server.
         uint32_t silentIntervals;
@@ -370,7 +364,6 @@ class BasicTransport : public Transport {
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
-            , resendLimit(0)
             , silentIntervals(0)
             , transmitPending(true)
             , accumulator()
@@ -408,12 +401,6 @@ class BasicTransport : public Transport {
         /// Unique identifier for this RPC.
         RpcId rpcId;
 
-        /// The sum of the offset and length fields from the most recent
-        /// RESEND we have sent, 0 if no RESEND has been sent for this
-        /// RPC. Used to detect unnecessary RESENDs (because the original
-        /// data eventually arrives).
-        uint32_t resendLimit;
-
         /// Number of times that the transport timer has fired since we
         /// received any packets from the client.
         uint32_t silentIntervals;
@@ -449,7 +436,6 @@ class BasicTransport : public Transport {
             , sequence(sequence)
             , cancelled(false)
             , rpcId(rpcId)
-            , resendLimit(0)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
@@ -688,7 +674,7 @@ class BasicTransport : public Transport {
     Poller poller;
 
     /// Maximum # bytes of message data that can fit in one packet.
-    const uint32_t maxDataPerPacket;
+    CONST uint32_t maxDataPerPacket;
 
     /// Maximum # bytes of message that we desire to receive in a zero-copy
     /// fashion; this only makes a difference if zero-copy RX is supported
@@ -699,6 +685,13 @@ class BasicTransport : public Transport {
     /// receiving packets (even worse, we can't complete any message to free
     /// up the hardware packet buffers; thus, a deadlock!).
     const uint32_t messageZeroCopyThreshold;
+
+    /// Maximum # bytes of a message that we consider as small. For small
+    /// messages, the tryToTransmitData mechanism takes more time then just
+    /// transmitting the packet. In order to be efficient on workloads with
+    /// lots of short messages, we only use tryToTransmitData for messages
+    /// of nontrivial length.
+    CONST uint32_t smallMessageThreshold;
 
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
