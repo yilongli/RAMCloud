@@ -866,6 +866,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     uint32_t bytesSent;
     if (length < t->smallMessageThreshold) {
         RpcId rpcId = clientRpc->rpcId;
+        assert(length <= t->maxDataPerPacket);
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
         Buffer::Iterator iter(request, 0, length);
         timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
@@ -1307,7 +1308,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                             received->sender->toString().c_str(),
                             header->common.rpcId.clientId,
                             header->common.rpcId.sequence, header->offset,
-                            serverRpc ? "receiving request" : "not found");
+                            serverRpc ? "not sending response" : "not found");
                     return;
                 }
                 OutgoingMessage* response = &serverRpc->response;
@@ -1783,7 +1784,7 @@ BasicTransport::Poller::poll()
         if (t->timeoutCheckDeadline == 0) {
             t->timeoutCheckDeadline = now + t->timerInterval;
         }
-        if ((numPackets < MAX_PACKETS)
+        if ((totalPackets < MAX_PACKETS)
                 || (now >= t->timeoutCheckDeadline)) {
             if (numPackets == MAX_PACKETS) {
                 RAMCLOUD_CLOG(NOTICE, "Deadline invocation of checkTimeouts");
@@ -1798,7 +1799,7 @@ BasicTransport::Poller::poll()
 
     // Transmit data packets if possible.
     uint32_t totalBytesSent = t->tryToTransmitData();
-    result |= totalBytesSent;
+    result = totalBytesSent > 0 ? 1 : result;
 
     // Release a few retained payloads to the driver. As of 02/2017, releasing
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything

@@ -86,11 +86,12 @@ MockDriver::sendPacket(const Address* addr,
                        TransmitQueueState* txQueueState)
 {
     sendPacketCount++;
+    lastTransmitTime = Cycles::rdtsc();
     uint32_t bytesSent = headerLen;
     if (payload != NULL) {
         bytesSent += payload->size();
     }
-    if (bytesSent > transmitQueueSpace) {
+    if (downCast<int>(bytesSent) > transmitQueueSpace) {
         transmitQueueSpace = 0;
     } else {
         transmitQueueSpace -= bytesSent;
