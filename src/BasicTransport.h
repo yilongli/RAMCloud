@@ -18,11 +18,13 @@
 
 #include <deque>
 
+#if __cplusplus >= 201402L
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Weffc++"
-//#include "flat_hash_map.h"
+#include "flat_hash_map.h"
 #pragma GCC diagnostic warning "-Wconversion"
 #pragma GCC diagnostic warning "-Weffc++"
+#endif
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -59,12 +61,17 @@ class BasicTransport : public Transport {
     }
 
   PRIVATE:
-    // FIXME:
-    /// As of 08/17, std::unordered_map is considerably slower than XXX.
-    // TODO: Add some perf numbers here.
+    /// As of 08/17, std::unordered_map is significantly slower than
+    /// ska::flat_hash_map. According to the Perf benchmark, inserting
+    /// +deleting an entry and lookup in an ska::flat_hash_map take 15 ns
+    /// and 4 ns, respectively (vs. 80 ns and 15 ns using std::unordered_map).
     template<typename K, typename V, typename H = std::hash<K>>
+#if __cplusplus >= 201402L
+    // ska::flat_hash_map requires c++14 features to compile.
+    using HashMap = ska::flat_hash_map<K, V, H>;
+#else
     using HashMap = std::unordered_map<K, V, H>;
-//    using HashMap = ska::flat_hash_map<K, V, H>;
+#endif
 
     /**
      * A unique identifier for an RPC.

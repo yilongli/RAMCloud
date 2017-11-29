@@ -44,6 +44,13 @@
 #include <thread>
 #include <vector>
 #include <boost/program_options.hpp>
+#if __cplusplus >= 201402L
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Weffc++"
+#include "flat_hash_map.h"
+#pragma GCC diagnostic warning "-Wconversion"
+#pragma GCC diagnostic warning "-Weffc++"
+#endif
 
 #include "Common.h"
 #include "Atomic.h"
@@ -2180,6 +2187,57 @@ double unorderedMapLookup()
     return Cycles::toSeconds(stop - start)/(count*numKeys);
 }
 
+#if __cplusplus >= 201402L
+// Measure the time to create and delete an entry in a small ska::flat_hash_map.
+double skaFlatHashMapCreate()
+{
+    ska::flat_hash_map<uint64_t, uint64_t> map;
+
+    int count = 100000;
+    uint64_t start = Cycles::rdtsc();
+    for (int i = 0; i < count; i += 5) {
+        map[i] = 100;
+        map[i+1] = 200;
+        map[i+2] = 300;
+        map[i+3] = 400;
+        map[i+4] = 500;
+        map.erase(i);
+        map.erase(i+1);
+        map.erase(i+2);
+        map.erase(i+3);
+        map.erase(i+4);
+    }
+    uint64_t stop = Cycles::rdtsc();
+    return Cycles::toSeconds(stop - start)/count;
+}
+
+// Measure the time to lookup a random element in a small ska::flat_hash_map.
+double skaFlatHashMapLookup()
+{
+    ska::flat_hash_map<uint64_t, uint64_t> map;
+
+    // Generate an array of random keys that will be used to lookup
+    // entries in the map.
+    int numKeys = 10;
+    uint64_t keys[numKeys];
+    for (int i = 0; i < numKeys; i++) {
+        keys[i] = generateRandom();
+        map[keys[i]] = 12345;
+    }
+
+    int count = 100000;
+    uint64_t sum = 0;
+    uint64_t start = Cycles::rdtsc();
+    for (int i = 0; i < count; i++) {
+        for (int j = 0; j < numKeys; j++) {
+            sum += map[keys[j]];
+        }
+    }
+    uint64_t stop = Cycles::rdtsc();
+    return Cycles::toSeconds(stop - start)/(count*numKeys);
+}
+#endif
+
 // Measure the cost of pushing a new element on a std::vector, copying
 // from the end to an internal element, and popping the end element.
 double vectorPushPop()
@@ -2415,6 +2473,12 @@ TestInfo tests[] = {
      "Create+delete entry in unordered_map"},
     {"unorderedMapLookup", unorderedMapLookup,
      "Lookup in std::unordered_map<uint64_t, uint64_t>"},
+#if __cplusplus >= 201402L
+    {"skaFlatHashMapCreate", skaFlatHashMapCreate,
+     "Create+delete entry in ska::flat_hash_map"},
+    {"skaFlatHashMapLookup", skaFlatHashMapLookup,
+     "Lookup in ska::flat_hash_map<uint64_t, uint64_t>"},
+#endif
     {"vectorPushPop", vectorPushPop,
      "Push and pop a std::vector"},
 };
