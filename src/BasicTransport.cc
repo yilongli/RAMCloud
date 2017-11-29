@@ -1721,33 +1721,29 @@ BasicTransport::Poller::poll()
     uint64_t startTime = Cycles::rdtsc();
 #endif
 
-    // Process any available incoming packets. Try to receive MAX_PACKETS
-    // packets at a time; continue until we have received all the packets.
-#define MAX_PACKETS 4
+    // Process available incoming packets. Try to receive MAX_PACKETS packets
+    // at a time (an optimized driver implementation may prefetch the payloads
+    // for us). As of 07/2016, MAX_PACKETS is set to 8 because our CPU can
+    // take at most 8 cache misses at a time.
+#define MAX_PACKETS 8
     uint32_t numPackets;
-    uint32_t totalPackets = 0;
-    do {
-        t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
-        numPackets = downCast<uint>(t->receivedPackets.size());
+    t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
+    numPackets = downCast<uint>(t->receivedPackets.size());
 #if TIME_TRACE
-        // Log the beginning of poll() here so that timetrace entries do not
-        // go back in time.
-        if (totalPackets == 0 && numPackets > 0) {
-            uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
-            timeTrace(startTime, "start of polling iteration %u, "
-                    "last poll was %u ns ago", owner->iteration, ns);
-        }
-        if (numPackets < MAX_PACKETS) {
-            lastPollTime = Cycles::rdtsc();
-        }
+    // Log the beginning of poll() here so that timetrace entries do not
+    // go back in time.
+    if (numPackets > 0) {
+        uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
+        timeTrace(startTime, "start of polling iteration %u, "
+                "last poll was %u ns ago", owner->iteration, ns);
+    }
+    lastPollTime = Cycles::rdtsc();
 #endif
-        for (uint i = 0; i < numPackets; i++) {
-            t->handlePacket(&t->receivedPackets[i]);
-        }
-        t->receivedPackets.clear();
-        totalPackets += numPackets;
-    } while (numPackets == MAX_PACKETS);
-    result = totalPackets > 0 ? 1 : result;
+    for (uint i = 0; i < numPackets; i++) {
+        t->handlePacket(&t->receivedPackets[i]);
+    }
+    t->receivedPackets.clear();
+    result = numPackets > 0 ? 1 : result;
 
     // See if we should send out new GRANT packets. Grants are sent here as
     // opposed to inside #handlePacket because we would like to coalesse
@@ -1785,7 +1781,7 @@ BasicTransport::Poller::poll()
         if (t->timeoutCheckDeadline == 0) {
             t->timeoutCheckDeadline = now + t->timerInterval;
         }
-        if ((totalPackets < MAX_PACKETS)
+        if ((numPackets < MAX_PACKETS)
                 || (now >= t->timeoutCheckDeadline)) {
             if (numPackets == MAX_PACKETS) {
                 RAMCLOUD_CLOG(NOTICE, "Deadline invocation of checkTimeouts");
@@ -1828,7 +1824,7 @@ BasicTransport::Poller::poll()
     if (result) {
         timeTrace("end of polling iteration %u, received %u packets, "
                 "transmitted %u bytes, released %u packet buffers",
-                owner->iteration, totalPackets, totalBytesSent, releaseCount);
+                owner->iteration, numPackets, totalBytesSent, releaseCount);
     }
     return result;
 }

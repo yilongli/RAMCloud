@@ -175,8 +175,8 @@ void arachneThreadCreateWorker(Atomic<uint64_t>* maskAndCount,
         }
         total += threadContext->args[0] + threadContext->args[1]
                 + threadContext->args[2] + threadContext->args[3];
-        stopTime = Cycles::rdtsc();
-        uint64_t extraRdtsc = Cycles::rdtsc();
+        stopTime = Cycles::rdtscp();
+        uint64_t extraRdtsc = Cycles::rdtscp();
         timeTrace(stopTime, "thread created");
         if (*maskAndCount > 100) {
             break;
@@ -224,7 +224,7 @@ double arachneThreadCreate()
             totalCycles = 0;
         }
         elapsed = 0;
-        uint64_t startTime = Cycles::rdtsc();
+        uint64_t startTime = Cycles::rdtscp();
         timeTrace(startTime, "about to read maskAndCount");
         uint64_t maskCopy = *maskAndCount;
         // uint64_t maskCopy = maskAndCount->compareExchange(0, 0);
@@ -266,12 +266,12 @@ double atomicIntCmpX()
     int count = 1000000;
     Atomic<int> value(11);
     int test = 11;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
          value.compareExchange(test, test+2);
          test += 2;
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Final value: %d\n", value.load());
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -281,11 +281,11 @@ double atomicIntInc()
     int count = 1000000;
     Atomic<int> value(11);
     int prevValue = 1;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
          prevValue = value.inc(prevValue);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Final value: %d\n", prevValue);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -296,11 +296,11 @@ double cppAtomicIntInc()
     int count = 1000000;
     std::atomic<int> value(11);
     int prevValue = 1;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         prevValue = value.fetch_add(prevValue, std::memory_order_relaxed);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Final value: %d\n", prevValue);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -311,11 +311,11 @@ double atomicIntLoad()
     int count = 1000000;
     Atomic<int> value(11);
     int total = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
          total += value.load();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Total: %d\n", total);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -326,11 +326,11 @@ double atomicIntXchg()
     int count = 1000000;
     Atomic<int> value(11);
     int total = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
          total += value.exchange(i);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Total: %d\n", total);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -340,11 +340,11 @@ double atomicIntStore()
 {
     int count = 1000000;
     Atomic<int> value(11);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         value.store(88);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -354,12 +354,12 @@ double bMutexNoBlock()
 {
     int count = 1000000;
     std::mutex m;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         m.lock();
         m.unlock();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -371,9 +371,9 @@ static double bufferAppendCommon()
     int count = 1000000;
     uint64_t totalTime = 0;
     for (int i = 0; i < count; i++) {
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         b.appendCopy(src, keyLength);
-        totalTime += Cycles::rdtsc() - start;
+        totalTime += Cycles::rdtscp() - start;
         b.reset();
     }
     return Cycles::toSeconds(totalTime)/count;
@@ -387,9 +387,9 @@ static double bufferAppendExternalCommon()
     int count = 1000000;
     uint64_t totalTime = 0;
     for (int i = 0; i < count; i++) {
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         b.appendExternal(src, keyLength);
-        totalTime += Cycles::rdtsc() - start;
+        totalTime += Cycles::rdtscp() - start;
         b.reset();
     }
     return Cycles::toSeconds(totalTime)/count;
@@ -460,12 +460,12 @@ double bufferAppendExternal500()
 double bufferBasic()
 {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Buffer b;
         b.appendExternal("abcdefg", 5);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -478,12 +478,12 @@ struct dummyBlock {
 double bufferBasicAlloc()
 {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Buffer b;
         b.emplaceAppend<dummyBlock>();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -492,12 +492,12 @@ double bufferBasicAlloc()
 double bufferBasicCopy()
 {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Buffer b;
         b.appendCopy("abcdefg", 6);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -509,21 +509,21 @@ double bufferCopy()
     b.appendExternal("abcde", 5);
     b.appendExternal("01234", 5);
     char copy[10];
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         b.copy(2, 6, copy);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
 double bufferConstruct() {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Buffer b;   // Compiler doesn't seem to optimize this out.
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -536,7 +536,7 @@ double bufferExtendChunk()
     for (int i = 0; i < count; i++) {
         Buffer b;
         b.emplaceAppend<dummyBlock>();
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         b.emplaceAppend<dummyBlock>();
         b.emplaceAppend<dummyBlock>();
         b.emplaceAppend<dummyBlock>();
@@ -547,7 +547,7 @@ double bufferExtendChunk()
         b.emplaceAppend<dummyBlock>();
         b.emplaceAppend<dummyBlock>();
         b.emplaceAppend<dummyBlock>();
-        total += Cycles::rdtsc() - start;
+        total += Cycles::rdtscp() - start;
         b.reset();
     }
     return Cycles::toSeconds(total)/(count*10);
@@ -556,11 +556,11 @@ double bufferExtendChunk()
 double bufferReset() {
     Buffer b;
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         b.reset();
     }
-    uint64_t totalTime = Cycles::rdtsc() - start;
+    uint64_t totalTime = Cycles::rdtscp() - start;
     return Cycles::toSeconds(totalTime)/count;
 }
 
@@ -572,11 +572,11 @@ double bufferGetStart()
     Buffer b;
     b.appendCopy(&value);
     int sum = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         sum += *b.getStart<int>();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -593,7 +593,7 @@ double bufferCopyIterator()
 
     int sum = 0;
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Buffer::Iterator it(&b);
         while (!it.isDone()) {
@@ -602,7 +602,7 @@ double bufferCopyIterator()
             it.next();
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     discard(&sum);
 
     return Cycles::toSeconds(stop - start)/count;
@@ -621,7 +621,7 @@ double bufferExternalIterator()
 
     int sum = 0;
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Buffer::Iterator it(&b);
         while (!it.isDone()) {
@@ -630,7 +630,7 @@ double bufferExternalIterator()
             it.next();
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     discard(&sum);
 
     return Cycles::toSeconds(stop - start)/count;
@@ -704,7 +704,7 @@ double cacheCasThenCas()
             /* Wait for worker thread to update value, which flushes
              * it from our cache. */
         }
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         if (value->compareExchange(4, 6) != 0) {
             // Put in if statement just to make sure first op completes
             // before second one runs.
@@ -712,8 +712,8 @@ double cacheCasThenCas()
             dummy += value->compareExchange(1, 2);
         }
         Fence::sfence();
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -757,11 +757,11 @@ double cacheRead()
             /* Wait for worker thread to update value, which flushes
              * it from our cache. */
         }
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         dummy += *value;
         Fence::lfence();
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -827,14 +827,14 @@ double cacheReadLines(int numLines)
             /* Wait for worker thread to modify all of the cache lines. */
         }
         volatile char* p = firstByte + (numLines-1)*stride;
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
             for ( ; p >= firstByte; p -= stride) {
                 dummy += *p;
             }
         Fence::lfence();
         // total += p[0] + p[64] + p[128] + p[192];
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -906,11 +906,11 @@ double cacheReadExcl()
             /* Wait for worker thread to update value, which flushes
              * it from our cache. */
         }
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         total += value->compareExchange(1, 2);
         Fence::lfence();
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -952,13 +952,13 @@ double cacheReadThenCas()
             /* Wait for worker thread to update value, which flushes
              * it from our cache. */
         }
-        uint64_t start = Cycles::rdtsc();
+        uint64_t start = Cycles::rdtscp();
         if (*value >= 0) {
             check++;
             dummy += value->compareExchange(1, 2);
         }
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -985,7 +985,7 @@ void cacheTransferWorker(volatile uint64_t* startTime)
         if (*startTime == 0) {
             return;
         }
-        *startTime = Cycles::rdtsc();
+        *startTime = Cycles::rdtscp();
     }
 }
 
@@ -1019,8 +1019,8 @@ double cacheTransfer()
             }
             // Retry until the value changes.
         }
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -1047,7 +1047,7 @@ void cacheTransferAfterMissWorker(volatile uint64_t* startTime,
         if (*sync < 0) {
             break;
         }
-        *startTime = Cycles::rdtsc();
+        *startTime = Cycles::rdtscp();
         *sync = 0;
     }
 }
@@ -1087,8 +1087,8 @@ double cacheTransferAfterMiss()
             }
             // Retry until the value changes.
         }
-        uint64_t t1 = Cycles::rdtsc();
-        uint64_t t2 = Cycles::rdtsc();
+        uint64_t t1 = Cycles::rdtscp();
+        uint64_t t2 = Cycles::rdtscp();
         if (i >= 0) {
             samples.push_back((t1 - start) - (t2 - t1));
         }
@@ -1112,11 +1112,11 @@ double cppAtomicExchange()
     int count = 100000;
     std::atomic_int value(11);
     int other = 22;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
          other = value.exchange(other);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1127,11 +1127,11 @@ double cppAtomicLoad()
     int count = 100000;
     std::atomic_int value(11);
     int total = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         total += value.load();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Total: %d\n", total);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1142,11 +1142,11 @@ double dispatchPoll()
 {
     int count = 1000000;
     Dispatch dispatch(false);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         dispatch.poll();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1158,7 +1158,7 @@ double div32()
 {
     int count = 1000000;
     Dispatch dispatch(false);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     // NB: Expect an x86 processor exception is there's overflow.
     uint32_t numeratorHi = 0xa5a5a5a5U;
     uint32_t numeratorLo = 0x55aa55aaU;
@@ -1171,7 +1171,7 @@ double div32()
                              "a"(numeratorLo), "d"(numeratorHi), "r"(divisor) :
                              "cc");
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1184,7 +1184,7 @@ double div64()
     int count = 1000000;
     Dispatch dispatch(false);
     // NB: Expect an x86 processor exception is there's overflow.
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     uint64_t numeratorHi = 0x5a5a5a5a5a5UL;
     uint64_t numeratorLo = 0x55aa55aa55aa55aaUL;
     uint64_t divisor = 0xaa55aa55aa55aa55UL;
@@ -1196,7 +1196,7 @@ double div64()
                              "a"(numeratorLo), "d"(numeratorHi), "r"(divisor) :
                              "cc");
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1205,11 +1205,11 @@ double functionCall()
 {
     int count = 1000000;
     uint64_t x = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         x = PerfHelper::plusOne(x);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1218,11 +1218,11 @@ double generateRandomNumber() {
     int count = 100000;
     uint64_t x = 0;
 
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 1; i < count + 1; ++i) {
         x += randomNumberGenerator(i);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     discard(&x);
 
     return Cycles::toSeconds(stop - start)/count;
@@ -1232,11 +1232,11 @@ double generateRandomNumber() {
 double genRandomString() {
     int count = 100000;
     char buffer[100];
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Util::genRandomString(buffer, 100);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1245,11 +1245,11 @@ double getThreadId()
 {
     int count = 1000000;
     int64_t result = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         result += ThreadId::get();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Result: %d\n", downCast<int>(result));
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1259,11 +1259,11 @@ double getThreadIdSyscall()
 {
     int count = 1000000;
     int64_t result = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         result += syscall(SYS_gettid);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Result: %d\n", downCast<int>(result));
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1292,7 +1292,7 @@ double hashTableLookup()
     PerfHelper::flushCache();
 
     // now look up the objects again
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (uint64_t i = 0; i < numLookups; i++) {
         if (prefetchBucketAhead) {
             if (i + prefetchBucketAhead < numLookups) {
@@ -1310,7 +1310,7 @@ double hashTableLookup()
             candidates.next();
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
 
     // clean up
     for (uint64_t i = 0; i < numLookups; i++) {
@@ -1333,11 +1333,11 @@ double lfence()
 {
     int count = 1000000;
     Dispatch dispatch(false);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Fence::lfence();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1347,11 +1347,11 @@ double lockInDispThrd()
 {
     int count = 1000000;
     Dispatch dispatch(false);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Dispatch::Lock lock(&dispatch);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1382,11 +1382,11 @@ double lockNonDispThrd()
         usleep(100);
     }
 
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Dispatch::Lock lock(dispatch);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     flag = 0;
     thread.join();
     unpinThread();
@@ -1406,7 +1406,7 @@ double mapCreate()
     }
 
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i += 5) {
         std::map<uint64_t, uint64_t> map;
         for (int j = 0; j < numKeys; j++) {
@@ -1416,7 +1416,7 @@ double mapCreate()
             map.erase(keys[j]);
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/(count * numKeys);
 }
 
@@ -1436,13 +1436,13 @@ double mapLookup()
 
     int count = 100000;
     uint64_t sum = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         for (int j = 0; j < numKeys; j++) {
             sum += map[keys[j]];
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/(count*numKeys);
 }
 
@@ -1460,13 +1460,13 @@ double memcpyShared(int cpySize, bool coldSrc = false, bool coldDst = false)
         dst[i] = (coldDst) ? downCast<uint32_t>(generateRandom() % bound) : 0;
     }
 
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         memcpy((buf + dst[i]),
                 (buf + src[i]),
                 cpySize);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
 
     free(buf);
     return Cycles::toSeconds(stop - start)/(count);
@@ -1528,10 +1528,10 @@ double murmur3()
     uint32_t seed = 11051955;
     uint64_t out[2];
 
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++)
         MurmurHash3_x64_128(buf, sizeof(buf), seed, &out);
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
 
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1555,11 +1555,11 @@ double objectPoolAlloc()
         }
     }
 
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         toDestroy[i] = pool.construct();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
 
     // clean up
     for (int i = 0; i < count; i++) {
@@ -1576,11 +1576,11 @@ double perfCyclesToNanoseconds()
     std::atomic_int value(11);
     uint64_t total = 0;
     uint64_t cycles = 994261;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         total += Cycles::toNanoseconds(cycles);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Result: %lu\n", total/count);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1592,11 +1592,11 @@ double perfCyclesToSeconds()
     std::atomic_int value(11);
     double total = 0;
     uint64_t cycles = 994261;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         total += Cycles::toSeconds(cycles);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Result: %.4f\n", total/count);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1667,12 +1667,12 @@ double pingConditionVar()
         if (i == 0) {
             // Restart the timing after the test has been running
             // for a while, so everything is warmed up.
-            start = Cycles::rdtsc();
+            start = Cycles::rdtscp();
         }
         condition1.notify_one();
         condition2.wait(*guard);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     finished = true;
     condition1.notify_one();
     guard.destroy();
@@ -1710,12 +1710,12 @@ double pingMutex()
         if (i == 0) {
             // Restart the timing after the test has been running
             // for a while, so everything is warmed up.
-            start = Cycles::rdtsc();
+            start = Cycles::rdtscp();
         }
         mutex1.unlock();
         mutex2.lock();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     finished = true;
     mutex1.unlock();
     thread.join();
@@ -1762,7 +1762,7 @@ double pingVariable()
         if (i == 0) {
             // Restart the timing after the test has been running
             // for a while, so everything is warmed up.
-            start = Cycles::rdtsc();
+            start = Cycles::rdtscp();
         }
         while (1) {
             int current = *value;
@@ -1773,7 +1773,7 @@ double pingVariable()
             }
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     *value = -1;
     Fence::sfence();
     thread.join();
@@ -1786,13 +1786,13 @@ double queueEstimator()
 {
     int count = 1000000;
     QueueEstimator estimator(8000);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     static uint32_t total = 0;
     for (int i = 0; i < count; i++) {
         estimator.setQueueSize(1000, 100000+i);
         total += estimator.getQueueSize(200000);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     // printf("Result: %u\n", total/count);
     return Cycles::toSeconds(stop - start)/count;
 }
@@ -1823,12 +1823,12 @@ randomUint64(void) {
 double randomTest()
 {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
         total += randomUint64();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1836,12 +1836,12 @@ double randomTest()
 double rdtscTest()
 {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     uint64_t total = 0;
     for (int i = 0; i < count; i++) {
-        total += Cycles::rdtsc();
+        total += Cycles::rdtscp();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1885,7 +1885,7 @@ double segmentEntrySort()
     // doesn't appear to help
     entries.reserve(count);
 
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
 
     // appears to take about 1/8th the time
     for (SegmentIterator i(s); !i.isDone(); i.next()) {
@@ -1903,7 +1903,7 @@ double segmentEntrySort()
     // the rest is, unsurprisingly, here
     std::sort(entries.begin(), entries.end(), SegmentEntryLessThan());
 
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
 
     return Cycles::toSeconds(stop - start);
 }
@@ -1957,11 +1957,11 @@ double segmentIterator()
 // Measure the cost of cpuid
 double serialize() {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Util::serialize();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1971,11 +1971,11 @@ double sessionRefCount()
 {
     int count = 1000000;
     Transport::SessionRef ref1(new Transport::Session("test"));
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Transport::SessionRef ref2 = ref1;
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1983,11 +1983,11 @@ double sessionRefCount()
 double sfence()
 {
     int count = 1000000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         Fence::sfence();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -1997,12 +1997,12 @@ double spinLock()
 {
     int count = 1000000;
     SpinLock lock("Perf");
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         lock.lock();
         lock.unlock();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2016,12 +2016,12 @@ void spawnThreadHelper()
 double spawnThread()
 {
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         std::thread thread(&spawnThreadHelper);
         thread.join();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2031,12 +2031,12 @@ double startStopTimer()
     int count = 1000000;
     Dispatch dispatch(false);
     Dispatch::Timer timer(&dispatch);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         timer.start(12345U);
         timer.stop();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2045,7 +2045,7 @@ double startStopTimer()
 double throwInt()
 {
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         try {
             throw 0;
@@ -2053,7 +2053,7 @@ double throwInt()
             // pass
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2061,7 +2061,7 @@ double throwInt()
 double throwIntNL()
 {
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         try {
             PerfHelper::throwInt();
@@ -2069,7 +2069,7 @@ double throwIntNL()
             // pass
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2078,7 +2078,7 @@ double throwIntNL()
 double throwException()
 {
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         try {
             throw ObjectDoesntExistException(HERE);
@@ -2086,7 +2086,7 @@ double throwException()
             // pass
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2094,7 +2094,7 @@ double throwException()
 double throwExceptionNL()
 {
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         try {
             PerfHelper::throwObjectDoesntExistException();
@@ -2102,7 +2102,7 @@ double throwExceptionNL()
             // pass
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2111,7 +2111,7 @@ double throwExceptionNL()
 double throwSwitch()
 {
     int count = 10000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         try {
             ClientException::throwException(HERE, STATUS_OBJECT_DOESNT_EXIST);
@@ -2119,7 +2119,7 @@ double throwSwitch()
             // pass
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2129,11 +2129,11 @@ double timeTrace()
     int count = 100000;
     TimeTrace::Buffer trace;
     trace.record("warmup record");
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         trace.record("sample TimeTrace record");
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2144,7 +2144,7 @@ double unorderedMapCreate()
     std::unordered_map<uint64_t, uint64_t> map;
 
     int count = 100000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i += 5) {
         map[i] = 100;
         map[i+1] = 200;
@@ -2157,7 +2157,7 @@ double unorderedMapCreate()
         map.erase(i+3);
         map.erase(i+4);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2177,13 +2177,13 @@ double unorderedMapLookup()
 
     int count = 100000;
     uint64_t sum = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         for (int j = 0; j < numKeys; j++) {
             sum += map[keys[j]];
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/(count*numKeys);
 }
 
@@ -2194,7 +2194,7 @@ double skaFlatHashMapCreate()
     ska::flat_hash_map<uint64_t, uint64_t> map;
 
     int count = 100000;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i += 5) {
         map[i] = 100;
         map[i+1] = 200;
@@ -2207,7 +2207,7 @@ double skaFlatHashMapCreate()
         map.erase(i+3);
         map.erase(i+4);
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/count;
 }
 
@@ -2227,13 +2227,13 @@ double skaFlatHashMapLookup()
 
     int count = 100000;
     uint64_t sum = 0;
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         for (int j = 0; j < numKeys; j++) {
             sum += map[keys[j]];
         }
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/(count*numKeys);
 }
 #endif
@@ -2247,7 +2247,7 @@ double vectorPushPop()
     vector.push_back(1);
     vector.push_back(2);
     vector.push_back(3);
-    uint64_t start = Cycles::rdtsc();
+    uint64_t start = Cycles::rdtscp();
     for (int i = 0; i < count; i++) {
         vector.push_back(i);
         vector.push_back(i+1);
@@ -2259,7 +2259,7 @@ double vectorPushPop()
         vector[1] = vector.back();
         vector.pop_back();
     }
-    uint64_t stop = Cycles::rdtsc();
+    uint64_t stop = Cycles::rdtscp();
     return Cycles::toSeconds(stop - start)/(count*3);
 }
 

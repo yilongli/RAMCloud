@@ -360,6 +360,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     // Process received packets by constructing appropriate Received objects.
     for (uint32_t i = 0; i < totalPkts; i++) {
         struct rte_mbuf* m = mPkts[i];
+        rte_prefetch0(rte_pktmbuf_mtod(m, void *));
         if (unlikely(m->nb_segs > 1)) {
             RAMCLOUD_CLOG(WARNING,
                     "Can't handle packet with %u segments; discarding",
