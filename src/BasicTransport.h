@@ -59,13 +59,6 @@ class BasicTransport : public Transport {
     }
 
   PRIVATE:
-    /// The maximum size of a message, in bytes, that we consider as small.
-    /// As of 09/2017, we set this number to 300 bytes (which takes 240 ns
-    /// to transmit on a 10Gbps network). This value is chosen experimentally
-    /// so that we can run W3 in Homa paper at 80% load on a 10Gbps network
-    /// and that no significant queueing delay at the TX queue is observed.
-    static const uint32_t SMALL_MESSAGE_SIZE = 300;
-
     // FIXME:
     /// As of 08/17, std::unordered_map is considerably slower than XXX.
     // TODO: Add some perf numbers here.
@@ -393,7 +386,7 @@ class BasicTransport : public Transport {
         uint64_t sequence;
 
         /// True if the RPC has been cancelled by the client. This is only
-        /// neccessary for cases where an RPC cannot be deleted immediately
+        /// neccessary for the case where an RPC cannot be deleted immediately
         /// (e.g., it's being executed); we use this flag to indicate that
         /// this RPC should be removed at the server's earliest convenience.
         bool cancelled;
@@ -676,14 +669,14 @@ class BasicTransport : public Transport {
     /// Maximum # bytes of message data that can fit in one packet.
     CONST uint32_t maxDataPerPacket;
 
-    /// Maximum # bytes of message that we desire to receive in a zero-copy
-    /// fashion; this only makes a difference if zero-copy RX is supported
-    /// by the underlying driver. The larger this number is set, the more
-    /// hardware packet buffers we will likely retain at any given time,
-    /// and the more we deviate from the SRPT policy. If this number is set
-    /// too large, we may run out of hardware packet buffers and have to stop
-    /// receiving packets (even worse, we can't complete any message to free
-    /// up the hardware packet buffers; thus, a deadlock!).
+    /// Messages smaller than or equal to this many bytes are received in
+    /// a zero-copy fashion in their entireties, if the underlying driver
+    /// permits. The larger this number is set, the more hardware packet
+    /// buffers we will likely retain at any given time, and the more we
+    /// deviate from the SRPT policy. If this number is set too large, we
+    /// may run out of hardware packet buffers and have to stop receiving
+    /// packets (even worse, we can't complete any message to free up the
+    /// hardware packet buffers; thus, a deadlock!).
     const uint32_t messageZeroCopyThreshold;
 
     /// Maximum # bytes of a message that we consider as small. For small

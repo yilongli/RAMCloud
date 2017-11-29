@@ -110,7 +110,7 @@ class DpdkDriver : public Driver
              7 << 13};
 
     /// See docs in Driver class. The additional headroom space is used to
-    /// store the type of the packet buf.
+    /// store the packet buf type.
     typedef Driver::PacketBuf<MacAddress, MAX_PAYLOAD_SIZE,
             PACKETBUF_TYPE_SIZE> PacketBuf;
 

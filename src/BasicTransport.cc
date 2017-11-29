@@ -1560,12 +1560,13 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
     length -= sizeof32(DataHeader);
 
     // These should not happen normally.
-    if (header->offset % t->maxDataPerPacket != 0) {
-        // Unexpected packet offset
+    if (expect_false(header->offset % t->maxDataPerPacket != 0)) {
+        LOG(WARNING, "Unexpected packet offset %u", header->offset);
         return false;
-    } else if ((length != t->maxDataPerPacket) &&
-            (header->offset + length < header->totalLength)) {
-        // Unexpected packet size
+    } else if (expect_false((length != t->maxDataPerPacket) &&
+            (header->offset + length < header->totalLength))) {
+        LOG(WARNING, "Unexpected packet size %u, offset %u", length,
+                header->offset);
         return false;
     }
 
@@ -1877,36 +1878,22 @@ BasicTransport::checkTimeouts()
         }
 
         if (clientRpc->response->size() == 0) {
-            // We haven't received any part of the response message.
-            if (clientRpc->transmitPending) {
-                // We haven't finished transmitting the request. There are
-                // two cases. (1) We haven't transmitted every byte we can:
-                // probably too busy transmitting messages with higher
-                // priority. (2) This request is waiting for grants: the
-                // request might be lost, the grant might be lost, or the
-                // server hasn't got around to grant us more bytes. In either
-                // case, just reset the timer and let the server deal with it.
-                // FIXME: 1. If we entirely rely on the receiver to detect
-                // and handle the case, the receiver (i.e., server) needs to
-                // be at least aware of this RPC.
-                // 2. What if the receiver crashed? We can't just set silentIntervals to 0
-                // forever!
-                clientRpc->silentIntervals = 0;
-            } else {
-                // Send occasional RESEND packets, which should produce
-                // some response from the server, so that we know it's
-                // still alive and working. Note: the wait time for this
-                // ping is longer than the server's wait time to request
-                // retransmission (first give the server a chance to handle
-                // the problem).
-                if (clientRpc->silentIntervals % pingIntervals == 0) {
-                    timeTrace("client sending RESEND for clientId %u, "
-                            "sequence %u", clientId, sequence);
-                    ResendHeader resend(RpcId(clientId, sequence), 0,
-                            roundTripBytes, FROM_CLIENT);
-                    sendControlPacket(clientRpc->session->serverAddress,
-                            &resend);
-                }
+            // We haven't received any part of the response message. Normally,
+            // it's the server's responsibility to request retransmission.
+            // However, in case the whole request was lost (so the server is
+            // not aware of this RPC) or the server crashed, we need to send
+            // occasional RESEND packets, which should produce some response
+            // from the server, so that we know it's still alive and working.
+            // Note: the wait time for this ping is longer than the server's
+            // wait time to request retransmission (first give the server a
+            // chance to handle the problem).
+            if (clientRpc->silentIntervals % pingIntervals == 0) {
+                timeTrace("client sending RESEND for clientId %u, "
+                        "sequence %u", clientId, sequence);
+                ResendHeader resend(RpcId(clientId, sequence), 0,
+                        roundTripBytes, FROM_CLIENT);
+                sendControlPacket(clientRpc->session->serverAddress,
+                        &resend);
             }
         } else {
             // We have received part of the response.

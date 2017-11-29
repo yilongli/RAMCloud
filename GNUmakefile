@@ -56,7 +56,7 @@ endif
 BASECFLAGS := -g
 ifeq ($(DEBUG),yes)
 ifeq ($(DEBUG_OPT),yes)
-OPTFLAG := -Og
+OPTFLAG := -O0
 endif
 DEBUGFLAGS := -DTESTING=1 -fno-builtin
 else

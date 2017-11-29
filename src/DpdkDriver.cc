@@ -357,8 +357,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     }
     uint32_t totalPkts = incomingPkts + loopbackPkts;
 
-    // Process received packets by constructing appropriate Received
-    // objects and copying the payload from the DPDK packet buffers.
+    // Process received packets by constructing appropriate Received objects.
     for (uint32_t i = 0; i < totalPkts; i++) {
         struct rte_mbuf* m = mPkts[i];
         if (unlikely(m->nb_segs > 1)) {
@@ -391,9 +390,11 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         }
         PerfStats::threadStats.networkInputBytes += rte_pktmbuf_pkt_len(m);
 
-        // Use the headroom in rte_mbuf to embed the packet sender address
-        // and packet buffer type directly, according to the layout defined
-        // by #DpdkDriver::PacketBuf.
+        // By default, we would like to construct the Received object using
+        // the payload directly (as opposed to copying out the payload to a
+        // PacketBuf first). Therefore, we use the headroom in rte_mbuf to
+        // store the packet sender address (as required by the Received object)
+        // and the packet buf type (so we know where this payload comes from).
         // See http://dpdk.org/doc/guides/prog_guide/mbuf_lib.html for the
         // diagram of rte_mbuf's internal structure.
         MacAddress* sender = reinterpret_cast<MacAddress*>(m->buf_addr);
