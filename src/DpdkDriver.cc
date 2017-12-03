@@ -435,7 +435,7 @@ DpdkDriver::release(char *payload)
 }
 
 // See docs in Driver class.
-bool
+void
 DpdkDriver::releaseHwPacketBuf(Driver::Received* received)
 {
     struct rte_mbuf* mbuf = payload_to_mbuf(received->payload);
@@ -449,7 +449,6 @@ DpdkDriver::releaseHwPacketBuf(Driver::Received* received)
     received->sender = packetBuf->sender.get();
     received->payload = packetBuf->payload;
     rte_pktmbuf_free(mbuf);
-    return true;
 }
 
 // See docs in Driver class.

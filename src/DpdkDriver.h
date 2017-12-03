@@ -66,7 +66,7 @@ class DpdkDriver : public Driver
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
-    virtual bool releaseHwPacketBuf(Driver::Received* received);
+    virtual void releaseHwPacketBuf(Driver::Received* received);
     virtual void sendPacket(const Address* addr,
                             const void* header,
                             uint32_t headerLen,
