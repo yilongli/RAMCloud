@@ -307,6 +307,7 @@ TEST_F(BasicTransportTest, tryToTransmitData_pickShortestRequest) {
             driver->outputLog);
     EXPECT_EQ(14u, result);
     EXPECT_EQ(2u, transport.outgoingRequests.size());
+    EXPECT_EQ(1u, transport.topOutgoingMessages.size());
     BasicTransport::ClientRpc* clientRpc1 = transport.outgoingRpcs[1lu];
     EXPECT_EQ(0u, clientRpc1->request.transmitOffset);
     BasicTransport::ClientRpc* clientRpc3 = transport.outgoingRpcs[3lu];
@@ -331,6 +332,7 @@ TEST_F(BasicTransportTest, tryToTransmitData_pickShortestResponse) {
     EXPECT_EQ(15u, result);
     EXPECT_EQ(2u, transport.outgoingResponses.size());
     EXPECT_EQ(2u, transport.incomingRpcs.size());
+    EXPECT_EQ(1u, transport.topOutgoingMessages.size());
     EXPECT_EQ(0u, serverRpc1->response.transmitOffset);
     EXPECT_EQ(5u, serverRpc2->response.transmitOffset);
     EXPECT_EQ(10u, serverRpc3->response.transmitOffset);
@@ -358,6 +360,50 @@ TEST_F(BasicTransportTest, tryToTransmitData_requestsAndResponsesToTransmit) {
             "offset 10 abcde",
             driver->outputLog);
     EXPECT_EQ(34u, result);
+}
+TEST_F(BasicTransportTest, tryToTransmitData_slowPath) {
+    // The top outgoing message set is populated with four shorter requests
+    // that are waiting for grants.
+    transport.roundTripBytes = 0;
+    transport.maxDataPerPacket = 10;
+    transport.smallMessageThreshold = 0;
+    transport.transmitDataSlowPath = false;
+    driver->transmitQueueSpace = -1;
+    MockWrapper wrapper1("0123456789");
+    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
+    MockWrapper wrapper2("0123456789");
+    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
+    MockWrapper wrapper3("0123456789");
+    session->sendRequest(&wrapper3.request, &wrapper3.response, &wrapper3);
+    MockWrapper wrapper4("0123456789");
+    session->sendRequest(&wrapper4.request, &wrapper4.response, &wrapper4);
+    EXPECT_FALSE(transport.transmitDataSlowPath);
+    EXPECT_EQ(0u, transport.topOutgoingMessages.size());
+
+    // The fifth request arrives and is granted for 10 bytes.
+    MockWrapper wrapper5("0123456789abcde");
+    session->sendRequest(&wrapper5.request, &wrapper5.response, &wrapper5);
+    handlePacket("mock:server=1",
+            BasicTransport::GrantHeader(BasicTransport::RpcId(666, 5), 10,
+            BasicTransport::FROM_SERVER));
+    EXPECT_TRUE(transport.transmitDataSlowPath);
+
+    // tryToTransmitData should take the slow path and then update the top
+    // outgoing message set.
+    driver->transmitQueueSpace = 10;
+    uint32_t result = transport.tryToTransmitData();
+    EXPECT_EQ("DATA FROM_CLIENT, rpcId 666.5, totalLength 15, offset 0 "
+            "0123456789", driver->outputLog);
+    EXPECT_EQ(10u, result);
+    EXPECT_TRUE(transport.transmitDataSlowPath);
+    EXPECT_TRUE(transport.outgoingRpcs[5]->request.topChoice);
+
+    // all requests are waiting for grants now; tryToTransmitData will set
+    // transmitDataSlowPath to false after scanning all outgoing messages.
+    driver->transmitQueueSpace = 1000;
+    result = transport.tryToTransmitData();
+    EXPECT_EQ(0u, result);
+    EXPECT_FALSE(transport.transmitDataSlowPath);
 }
 
 TEST_F(BasicTransportTest, tryToTransmitData_negativeTransmitQueueSpace) {
@@ -414,6 +460,7 @@ TEST_F(BasicTransportTest, Session_cancelRequest) {
         requests[i].append(message, downCast<uint32_t>(strlen(message)));
         session->sendRequest(&requests[i], &responses[i], &notifiers[i]);
     }
+    driver->outputLog.clear();
     EXPECT_EQ(10u, transport.outgoingRpcs.size());
     session->cancelRequest(&notifiers[7]);
     session->cancelRequest(&notifiers[9]);
@@ -421,6 +468,9 @@ TEST_F(BasicTransportTest, Session_cancelRequest) {
     session->cancelRequest(&notifiers[2]);
     EXPECT_EQ(6u, transport.outgoingRpcs.size());
     EXPECT_EQ(6u, transport.clientRpcPool.outstandingObjects);
+    EXPECT_EQ("ABORT FROM_CLIENT, rpcId 666.8 | "
+            "ABORT FROM_CLIENT, rpcId 666.10 | ABORT FROM_CLIENT, rpcId 666.1"
+            " | ABORT FROM_CLIENT, rpcId 666.3", driver->outputLog);
 }
 
 TEST_F(BasicTransportTest, Session_getRpcInfo) {
@@ -439,6 +489,56 @@ TEST_F(BasicTransportTest, Session_getRpcInfo) {
             "PING, READ to server at mock:node=3") == 0) ||
             (session->getRpcInfo().compare(
             "READ, PING to server at mock:node=3") == 0));
+}
+
+TEST_F(BasicTransportTest, augmentTopOutgoingMessageSet) {
+    driver->transmitQueueSpace = 0;
+    MockWrapper wrapper1("0123456789");
+    MockWrapper wrapper2("0123456789");
+    MockWrapper wrapper3("0123456789");
+    MockWrapper wrapper4("0123456789");
+    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
+    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
+    session->sendRequest(&wrapper3.request, &wrapper3.response, &wrapper3);
+    session->sendRequest(&wrapper4.request, &wrapper4.response, &wrapper4);
+    transport.outgoingRpcs[1]->request.transmitOffset = 0;
+    transport.outgoingRpcs[2]->request.transmitOffset = 1;
+    transport.outgoingRpcs[3]->request.transmitOffset = 7;
+    transport.outgoingRpcs[4]->request.transmitOffset = 8;
+    transport.outgoingRpcs[3]->request.topChoice = true;
+    transport.outgoingRpcs[4]->request.topChoice = true;
+    transport.topOutgoingMessages.push_back(
+            transport.outgoingRpcs[3]->request);
+    transport.topOutgoingMessages.push_back(
+            transport.outgoingRpcs[4]->request);
+    transport.augmentTopOutgoingMessageSet();
+    EXPECT_EQ(3u, transport.topOutgoingMessages.size());
+    EXPECT_TRUE(transport.outgoingRpcs[2]->request.topChoice);
+}
+TEST_F(BasicTransportTest, maintainTopOutgoingMessages) {
+    driver->transmitQueueSpace = 0;
+    MockWrapper wrapper1("0123456789");
+    MockWrapper wrapper2("0123456789");
+    MockWrapper wrapper3("0123456789");
+    MockWrapper wrapper4("0123456789");
+    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
+    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
+    session->sendRequest(&wrapper3.request, &wrapper3.response, &wrapper3);
+    session->sendRequest(&wrapper4.request, &wrapper4.response, &wrapper4);
+    transport.outgoingRpcs[1]->request.transmitOffset = 0;
+    transport.outgoingRpcs[2]->request.transmitOffset = 1;
+    transport.outgoingRpcs[3]->request.transmitOffset = 7;
+    transport.outgoingRpcs[4]->request.transmitOffset = 8;
+    transport.outgoingRpcs[2]->request.topChoice = true;
+    transport.outgoingRpcs[4]->request.topChoice = true;
+    transport.topOutgoingMessages.push_back(
+            transport.outgoingRpcs[2]->request);
+    transport.topOutgoingMessages.push_back(
+            transport.outgoingRpcs[4]->request);
+    transport.maintainTopOutgoingMessages(&transport.outgoingRpcs[3]->request);
+    EXPECT_EQ(2u, transport.topOutgoingMessages.size());
+    EXPECT_FALSE(transport.outgoingRpcs[2]->request.topChoice);
+    EXPECT_TRUE(transport.outgoingRpcs[3]->request.topChoice);
 }
 
 TEST_F(BasicTransportTest, Session_sendRequest_aborted) {
@@ -463,6 +563,19 @@ TEST_F(BasicTransportTest, Session_sendRequest_normal) {
     EXPECT_EQ(2u, transport.outgoingRpcs.size());
     EXPECT_EQ(1u, transport.outgoingRequests.size());
     EXPECT_EQ(3u, transport.nextClientSequenceNumber);
+}
+TEST_F(BasicTransportTest, Session_sendRequest_smallMessage) {
+    // Small messages are passed to the NIC directly, bypassing the
+    // sender's congestion control mechanism in tryToTransmitData.
+    driver->transmitQueueSpace = -1;
+    transport.smallMessageThreshold = 10;
+    MockWrapper wrapper1("012345678");
+    MockWrapper wrapper2("0123456789");
+    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
+    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
+    EXPECT_EQ(1u, transport.outgoingRequests.size());
+    EXPECT_EQ("ALL_DATA FROM_CLIENT, rpcId 666.1 012345678",
+            driver->outputLog);
 }
 
 TEST_F(BasicTransportTest, handlePacket_noHeader) {
@@ -635,17 +748,23 @@ TEST_F(BasicTransportTest, handlePacket_grantFromServer) {
     BasicTransport::ClientRpc* clientRpc = transport.outgoingRpcs[1];
     EXPECT_EQ(10lu, clientRpc->request.transmitLimit);
 
+    // Temporarily set topChoice to false to test the non-trivial code path.
+    transport.transmitDataSlowPath = false;
+    clientRpc->request.topChoice = false;
     // First grant doesn't get past transmitLimit.
     handlePacket("mock:server=1",
             BasicTransport::GrantHeader(BasicTransport::RpcId(666, 1), 10,
             BasicTransport::FROM_SERVER));
     EXPECT_EQ(10lu, clientRpc->request.transmitLimit);
+    EXPECT_FALSE(transport.transmitDataSlowPath);
 
     // Second grant is far enough out to enable more bytes to be sent.
     handlePacket("mock:server=1",
             BasicTransport::GrantHeader(BasicTransport::RpcId(666, 1), 15,
             BasicTransport::FROM_SERVER));
     EXPECT_EQ(15lu, clientRpc->request.transmitLimit);
+    EXPECT_TRUE(transport.transmitDataSlowPath);
+    clientRpc->request.topChoice = true;
 }
 TEST_F(BasicTransportTest, handlePacket_logTimeTraceFromServer) {
     MockWrapper wrapper("message1");
@@ -683,11 +802,28 @@ TEST_F(BasicTransportTest, handlePacket_resendFromServer_restart) {
             &transport.outgoingRpcs[1]->request;
     EXPECT_EQ(10u, request->transmitOffset);
 
+    // Four 15-byte requests arrive. The previous request has 10 bytes
+    // left and, thus, remains in the top outgoing message set.
+    driver->transmitQueueSpace = 0;
+    MockWrapper wrapper1("0123456789abcde");
+    MockWrapper wrapper2("0123456789abcde");
+    MockWrapper wrapper3("0123456789abcde");
+    MockWrapper wrapper4("0123456789abcde");
+    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
+    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
+    session->sendRequest(&wrapper3.request, &wrapper3.response, &wrapper3);
+    session->sendRequest(&wrapper4.request, &wrapper4.response, &wrapper4);
+    EXPECT_TRUE(request->topChoice);
+
+    // The first request is restarted and removed from the top outgoing
+    // message set.
     handlePacket("mock:server=1", BasicTransport::ResendHeader(
             BasicTransport::RpcId(666, 1), 0, 5,
             BasicTransport::FROM_SERVER|BasicTransport::RESTART));
     EXPECT_EQ(0u, request->transmitOffset);
     EXPECT_EQ(5u, request->transmitLimit);
+    EXPECT_FALSE(request->topChoice);
+    EXPECT_EQ(0u, transport.topOutgoingMessages.size());
 }
 TEST_F(BasicTransportTest,
         handlePacket_resendFromServer_transmitLimitChanges) {
@@ -1064,6 +1200,27 @@ TEST_F(BasicTransportTest, handlePacket_ackFromClient) {
             BasicTransport::RpcId(100, 101), BasicTransport::FROM_CLIENT));
     EXPECT_EQ(0u, serverRpc->silentIntervals);
 }
+TEST_F(BasicTransportTest, handlePacket_abortFromClient_sendingResponse) {
+    // Cancel a ServerRpc that is sending response.
+    driver->transmitQueueSpace = 0;
+    BasicTransport::ServerRpc* serverRpc = prepareToRespond();
+    serverRpc->sendReply();
+    EXPECT_EQ(1u, transport.incomingRpcs.size());
+    handlePacket("mock:client=1", BasicTransport::AbortHeader(
+            BasicTransport::RpcId(100, 101)));
+    EXPECT_EQ(0u, transport.incomingRpcs.size());
+}
+TEST_F(BasicTransportTest, handlePacket_abortFromClient_localExecution) {
+    // Cancel a ServerRpc that is being executed locally.
+    BasicTransport::ServerRpc* serverRpc = prepareToRespond();
+    EXPECT_EQ(1u, transport.incomingRpcs.size());
+    handlePacket("mock:client=1", BasicTransport::AbortHeader(
+            BasicTransport::RpcId(100, 101)));
+    EXPECT_TRUE(serverRpc->cancelled);
+    serverRpc->sendReply();
+    EXPECT_EQ("", driver->outputLog);
+    EXPECT_EQ(0u, transport.incomingRpcs.size());
+}
 TEST_F(BasicTransportTest, handlePacket_unknownOpcodeFromClient) {
     handlePacket("mock:client=1", BasicTransport::CommonHeader(
             BasicTransport::BOGUS, BasicTransport::RpcId(100, 101),
@@ -1080,27 +1237,50 @@ TEST_F(BasicTransportTest, sendReply_basics) {
     EXPECT_EQ(10lu, serverRpc->response.transmitLimit);
     EXPECT_EQ(1lu, transport.outgoingResponses.size());
     EXPECT_EQ(1lu, transport.serverTimerList.size());
+    EXPECT_EQ(1u, transport.topOutgoingMessages.size());
+}
+TEST_F(BasicTransportTest, sendReply_smallMessage) {
+    // Small messages are passed to the NIC directly, bypassing the
+    // sender's congestion control mechanism in tryToTransmitData.
+    driver->transmitQueueSpace = -1;
+    transport.smallMessageThreshold = 10;
+    BasicTransport::ServerRpc* serverRpc1 = prepareToRespond();
+    BasicTransport::ServerRpc* serverRpc2 = prepareToRespond(102, 9, "012345678");
+    serverRpc1->sendReply();
+    serverRpc2->sendReply();
+    EXPECT_EQ(1u, transport.outgoingResponses.size());
+    EXPECT_EQ("ALL_DATA FROM_SERVER, rpcId 100.102 012345678",
+            driver->outputLog);
 }
 
 TEST_F(BasicTransportTest, MessageAccumulator_destructor) {
     transport.maxDataPerPacket = 5;
     uint32_t unscheduledBytes = transport.roundTripBytes;
     handlePacket("mock:client=1",
-            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 20, 5,
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 25, 10,
             unscheduledBytes, BasicTransport::FROM_CLIENT), "abcde");
     handlePacket("mock:client=1",
-            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 20, 15,
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 25, 20,
             unscheduledBytes, BasicTransport::FROM_CLIENT), "56789");
     handlePacket("mock:client=1",
-            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 20, 10,
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 25, 15,
             unscheduledBytes, BasicTransport::FROM_CLIENT), "01234");
+    handlePacket("mock:client=1",
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 25, 0,
+            unscheduledBytes, BasicTransport::FROM_CLIENT), "xxxxx");
     BasicTransport::ServerRpc* serverRpc =
             transport.incomingRpcs[BasicTransport::RpcId(100, 101)];
     EXPECT_TRUE(serverRpc->accumulator);
     EXPECT_EQ(3u, serverRpc->accumulator->fragments.size());
+    EXPECT_EQ(1u, serverRpc->accumulator->assembledPayloads->size());
     EXPECT_EQ(0u, driver->releaseCount);
     transport.deleteServerRpc(serverRpc);
     EXPECT_EQ(3u, driver->releaseCount);
+    EXPECT_EQ(1u, transport.messagesToRelease.size());
+
+    transport.poller.poll();
+    EXPECT_EQ(4u, driver->releaseCount);
+    EXPECT_EQ(0u, transport.messagesToRelease.size());
 }
 
 TEST_F(BasicTransportTest, addPacket_basics) {
@@ -1300,6 +1480,31 @@ TEST_F(BasicTransportTest, poll_callCheckTimeouts) {
 
     Cycles::mockTscValue = 0;
 }
+TEST_F(BasicTransportTest, poll_outgoingGrant) {
+    transport.maxDataPerPacket = 5;
+    transport.roundTripBytes = 20;
+    transport.grantIncrement = 5;
+    uint32_t unscheduledBytes = transport.roundTripBytes;
+    // Send 3 fragments, process all at once.
+    driver->packetArrived("mock:client=1",
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 100, 0,
+            unscheduledBytes, BasicTransport::FROM_CLIENT), "01234");
+    driver->packetArrived("mock:client=1",
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 100, 5,
+            unscheduledBytes, BasicTransport::FROM_CLIENT), "56789");
+    driver->packetArrived("mock:client=1",
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 101), 100, 10,
+            unscheduledBytes, BasicTransport::FROM_CLIENT), "abcde");
+    driver->packetArrived("mock:client=1",
+            BasicTransport::DataHeader(BasicTransport::RpcId(100, 102), 100, 0,
+            unscheduledBytes, BasicTransport::FROM_CLIENT), "ABCDE");
+    int result = transport.poller.poll();
+    EXPECT_EQ("GRANT FROM_SERVER, rpcId 100.101, offset 40 | "
+            "GRANT FROM_SERVER, rpcId 100.102, offset 30",
+            driver->outputLog);
+    EXPECT_EQ(1, result);
+    EXPECT_EQ(0u, transport.messagesToGrant.size());
+}
 TEST_F(BasicTransportTest, poll_outgoingPacket) {
     driver->transmitQueueSpace = 0;
     MockWrapper wrapper1("012345678901234");
@@ -1311,7 +1516,6 @@ TEST_F(BasicTransportTest, poll_outgoingPacket) {
             driver->outputLog);
     EXPECT_EQ(1, result);
 }
-
 TEST_F(BasicTransportTest, checkTimeouts_clientTransmissionNotStartedYet) {
     driver->transmitQueueSpace = 0;
     MockWrapper wrapper("message1");
@@ -1399,6 +1603,28 @@ TEST_F(BasicTransportTest, checkTimeouts_sendResendFromClient) {
     transport.checkTimeouts();
     EXPECT_EQ("RESEND FROM_CLIENT, rpcId 666.1, offset 10, length 145",
             driver->outputLog);
+}
+TEST_F(BasicTransportTest, checkTimeouts_clientReceivedAllGrantedBytes) {
+    // All granted bytes of a response have been received; just reset
+    // the timer.
+    transport.roundTripBytes = 5;
+    transport.maxDataPerPacket = 5;
+    uint32_t unscheduledBytes = 5;
+    MockWrapper wrapper(NULL);
+    WireFormat::RequestCommon* header =
+            wrapper.request.emplaceAppend<WireFormat::RequestCommon>();
+    header->opcode = WireFormat::READ;
+    header->service = WireFormat::MASTER_SERVICE;
+    session->sendRequest(&wrapper.request, &wrapper.response, &wrapper);
+    handlePacket("mock:server=1",
+            BasicTransport::DataHeader(BasicTransport::RpcId(666, 1), 200,
+            0, unscheduledBytes, BasicTransport::FROM_SERVER),
+            "abcde");
+    BasicTransport::ClientRpc* clientRpc = transport.outgoingRpcs[1];
+    clientRpc->scheduledMessage ->grantOffset = 5;
+    EXPECT_EQ(0u, clientRpc->silentIntervals);
+    transport.checkTimeouts();
+    EXPECT_EQ(0u, clientRpc->silentIntervals);
 }
 TEST_F(BasicTransportTest, checkTimeouts_serverResponseTransmissionDelayed) {
     driver->transmitQueueSpace = 0;
