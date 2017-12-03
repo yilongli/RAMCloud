@@ -654,8 +654,8 @@ class BasicTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void updateTopOutgoingMessageSet(OutgoingMessage* candidate,
-            bool newMessage);
+    void augmentTopOutgoingMessageSet();
+    void maintainTopOutgoingMessages(OutgoingMessage* candidate);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -745,11 +745,11 @@ class BasicTransport : public Transport {
     OutgoingRequestList outgoingRequests;
 
     /// Holds the sender's top K outgoing messages with the fewest bytes
-    /// remaining to be transmitted. We choose K to be a small constant
-    /// so that scanning the list is efficient. This is used to handle
-    /// situations where there are very large numbers of outgoing messages:
-    /// the sender only needs to scan this list in the common case of
-    /// transmitting a message (i.e., at least one message in this list has
+    /// remaining to be transmitted. K varies dynamically but is limited to
+    /// a small constant so that scanning the list is efficient. This is used
+    /// to handle situations where there are very large numbers of outgoing
+    /// messages: the sender only needs to scan this list in the common case
+    /// of transmitting a message (i.e., at least one message in this list has
     /// bytes ready to transmit).
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;

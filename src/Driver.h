@@ -326,27 +326,31 @@ class Driver {
     }
 
     /**
-     * Replace the underlying hardware packet buffer with a software packet
-     * buffer (i.e., Driver::PacketBuf) that has the same content. The
-     * ownership of the hardware packet buffer is returned to the driver.
-     *
-     * This method does nothing if the underlying packet buffer is not a
-     * hardware packet buffer, or the driver decides not to replace it.
+     * This method is invoked by transports to tell a driver that it should
+     * release a packet buffer back to the NIC. It is needed because some
+     * drivers may use zero-copy techniques when packets arrive, passing the
+     * input packet buffer to the transport instead of copying the data into
+     * a separate buffer. The zero-copy approach can potentially cause the NIC
+     * to run out of packet buffers (e.g. if several very long messages are
+     * being received but none is yet complete). Transports must detect
+     * excessive use of packet buffers and invoke this method on some
+     * of the incoming packets. If received is currently occupying one of
+     * the NIC's packet buffers (i.e. it hasn't already been copied), the
+     * driver must copy the packet into a separate copy in memory (e.g.
+     * Driver::PacketBuf) so it can release the packet buffer back to the
+     * NIC. If this packet has already been copied out of the NIC's buffer,
+     * then the method does nothing. This method must not be invoked if the
+     * transport has retained a pointer to data in the original packet (e.g.
+     * by calling getRange or getOffset, or by accessing payload).
      *
      * \param received
-     *      The incoming packet whose backing packet buffer might be
-     *      silently replaced.
-     * \return
-     *      True, if the underlying NIC packet buffer has been released;
-     *      false, if the underlying packet buffer is not a hardware packet
-     *      buffer or the driver decides not to replace it.
+     *      An incoming packet which contains the packet buffer to copy.
      */
-    virtual bool releaseHwPacketBuf(Driver::Received* received)
+    virtual void releaseHwPacketBuf(Driver::Received* received)
     {
-        // The default implementation does nothing. It can be used by
-        // drivers that don't support zero-copy RX or have sufficient
-        // NIC packet buffers.
-        return false;
+        // The default implementation does nothing. It can be used by drivers
+        // that don't support zero-copy RX or have sufficient hardware-managed
+        // packet buffers.
     }
 
     /**

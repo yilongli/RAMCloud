@@ -613,10 +613,9 @@ BasicTransport::tryToTransmitData()
 
             for (OutgoingResponseList::iterator it = outgoingResponses.begin();
                         it != outgoingResponses.end(); it++) {
-                ServerRpc* rpc = &(*it);
                 OutgoingMessage* response = &it->response;
                 if (!response->topChoice) {
-                    uint32_t bytesLeft = rpc->replyPayload.size() -
+                    uint32_t bytesLeft = response->buffer->size() -
                             response->transmitOffset;
                     if (response->transmitLimit <= response->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
@@ -682,7 +681,10 @@ BasicTransport::tryToTransmitData()
                 // This message is taken from the slow path; see if we should
                 // include it to topOutgoingMessages so that we may avoid the
                 // slow path next time.
-                updateTopOutgoingMessageSet(message, false);
+                maintainTopOutgoingMessages(message);
+                if (!message->topChoice) {
+                    augmentTopOutgoingMessageSet();
+                }
             }
         } else {
             // There are no messages with data that can be transmitted.
@@ -784,56 +786,95 @@ BasicTransport::Session::getRpcInfo()
 }
 
 /**
- * This method decides if we should update the top outgoing message set;
- * invoked when a new message arrives or we just transmited a few more bytes
- * of an existing message outside this set.
+ * Attempt to expand the size of the top outgoing message set by one. This
+ * method will scan all messages outside the top outgoing message set and
+ * select the one with the smallest remaining size to include. This method
+ * is invoked by #tryToTransmitData whenever it has to look outside the top
+ * outgoing message set to pick the next message to transmit.
+ */
+void
+BasicTransport::augmentTopOutgoingMessageSet()
+{
+    // As of 09/2017, the maximum size of the top outgoing message set is
+    // limited to 4. During evaluation, we found that this value is large
+    // enough to ensure that the sender doesn't have to look outside this
+    // set very often when picking the next message to transmit.
+#define MAX_TOP_MESSAGES 4
+    if (topOutgoingMessages.size() == MAX_TOP_MESSAGES) {
+        return;
+    }
+
+    uint32_t minBytesLeft = ~0u;
+    OutgoingMessage* message = NULL;
+    for (OutgoingRequestList::iterator it = outgoingRequests.begin();
+                it != outgoingRequests.end(); it++) {
+        OutgoingMessage* request = &it->request;
+        if (!request->topChoice) {
+            uint32_t bytesLeft =
+                    request->buffer->size() - request->transmitOffset;
+            if (bytesLeft < minBytesLeft) {
+                minBytesLeft = bytesLeft;
+                message = request;
+            }
+        }
+    }
+
+    for (OutgoingResponseList::iterator it = outgoingResponses.begin();
+                it != outgoingResponses.end(); it++) {
+        OutgoingMessage* response = &it->response;
+        if (!response->topChoice) {
+            uint32_t bytesLeft = response->buffer->size() -
+                    response->transmitOffset;
+            if (bytesLeft < minBytesLeft) {
+                minBytesLeft = bytesLeft;
+                message = response;
+            }
+        }
+    }
+
+    message->topChoice = true;
+    topOutgoingMessages.push_back(*message);
+}
+
+/**
+ * Ensure that messages in our top outgoing message set still have the
+ * smallest remaining sizes in all outgoing messages. When a new outgoing
+ * message arrives or we just transmitted a few more bytes of an existing
+ * message outside this set, this method is invoked to check if this message
+ * should replace an existing top outgoing message.
  *
  * \param candidate
  *      A message that might be added to the top outgoing message set.
- * \param newMessage
- *      True means this message was just included in the outgoing
- *      request/response set; false means the message was already in the
- *      system.
  */
 void
-BasicTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
-        bool newMessage)
+BasicTransport::maintainTopOutgoingMessages(OutgoingMessage* candidate)
 {
     assert(!candidate->topChoice);
-    // As of 09/2017, the maximum size of the top outgoing message set is
-    // bounded to 4. During evaluation, we found that this value is large
-    // enough to ensure that the sender doesn't have to look outside this
-    // set very often when picking the next message to transmit.
-    if (topOutgoingMessages.size() < 4) {
+    uint32_t maxBytesLeft =
+            candidate->buffer->size() - candidate->transmitOffset;
+    uint32_t bytesLeft;
+    OutgoingMessage* messageToReplace = NULL;
+    for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
+            it != topOutgoingMessages.end(); it++) {
+        OutgoingMessage* m = &(*it);
+        bytesLeft = m->buffer->size() - m->transmitOffset;
+        if (maxBytesLeft < bytesLeft) {
+            maxBytesLeft = bytesLeft;
+            messageToReplace = m;
+        }
+    }
+    OutgoingMessage* loser = candidate;
+    if (messageToReplace != NULL) {
+        loser = messageToReplace;
+        messageToReplace->topChoice = false;
+        erase(topOutgoingMessages, *messageToReplace);
         candidate->topChoice = true;
         topOutgoingMessages.push_back(*candidate);
-    } else {
-        uint32_t maxBytesLeft =
-                candidate->buffer->size() - candidate->transmitOffset;
-        uint32_t bytesLeft;
-        OutgoingMessage* messageToReplace = NULL;
-        for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
-                it != topOutgoingMessages.end(); it++) {
-            OutgoingMessage* m = &(*it);
-            bytesLeft = m->buffer->size() - m->transmitOffset;
-            if (maxBytesLeft < bytesLeft) {
-                maxBytesLeft = bytesLeft;
-                messageToReplace = m;
-            }
-        }
-        if (messageToReplace != NULL) {
-            messageToReplace->topChoice = false;
-            erase(topOutgoingMessages, *messageToReplace);
-            transmitDataSlowPath |= messageToReplace->transmitOffset
-                    < messageToReplace->transmitLimit;
-            candidate->topChoice = true;
-            topOutgoingMessages.push_back(*candidate);
-        }
-        if (newMessage && !candidate->topChoice) {
-            // A new message arrives, but it doesn't end up in the top
-            // outgoing message set.
-            transmitDataSlowPath = true;
-        }
+    }
+    if (loser->transmitOffset < loser->transmitLimit) {
+        // The loser, which ends up outside the top outgoing message set,
+        // has bytes ready to be transmitted.
+        transmitDataSlowPath = true;
     }
 }
 
@@ -877,7 +918,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         bytesSent = length;
     } else {
         t->outgoingRequests.push_back(*clientRpc);
-        t->updateTopOutgoingMessageSet(&clientRpc->request, true);
+        t->maintainTopOutgoingMessages(&clientRpc->request);
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
@@ -1043,9 +1084,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                 OutgoingMessage* request = &clientRpc->request;
                 if (header->offset > request->transmitLimit) {
                     request->transmitLimit = header->offset;
-                }
-                if (!request->topChoice) {
-                    transmitDataSlowPath = true;
+                    if (!request->topChoice) {
+                        transmitDataSlowPath = true;
+                    }
                 }
                 return;
             }
@@ -1084,11 +1125,11 @@ BasicTransport::handlePacket(Driver::Received* received)
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
-                        updateTopOutgoingMessageSet(request, true);
+                        maintainTopOutgoingMessages(request);
                     } else if (request->topChoice) {
                         request->topChoice = false;
                         erase(topOutgoingMessages, clientRpc->request);
-                        updateTopOutgoingMessageSet(request, false);
+                        maintainTopOutgoingMessages(request);
                     }
                     return;
                 }
@@ -1314,9 +1355,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                 OutgoingMessage* response = &serverRpc->response;
                 if (header->offset > response->transmitLimit) {
                     response->transmitLimit = header->offset;
-                }
-                if (!response->topChoice) {
-                    transmitDataSlowPath = true;
+                    if (!response->topChoice) {
+                        transmitDataSlowPath = true;
+                    }
                 }
                 return;
             }
@@ -1487,7 +1528,7 @@ BasicTransport::ServerRpc::sendReply()
         sendingResponse = true;
         t->outgoingResponses.push_back(*this);
         t->serverTimerList.push_back(*this);
-        t->updateTopOutgoingMessageSet(&response, true);
+        t->maintainTopOutgoingMessages(&response);
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
@@ -1724,7 +1765,8 @@ BasicTransport::Poller::poll()
     // Process available incoming packets. Try to receive MAX_PACKETS packets
     // at a time (an optimized driver implementation may prefetch the payloads
     // for us). As of 07/2016, MAX_PACKETS is set to 8 because our CPU can
-    // take at most 8 cache misses at a time.
+    // take at most 8 cache misses at a time (although it's not clear 8 is the
+    // best value).
 #define MAX_PACKETS 8
     uint32_t numPackets;
     t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
@@ -1798,26 +1840,33 @@ BasicTransport::Poller::poll()
     uint32_t totalBytesSent = t->tryToTransmitData();
     result = totalBytesSent > 0 ? 1 : result;
 
-    // Release a few retained payloads to the driver. As of 02/2017, releasing
-    // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
-    // useful to do in this method up till now, try to release more payloads.
-    const uint32_t maxRelease = result ? 1 : 5;
+    // See if we should release a few retained payloads to the driver.
+    // As of 02/2017, releasing one payload to the DpdkDriver takes ~65ns.
+    // If we have received up to MAX_PACKETS packets, then there may be more
+    // packets outstanding in the NIC's RX queue and we should skip returning
+    // payloads to get to the next poll ASAP. On the other hand, if we haven't
+    // found anything useful to do in this method up till now, try to release
+    // more payloads.
     uint32_t releaseCount = 0;
-    while (!t->messagesToRelease.empty()) {
-        MessageAccumulator::Payloads* message = t->messagesToRelease.back();
-        while (!message->empty() && (releaseCount < maxRelease)) {
-            char* payload = message->back();
-            message->pop_back();
-            t->driver->release(payload);
-            releaseCount++;
-            result = 1;
-        }
+    if (numPackets < MAX_PACKETS) {
+        const uint32_t maxRelease = result ? 1 : 5;
+        while (!t->messagesToRelease.empty()) {
+            MessageAccumulator::Payloads* message =
+                    t->messagesToRelease.back();
+            while (!message->empty() && (releaseCount < maxRelease)) {
+                char* payload = message->back();
+                message->pop_back();
+                t->driver->release(payload);
+                releaseCount++;
+                result = 1;
+            }
 
-        if (message->empty()) {
-            t->messagesToRelease.pop_back();
-            delete message;
-        } else {
-            break;
+            if (message->empty()) {
+                t->messagesToRelease.pop_back();
+                delete message;
+            } else {
+                break;
+            }
         }
     }
 
