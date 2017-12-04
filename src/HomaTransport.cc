@@ -13,8 +13,9 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include <algorithm>
+#include <fstream>
 
-#include "BasicTransport.h"
+#include "HomaTransport.h"
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
@@ -26,10 +27,7 @@ namespace RAMCloud {
 #define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
-// conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
-// are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
-// frequently cast their 64-bit arguments into uint32_t explicitly: we will
-// help perform the casting internally.
+// conditionally compiled in or out by the TIME_TRACE #ifdef.
 namespace {
     inline void
     timeTrace(const char* format,
@@ -41,10 +39,26 @@ namespace {
                 uint32_t(arg2), uint32_t(arg3));
 #endif
     }
+
+    inline void
+    timeTrace(uint64_t timestamp, const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(timestamp, format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
 }
 
+// FIXME: temporary hack to collapse priority levels (evaluation only)
+static int P = 1;
+#define SEND_PACKET(driver, addr, header, payload, prio) \
+    driver->sendPacket(addr, header, payload, prio / P)
+
 /**
- * Construct a new BasicTransport.
+ * Construct a new HomaTransport.
  * 
  * \param context
  *      Shared state about various RAMCloud modules.
@@ -53,41 +67,33 @@ namespace {
  *      NULL means this transport is created on the client-side to handle
  *      outgoing requests.
  * \param driver
- *      Used to send and receive packets.
- * \param driverOwner
- *      True if this transport becomes owner of the driver and will free it
- *      when this object is deleted.
+ *      Used to send and receive packets. This transport becomes owner
+ *      of the driver and will free it in when this object is deleted.
  * \param clientId
  *      Identifier that identifies us in outgoing RPCs: must be unique across
  *      all servers and clients.
  */
-BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
-        Driver* driver, bool driverOwner, uint64_t clientId)
+HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
+        Driver* driver, uint64_t clientId)
     : context(context)
     , driver(driver)
-    , driverOwner(driverOwner)
-    , locatorString("basic+"+driver->getServiceLocator())
+    , locatorString("homa+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
-
-    // As of 09/2017, with this value set to 100*maxDataPerPacket, we haven't
-    // observed any message drop due to driver packet buffer exhaustion when
-    // running workloads W3, W4 and W5 that are used in the HomaTransport paper
-    // evaluation.
-    , messageZeroCopyThreshold(100*maxDataPerPacket)
-
-    // As of 09/2017, we consider messages less than 300 bytes as small (which
-    // takes at most 240 ns to transmit on a 10Gbps network). This value is
-    // chosen experimentally so that we can run W3 in Homa paper at 80% load on
-    // a 10Gbps network/ and that no significant queueing delay at the TX queue
-    // is observed.
-    , smallMessageThreshold(300)
+    // TODO: document the choice of this parameter
+    , maxZeroCopyMessage(100*maxDataPerPacket)
     , clientId(clientId)
+
+    // For now, assume we can use all the priorities supported by the driver.
+    , highestAvailPriority(driver->getHighestPacketPriority())
+    , highestSchedPriority(-1)
+    , controlPacketPriority(highestAvailPriority)
+    , lowestUnschedPrio(-1)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
-    , messagesToGrant()
-    , messagesToRelease()
+    , grantRecipients()
+    , messageBuffers()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
@@ -97,8 +103,8 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , incomingRpcs()
     , outgoingResponses()
     , serverTimerList()
-    , roundTripBytes(getRoundTripBytes(locator))
-    , grantIncrement(5*maxDataPerPacket)
+    , roundTripBytes()
+    , grantIncrement(maxDataPerPacket)
     , timerInterval(0)
     , nextTimeoutCheck(0)
     , timeoutCheckDeadline(0)
@@ -110,6 +116,31 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // we don't want those delays to result in RPC timeouts.
     , timeoutIntervals(40)
     , pingIntervals(3)
+    , unschedPrioCutoffs()
+    , activeMessages()
+    , inactiveMessages()
+    , highestGrantedPrio(-1)
+    , maxGrantedMessages()
+    , lastMeasureTime(0)
+    , lastDispatchActiveCycles(0)
+    , lastTimeGrantRunDry(0)
+    , monitorInterval()
+    , monitorMillis()
+    , numPacketsReceived(0)
+    , numDataPacketsReceived(0)
+    , numControlPacketsSent(0)
+    , numDataPacketsSent(0)
+    , numTimesGrantRunDry(0)
+    , outputControlBytes(0)
+    , outputDataBytes(0)
+    , outputResentBytes(0)
+    , perfMonitorIntervals(0)
+    , processPacketCycles(0)
+    , timeoutCheckCycles(0)
+    , transmitDataCycles(0)
+    , transmitGrantCycles(0)
+    , tryToTransmitDataCacheMisses(0)
+    , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -118,18 +149,120 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
 
-    LOG(NOTICE, "BasicTransport parameters: maxDataPerPacket %u, "
-            "roundTripBytes %u, grantIncrement %u, pingIntervals %d, "
-            "timeoutIntervals %d, timerInterval %.2f ms",
-            maxDataPerPacket, roundTripBytes,
+    // Measure network throughput at 1 ms intervals.
+    monitorMillis = 1;
+    monitorInterval = Cycles::fromMicroseconds(1000*monitorMillis);
+
+    // FIXME: use context->options->getOption("configDir")?
+    std::ifstream configFile("/shome/RAMCloud/config/transport.txt");
+    Tub<ServiceLocator> params;
+    if (configFile.is_open()) {
+        std::string line;
+        try {
+            ServiceLocator localSL(locatorString);
+            while (std::getline(configFile, line)) {
+                if (line.find(localSL.getProtocol()) != string::npos) {
+                    params.construct(line);
+                    break;
+                }
+            }
+        } catch (ServiceLocator::BadServiceLocatorException&) {
+            // FIXME: sometimes driver->getLocator can be empty...
+            // leaving our locatorString as "homa+"
+        }
+    }
+    uint32_t value;
+
+    // As of 08/2017, The RTT in the m510 cluster is ~8us (5 us of data packet
+    // propagation delay plus 1 us of service time plus 1 us of grant packet
+    // propagation delay) in the unloaded case.
+    uint32_t roundTripMicros = 8;
+    if (params && params->hasOption("rttMicros")) {
+        value = params->getOption<uint32_t>("rttMicros");
+        if (value != 0) {
+            roundTripMicros = value;
+        } else {
+            LOG(ERROR, "Bad HomaTransport rttMicros option value '%u' "
+                    "(expected positive integer); ignoring option", value);
+        }
+    }
+    roundTripBytes = getRoundTripBytes(locator, roundTripMicros);
+
+    // Assign priority levels to unscheduled and scheduled traffic.
+    // By default, use the highest priority for all unscheduled traffic.
+    int numPrio = highestAvailPriority + 1;
+    lowestUnschedPrio = highestAvailPriority;
+    if (params && params->hasOption("unschedPrio")) {
+        value = params->getOption<uint32_t>("unschedPrio");
+        if ((value > 0) && (value <= numPrio)) {
+            lowestUnschedPrio = numPrio - value;
+        } else {
+            LOG(ERROR, "Bad HomaTransport unschedPrio option value '%u' "
+                    "(expected positive integer < %d); ignoring option",
+                    value, numPrio);
+        }
+    }
+    highestSchedPriority = std::max(lowestUnschedPrio-1, 0);
+
+    // By default, set the degree of over-commitment to # scheduled
+    // priorities.
+    int numSchedPrio = highestSchedPriority + 1;
+    maxGrantedMessages = downCast<uint32_t>(numSchedPrio);
+    if (params && params->hasOption("degreeOC")) {
+        value = params->getOption<uint32_t>("degreeOC");
+        // FIXME: eventually, we would like to decouple # scheduled priorities
+        // and the degree of over-commitment so that the former could be less
+        // than the latter.
+        if ((value > 0) && (value <= numSchedPrio)) {
+            maxGrantedMessages = value;
+        } else {
+            LOG(ERROR, "Bad HomaTransport degreeOC option value '%u' "
+                    "(expected positive integer < %d); ignoring option",
+                    value, numSchedPrio);
+        }
+    }
+
+    if (params && params->hasOption("dpdkPrio")) {
+        P = 8 / params->getOption<int>("dpdkPrio");
+    }
+
+    // Set unscheduled priority cutoffs.
+    string unschedMessageBrackets = "[0";
+    int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
+    if (params && params->hasOption("unschedPrioCutoffs")) {
+        std::stringstream sstream(params->getOption("unschedPrioCutoffs"));
+        std::string cutoff;
+        while (std::getline(sstream, cutoff, '.')) {
+            value = downCast<uint32_t>(stoi(cutoff));
+            unschedPrioCutoffs.push_back(value + 1);
+            unschedMessageBrackets += format(", %u] [%u", value, value + 1);
+        }
+    }
+    if (unschedPrioCutoffs.size() + 1 != numUnschedPrio) {
+        LOG(ERROR, "Bad unscheduled priority cutoffs, %lu brackets specified "
+                "(expecting %u)", unschedPrioCutoffs.size()+1, numUnschedPrio);
+    }
+    unschedPrioCutoffs.push_back(~0u);
+    unschedMessageBrackets += format(", %u]", ~0u);
+
+    LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
+            "roundTripMicros %u, roundTripBytes %u, grantIncrement %u, "
+            "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
+            "monitorInterval %.2f ms, maxGrantedMessages %u, "
+            "highestAvailPriority %d, lowestUnschedPriority %d, "
+            "highestSchedPriority %d, unscheduedMessageBrackets %s",
+            clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
-            Cycles::toSeconds(timerInterval)*1e3);
+            Cycles::toSeconds(timerInterval)*1e3,
+            Cycles::toSeconds(monitorInterval)*1e3, maxGrantedMessages,
+            highestAvailPriority, lowestUnschedPrio, highestSchedPriority,
+            unschedMessageBrackets.c_str());
 }
 
 /**
- * Destructor for BasicTransports.
+ * Destructor for HomaTransports.
  */
-BasicTransport::~BasicTransport()
+HomaTransport::~HomaTransport()
 {
     // This cleanup is mostly for the benefit of unit tests: in production,
     // this destructor is unlikely ever to get called.
@@ -155,20 +288,16 @@ BasicTransport::~BasicTransport()
     }
 
     // Release all retained payloads after reclaiming all RPC objects.
-    for (MessageAccumulator::Payloads* message : messagesToRelease) {
-        for (char* payload : *message) {
+    for (MessageAccumulator::MessageBuffer* messageBuffer : messageBuffers) {
+        for (char* payload : *messageBuffer) {
             driver->release(payload);
         }
-    }
-
-    if (driverOwner) {
-        delete driver;
     }
 }
 
 // See Transport::getServiceLocator().
 string
-BasicTransport::getServiceLocator()
+HomaTransport::getServiceLocator()
 {
     return locatorString;
 }
@@ -183,16 +312,17 @@ BasicTransport::getServiceLocator()
  *      aborted.
  */
 void
-BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
+HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
+    timeTrace("deleteClientRpc invoked");
     uint64_t sequence = clientRpc->rpcId.sequence;
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
         erase(outgoingRequests, *clientRpc);
     }
-    if (clientRpc->request.topChoice) {
-        erase(topOutgoingMessages, clientRpc->request);
+    if (clientRpc->topChoice) {
+        erase(topOutgoingMessages, *clientRpc);
     }
     clientRpcPool.destroy(clientRpc);
     timeTrace("deleted client RPC, clientId %u, sequence %u, %u outgoing RPCs",
@@ -209,11 +339,13 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
  *      aborted.
  */
 void
-BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
+HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
+    timeTrace("deleteServerRpc invoked");
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
+    // TODO: Profile how long it takes; might have to optimize it
     incomingRpcs.erase(serverRpc->rpcId);
     if (serverRpc->sendingResponse) {
         erase(outgoingResponses, *serverRpc);
@@ -221,8 +353,8 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
     if (serverRpc->sendingResponse || !serverRpc->requestComplete) {
         erase(serverTimerList, *serverRpc);
     }
-    if (serverRpc->response.topChoice) {
-        erase(topOutgoingMessages, serverRpc->response);
+    if (serverRpc->topChoice) {
+        erase(topOutgoingMessages, *serverRpc);
     }
     serverRpcPool.destroy(serverRpc);
     timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
@@ -239,20 +371,17 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
  *      If NULL, or if any of the options  are missing, then defaults
  *      are supplied.  Note: as of 8/2016 these options don't work very well
  *      because they are only visible to servers, not clients.
+ * \param roundTripMicros
+ *      Round-trip time between two machines, in microseconds.
  */
 uint32_t
-BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
+HomaTransport::getRoundTripBytes(const ServiceLocator* locator,
+        uint32_t roundTripMicros)
 {
     uint32_t gBitsPerSec = 0;
-    // To be precise, the RTT includes the one-way delay of a data packet,
-    // the server processing time and the one-way delay of a grant packet.
-    // As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of one-way
-    // delay of a full-size data packet plus 1 us of server processing time
-    // plus 2 us of grant packet one-way delay). Note: it's hacky to hardwire
-    // this number in the code; a proper implementation would need to measure
-    // and set the RTT dynamically.
-    uint32_t roundTripMicros = 8;
 
+    // FIXME: I don't understand how options like "rttMicros" can be
+    // implemented this way since `locator` is always NULL on client-side.
     if (locator != NULL) {
         if (locator->hasOption("gbs")) {
             char* end;
@@ -261,21 +390,9 @@ BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
             if ((*end == 0) && (value != 0)) {
                 gBitsPerSec = value;
             } else {
-                LOG(ERROR, "Bad BasicTransport gbs option value '%s' "
+                LOG(ERROR, "Bad HomaTransport gbs option value '%s' "
                         "(expected positive integer); ignoring option",
                         locator->getOption("gbs").c_str());
-            }
-        }
-        if (locator->hasOption("rttMicros")) {
-            char* end;
-            uint32_t value = downCast<uint32_t>(strtoul(
-                    locator->getOption("rttMicros").c_str(), &end, 10));
-            if ((*end == 0) && (value != 0)) {
-                roundTripMicros = value;
-            } else {
-                LOG(ERROR, "Bad BasicTransport rttMicros option value '%s' "
-                        "(expected positive integer); ignoring option",
-                        locator->getOption("rttMicros").c_str());
             }
         }
     }
@@ -294,6 +411,26 @@ BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
 }
 
 /**
+ * Decides which packet priority should be used to transmit the unscheduled
+ * portion of a message.
+ *
+ * \param messageSize
+ *      The size of the message to be transmitted.
+ * \return
+ *      The packet priority to use.
+ */
+uint8_t
+HomaTransport::getUnschedTrafficPrio(uint32_t messageSize) {
+    int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
+    for (int i = 0; i < numUnschedPrio - 1; i++) {
+        if (messageSize < unschedPrioCutoffs[i]) {
+            return downCast<uint8_t>(highestAvailPriority - i);
+        }
+    }
+    return downCast<uint8_t>(lowestUnschedPrio);
+}
+
+/**
  * Return a printable symbol for the opcode field from a packet.
  * \param opcode
  *     Opcode field from a packet.
@@ -302,22 +439,24 @@ BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
  *
  */
 string
-BasicTransport::opcodeSymbol(uint8_t opcode) {
+HomaTransport::opcodeSymbol(uint8_t opcode) {
     switch (opcode) {
-        case BasicTransport::PacketOpcode::ALL_DATA:
+        case HomaTransport::PacketOpcode::ALL_DATA:
             return "ALL_DATA";
-        case BasicTransport::PacketOpcode::DATA:
+        case HomaTransport::PacketOpcode::DATA:
             return "DATA";
-        case BasicTransport::PacketOpcode::GRANT:
+        case HomaTransport::PacketOpcode::GRANT:
             return "GRANT";
-        case BasicTransport::PacketOpcode::LOG_TIME_TRACE:
+        case HomaTransport::PacketOpcode::LOG_TIME_TRACE:
             return "LOG_TIME_TRACE";
-        case BasicTransport::PacketOpcode::RESEND:
+        case HomaTransport::PacketOpcode::RESEND:
             return "RESEND";
-        case BasicTransport::PacketOpcode::ACK:
+        case HomaTransport::PacketOpcode::ACK:
             return "ACK";
-        case BasicTransport::PacketOpcode::ABORT:
+        case HomaTransport::PacketOpcode::ABORT:
             return "ABORT";
+        case HomaTransport::PacketOpcode::PING:
+            return "PING";
     }
 
     return format("%d", opcode);
@@ -342,7 +481,9 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
  *      the message length, then all of the remaining bytes in message,
  *      will be transmitted.
  * \param unscheduledBytes
- *      Unscheduled bytes that will be sent unilaterally in this message.
+ *      Unscheduled bytes sent unilaterally in this message.
+ * \param priority
+ *      Priority used to send the packets.
  * \param flags
  *      Extra flags to set in packet headers, such as FROM_CLIENT or
  *      RETRANSMISSION. Must at least specify either FROM_CLIENT or
@@ -356,9 +497,10 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
  *      some situations).
  */
 uint32_t
-BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
+HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         Buffer* message, uint32_t offset, uint32_t maxBytes,
-        uint32_t unscheduledBytes, uint8_t flags, bool partialOK)
+        uint32_t unscheduledBytes, uint8_t priority, uint8_t flags,
+        bool partialOK)
 {
     uint32_t messageSize = message->size();
 
@@ -375,45 +517,63 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             }
             bytesThisPacket = maxBytes - bytesSent;
         }
-        QueueEstimator::TransmitQueueState txQueueState;
         if (bytesThisPacket == messageSize) {
             // Entire message fits in a single packet.
             AllDataHeader header(rpcId, flags,
                     downCast<uint16_t>(messageSize));
             Buffer::Iterator iter(message, 0, messageSize);
             const char* fmt = (flags & FROM_CLIENT) ?
-                    "client sending ALL_DATA, clientId %u, sequence %u" :
-                    "server sending ALL_DATA, clientId %u, sequence %u";
-            timeTrace(fmt, rpcId.clientId, rpcId.sequence);
-            driver->sendPacket(address, &header, &iter, 0, &txQueueState);
+                    "client sending ALL_DATA, clientId %u, sequence %u, "
+                    "priority %u" :
+                    "server sending ALL_DATA, clientId %u, sequence %u, "
+                    "priority %u";
+            timeTrace(fmt, rpcId.clientId, rpcId.sequence, priority);
+            SEND_PACKET(driver, address, &header, &iter, priority);
+//            driver->sendPacket(address, &header, &iter, priority);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
                     unscheduledBytes, flags);
             Buffer::Iterator iter(message, curOffset, bytesThisPacket);
             const char* fmt = (flags & FROM_CLIENT) ?
                     "client sending DATA, clientId %u, sequence %u, "
-                    "offset %u" :
+                    "offset %u, priority %u" :
                     "server sending DATA, clientId %u, sequence %u, "
-                    "offset %u";
-            timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset);
-            driver->sendPacket(address, &header, &iter, 0, &txQueueState);
+                    "offset %u, priority %u";
+            timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset,
+                    priority);
+            SEND_PACKET(driver, address, &header, &iter, priority);
+//            driver->sendPacket(address, &header, &iter, priority);
         }
-        if (txQueueState.outstandingBytes > 0) {
-            timeTrace("sent data, %u bytes queued ahead",
-                    txQueueState.outstandingBytes);
+        uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
+        if (bytesQueuedAhead > 0) {
+            timeTrace(driver->getLastTransmitTime(),
+                    "sent data, clientId %u, sequence %u, offset %u, "
+                    "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
+                    curOffset, bytesQueuedAhead);
         } else {
-            timeTrace("sent data, tx queue idle time %u cyc",
-                    txQueueState.idleTime);
+            uint64_t idleInterval = driver->getTxQueueIdleInterval();
+            unusedBandwidth += idleInterval;
+            timeTrace(driver->getLastTransmitTime(),
+                    "sent data, clientId %u, sequence %u, offset %u, "
+                    "0 bytes queued ahead, idle time %u cyc",
+                    rpcId.clientId, rpcId.sequence, curOffset, idleInterval);
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
+
+        // Update performance monitor metrics.
+        numDataPacketsSent++;
+        outputDataBytes += bytesThisPacket;
+        if (flags & RETRANSMISSION) {
+            outputResentBytes += bytesThisPacket;
+        }
     }
 
     return bytesSent;
 }
 
 /**
- * Send a control packet.
+ * Send out a single control packet.
  *
  * \param recipient
  *      Where to send the packet.
@@ -422,18 +582,39 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
  */
 template<typename T>
 void
-BasicTransport::sendControlPacket(const Driver::Address* recipient,
+HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
-    QueueEstimator::TransmitQueueState txQueueState;
-    driver->sendPacket(recipient, packet, NULL, 0, &txQueueState);
-    timeTrace("sent control packet, opcode %u, %u bytes queued ahead, "
-            "tx queue idle time %u cyc", packet->common.opcode,
-            txQueueState.outstandingBytes, txQueueState.idleTime);
+//    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+    SEND_PACKET(driver, recipient, packet, NULL, controlPacketPriority);
+    uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
+    uint64_t idleInterval = driver->getTxQueueIdleInterval();
+    if (std::is_same<T, GrantHeader>::value) {
+        const GrantHeader* grant = reinterpret_cast<const GrantHeader*>(packet);
+        const RpcId* rpcId = &grant->common.rpcId;
+        if (bytesQueuedAhead > 0) {
+            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
+                    "%u bytes queued ahead, idle time 0 cyc",
+                    rpcId->clientId, rpcId->sequence, grant->offset,
+                    bytesQueuedAhead);
+        } else {
+            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
+                    "0 bytes queued ahead, idle time %u cyc",
+                    rpcId->clientId, rpcId->sequence, grant->offset,
+                    idleInterval);
+        }
+    } else {
+        timeTrace("sent control packet, %u bytes queued ahead, "
+                "idle time %u cyc", bytesQueuedAhead, idleInterval);
+    }
+    unusedBandwidth += idleInterval;
+    outputControlBytes +=
+            static_cast<uint32_t>(sizeof(T)) + driver->getPacketOverhead();
+    numControlPacketsSent++;
 }
 
 /**
- * Given a pointer to a BasicTransport packet, return a human-readable
+ * Given a pointer to a HomaTransport packet, return a human-readable
  * string describing the information in its header.
  * 
  * \param packet
@@ -443,17 +624,17 @@ BasicTransport::sendControlPacket(const Driver::Address* recipient,
  *      Size of the header, in bytes.
  */
 string
-BasicTransport::headerToString(const void* packet, uint32_t packetLength)
+HomaTransport::headerToString(const void* packet, uint32_t packetLength)
 {
     string result;
-    const BasicTransport::CommonHeader* common =
-            static_cast<const BasicTransport::CommonHeader*>(packet);
-    uint32_t headerLength = sizeof32(BasicTransport::CommonHeader);
+    const HomaTransport::CommonHeader* common =
+            static_cast<const HomaTransport::CommonHeader*>(packet);
+    uint32_t headerLength = sizeof32(HomaTransport::CommonHeader);
     if (packetLength < headerLength) {
         goto packetTooShort;
     }
-    result += BasicTransport::opcodeSymbol(common->opcode);
-    if (common->flags & BasicTransport::FROM_CLIENT) {
+    result += HomaTransport::opcodeSymbol(common->opcode);
+    if (common->flags & HomaTransport::FROM_CLIENT) {
         result += " FROM_CLIENT";
     } else {
         result += " FROM_SERVER";
@@ -461,64 +642,74 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
     result += format(", rpcId %lu.%lu",
             common->rpcId.clientId, common->rpcId.sequence);
     switch (common->opcode) {
-        case BasicTransport::PacketOpcode::ALL_DATA:
-            headerLength = sizeof32(BasicTransport::AllDataHeader);
+        case HomaTransport::PacketOpcode::ALL_DATA:
+            headerLength = sizeof32(HomaTransport::AllDataHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
             break;
-        case BasicTransport::PacketOpcode::DATA: {
-            headerLength = sizeof32(BasicTransport::DataHeader);
+        case HomaTransport::PacketOpcode::DATA: {
+            headerLength = sizeof32(HomaTransport::DataHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
-            const BasicTransport::DataHeader* data =
-                    static_cast<const BasicTransport::DataHeader*>(packet);
+            const HomaTransport::DataHeader* data =
+                    static_cast<const HomaTransport::DataHeader*>(packet);
             result += format(", totalLength %u, offset %u%s",
                     data->totalLength, data->offset,
-                    common->flags & BasicTransport::RETRANSMISSION
+                    common->flags & HomaTransport::RETRANSMISSION
                             ? ", RETRANSMISSION" : "");
             break;
         }
-        case BasicTransport::PacketOpcode::GRANT: {
-            headerLength = sizeof32(BasicTransport::GrantHeader);
+        case HomaTransport::PacketOpcode::GRANT: {
+            headerLength = sizeof32(HomaTransport::GrantHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
-            const BasicTransport::GrantHeader* grant =
-                    static_cast<const BasicTransport::GrantHeader*>(packet);
+            const HomaTransport::GrantHeader* grant =
+                    static_cast<const HomaTransport::GrantHeader*>(packet);
             result += format(", offset %u", grant->offset);
+            // TODO: change to the following and fix unit tests
+//            result += format(", offset %u, priority %u", grant->offset,
+//                    grant->priority);
             break;
         }
-        case BasicTransport::PacketOpcode::LOG_TIME_TRACE:
-            headerLength = sizeof32(BasicTransport::LogTimeTraceHeader);
+        case HomaTransport::PacketOpcode::LOG_TIME_TRACE:
+            headerLength = sizeof32(HomaTransport::LogTimeTraceHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
             break;
-        case BasicTransport::PacketOpcode::RESEND: {
-            headerLength = sizeof32(BasicTransport::ResendHeader);
+        case HomaTransport::PacketOpcode::RESEND: {
+            headerLength = sizeof32(HomaTransport::ResendHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
-            const BasicTransport::ResendHeader* resend =
-                    static_cast<const BasicTransport::ResendHeader*>(
+            const HomaTransport::ResendHeader* resend =
+                    static_cast<const HomaTransport::ResendHeader*>(
                     packet);
             result += format(", offset %u, length %u%s",
                     resend->offset, resend->length,
-                    common->flags & BasicTransport::RESTART
+                    common->flags & HomaTransport::RESTART
                             ? ", RESTART" : "");
             break;
         }
-        case BasicTransport::PacketOpcode::ACK: {
-            headerLength = sizeof32(BasicTransport::AckHeader);
+        case HomaTransport::PacketOpcode::ACK: {
+            headerLength = sizeof32(HomaTransport::AckHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
             break;
         }
-        case BasicTransport::PacketOpcode::ABORT: {
-            headerLength = sizeof32(BasicTransport::AbortHeader);
+        case HomaTransport::PacketOpcode::ABORT: {
+            headerLength = sizeof32(HomaTransport::AbortHeader);
+            if (packetLength < headerLength) {
+                goto packetTooShort;
+            }
+            break;
+        }
+        case HomaTransport::PacketOpcode::PING: {
+            headerLength = sizeof32(HomaTransport::PingHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -543,7 +734,7 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
  *      Total number of bytes transmitted.
  */
 uint32_t
-BasicTransport::tryToTransmitData()
+HomaTransport::tryToTransmitData()
 {
     uint32_t totalBytesSent = 0;
 
@@ -553,25 +744,31 @@ BasicTransport::tryToTransmitData()
     // packets with control packets. The code here only handles data packets;
     // control packets (and retransmitted data) are always passed to the
     // driver immediately.
-    int transmitQueueSpace =
-            driver->getTransmitQueueSpace(context->dispatch->currentTime);
+
+    uint32_t transmitQueueSpace = static_cast<uint32_t>(
+            driver->getTransmitQueueSpace(context->dispatch->currentTime));
+    if (static_cast<int>(transmitQueueSpace) < 0) {
+        return 0;
+    }
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
-    while (transmitQueueSpace > 0) {
+    while (true) {
+        uint64_t numOutgoingMessages =
+                outgoingRequests.size() + outgoingResponses.size();
+        if (numOutgoingMessages == 0) {
+            break;
+        }
+
         // Find an outgoing request or response that is ready to transmit.
         // The policy here is "shortest remaining processing time" (SRPT).
-        // That is, choosing the message with the fewest bytes remaining
-        // to be transmitted.
 
         // Note: this code used to use std::maps instead of lists; the maps
         // were sorted by message length to avoid the cost of scanning
         // all RPCs. However, the maps had a very high insertion cost
         // (~50ns) even when empty, so it is faster overall to use lists.
-        // To optimize for the case where lists become too long, we use
-        // #topOutgoingMessages to cache a fixed number of messages with
-        // SRPT so that we only need to scan a small number of messages
-        // in the common case.
+        // If these lists were to become very long, then this decision made
+        // need to be revisited.
         uint32_t minBytesLeft = ~0u;
         OutgoingMessage* message = NULL;
         for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
@@ -588,70 +785,91 @@ BasicTransport::tryToTransmitData()
             }
         }
 
-        // Couldn't find a message to transmit from our top outgoing message
-        // set; take the slow path
-        if (expect_false((NULL == message) && transmitDataSlowPath)) {
+        if (expect_false((NULL == message) && transmitDataSlowPath
+                && (numOutgoingMessages > topOutgoingMessages.size()))) {
+            tryToTransmitDataCacheMisses++;
             timeTrace("slow path taken, iterating over %u outgoing messages",
                     outgoingRequests.size() + outgoingResponses.size());
 
+            uint32_t outsideMinBytesLeft = ~0u;
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                         it != outgoingRequests.end(); it++) {
-                OutgoingMessage* request = &it->request;
-                if (!request->topChoice) {
+                ClientRpc* rpc = &(*it);
+                if (!rpc->topChoice) {
                     uint32_t bytesLeft =
-                            request->buffer->size() - request->transmitOffset;
-                    if (request->transmitLimit <= request->transmitOffset) {
+                            rpc->request->size() - rpc->transmitOffset;
+                    outsideMinBytesLeft =
+                            std::min(bytesLeft, outsideMinBytesLeft);
+                    if (rpc->transmitLimit <= rpc->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
                     }
                     if (bytesLeft < minBytesLeft) {
                         minBytesLeft = bytesLeft;
-                        message = request;
+                        message = rpc;
                     }
                 }
             }
 
             for (OutgoingResponseList::iterator it = outgoingResponses.begin();
                         it != outgoingResponses.end(); it++) {
-                OutgoingMessage* response = &it->response;
-                if (!response->topChoice) {
-                    uint32_t bytesLeft = response->buffer->size() -
-                            response->transmitOffset;
-                    if (response->transmitLimit <= response->transmitOffset) {
+                ServerRpc* rpc = &(*it);
+                if (!rpc->topChoice) {
+                    uint32_t bytesLeft = rpc->replyPayload.size() -
+                            rpc->transmitOffset;
+                    outsideMinBytesLeft =
+                            std::min(bytesLeft, outsideMinBytesLeft);
+                    if (rpc->transmitLimit <= rpc->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
                     }
                     if (bytesLeft < minBytesLeft) {
                         minBytesLeft = bytesLeft;
-                        message = response;
+                        message = rpc;
                     }
                 }
             }
 
             if (message == NULL) {
-                // Can't find one outgoing message that is ready to transmit.
                 transmitDataSlowPath = false;
+            } else if (minBytesLeft == outsideMinBytesLeft) {
+                // TODO: rephrase it
+                // Expand the top outgoing message set only if the message
+                // has the fewest bytes left among outgoing messages not in
+                // this set.
+                message->topChoice = true;
+                topOutgoingMessages.push_back(*message);
+            }
+        }
+
+        ClientRpc* clientRpc = NULL;
+        ServerRpc* serverRpc = NULL;
+        if (message != NULL) {
+            if (message->isRequest) {
+                clientRpc = static_cast<ClientRpc*>(message);
+            } else {
+                serverRpc = static_cast<ServerRpc*>(message);
             }
         }
 
         if (message != NULL) {
             // Transmit one or more request DATA packets from the message,
             // if appropriate.
-            ClientRpc* clientRpc = message->clientRpc;
-            ServerRpc* serverRpc = message->serverRpc;
             uint32_t maxBytes = std::min(message->transmitLimit,
                     message->buffer->size()) - message->transmitOffset;
-            maxBytes = std::min(maxBytes,
-                    static_cast<uint32_t>(transmitQueueSpace));
+            if (maxBytes > transmitQueueSpace) {
+                maxBytes = transmitQueueSpace;
+            }
 
             RpcId rpcId = clientRpc ? clientRpc->rpcId : serverRpc->rpcId;
             uint8_t whoFrom = clientRpc ? FROM_CLIENT : FROM_SERVER;
             uint32_t bytesSent = sendBytes(message->recipient, rpcId,
                     message->buffer, message->transmitOffset, maxBytes,
-                    message->unscheduledBytes, whoFrom);
+                    message->unscheduledBytes, message->transmitPriority,
+                    whoFrom);
             if (bytesSent == 0) {
-                // We can't transmit any more data because the remaining queue
-                // space is too small.
+                // We can't transmit any more data because the queue space
+                // is too small.
                 break;
             }
 
@@ -660,7 +878,6 @@ BasicTransport::tryToTransmitData()
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             if (message->transmitOffset >= message->buffer->size()) {
-                // We have transmitted the last byte of the message.
                 if (clientRpc) {
                     erase(outgoingRequests, *clientRpc);
                     clientRpc->transmitPending = false;
@@ -678,16 +895,35 @@ BasicTransport::tryToTransmitData()
                     deleteServerRpc(serverRpc);
                 }
             } else if (!message->topChoice) {
-                // This message is taken from the slow path; see if we should
-                // include it to topOutgoingMessages so that we may avoid the
-                // slow path next time.
-                maintainTopOutgoingMessages(message);
-                if (!message->topChoice) {
-                    augmentTopOutgoingMessageSet();
-                }
+                updateTopOutgoingMessageSet(message, false);
             }
         } else {
             // There are no messages with data that can be transmitted.
+#if TIME_TRACE
+            uint64_t currentTime = context->dispatch->currentTime;
+            // TODO: only correct on m510
+            const uint32_t cyclesPerPacket = 2500;
+            if ((totalBytesSent == 0)
+                    && (lastTimeGrantRunDry + cyclesPerPacket < currentTime)) {
+                uint64_t now = Cycles::rdtsc();
+                // transmitQueueSpace is computed w.r.t. a stale timestamp.
+                // It's too imprecise for the purpose of analyzing bandwidth
+                // wasted in waiting for grants.
+                bool transmitQueueEmpty = (driver->getTransmitQueueSpace(now)
+                        == (int)driver->getMaxTransmitQueueSize());
+                if (transmitQueueEmpty) {
+                    std::set<const Driver::Address*> recipients;
+                    for (OutgoingMessage& m : topOutgoingMessages) {
+                        recipients.insert(m.recipient);
+                    }
+                    timeTrace(now, "not enough GRANTs to transmit data, "
+                            "%u top outgoing messages to %u recipients",
+                            topOutgoingMessages.size(), recipients.size());
+                    numTimesGrantRunDry++;
+                    lastTimeGrantRunDry = currentTime;
+                }
+            }
+#endif
             break;
         }
     }
@@ -702,7 +938,7 @@ BasicTransport::tryToTransmitData()
  *      The service locator couldn't be parsed (a log message will
  *      have been generated already).
  */
-BasicTransport::Session::Session(BasicTransport* t,
+HomaTransport::Session::Session(HomaTransport* t,
         const ServiceLocator* locator, uint32_t timeoutMs)
     : Transport::Session(locator->getOriginalString())
     , t(t)
@@ -715,14 +951,14 @@ BasicTransport::Session::Session(BasicTransport* t,
     catch (const Exception& e) {
         LOG(NOTICE, "%s", e.message.c_str());
         throw TransportException(HERE,
-                "BasicTransport couldn't parse service locator");
+                "HomaTransport couldn't parse service locator");
     }
 }
 
 /**
  * Destructor for client sessions.
  */
-BasicTransport::Session::~Session()
+HomaTransport::Session::~Session()
 {
     abort();
     delete serverAddress;
@@ -730,7 +966,7 @@ BasicTransport::Session::~Session()
 
 // See Transport::Session::abort for docs.
 void
-BasicTransport::Session::abort()
+HomaTransport::Session::abort()
 {
     aborted = true;
     for (ClientRpcMap::iterator it = t->outgoingRpcs.begin();
@@ -745,7 +981,7 @@ BasicTransport::Session::abort()
 
 // See Transport::Session::cancelRequest for docs.
 void
-BasicTransport::Session::cancelRequest(RpcNotifier* notifier)
+HomaTransport::Session::cancelRequest(RpcNotifier* notifier)
 {
     for (ClientRpcMap::iterator it = t->outgoingRpcs.begin();
             it != t->outgoingRpcs.end(); it++) {
@@ -764,7 +1000,7 @@ BasicTransport::Session::cancelRequest(RpcNotifier* notifier)
 
 // See Transport::Session::getRpcInfo for docs.
 string
-BasicTransport::Session::getRpcInfo()
+HomaTransport::Session::getRpcInfo()
 {
     string result;
     for (ClientRpcMap::iterator it = t->outgoingRpcs.begin();
@@ -776,7 +1012,7 @@ BasicTransport::Session::getRpcInfo()
         if (result.size() != 0) {
             result += ", ";
         }
-        result += WireFormat::opcodeSymbol(clientRpc->request.buffer);
+        result += WireFormat::opcodeSymbol(clientRpc->request);
     }
     if (result.empty())
         result = "no active RPCs";
@@ -786,101 +1022,56 @@ BasicTransport::Session::getRpcInfo()
 }
 
 /**
- * Attempt to expand the size of the top outgoing message set by one. This
- * method will scan all messages outside the top outgoing message set and
- * select the one with the smallest remaining size to include. This method
- * is invoked by #tryToTransmitData whenever it has to look outside the top
- * outgoing message set to pick the next message to transmit.
- */
-void
-BasicTransport::augmentTopOutgoingMessageSet()
-{
-    // As of 09/2017, the maximum size of the top outgoing message set is
-    // limited to 4. During evaluation, we found that this value is large
-    // enough to ensure that the sender doesn't have to look outside this
-    // set very often when picking the next message to transmit.
-#define MAX_TOP_MESSAGES 4
-    if (topOutgoingMessages.size() == MAX_TOP_MESSAGES) {
-        return;
-    }
-
-    uint32_t minBytesLeft = ~0u;
-    OutgoingMessage* message = NULL;
-    for (OutgoingRequestList::iterator it = outgoingRequests.begin();
-                it != outgoingRequests.end(); it++) {
-        OutgoingMessage* request = &it->request;
-        if (!request->topChoice) {
-            uint32_t bytesLeft =
-                    request->buffer->size() - request->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                message = request;
-            }
-        }
-    }
-
-    for (OutgoingResponseList::iterator it = outgoingResponses.begin();
-                it != outgoingResponses.end(); it++) {
-        OutgoingMessage* response = &it->response;
-        if (!response->topChoice) {
-            uint32_t bytesLeft = response->buffer->size() -
-                    response->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                message = response;
-            }
-        }
-    }
-
-    message->topChoice = true;
-    topOutgoingMessages.push_back(*message);
-}
-
-/**
- * Ensure that messages in our top outgoing message set still have the
- * smallest remaining sizes in all outgoing messages. When a new outgoing
- * message arrives or we just transmitted a few more bytes of an existing
- * message outside this set, this method is invoked to check if this message
- * should replace an existing top outgoing message.
+ * Implements the logic of updating the top outgoing message set, if
+ * appropriate, when a new message arrives or we transmit a few more bytes
+ * of an existing message outside this set.
  *
  * \param candidate
- *      A message that might be added to the top outgoing message set.
+ *      A message that might be included in the top outgoing message set.
+ * \param newMessage
+ *      True means this message was just included in the outgoing
+ *      request/response set; false means the message was already in the
+ *      system.
  */
 void
-BasicTransport::maintainTopOutgoingMessages(OutgoingMessage* candidate)
+HomaTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
+        bool newMessage)
 {
     assert(!candidate->topChoice);
-    uint32_t maxBytesLeft =
-            candidate->buffer->size() - candidate->transmitOffset;
-    uint32_t bytesLeft;
-    OutgoingMessage* messageToReplace = NULL;
-    for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
-            it != topOutgoingMessages.end(); it++) {
-        OutgoingMessage* m = &(*it);
-        bytesLeft = m->buffer->size() - m->transmitOffset;
-        if (maxBytesLeft < bytesLeft) {
-            maxBytesLeft = bytesLeft;
-            messageToReplace = m;
-        }
-    }
-    OutgoingMessage* loser = candidate;
-    if (messageToReplace != NULL) {
-        loser = messageToReplace;
-        messageToReplace->topChoice = false;
-        erase(topOutgoingMessages, *messageToReplace);
+#define LOW_WATERMARK 4
+    if (topOutgoingMessages.size() < LOW_WATERMARK) {
         candidate->topChoice = true;
         topOutgoingMessages.push_back(*candidate);
-    }
-    if (loser->transmitOffset < loser->transmitLimit) {
-        // The loser, which ends up outside the top outgoing message set,
-        // has bytes ready to be transmitted.
-        transmitDataSlowPath = true;
+    } else {
+        uint32_t maxBytesLeft =
+                candidate->buffer->size() - candidate->transmitOffset;
+        uint32_t bytesLeft;
+        OutgoingMessage* messageToReplace = NULL;
+        for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
+                it != topOutgoingMessages.end(); it++) {
+            OutgoingMessage* m = &(*it);
+            bytesLeft = m->buffer->size() - m->transmitOffset;
+            if (maxBytesLeft < bytesLeft) {
+                maxBytesLeft = bytesLeft;
+                messageToReplace = m;
+            }
+        }
+        if (messageToReplace != NULL) {
+            messageToReplace->topChoice = false;
+            erase(topOutgoingMessages, *messageToReplace);
+            transmitDataSlowPath = true;
+            candidate->topChoice = true;
+            topOutgoingMessages.push_back(*candidate);
+        }
+        if (newMessage) {
+            transmitDataSlowPath = true;
+        }
     }
 }
 
 // See Transport::Session::sendRequest for docs.
 void
-BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
+HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier)
 {
     uint32_t length = request->size();
@@ -891,34 +1082,37 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         notifier->failed();
         return;
     }
-    if (request->size() > MAX_RPC_LEN) {
-        throw TransportException(HERE,
-             format("client request exceeds maximum rpc size "
-                    "(attempted %u bytes, maximum %u bytes)",
-                    request->size(), MAX_RPC_LEN));
-    }
-
     response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
+    // TODO: set `transmitPriority` in ctor once OutgoingMessage is not implemented as a base class
+    clientRpc->transmitPriority = t->getUnschedTrafficPrio(length);
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
     uint32_t bytesSent;
-    if (length < t->smallMessageThreshold) {
+    // TODO: how to justify this threshold?
+#define SMALL_MESSAGE_SIZE 300
+    if (length < SMALL_MESSAGE_SIZE) {
+        // Pass small messages directly to NIC: it's not worth going through
+        // all the hassles of tryToTransmitData and sendBytes
         RpcId rpcId = clientRpc->rpcId;
-        assert(length <= t->maxDataPerPacket);
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
         Buffer::Iterator iter(request, 0, length);
         timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
-                "priority %u", rpcId.clientId, rpcId.sequence, 0);
-        t->driver->sendPacket(serverAddress, &header, &iter, 0);
-        clientRpc->request.transmitOffset = length;
+                "priority %u", rpcId.clientId, rpcId.sequence,
+                clientRpc->transmitPriority);
+        SEND_PACKET(t->driver, serverAddress, &header, &iter,
+                clientRpc->transmitPriority);
+//        t->driver->sendPacket(serverAddress, &header, &iter,
+//                clientRpc->transmitPriority);
+        clientRpc->transmitOffset = length;
+//        clientRpc->lastTransmitTime = t->driver->getLastTransmitTime();
         clientRpc->transmitPending = false;
         bytesSent = length;
     } else {
         t->outgoingRequests.push_back(*clientRpc);
-        t->maintainTopOutgoingMessages(&clientRpc->request);
+        t->updateTopOutgoingMessageSet(clientRpc, true);
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
@@ -935,7 +1129,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
  *      Information about the new packet.
  */
 void
-BasicTransport::handlePacket(Driver::Received* received)
+HomaTransport::handlePacket(Driver::Received* received)
 {
     // The following method retrieves a header from a packet
     CommonHeader* common = received->getOffset<CommonHeader>(0);
@@ -943,6 +1137,9 @@ BasicTransport::handlePacket(Driver::Received* received)
         RAMCLOUD_CLOG(WARNING, "packet from %s too short (%u bytes)",
                 received->sender->toString().c_str(), received->len);
         return;
+    }
+    if (common->opcode == ALL_DATA || common->opcode == DATA) {
+        numDataPacketsReceived++;
     }
 
     if (!(common->flags & FROM_CLIENT)) {
@@ -961,10 +1158,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "server %s for (unknown) sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                TimeTrace::record("client received LOG_TIME_TRACE for "
-                        "clientId %u, sequence %u",
-                        (uint32_t)common->rpcId.clientId,
-                        (uint32_t)common->rpcId.sequence);
+                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
+                        "sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
             }
             TEST_LOG("Discarding unknown packet, sequence %lu",
@@ -1014,7 +1210,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
-                if (header->totalLength > messageZeroCopyThreshold) {
+                if (header->totalLength > maxZeroCopyMessage) {
                     // For relatively long messages, it's possible we need to
                     // retain their packets for quite some time; give the
                     // driver a chance to copy out the contents of the
@@ -1031,11 +1227,12 @@ BasicTransport::handlePacket(Driver::Received* received)
                                 uint32_t(header->unscheduledBytes),
                                 clientRpc->session->serverAddress,
                                 uint32_t(header->totalLength),
-                                uint8_t(FROM_SERVER));
+                                static_cast<uint8_t>(FROM_SERVER));
                     }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
+                dataPacketArrive(clientRpc->scheduledMessage.get());
                 if (clientRpc->response->size() >= header->totalLength) {
                     // Response complete.
                     if (clientRpc->response->size() > header->totalLength) {
@@ -1047,23 +1244,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                     }
                     clientRpc->notifier->completed();
                     deleteClientRpc(clientRpc);
-                } else {
-                    // See if we need to output a GRANT.
-                    ScheduledMessage* schedMessage =
-                            clientRpc->scheduledMessage.get();
-                    if ((schedMessage != NULL) &&
-                            (schedMessage->grantOffset <
-                            (clientRpc->response->size() + roundTripBytes)) &&
-                            (schedMessage->grantOffset < header->totalLength)) {
-                        schedMessage->grantOffset = clientRpc->response->size()
-                                + roundTripBytes + grantIncrement;
-                        if (std::find(messagesToGrant.begin(),
-                                messagesToGrant.end(), schedMessage) ==
-                                messagesToGrant.end()) {
-                            messagesToGrant.push_back(schedMessage);
-                        }
-                    }
                 }
+
                 if (retainPacket) {
                     uint32_t dummy;
                     received->steal(&dummy);
@@ -1081,12 +1263,12 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset);
-                OutgoingMessage* request = &clientRpc->request;
-                if (header->offset > request->transmitLimit) {
-                    request->transmitLimit = header->offset;
-                    if (!request->topChoice) {
-                        transmitDataSlowPath = true;
-                    }
+                if (header->offset > clientRpc->transmitLimit) {
+                    clientRpc->transmitLimit = header->offset;
+                    clientRpc->transmitPriority = header->priority;
+                }
+                if (!clientRpc->topChoice) {
+                    transmitDataSlowPath = true;
                 }
                 return;
             }
@@ -1097,10 +1279,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "server %s for clientId %lu, sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.clientId, common->rpcId.sequence);
-                TimeTrace::record("client received LOG_TIME_TRACE for "
-                        "clientId %u, sequence %u",
-                        (uint32_t)common->rpcId.clientId,
-                        (uint32_t)common->rpcId.sequence);
+                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
+                        "sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1115,31 +1296,30 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, header->length);
-                OutgoingMessage* request = &clientRpc->request;
                 if (header->common.flags & RESTART) {
                     clientRpc->response->reset();
-                    request->transmitOffset = 0;
-                    request->transmitLimit = header->length;
+                    clientRpc->transmitOffset = 0;
+                    clientRpc->transmitLimit = header->length;
                     clientRpc->accumulator.destroy();
                     clientRpc->scheduledMessage.destroy();
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
-                        maintainTopOutgoingMessages(request);
-                    } else if (request->topChoice) {
-                        request->topChoice = false;
-                        erase(topOutgoingMessages, clientRpc->request);
-                        maintainTopOutgoingMessages(request);
+                        updateTopOutgoingMessageSet(clientRpc, true);
+                    } else if (clientRpc->topChoice) {
+                        clientRpc->topChoice = false;
+                        erase(topOutgoingMessages, *clientRpc);
+                        updateTopOutgoingMessageSet(clientRpc, false);
                     }
                     return;
                 }
                 uint32_t resendEnd = header->offset + header->length;
-                if (resendEnd > request->transmitLimit) {
+                if (resendEnd > clientRpc->transmitLimit) {
                     // Needed in case a GRANT packet was lost.
-                    request->transmitLimit = resendEnd;
+                    clientRpc->transmitLimit = resendEnd;
                 }
-                if ((header->offset >= request->transmitOffset)
-                        || ((Cycles::rdtsc() - request->lastTransmitTime)
+                if ((header->offset >= clientRpc->transmitOffset)
+                        || ((Cycles::rdtsc() - clientRpc->lastTransmitTime)
                         < timerInterval)) {
                     // One of two things has happened: either (a) we haven't
                     // yet sent the requested bytes for the first time (there
@@ -1154,22 +1334,23 @@ BasicTransport::handlePacket(Driver::Received* received)
 
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
-                        - request->lastTransmitTime)*1e06;
+                        - clientRpc->lastTransmitTime)*1e06;
+                // FIXME: W4 seems to have some spurious(?) retransmissions
                 RAMCLOUD_CLOG(NOTICE, "Retransmitting to server %s: "
                         "sequence %lu, offset %u, length %u, elapsed "
                         "time %.1f us",
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                // Resent bytes are passed directly to the NIC for simplicity;
-                // we expect retransmission to be rare enough so that this
-                // won't affect even the tail latency of other messages.
+                // TODO: document why pass bytes directly to NIC
                 sendBytes(clientRpc->session->serverAddress,
-                        header->common.rpcId, clientRpc->request.buffer,
+                        header->common.rpcId, clientRpc->request,
                         header->offset, header->length,
-                        request->unscheduledBytes,
+                        clientRpc->unscheduledBytes, header->priority,
                         FROM_CLIENT|RETRANSMISSION, true);
-                request->lastTransmitTime = driver->getLastTransmitTime();
+                // TODO: NO NEED TO CALL RDTSC DIRECTLY; GET THIS FROM DRIVER;
+                // ALSO, MOVE THIS STATEMENT INTO sendBytes?
+                clientRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
 
@@ -1178,6 +1359,17 @@ BasicTransport::handlePacket(Driver::Received* received)
                 // Nothing to do.
                 timeTrace("client received ACK, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
+                return;
+            }
+
+            // PING from server
+            case PacketOpcode::PING: {
+                timeTrace("client received PING, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (clientRpc != NULL) {
+                    AckHeader ack(common->rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress, &ack);
+                }
                 return;
             }
 
@@ -1253,7 +1445,22 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, received->len);
-                if (header->totalLength > messageZeroCopyThreshold) {
+                if ((header->offset > header->unscheduledBytes) &&
+                        ((serverRpc == NULL) || (header->offset >
+                        serverRpc->scheduledMessage->grantOffset))) {
+                    // TODO: THIS COULD HAPPEN BECAUSE?
+                    uint32_t grantOffset = (serverRpc == NULL) ?
+                            header->unscheduledBytes :
+                            serverRpc->scheduledMessage->grantOffset;
+                    LOG(WARNING, "unexpected DATA from client %s, "
+                            "id (%lu,%lu), offset %u, grantOffset %u",
+                            received->sender->toString().c_str(),
+                            header->common.rpcId.clientId,
+                            header->common.rpcId.sequence, header->offset,
+                            grantOffset);
+                    goto serverDataDone;
+                }
+                if (header->totalLength > maxZeroCopyMessage) {
                     // For relatively long messages, it's possible we need to
                     // retain their packets for quite some time; give the
                     // driver a chance to copy out the contents of the
@@ -1274,9 +1481,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                         serverRpc->scheduledMessage.construct(
                                 serverRpc->rpcId, serverRpc->accumulator.get(),
                                 uint32_t(header->unscheduledBytes),
-                                serverRpc->response.recipient,
+                                serverRpc->clientAddress,
                                 uint32_t(header->totalLength),
-                                uint8_t(FROM_CLIENT));
+                                static_cast<uint8_t>(FROM_CLIENT));
                     }
                     serverTimerList.push_back(*serverRpc);
                 } else if (serverRpc->requestComplete) {
@@ -1293,6 +1500,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                             WireFormat::RequestCommon>()->opcode,
                             header->totalLength);
                 }
+                dataPacketArrive(serverRpc->scheduledMessage.get());
                 if (serverRpc->requestPayload.size() >= header->totalLength) {
                     // Message complete; start servicing the RPC.
                     if (serverRpc->requestPayload.size()
@@ -1306,25 +1514,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                     erase(serverTimerList, *serverRpc);
                     serverRpc->requestComplete = true;
                     context->workerManager->handleRpc(serverRpc);
-                } else {
-                    // See if we need to output a GRANT.
-                    ScheduledMessage* schedMessage =
-                            serverRpc->scheduledMessage.get();
-                    if ((header->totalLength > header->unscheduledBytes) &&
-                            (schedMessage->grantOffset <
-                            (serverRpc->requestPayload.size()
-                            + roundTripBytes)) &&
-                            (schedMessage->grantOffset < header->totalLength)) {
-                        schedMessage->grantOffset =
-                                serverRpc->requestPayload.size()
-                                + roundTripBytes + grantIncrement;
-                        if (std::find(messagesToGrant.begin(),
-                                messagesToGrant.end(), schedMessage) ==
-                                messagesToGrant.end()) {
-                            messagesToGrant.push_back(schedMessage);
-                        }
-                    }
                 }
+
                 serverDataDone:
                 if (retainPacket) {
                     uint32_t dummy;
@@ -1349,15 +1540,15 @@ BasicTransport::handlePacket(Driver::Received* received)
                             received->sender->toString().c_str(),
                             header->common.rpcId.clientId,
                             header->common.rpcId.sequence, header->offset,
-                            serverRpc ? "not sending response" : "not found");
+                            serverRpc ? "receiving request" : "not found");
                     return;
                 }
-                OutgoingMessage* response = &serverRpc->response;
-                if (header->offset > response->transmitLimit) {
-                    response->transmitLimit = header->offset;
-                    if (!response->topChoice) {
-                        transmitDataSlowPath = true;
-                    }
+                if (header->offset > serverRpc->transmitLimit) {
+                    serverRpc->transmitLimit = header->offset;
+                    serverRpc->transmitPriority = header->priority;
+                }
+                if (!serverRpc->topChoice) {
+                    transmitDataSlowPath = true;
                 }
                 return;
             }
@@ -1368,10 +1559,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                         "client %s for sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                TimeTrace::record("server received LOG_TIME_TRACE for "
-                        "clientId %u, sequence %u",
-                        (uint32_t)common->rpcId.clientId,
-                        (uint32_t)common->rpcId.sequence);
+                timeTrace("server received LOG_TIME_TRACE for clientId %u, "
+                        "sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1392,23 +1582,28 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // request, or if a packet of the response got lost but
                     // we have already freed the ServerRpc. In either case,
                     // ask the client to restart the RPC from scratch.
+//                    RAMCLOUD_LOG(WARNING, "server received RESEND, "
+//                            "id (%lu,%lu), %u-%u, requesting RESTART",
+//                            header->common.rpcId.clientId,
+//                            header->common.rpcId.sequence, header->offset,
+//                            header->offset + header->length);
                     timeTrace("server requesting restart, clientId %u, "
                             "sequence %u",
                             common->rpcId.clientId, common->rpcId.sequence);
+                    // TODO: roundTripBytes should be replaced with what?
                     ResendHeader resend(header->common.rpcId, 0,
-                            roundTripBytes, FROM_SERVER|RESTART);
+                            roundTripBytes, 0, FROM_SERVER|RESTART);
                     sendControlPacket(received->sender, &resend);
                     return;
                 }
                 uint32_t resendEnd = header->offset + header->length;
-                OutgoingMessage* response = &serverRpc->response;
-                if (resendEnd > response->transmitLimit) {
+                if (resendEnd > serverRpc->transmitLimit) {
                     // Needed in case GRANT packet was lost.
-                    response->transmitLimit = resendEnd;
+                    serverRpc->transmitLimit = resendEnd;
                 }
                 if (!serverRpc->sendingResponse
-                        || (header->offset >= response->transmitOffset)
-                        || ((Cycles::rdtsc() - response->lastTransmitTime)
+                        || (header->offset >= serverRpc->transmitOffset)
+                        || ((Cycles::rdtsc() - serverRpc->lastTransmitTime)
                         < timerInterval)) {
                     // One of two things has happened: either (a) we haven't
                     // yet sent the requested bytes for the first time (there
@@ -1419,23 +1614,24 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // retransmit; just return an ACK so the client knows
                     // we're still alive.
                     AckHeader ack(serverRpc->rpcId, FROM_SERVER);
-                    sendControlPacket(response->recipient, &ack);
+                    sendControlPacket(serverRpc->clientAddress, &ack);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
-                        - response->lastTransmitTime)*1e06;
+                        - serverRpc->lastTransmitTime)*1e06;
                 RAMCLOUD_CLOG(NOTICE, "Retransmitting to client %s: "
                         "sequence %lu, offset %u, length %u, elapsed "
                         "time %.1f us",
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
                         header->length, elapsedMicros);
-                sendBytes(response->recipient,
+                // TODO: document why pass the bytes directly to NIC
+                sendBytes(serverRpc->clientAddress,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
-                        response->unscheduledBytes,
+                        serverRpc->unscheduledBytes, header->priority,
                         RETRANSMISSION|FROM_SERVER, true);
-                response->lastTransmitTime = driver->getLastTransmitTime();
+                serverRpc->lastTransmitTime = Cycles::rdtsc();
                 return;
             }
 
@@ -1464,6 +1660,17 @@ BasicTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
+            // PING from client
+            case PacketOpcode::PING: {
+                timeTrace("server received PING, clientId %u, sequence %u",
+                        common->rpcId.clientId, common->rpcId.sequence);
+                if (serverRpc != NULL) {
+                    AckHeader ack(common->rpcId, FROM_SERVER);
+                    sendControlPacket(serverRpc->clientAddress, &ack);
+                }
+                return;
+            }
+
             default:
                 RAMCLOUD_CLOG(WARNING,
                         "unexpected opcode %s received from client %s",
@@ -1487,9 +1694,9 @@ BasicTransport::handlePacket(Driver::Received* received)
  * locator; it just describes a Driver::Address.
  */
 string
-BasicTransport::ServerRpc::getClientServiceLocator()
+HomaTransport::ServerRpc::getClientServiceLocator()
 {
-    return response.recipient->toString();
+    return clientAddress->toString();
 }
 
 /**
@@ -1498,37 +1705,39 @@ BasicTransport::ServerRpc::getClientServiceLocator()
  * before that process is complete.
  */
 void
-BasicTransport::ServerRpc::sendReply()
+HomaTransport::ServerRpc::sendReply()
 {
     uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
             length, t->outgoingResponses.size());
     if (cancelled) {
+        // TODO: when this method returns, the caller's handle to this
+        // ServerRpc may become invalid; however, this behavior is already
+        // possible since tryToTransmitData may also invoke deleteServerRpc.
         t->deleteServerRpc(this);
         return;
     }
-    if (replyPayload.size() > MAX_RPC_LEN) {
-        throw TransportException(HERE,
-             format("server response exceeds maximum rpc size "
-                    "(attempted %u bytes, maximum %u bytes)",
-                    replyPayload.size(), MAX_RPC_LEN));
-    }
+    transmitPriority = t->getUnschedTrafficPrio(length);
 
     uint32_t bytesSent;
-    if (length < t->smallMessageThreshold) {
+    if (length < SMALL_MESSAGE_SIZE) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
         timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
-                "priority %u", rpcId.clientId, rpcId.sequence, 0);
-        t->driver->sendPacket(response.recipient, &header, &iter, 0);
+                "priority %u", rpcId.clientId, rpcId.sequence,
+                transmitPriority);
+        SEND_PACKET(t->driver, clientAddress, &header, &iter, transmitPriority);
+//        t->driver->sendPacket(clientAddress, &header, &iter, transmitPriority);
+//        transmitOffset = length;
+//        lastTransmitTime = t->driver->getLastTransmitTime();
         t->deleteServerRpc(this);
         bytesSent = length;
     } else {
         sendingResponse = true;
         t->outgoingResponses.push_back(*this);
         t->serverTimerList.push_back(*this);
-        t->maintainTopOutgoingMessages(&response);
+        t->updateTopOutgoingMessageSet(this, true);
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
@@ -1548,23 +1757,27 @@ BasicTransport::ServerRpc::sendReply()
  * \param totalLength
  *      Length of the message.
  */
-BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
+HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
         Buffer* buffer, uint32_t totalLength)
     : t(t)
-    , assembledPayloads(new Payloads())
+    // FIXME: avoid doing dynamic allocation? profile it first
+    , assembledPayloads(new MessageBuffer())
     , buffer(buffer)
     , fragments()
+    , packetLost(false)
 {
     assert(buffer->size() == 0);
+#define FRAGMENTS_HIGH_WATERMARK 64
     int numPackets = totalLength / t->maxDataPerPacket +
             (totalLength % t->maxDataPerPacket == 0 ? 0 : 1);
     assembledPayloads->reserve(numPackets);
+    fragments.reserve(std::min(numPackets, FRAGMENTS_HIGH_WATERMARK));
 }
 
 /**
  * Destructor for MessageAccumulators.
  */
-BasicTransport::MessageAccumulator::~MessageAccumulator()
+HomaTransport::MessageAccumulator::~MessageAccumulator()
 {
     // If there are any unassembled fragments, then we must release
     // them back to the driver.
@@ -1574,7 +1787,7 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->release(fragment.header);
     }
     fragments.clear();
-    t->messagesToRelease.push_back(assembledPayloads);
+    t->messageBuffers.push_back(assembledPayloads);
 }
 
 /**
@@ -1595,52 +1808,56 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
  *      not steal the Received.
  */
 bool
-BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
+HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         uint32_t length)
 {
     length -= sizeof32(DataHeader);
 
-    // These should not happen normally.
-    if (expect_false(header->offset % t->maxDataPerPacket != 0)) {
-        LOG(WARNING, "Unexpected packet offset %u", header->offset);
-        return false;
-    } else if (expect_false((length != t->maxDataPerPacket) &&
-            (header->offset + length < header->totalLength))) {
-        LOG(WARNING, "Unexpected packet size %u, offset %u", length,
-                header->offset);
-        return false;
-    }
+    assert((header->offset % t->maxDataPerPacket == 0) &&
+           ((length == t->maxDataPerPacket) ||
+           (header->offset + length >= header->totalLength)));
 
     bool retainPacket;
     if (header->offset > buffer->size()) {
         // Can't append this packet into the buffer because some prior
-        // data is missing. Save the packet for later, if it's not redundant.
+        // data is missing. Save the packet for later.
         FragmentMap::iterator iter;
         std::tie(iter, retainPacket) = fragments.emplace(
                 uint32_t(header->offset), MessageFragment(header, length));
+        if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
+            packetLost = true;
+            // FIXME: investigate why W4/5 produces so many false(?) alarms
+//            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
+            timeTrace("Packet might be lost, offset %u", buffer->size());
+        }
         return retainPacket;
     }
 
     // Append this fragment to the assembled message buffer, then see
     // if some of the unappended fragments can now be appended as well.
     if (header->offset == buffer->size()) {
-        // Each iteration of the following loop appends one fragment to
-        // the buffer.
-        MessageFragment fragment(header, length);
-        do {
-            char* payload = reinterpret_cast<char*>(fragment.header);
-            buffer->appendExternal(payload + sizeof32(DataHeader),
-                    fragment.length);
+        uint64_t numPayloads = assembledPayloads->size();
+        while (true) {
+            char* payload = reinterpret_cast<char*>(header);
+            buffer->appendExternal(payload + sizeof32(DataHeader), length);
             assembledPayloads->push_back(payload);
 
             FragmentMap::iterator it = fragments.find(buffer->size());
             if (it == fragments.end()) {
-                return true;
-            } else {
-                fragment = it->second;
-                fragments.erase(it);
+                break;
             }
-        } while (true);
+            MessageFragment fragment = it->second;
+            header = fragment.header;
+            length = fragment.length;
+            fragments.erase(it);
+        }
+        numPayloads = assembledPayloads->size() - numPayloads;
+        if (numPayloads > 1) {
+            timeTrace("addPacket assembled %u unappended fragments",
+                    numPayloads-1);
+        }
+        packetLost = false;
+        return true;
     } else {
         // This packet is redundant.
         return false;
@@ -1671,7 +1888,7 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
  *      was requested.
  */
 uint32_t
-BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
+HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
         uint8_t whoFrom)
 {
@@ -1705,14 +1922,17 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
             "client requesting retransmission of bytes %u-%u, clientId %u, "
             "sequence %u";
     timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
-    ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
-            whoFrom);
+    uint32_t length = endOffset - buffer->size();
+    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
+    ResendHeader resend(rpcId, buffer->size(), length,
+            t->getUnschedTrafficPrio(length), whoFrom);
     t->sendControlPacket(address, &resend);
     return endOffset;
 }
 
 /**
- * Constructor for ScheduledMessages.
+ * Construct a ScheduledMessage and notifies the scheduler the arrival of
+ * this new scheduled message.
  *
  * \param rpcId
  *      Unique identifier for the RPC this message belongs to.
@@ -1728,23 +1948,67 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
  *      Must be either FROM_CLIENT, indicating that this is a request, or
  *      FROM_SERVER, indicating that this is a response.
  */
-BasicTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
+HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
         MessageAccumulator* accumulator, uint32_t unscheduledBytes,
         const Driver::Address* senderAddress, uint32_t totalLength,
         uint8_t whoFrom)
     : accumulator(accumulator)
+    , activeMessageLinks()
+    , inactiveMessageLinks()
     , grantOffset(unscheduledBytes)
+    , grantPriority(0)
     , rpcId(rpcId)
     , senderAddress(senderAddress)
+    , senderHash(std::hash<std::string>{}(senderAddress->toString()))
+    , state(NEW)
     , totalLength(totalLength)
     , whoFrom(whoFrom)
-{}
+{
+    accumulator->t->tryToSchedule(this);
+}
 
 /**
  * Destructor for ScheduledMessages.
  */
-BasicTransport::ScheduledMessage::~ScheduledMessage()
-{}
+HomaTransport::ScheduledMessage::~ScheduledMessage()
+{
+    if (state == ACTIVE) {
+        accumulator->t->replaceActiveMessage(this, NULL, true);
+    } else if (state == INACTIVE) {
+        erase(accumulator->t->inactiveMessages, *this);
+    }
+}
+
+/**
+ * Compare the relative precedence of two scheduled messages in the message
+ * scheduler.
+ *
+ * \param other
+ *      The other message to compare with.
+ * \return
+ *      Negative number if this message has higher precedence; positive
+ *      number if the other message has higher precedence; 0 if the two
+ *      messages have equal precedence.
+ */
+int
+HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
+{
+    // Implement the SRPT policy.
+    int r0 = totalLength - accumulator->buffer->size();
+    int r1 = other.totalLength - other.accumulator->buffer->size();
+    return r0 - r1;
+}
+
+// TODO: NOT SURE THIS IS THE RIGHT PLACE TO DEFINE IT.
+#if TIME_TRACE
+#define UPDATE_CYCLES(cycles) do { \
+    currentTime = Cycles::rdtsc(); \
+    cycles += currentTime - prevTime; \
+    prevTime = currentTime; \
+} while (0)
+#else
+#define UPDATE_CYCLES(x) do {} while (0)
+#endif
 
 /**
  * This method is invoked in the inner polling loop of the dispatcher;
@@ -1754,56 +2018,135 @@ BasicTransport::ScheduledMessage::~ScheduledMessage()
  *      0 otherwise.
  */
 int
-BasicTransport::Poller::poll()
+HomaTransport::Poller::poll()
 {
     int result = 0;
 
 #if TIME_TRACE
+    // See if we should compute the network throughput in the last interval.
+    if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
+        t->perfMonitorIntervals++;
+//        if (t->perfMonitorIntervals % 100 == 0) {
+//            LOG(NOTICE, "%lu outgoing requests, %lu outgoing responses",
+//                    t->outgoingRequests.size(), t->outgoingResponses.size());
+//        }
+
+        t->unusedBandwidth +=
+                t->driver->getTxQueueIdleInterval(owner->currentTime);
+        uint32_t millis = t->monitorMillis;
+        uint64_t activeCycles = PerfStats::threadStats.dispatchActiveCycles
+                - t->lastDispatchActiveCycles;
+        uint64_t unusedBandwidthPct =
+                t->unusedBandwidth*100/t->monitorInterval;
+        uint64_t unusedUplinkBandwidth =
+                t->driver->getBandwidth()*unusedBandwidthPct/100;
+        uint32_t wastedGoodput = t->numTimesGrantRunDry *
+                t->driver->getMaxPacketSize()*8/1000/millis;
+        uint64_t now = Cycles::rdtsc();
+        timeTrace(now, "data packets goodput %u Mbps, "
+                "control packets throughput %u Mbps, "
+                "retransmission goodput %u Mbps",
+                t->outputDataBytes*8/1000/millis,
+                t->outputControlBytes*8/1000/millis,
+                t->outputResentBytes*8/1000/millis);
+        timeTrace(now, "data packet TX rate %u kpps, "
+                "control packet TX rate %u kpps, "
+                "data packet RX rate %u kpps, "
+                "control packet RX rate %u kpps,",
+                t->numDataPacketsSent/millis,
+                t->numControlPacketsSent/millis,
+                t->numDataPacketsReceived/millis,
+                (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
+        timeTrace(now, "dispatch utilization %u%%, process packets %u%%, "
+                "transmit data %u%%, transmit grant %u%%",
+                activeCycles*100/t->monitorInterval,
+                t->processPacketCycles*100/t->monitorInterval,
+                t->transmitDataCycles*100/t->monitorInterval,
+                t->transmitGrantCycles*100/t->monitorInterval);
+        timeTrace(now, "unused uplink bandwidth %u%% (%u Mbps), "
+                "run out of grants %u times, wasted goodput <= %u Mbps",
+                unusedBandwidthPct, unusedUplinkBandwidth,
+                t->numTimesGrantRunDry, wastedGoodput);
+        timeTrace(now, "%u outgoing requests, %u outgoing responses, "
+                "%u top outgoing messages",
+                t->outgoingRequests.size(), t->outgoingResponses.size(),
+                t->topOutgoingMessages.size());
+        timeTrace(now, "check timeouts %u%%, tryToTxData cache misses %u",
+                t->timeoutCheckCycles*100/t->monitorInterval,
+                t->tryToTransmitDataCacheMisses);
+
+        t->lastMeasureTime = owner->currentTime;
+        t->lastDispatchActiveCycles =
+                PerfStats::threadStats.dispatchActiveCycles;
+        t->numPacketsReceived = 0;
+        t->numDataPacketsReceived = 0;
+        t->numControlPacketsSent = 0;
+        t->numDataPacketsSent = 0;
+        t->numTimesGrantRunDry = 0;
+        t->outputControlBytes = 0;
+        t->outputDataBytes = 0;
+        t->outputResentBytes = 0;
+        t->processPacketCycles = 0;
+        t->timeoutCheckCycles = 0;
+        t->transmitDataCycles = 0;
+        t->transmitGrantCycles = 0;
+        t->tryToTransmitDataCacheMisses = 0;
+        t->unusedBandwidth = 0;
+    }
+
     uint64_t startTime = Cycles::rdtsc();
+    uint64_t prevTime = startTime, currentTime;
+    uint64_t lastIdleTime = t->driver->getRxQueueIdleTime();
 #endif
 
-    // Process available incoming packets. Try to receive MAX_PACKETS packets
-    // at a time (an optimized driver implementation may prefetch the payloads
-    // for us). As of 07/2016, MAX_PACKETS is set to 8 because our CPU can
-    // take at most 8 cache misses at a time (although it's not clear 8 is the
-    // best value).
-#define MAX_PACKETS 8
+    // Process any available incoming packets.
+#define MAX_PACKETS 4
     uint32_t numPackets;
-    t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
-    numPackets = downCast<uint>(t->receivedPackets.size());
+    uint32_t totalPackets = 0;
+    do {
+        t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
+        numPackets = downCast<uint>(t->receivedPackets.size());
 #if TIME_TRACE
-    // Log the beginning of poll() here so that timetrace entries do not
-    // go back in time.
-    if (numPackets > 0) {
-        uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
-        timeTrace(startTime, "start of polling iteration %u, "
-                "last poll was %u ns ago", owner->iteration, ns);
-    }
-    lastPollTime = Cycles::rdtsc();
+        // Log the beginning of poll() here so that timetrace entries do not
+        // go back in time.
+        if (totalPackets == 0 && numPackets > 0) {
+            uint64_t ns = Cycles::toNanoseconds(startTime - lastIdleTime);
+            timeTrace(startTime, "start of polling iteration %u, "
+                    "last poll was %u ns ago", owner->iteration, ns);
+        }
 #endif
-    for (uint i = 0; i < numPackets; i++) {
-        t->handlePacket(&t->receivedPackets[i]);
-    }
-    t->receivedPackets.clear();
-    result = numPackets > 0 ? 1 : result;
+        for (uint i = 0; i < numPackets; i++) {
+            t->handlePacket(&t->receivedPackets[i]);
+        }
+        t->receivedPackets.clear();
+        totalPackets += numPackets;
+    } while (numPackets == MAX_PACKETS);
+    t->numPacketsReceived += totalPackets;
+    result |= totalPackets;
+    UPDATE_CYCLES(t->processPacketCycles);
 
-    // See if we should send out new GRANT packets. Grants are sent here as
-    // opposed to inside #handlePacket because we would like to coalesse
-    // GRANT packets to the same message whenever possible. Besides,
-    // structuring code this way seems to improve the overall performance,
-    // potentially by being more cache-friendly.
-    for (ScheduledMessage* recipient : t->messagesToGrant) {
+    // Send out GRANTs that are produced in the previous processing step
+    // in a batch.
+    // TODO: should I do a bucket sort or something to rank them by priorities?
+    for (ScheduledMessage* recipient : t->grantRecipients) {
         uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
                 FROM_SERVER : FROM_CLIENT;
-        GrantHeader grant(recipient->rpcId, recipient->grantOffset, whoFrom);
+        GrantHeader grant(recipient->rpcId, recipient->grantOffset,
+                recipient->grantPriority, whoFrom);
         const char* fmt = (whoFrom == FROM_CLIENT) ?
-                "client sending GRANT, clientId %u, sequence %u, offset %u" :
-                "server sending GRANT, clientId %u, sequence %u, offset %u";
+                "client sending GRANT, clientId %u, sequence %u, offset %u, "
+                "priority %u" :
+                "server sending GRANT, clientId %u, sequence %u, offset %u, "
+                "priority %u";
         timeTrace(fmt, recipient->rpcId.clientId, recipient->rpcId.sequence,
-                grant.offset);
+                grant.offset, grant.priority);
+
         t->sendControlPacket(recipient->senderAddress, &grant);
     }
-    t->messagesToGrant.clear();
+    if (!t->grantRecipients.empty()) {
+        UPDATE_CYCLES(t->transmitGrantCycles);
+    }
+    t->grantRecipients.clear();
 
     // See if we should check for timeouts. Ideally, we'd like to do this
     // every timerInterval. However, it's better not to call checkTimeouts
@@ -1833,47 +2176,43 @@ BasicTransport::Poller::poll()
             result = 1;
             t->nextTimeoutCheck = now + t->timerInterval;
             t->timeoutCheckDeadline = 0;
+            UPDATE_CYCLES(t->timeoutCheckCycles);
         }
     }
 
     // Transmit data packets if possible.
     uint32_t totalBytesSent = t->tryToTransmitData();
-    result = totalBytesSent > 0 ? 1 : result;
+    result |= totalBytesSent;
+    UPDATE_CYCLES(t->transmitDataCycles);
 
-    // See if we should release a few retained payloads to the driver.
-    // As of 02/2017, releasing one payload to the DpdkDriver takes ~65ns.
-    // If we have received up to MAX_PACKETS packets, then there may be more
-    // packets outstanding in the NIC's RX queue and we should skip returning
-    // payloads to get to the next poll ASAP. On the other hand, if we haven't
-    // found anything useful to do in this method up till now, try to release
-    // more payloads.
+    // Release a few retained payloads to the driver. As of 02/2017, releasing
+    // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
+    // useful to do in this method uptill now, try to release more payloads.
+    const uint32_t maxRelease = result ? 2 : 5;
     uint32_t releaseCount = 0;
-    if (numPackets < MAX_PACKETS) {
-        const uint32_t maxRelease = result ? 1 : 5;
-        while (!t->messagesToRelease.empty()) {
-            MessageAccumulator::Payloads* message =
-                    t->messagesToRelease.back();
-            while (!message->empty() && (releaseCount < maxRelease)) {
-                char* payload = message->back();
-                message->pop_back();
-                t->driver->release(payload);
-                releaseCount++;
-                result = 1;
-            }
+    while (!t->messageBuffers.empty()) {
+        MessageAccumulator::MessageBuffer* messageBuffer =
+                t->messageBuffers.back();
+        while (!messageBuffer->empty() && (releaseCount < maxRelease)) {
+            char* payload = messageBuffer->back();
+            messageBuffer->pop_back();
+            t->driver->release(payload);
+            releaseCount++;
+            result = 1;
+        }
 
-            if (message->empty()) {
-                t->messagesToRelease.pop_back();
-                delete message;
-            } else {
-                break;
-            }
+        if (messageBuffer->empty()) {
+            t->messageBuffers.pop_back();
+            delete messageBuffer;
+        } else {
+            break;
         }
     }
 
     if (result) {
         timeTrace("end of polling iteration %u, received %u packets, "
                 "transmitted %u bytes, released %u packet buffers",
-                owner->iteration, numPackets, totalBytesSent, releaseCount);
+                owner->iteration, totalPackets, totalBytesSent, releaseCount);
     }
     return result;
 }
@@ -1885,17 +2224,17 @@ BasicTransport::Poller::poll()
  * retransmission and aborting RPCs.
  */
 void
-BasicTransport::checkTimeouts()
+HomaTransport::checkTimeouts()
 {
-    timeTrace("checkTimeouts invoked, %u client RPCs, %u server RPCs",
-            outgoingRpcs.size(), serverTimerList.size());
-
     // Scan all of the ClientRpc objects.
+    timeTrace("checkTimeouts invoked, %u outgoing RPCs, "
+            "%u incomplete incoming requests",
+            outgoingRpcs.size(), serverTimerList.size());
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
             it != outgoingRpcs.end(); ) {
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
-        if (clientRpc->request.transmitOffset == 0) {
+        if (clientRpc->transmitOffset == 0) {
             // We haven't started transmitting this RPC yet (our transmit
             // queue is probably backed up), so no need to worry about whether
             // we have heard from the server.
@@ -1914,7 +2253,7 @@ BasicTransport::checkTimeouts()
             // from the server, so abort the RPC.
             RAMCLOUD_LOG(WARNING, "aborting %s RPC to server %s, "
                     "sequence %lu: timeout",
-                    WireFormat::opcodeSymbol(clientRpc->request.buffer),
+                    WireFormat::opcodeSymbol(clientRpc->request),
                     clientRpc->session->serverAddress->toString().c_str(),
                     sequence);
             clientRpc->notifier->failed();
@@ -1922,48 +2261,57 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->response->size() == 0) {
-            // We haven't received any part of the response message. Normally,
-            // it's the server's responsibility to request retransmission.
-            // However, in case the whole request was lost (so the server is
-            // not aware of this RPC) or the server crashed, we need to send
-            // occasional RESEND packets, which should produce some response
-            // from the server, so that we know it's still alive and working.
-            // Note: the wait time for this ping is longer than the server's
-            // wait time to request retransmission (first give the server a
-            // chance to handle the problem).
-            if (clientRpc->silentIntervals % pingIntervals == 0) {
-                timeTrace("client sending RESEND for clientId %u, "
-                        "sequence %u", clientId, sequence);
-                ResendHeader resend(RpcId(clientId, sequence), 0,
-                        roundTripBytes, FROM_CLIENT);
-                sendControlPacket(clientRpc->session->serverAddress,
-                        &resend);
-            }
-        } else {
-            // We have received part of the response.
-            assert(clientRpc->accumulator);
-            ScheduledMessage* scheduledMessage =
-                    clientRpc->scheduledMessage.get();
-            uint32_t grantOffset = scheduledMessage ?
-                    scheduledMessage->grantOffset : 0;
-            if (grantOffset == clientRpc->response->size()) {
-                // The client has received every granted byte but hasn't got
-                // around to grant more because there are higher priority
-                // responses.
-                assert(scheduledMessage);
-                clientRpc->silentIntervals = 0;
+        if (clientRpc->silentIntervals >= 2) {
+            if (clientRpc->transmitPending) {
+                // We haven't finished transmitting the request.
+                if (clientRpc->transmitOffset == clientRpc->transmitLimit) {
+                    // The client has transmitted every granted byte. Poke the
+                    // server to see if it's still alive.
+                    PingHeader ping(clientRpc->rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress,
+                            &ping);
+                } else {
+                    clientRpc->silentIntervals = 0;
+                }
             } else {
-                // The client expects to receive more but the server
-                // has gone silent, this must mean packets were lost,
-                // grants were lost, or the server has preempted this
-                // response for higher priority messages, so request
-                // retransmission anyway.
-                if (clientRpc->silentIntervals % pingIntervals == 0) {
+                if (!clientRpc->accumulator) {
+                    // We haven't received any part of the response message.
+                    // Send occasional RESEND packets, which should produce
+                    // some response from the server, so that we know it's
+                    // still alive and working. Note: the wait time for this
+                    // ping is longer than the server's wait time to request
+                    // retransmission (first give the server a chance to handle
+                    // the problem).
+                    if ((clientRpc->silentIntervals % pingIntervals) == 0) {
+                        timeTrace("client sending RESEND for clientId %u, "
+                                "sequence %u", clientId, sequence);
+                        ResendHeader resend(RpcId(clientId, sequence), 0,
+                                roundTripBytes, 0, FROM_CLIENT);
+                        sendControlPacket(clientRpc->session->serverAddress,
+                                &resend);
+                    }
+                } else {
+                    // We have received part of the response.
+                    ScheduledMessage* scheduledMessage =
+                            clientRpc->scheduledMessage.get();
+                    uint32_t grantOffset = scheduledMessage ?
+                            scheduledMessage->grantOffset : 0;
+                    if (scheduledMessage && (grantOffset ==
+                            clientRpc->accumulator->buffer->size())) {
+                        // The client has received every byte of the response it has
+                        // granted but hasn't got around to grant more because there
+                        // are higher priority responses.
+                        clientRpc->silentIntervals = 0;
+                        continue;
+                    }
+                    // The client expects to receive more bytes but the server
+                    // has gone silent, this must mean packets were lost,
+                    // grants were lost, or the server has preempted this
+                    // response for higher priority messages, so request
+                    // retransmission anyway.
                     clientRpc->accumulator->requestRetransmission(this,
                             clientRpc->session->serverAddress,
-                            RpcId(clientId, sequence), grantOffset,
-                            FROM_CLIENT);
+                            RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
                 }
             }
         }
@@ -1974,8 +2322,7 @@ BasicTransport::checkTimeouts()
     for (ServerTimerList::iterator it = serverTimerList.begin();
             it != serverTimerList.end(); ) {
         ServerRpc* serverRpc = &(*it);
-        if (serverRpc->sendingResponse &&
-                (serverRpc->response.transmitOffset == 0)) {
+        if (serverRpc->sendingResponse && (serverRpc->transmitOffset == 0)) {
             // Looks like the transmit queue has been too backed up to start
             // sending the response, so no need to check for a timeout.
             it++;
@@ -1986,6 +2333,10 @@ BasicTransport::checkTimeouts()
         // Advance the iterator now, so it won't get invalidated if we
         // delete the ServerRpc below.
         it++;
+
+        ScheduledMessage* scheduledMessage = serverRpc->scheduledMessage.get();
+        uint32_t grantOffset =
+                scheduledMessage ? scheduledMessage->grantOffset : 0;
 
         // If a long time has elapsed with no communication whatsoever
         // from the client, then abort the RPC. Note: this code should
@@ -2005,25 +2356,322 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
-        // See if we need to request retransmission for part of the request
-        // message.
-        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete) {
-            ScheduledMessage* scheduledMessage =
-                    serverRpc->scheduledMessage.get();
-            uint32_t grantOffset =
-                    scheduledMessage ? scheduledMessage->grantOffset : 0;
-            if (scheduledMessage &&
-                    (grantOffset == serverRpc->requestPayload.size())) {
-                // The server has received every granted byte but hasn't got
-                // around to grant more because there are higher priority
-                // responses.
-                serverRpc->silentIntervals = 0;
-            } else {
+        if (serverRpc->silentIntervals >= 2) {
+            if (!serverRpc->requestComplete) {
+                // See if we need to request retransmission for part of the
+                // request message.
+                if (scheduledMessage && (grantOffset ==
+                        serverRpc->accumulator->buffer->size())) {
+                    // The server has received every byte of the request it has
+                    // granted but hasn't got around to grant more because there
+                    // are higher priority requests.
+                    serverRpc->silentIntervals = 0;
+                    continue;
+                }
                 serverRpc->accumulator->requestRetransmission(this,
-                        serverRpc->response.recipient, serverRpc->rpcId,
+                        serverRpc->clientAddress, serverRpc->rpcId,
                         grantOffset, FROM_SERVER);
+            } else if (serverRpc->sendingResponse) {
+                if (serverRpc->transmitOffset == serverRpc->transmitLimit) {
+                    // The server has transmitted every granted byte. Poke the
+                    // client to see if it's still alive.
+                    PingHeader ping(serverRpc->rpcId, FROM_SERVER);
+                    sendControlPacket(serverRpc->clientAddress, &ping);
+                } else {
+                    serverRpc->silentIntervals = 0;
+                }
             }
         }
+    }
+}
+
+/**
+ * A non-active (new or inactive) message needs to be inserted to the active
+ * message list or an existing active message needs to move forward in the
+ * list. Either case, put this message to the right place in the list that
+ * reflects its precedence among the active messages.
+ *
+ * \param message
+ *      A message that needs to be put at the right place in the active message
+ *      list.
+ */
+void
+HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
+{
+    assert(message->state != ScheduledMessage::PURGED);
+    bool alreadyActive = (message->state == ScheduledMessage::ACTIVE);
+
+    // The following loop iterates over the active message list to find the
+    // right place to insert the given message.
+    ScheduledMessage* insertHere = NULL;
+    for (ScheduledMessage& m : activeMessages) {
+        if (&m == message) {
+            // This existing message is still in the right place: all preceding
+            // messages are smaller.
+            return;
+        }
+
+        if (message->compareTo(m) < 0) {
+            if (alreadyActive) {
+                erase(activeMessages, *message);
+            }
+            insertHere = &m;
+            break;
+        }
+    }
+
+    // Insert the message.
+    if (message->state == ScheduledMessage::INACTIVE) {
+        erase(inactiveMessages, *message);
+    }
+    message->state = ScheduledMessage::ACTIVE;
+    if (insertHere) {
+        insertBefore(activeMessages, *message, *insertHere);
+    } else {
+        activeMessages.push_back(*message);
+    }
+}
+
+/**
+ * Replace an active message by an non-active (new or inactive) one because
+ * 1) our scheduling policy says it's a better choice, 2) the active message
+ * has been fully granted or 3) the active message needs to be destroyed
+ * (e.g. the RPC is cancelled).
+ *
+ * \param oldMessage
+ *      A currently active message that is about to be deactivated.
+ * \param newMessage
+ *      A non-active message that should be activated. NULL means this method
+ *      is invoked because \p oldMessage must be purged and it is the duty
+ *      of this method to pick a replacement from the inactive message list.
+ *      Otherwise, this method is invoked because \p newMessage is a better
+ *      choice compared to \p oldMessage.
+ * \param cancelled
+ *      True means we are not interested in receiving \p oldMessage anymore;
+ *      false, otherwise.
+ */
+void
+HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
+        ScheduledMessage *newMessage, bool cancelled)
+{
+    assert(oldMessage != newMessage);
+    assert(oldMessage->state == ScheduledMessage::ACTIVE);
+    assert(newMessage == NULL ||
+            newMessage->state == ScheduledMessage::NEW ||
+            newMessage->state == ScheduledMessage::INACTIVE);
+
+    bool purgeOK = (oldMessage->grantOffset == oldMessage->totalLength);
+
+    if (oldMessage == &activeMessages.front()) {
+        // The top message is removed. Reclaim the highest granted priority.
+        highestGrantedPrio--;
+    }
+    erase(activeMessages, *oldMessage);
+    if (newMessage == NULL) {
+        assert(purgeOK || cancelled);
+        oldMessage->state = ScheduledMessage::PURGED;
+
+        // No designated message to promote. Pick one from the inactive
+        // messages.
+        for (ScheduledMessage& candidate : inactiveMessages) {
+            if (newMessage != NULL && newMessage->compareTo(candidate) <= 0) {
+                continue;
+            }
+
+            for (ScheduledMessage& m : activeMessages) {
+                if (m.senderHash == candidate.senderHash) {
+                    // Active messages must come from distinct senders. Move on
+                    // to check the next inactive message.
+                    goto tryNextCandidate;
+                }
+            }
+
+            newMessage = &candidate;
+            tryNextCandidate:
+            ;
+        }
+    } else {
+        assert(!purgeOK);
+        oldMessage->state = ScheduledMessage::INACTIVE;
+        inactiveMessages.push_back(*oldMessage);
+    }
+
+    if (newMessage) {
+        adjustSchedulingPrecedence(newMessage);
+        if (newMessage == &activeMessages.front()
+                && highestGrantedPrio < highestSchedPriority) {
+            // This message is promoted to the top. Bump the highest granted
+            // priority if we haven't used up all the priorities for scheduled
+            // traffic.
+            highestGrantedPrio++;
+        } else if (highestGrantedPrio + 1 < int(activeMessages.size())) {
+            // The priorities we are granting for scheduled traffic is not
+            // enough to accommodate all the active messages.
+            highestGrantedPrio++;
+            assert(highestGrantedPrio + 1 == int(activeMessages.size()));
+        }
+    }
+
+    // Packet the priorities for scheduled packets when there is no enough
+    // message to buffer.
+    if (activeMessages.size() < maxGrantedMessages) {
+        highestGrantedPrio = int(activeMessages.size()) - 1;
+    }
+
+    assert(oldMessage->state == ScheduledMessage::INACTIVE ||
+            oldMessage->state == ScheduledMessage::PURGED);
+    assert(newMessage == NULL || newMessage->state == ScheduledMessage::ACTIVE);
+}
+
+/**
+ * Attempts to schedule a message by placing it in the active message list.
+ * This function is invoked when a new scheduled message arrives or an existing
+ * inactive message tries to step up to the active message list.
+ *
+ * \param message
+ *      A message that cannot be completely sent as unscheduled bytes.
+ * \return
+ *      True if the message will start to receive grants regularly after this
+ *      this method returns; false, otherwise.
+ */
+bool
+HomaTransport::tryToSchedule(ScheduledMessage* message)
+{
+    assert(message->state == ScheduledMessage::NEW ||
+            message->state == ScheduledMessage::INACTIVE);
+    bool newMessageArrives = (message->state == ScheduledMessage::NEW);
+
+    // The following loop handles the special case where some active message
+    // comes from the same sender as the new message to avoid violating the
+    // constraint that active messages must come from distinct senders.
+    for (ScheduledMessage &m : activeMessages) {
+        if (m.senderHash != message->senderHash) {
+            continue;
+        }
+
+        if (message->compareTo(m) < 0) {
+            // The new message should replace an active message that is from
+            // the same sender.
+            replaceActiveMessage(&m, message);
+        }
+        goto schedulingDone;
+    }
+
+    // From now on, we can assume that the new message has a different sender
+    // than the active messages.
+    if (activeMessages.size() < maxGrantedMessages) {
+        // We have not buffered enough messages. This also implies we have not
+        // used up our priority levels for scheduled packets. Bump the highest
+        // granted priority.
+        assert(newMessageArrives); // TODO: EXPLAIN THE ASSERTION
+        adjustSchedulingPrecedence(message);
+        highestGrantedPrio++;
+        assert(highestGrantedPrio <= highestSchedPriority);
+        assert(highestGrantedPrio + 1 == int(activeMessages.size()));
+    } else if (message->compareTo(activeMessages.back()) < 0) {
+        // The new message should replace the "worst" active message.
+        replaceActiveMessage(&activeMessages.back(), message);
+    }
+
+    schedulingDone:
+    if (message->state == ScheduledMessage::ACTIVE) {
+        return true;
+    } else {
+        if (newMessageArrives) {
+            message->state = ScheduledMessage::INACTIVE;
+            inactiveMessages.push_back(*message);
+        }
+        return false;
+    }
+}
+
+/**
+ * When a full data packet is received, this method is invoked to see
+ * if the scheduler needs to 1) update its active message list and
+ * 2) send out a GRANT.
+ *
+ * \param message
+ *      NULL means the data packet belongs to a unscheduled message;
+ *      otherwise, it is the scheduled message that receives the data
+ *      packet.
+ */
+void
+HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
+{
+    // If this data packet belongs to a scheduled message, see if we need to
+    // adjust the scheduling precedence of this message.
+    if (scheduledMessage) {
+        switch (scheduledMessage->state) {
+            case ScheduledMessage::ACTIVE:
+                adjustSchedulingPrecedence(scheduledMessage);
+                break;
+            case ScheduledMessage::INACTIVE:
+                tryToSchedule(scheduledMessage);
+                break;
+            case ScheduledMessage::PURGED:
+                // A scheduled message will be purged from the scheduler as
+                // soon as it was fully granted. However, we will continue to
+                // receive data packets from it for a while.
+                break;
+            default:
+                LOG(ERROR, "unexpected message state %u",
+                        scheduledMessage->state);
+                return;
+        }
+    }
+
+    // Find the first active message that could use a GRANT.
+    ScheduledMessage* messageToGrant = NULL;
+    uint8_t priority;
+    if (highestGrantedPrio >= 0) {
+        priority = downCast<uint8_t>(highestGrantedPrio);
+    } else {
+        // No scheduled message.
+        assert(activeMessages.size() + inactiveMessages.size() == 0);
+        return;
+    }
+    for (ScheduledMessage& m : activeMessages) {
+        uint32_t estimatedReceivedBytes = downCast<uint32_t>(
+                m.accumulator->buffer->size() +
+                maxDataPerPacket * m.accumulator->fragments.size());
+        // When a packet might be lost, stop granting the message so that
+        // the size of message fragment map does not grow without bound.
+        if (!m.accumulator->packetLost &&
+                (m.grantOffset < estimatedReceivedBytes + roundTripBytes)) {
+            messageToGrant = &m;
+            break;
+        }
+        priority--;
+    }
+
+    if (messageToGrant == NULL) {
+        // All of the active messages (or, more precisely, their senders) have
+        // been granted for 1 RTT incoming bytes.
+        return;
+    }
+    if (messageToGrant->totalLength - messageToGrant->grantOffset
+            <= roundTripBytes) {
+        // For the last 1 RTT remaining bytes of a scheduled message
+        // with size (1+a)RTT, use the same priority as an unscheduled
+        // message that has size min{1, a}*RTT.
+        priority = getUnschedTrafficPrio(std::min(roundTripBytes,
+                messageToGrant->totalLength - roundTripBytes));
+    }
+
+    messageToGrant->grantOffset += grantIncrement;
+    messageToGrant->grantPriority = priority;
+    if (messageToGrant->grantOffset >=
+            messageToGrant->totalLength) {
+        // Slow path: a message has been fully granted. Purge it from the
+        // scheduler.
+        messageToGrant->grantOffset = messageToGrant->totalLength;
+        replaceActiveMessage(messageToGrant, NULL);
+    }
+
+    // Output a GRANT for the selected message.
+    if (std::find(grantRecipients.begin(), grantRecipients.end(),
+            messageToGrant) == grantRecipients.end()) {
+        grantRecipients.push_back(messageToGrant);
     }
 }
 
