@@ -1435,7 +1435,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->offset, header->length,
                         response->unscheduledBytes,
                         RETRANSMISSION|FROM_SERVER, true);
-                response->lastTransmitTime = Cycles::rdtsc();
+                response->lastTransmitTime = driver->getLastTransmitTime();
                 return;
             }
 
