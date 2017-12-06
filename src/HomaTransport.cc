@@ -1930,33 +1930,40 @@ HomaTransport::Poller::poll()
 {
     int result = 0;
 
-    // Process any available incoming packets.
-#define MAX_PACKETS 4
-    uint32_t numPackets;
-    uint32_t totalPackets = 0;
-    do {
-        t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
-        numPackets = downCast<uint>(t->receivedPackets.size());
 #if TIME_TRACE
-        // Log the beginning of poll() here so that timetrace entries do not
-        // go back in time.
-        if (totalPackets == 0 && numPackets > 0) {
-            uint64_t ns = Cycles::toNanoseconds(startTime - lastIdleTime);
-            timeTrace(startTime, "start of polling iteration %u, "
-                    "last poll was %u ns ago", owner->iteration, ns);
-        }
+    uint64_t startTime = Cycles::rdtsc();
 #endif
-        for (uint i = 0; i < numPackets; i++) {
-            t->handlePacket(&t->receivedPackets[i]);
-        }
-        t->receivedPackets.clear();
-        totalPackets += numPackets;
-    } while (numPackets == MAX_PACKETS);
-    result |= totalPackets;
 
-    // Send out GRANTs that are produced in the previous processing step
-    // in a batch.
-    // TODO: should I do a bucket sort or something to rank them by priorities?
+    // Process available incoming packets. Try to receive MAX_PACKETS packets
+    // at a time (an optimized driver implementation may prefetch the payloads
+    // for us). As of 07/2016, MAX_PACKETS is set to 8 because our CPU can
+    // take at most 8 cache misses at a time (although it's not clear 8 is the
+    // best value).
+#define MAX_PACKETS 8
+    uint32_t numPackets;
+    t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
+    numPackets = downCast<uint>(t->receivedPackets.size());
+#if TIME_TRACE
+    // Log the beginning of poll() here so that timetrace entries do not
+    // go back in time.
+    if (numPackets > 0) {
+        uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
+        timeTrace(startTime, "start of polling iteration %u, "
+                "last poll was %u ns ago", owner->iteration, ns);
+    }
+    lastPollTime = Cycles::rdtsc();
+#endif
+    for (uint i = 0; i < numPackets; i++) {
+        t->handlePacket(&t->receivedPackets[i]);
+    }
+    t->receivedPackets.clear();
+    result = numPackets > 0 ? 1 : result;
+
+    // See if we should send out new GRANT packets. Grants are sent here as
+    // opposed to inside #handlePacket because we would like to coalesse
+    // GRANT packets to the same message whenever possible. Besides,
+    // structuring code this way seems to improve the overall performance,
+    // potentially by being more cache-friendly.
     for (ScheduledMessage* recipient : t->messagesToGrant) {
         uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
                 FROM_SERVER : FROM_CLIENT;
@@ -2007,36 +2014,42 @@ HomaTransport::Poller::poll()
 
     // Transmit data packets if possible.
     uint32_t totalBytesSent = t->tryToTransmitData();
-    result |= totalBytesSent;
+    result = totalBytesSent > 0 ? 1 : result;
 
-    // Release a few retained payloads to the driver. As of 02/2017, releasing
-    // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
-    // useful to do in this method uptill now, try to release more payloads.
-    const uint32_t maxRelease = result ? 2 : 5;
+    // See if we should release a few retained payloads to the driver.
+    // As of 02/2017, releasing one payload to the DpdkDriver takes ~65ns.
+    // If we have received up to MAX_PACKETS packets, then there may be more
+    // packets outstanding in the NIC's RX queue and we should skip returning
+    // payloads to get to the next poll ASAP. On the other hand, if we haven't
+    // found anything useful to do in this method up till now, try to release
+    // more payloads.
     uint32_t releaseCount = 0;
-    while (!t->messagesToRelease.empty()) {
-        MessageAccumulator::Payloads* messageBuffer =
-                t->messagesToRelease.back();
-        while (!messageBuffer->empty() && (releaseCount < maxRelease)) {
-            char* payload = messageBuffer->back();
-            messageBuffer->pop_back();
-            t->driver->release(payload);
-            releaseCount++;
-            result = 1;
-        }
+    if (numPackets < MAX_PACKETS) {
+        const uint32_t maxRelease = result ? 1 : 5;
+        while (!t->messagesToRelease.empty()) {
+            MessageAccumulator::Payloads* message =
+                    t->messagesToRelease.back();
+            while (!message->empty() && (releaseCount < maxRelease)) {
+                char* payload = message->back();
+                message->pop_back();
+                t->driver->release(payload);
+                releaseCount++;
+                result = 1;
+            }
 
-        if (messageBuffer->empty()) {
-            t->messagesToRelease.pop_back();
-            delete messageBuffer;
-        } else {
-            break;
+            if (message->empty()) {
+                t->messagesToRelease.pop_back();
+                delete message;
+            } else {
+                break;
+            }
         }
     }
 
     if (result) {
         timeTrace("end of polling iteration %u, received %u packets, "
                 "transmitted %u bytes, released %u packet buffers",
-                owner->iteration, totalPackets, totalBytesSent, releaseCount);
+                owner->iteration, numPackets, totalBytesSent, releaseCount);
     }
     return result;
 }
