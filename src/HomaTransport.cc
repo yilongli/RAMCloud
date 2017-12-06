@@ -687,31 +687,25 @@ HomaTransport::tryToTransmitData()
     // packets with control packets. The code here only handles data packets;
     // control packets (and retransmitted data) are always passed to the
     // driver immediately.
-
-    uint32_t transmitQueueSpace = static_cast<uint32_t>(
-            driver->getTransmitQueueSpace(context->dispatch->currentTime));
-    if (static_cast<int>(transmitQueueSpace) < 0) {
-        return 0;
-    }
+    int transmitQueueSpace =
+            driver->getTransmitQueueSpace(context->dispatch->currentTime);
 
     // Each iteration of the following loop transmits data packets for
     // a single request or response.
-    while (true) {
-        uint64_t numOutgoingMessages =
-                outgoingRequests.size() + outgoingResponses.size();
-        if (numOutgoingMessages == 0) {
-            break;
-        }
-
+    while (transmitQueueSpace > 0) {
         // Find an outgoing request or response that is ready to transmit.
         // The policy here is "shortest remaining processing time" (SRPT).
+        // That is, choosing the message with the fewest bytes remaining
+        // to be transmitted.
 
         // Note: this code used to use std::maps instead of lists; the maps
         // were sorted by message length to avoid the cost of scanning
         // all RPCs. However, the maps had a very high insertion cost
         // (~50ns) even when empty, so it is faster overall to use lists.
-        // If these lists were to become very long, then this decision made
-        // need to be revisited.
+        // To optimize for the case where lists become too long, we use
+        // #topOutgoingMessages to cache a fixed number of messages with
+        // SRPT so that we only need to scan a small number of messages
+        // in the common case.
         uint32_t minBytesLeft = ~0u;
         OutgoingMessage* message = NULL;
         for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
@@ -728,80 +722,61 @@ HomaTransport::tryToTransmitData()
             }
         }
 
-        if (expect_false((NULL == message) && transmitDataSlowPath
-                && (numOutgoingMessages > topOutgoingMessages.size()))) {
+        // Couldn't find a message to transmit from our top outgoing message
+        // set; take the slow path
+        if (expect_false((NULL == message) && transmitDataSlowPath)) {
             timeTrace("slow path taken, iterating over %u outgoing messages",
                     outgoingRequests.size() + outgoingResponses.size());
 
-            uint32_t outsideMinBytesLeft = ~0u;
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                         it != outgoingRequests.end(); it++) {
-                ClientRpc* rpc = &(*it);
-                if (!rpc->request.topChoice) {
+                OutgoingMessage* request = &it->request;
+                if (!request->topChoice) {
                     uint32_t bytesLeft =
-                            rpc->request.buffer->size() - rpc->request.transmitOffset;
-                    outsideMinBytesLeft =
-                            std::min(bytesLeft, outsideMinBytesLeft);
-                    if (rpc->request.transmitLimit <= rpc->request.transmitOffset) {
+                            request->buffer->size() - request->transmitOffset;
+                    if (request->transmitLimit <= request->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
                     }
                     if (bytesLeft < minBytesLeft) {
                         minBytesLeft = bytesLeft;
-                        message = &rpc->request;
+                        message = request;
                     }
                 }
             }
 
             for (OutgoingResponseList::iterator it = outgoingResponses.begin();
                         it != outgoingResponses.end(); it++) {
-                ServerRpc* rpc = &(*it);
-                if (!rpc->response.topChoice) {
-                    uint32_t bytesLeft = rpc->replyPayload.size() -
-                            rpc->response.transmitOffset;
-                    outsideMinBytesLeft =
-                            std::min(bytesLeft, outsideMinBytesLeft);
-                    if (rpc->response.transmitLimit <= rpc->response.transmitOffset) {
+                OutgoingMessage* response = &it->response;
+                if (!response->topChoice) {
+                    uint32_t bytesLeft = response->buffer->size() -
+                            response->transmitOffset;
+                    if (response->transmitLimit <= response->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
                     }
                     if (bytesLeft < minBytesLeft) {
                         minBytesLeft = bytesLeft;
-                        message = &rpc->response;
+                        message = response;
                     }
                 }
             }
 
             if (message == NULL) {
+                // Can't find one outgoing message that is ready to transmit.
                 transmitDataSlowPath = false;
-            } else if (minBytesLeft == outsideMinBytesLeft) {
-                // TODO: rephrase it
-                // Expand the top outgoing message set only if the message
-                // has the fewest bytes left among outgoing messages not in
-                // this set.
-                message->topChoice = true;
-                topOutgoingMessages.push_back(*message);
-            }
-        }
-
-        ClientRpc* clientRpc = NULL;
-        ServerRpc* serverRpc = NULL;
-        if (message != NULL) {
-            if (message->clientRpc) {
-                clientRpc = message->clientRpc;
-            } else {
-                serverRpc = message->serverRpc;
             }
         }
 
         if (message != NULL) {
             // Transmit one or more request DATA packets from the message,
             // if appropriate.
+            ClientRpc* clientRpc = message->clientRpc;
+            ServerRpc* serverRpc = message->serverRpc;
             uint32_t maxBytes = std::min(message->transmitLimit,
                     message->buffer->size()) - message->transmitOffset;
-            if (maxBytes > transmitQueueSpace) {
-                maxBytes = transmitQueueSpace;
-            }
+            maxBytes = std::min(maxBytes,
+                    static_cast<uint32_t>(transmitQueueSpace));
 
             RpcId rpcId = clientRpc ? clientRpc->rpcId : serverRpc->rpcId;
             uint8_t whoFrom = clientRpc ? FROM_CLIENT : FROM_SERVER;
@@ -810,8 +785,8 @@ HomaTransport::tryToTransmitData()
                     message->unscheduledBytes, message->transmitPriority,
                     whoFrom);
             if (bytesSent == 0) {
-                // We can't transmit any more data because the queue space
-                // is too small.
+                // We can't transmit any more data because the remaining queue
+                // space is too small.
                 break;
             }
 
@@ -820,6 +795,7 @@ HomaTransport::tryToTransmitData()
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             if (message->transmitOffset >= message->buffer->size()) {
+                // We have transmitted the last byte of the message.
                 if (clientRpc) {
                     erase(outgoingRequests, *clientRpc);
                     clientRpc->transmitPending = false;
@@ -847,31 +823,6 @@ HomaTransport::tryToTransmitData()
             }
         } else {
             // There are no messages with data that can be transmitted.
-#if TIME_TRACE
-            uint64_t currentTime = context->dispatch->currentTime;
-            // TODO: only correct on m510
-            const uint32_t cyclesPerPacket = 2500;
-            if ((totalBytesSent == 0)
-                    && (lastTimeGrantRunDry + cyclesPerPacket < currentTime)) {
-                uint64_t now = Cycles::rdtsc();
-                // transmitQueueSpace is computed w.r.t. a stale timestamp.
-                // It's too imprecise for the purpose of analyzing bandwidth
-                // wasted in waiting for grants.
-                bool transmitQueueEmpty = (driver->getTransmitQueueSpace(now)
-                        == (int)driver->getMaxTransmitQueueSize());
-                if (transmitQueueEmpty) {
-                    std::set<const Driver::Address*> recipients;
-                    for (OutgoingMessage& m : topOutgoingMessages) {
-                        recipients.insert(m.recipient);
-                    }
-                    timeTrace(now, "not enough GRANTs to transmit data, "
-                            "%u top outgoing messages to %u recipients",
-                            topOutgoingMessages.size(), recipients.size());
-                    numTimesGrantRunDry++;
-                    lastTimeGrantRunDry = currentTime;
-                }
-            }
-#endif
             break;
         }
     }
@@ -1075,6 +1026,13 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
         notifier->failed();
         return;
     }
+    if (request->size() > MAX_RPC_LEN) {
+        throw TransportException(HERE,
+             format("client request exceeds maximum rpc size "
+                    "(attempted %u bytes, maximum %u bytes)",
+                    request->size(), MAX_RPC_LEN));
+    }
+
     response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
@@ -1084,12 +1042,9 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     t->nextClientSequenceNumber++;
 
     uint32_t bytesSent;
-    // TODO: how to justify this threshold?
-#define SMALL_MESSAGE_SIZE 300
-    if (length < SMALL_MESSAGE_SIZE) {
-        // Pass small messages directly to NIC: it's not worth going through
-        // all the hassles of tryToTransmitData and sendBytes
+    if (length < t->smallMessageThreshold) {
         RpcId rpcId = clientRpc->rpcId;
+        assert(length <= t->maxDataPerPacket);
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
         Buffer::Iterator iter(request, 0, length);
         timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
@@ -1098,7 +1053,6 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
         t->driver->sendPacket(serverAddress, &header, &iter,
                 clientRpc->request.transmitPriority);
         clientRpc->request.transmitOffset = length;
-//        clientRpc->request.lastTransmitTime = t->driver->getLastTransmitTime();
         clientRpc->transmitPending = false;
         bytesSent = length;
     } else {
@@ -1216,7 +1170,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                                 uint32_t(header->unscheduledBytes),
                                 clientRpc->session->serverAddress,
                                 uint32_t(header->totalLength),
-                                static_cast<uint8_t>(FROM_SERVER));
+                                uint8_t(FROM_SERVER));
                     }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
@@ -1252,12 +1206,13 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset);
-                if (header->offset > clientRpc->request.transmitLimit) {
-                    clientRpc->request.transmitLimit = header->offset;
-                    clientRpc->request.transmitPriority = header->priority;
-                }
-                if (!clientRpc->request.topChoice) {
-                    transmitDataSlowPath = true;
+                OutgoingMessage* request = &clientRpc->request;
+                if (header->offset > request->transmitLimit) {
+                    request->transmitLimit = header->offset;
+                    request->transmitPriority = header->priority;
+                    if (!request->topChoice) {
+                        transmitDataSlowPath = true;
+                    }
                 }
                 return;
             }
@@ -1286,20 +1241,21 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId.clientId,
                         header->common.rpcId.sequence,
                         header->offset, header->length);
+                OutgoingMessage* request = &clientRpc->request;
                 if (header->common.flags & RESTART) {
                     clientRpc->response->reset();
-                    clientRpc->request.transmitOffset = 0;
-                    clientRpc->request.transmitLimit = header->length;
+                    request->transmitOffset = 0;
+                    request->transmitLimit = header->length;
                     clientRpc->accumulator.destroy();
                     clientRpc->scheduledMessage.destroy();
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
-                        maintainTopOutgoingMessages(&clientRpc->request);
-                    } else if (clientRpc->request.topChoice) {
-                        clientRpc->request.topChoice = false;
+                        maintainTopOutgoingMessages(request);
+                    } else if (request->topChoice) {
+                        request->topChoice = false;
                         erase(topOutgoingMessages, clientRpc->request);
-                        maintainTopOutgoingMessages(&clientRpc->request);
+                        maintainTopOutgoingMessages(request);
                     }
                     return;
                 }
@@ -1703,24 +1659,26 @@ HomaTransport::ServerRpc::sendReply()
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
             length, t->outgoingResponses.size());
     if (cancelled) {
-        // TODO: when this method returns, the caller's handle to this
-        // ServerRpc may become invalid; however, this behavior is already
-        // possible since tryToTransmitData may also invoke deleteServerRpc.
         t->deleteServerRpc(this);
         return;
     }
-    response.transmitPriority = t->getUnschedTrafficPrio(length);
+    if (replyPayload.size() > MAX_RPC_LEN) {
+        throw TransportException(HERE,
+             format("server response exceeds maximum rpc size "
+                    "(attempted %u bytes, maximum %u bytes)",
+                    replyPayload.size(), MAX_RPC_LEN));
+    }
 
     uint32_t bytesSent;
-    if (length < SMALL_MESSAGE_SIZE) {
+    response.transmitPriority = t->getUnschedTrafficPrio(length);
+    if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
         timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence,
                 response.transmitPriority);
-        t->driver->sendPacket(response.recipient, &header, &iter, response.transmitPriority);
-//        transmitOffset = length;
-//        lastTransmitTime = t->driver->getLastTransmitTime();
+        t->driver->sendPacket(response.recipient, &header, &iter,
+                response.transmitPriority);
         t->deleteServerRpc(this);
         bytesSent = length;
     } else {
