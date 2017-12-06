@@ -18,13 +18,7 @@
 
 #include <deque>
 
-#if __cplusplus >= 201402L
-#pragma GCC diagnostic ignored "-Wconversion"
-#pragma GCC diagnostic ignored "-Weffc++"
 #include "flat_hash_map.h"
-#pragma GCC diagnostic warning "-Wconversion"
-#pragma GCC diagnostic warning "-Weffc++"
-#endif
 #include "BoostIntrusive.h"
 #include "Buffer.h"
 #include "Cycles.h"
@@ -46,7 +40,7 @@ class HomaTransport : public Transport {
 
   public:
     explicit HomaTransport(Context* context, const ServiceLocator* locator,
-            Driver* driver, bool driverOwner, uint64_t clientId);
+            Driver* driver, uint64_t clientId);
     ~HomaTransport();
 
     string getServiceLocator();
@@ -61,18 +55,6 @@ class HomaTransport : public Transport {
     }
 
   PRIVATE:
-    /// As of 08/17, std::unordered_map is significantly slower than
-    /// ska::flat_hash_map. According to the Perf benchmark, inserting
-    /// +deleting an entry and lookup in an ska::flat_hash_map take 15 ns
-    /// and 4 ns, respectively (vs. 80 ns and 15 ns using std::unordered_map).
-    template<typename K, typename V, typename H = std::hash<K>>
-#if __cplusplus >= 201402L
-    // ska::flat_hash_map requires c++14 features to compile.
-    using HashMap = ska::flat_hash_map<K, V, H>;
-#else
-    using HashMap = std::unordered_map<K, V, H>;
-#endif
-
     /**
      * A unique identifier for an RPC.
      */
@@ -171,12 +153,8 @@ class HomaTransport : public Transport {
         /// Transport that is managing this object.
         HomaTransport* t;
 
-        /// Holds all of the packets that have been received for the message
-        /// so far in order, up to the first packet that has not been received.
-        /// Upon destruction, these packets are passed to t->messagesToRelease,
-        /// and incrementally deleted in the polling loop to avoid jitters.
-        using Payloads = std::vector<char*>;
-        Payloads* assembledPayloads;
+        using MessageBuffer = std::vector<char*>;
+        MessageBuffer* assembledPayloads;
 
         /// Used to assemble the complete message. It holds all of the
         /// data that has been received for the message so far, up to the
@@ -205,18 +183,22 @@ class HomaTransport : public Transport {
         /// more preceding packets have not yet been received. Each
         /// key is an offset in the message; each value describes the
         /// corresponding fragment, which is a stolen Driver::Received.
-        typedef HashMap<uint32_t, MessageFragment> FragmentMap;
+        typedef ska::flat_hash_map<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
+
+        // True if a packet might be lost (which prevents many message
+        // fragments from being assembled to the buffer).
+        bool packetLost;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
 
     /**
-     * An object of this class stores the state for an incoming message that
-     * requires scheduling. It is used both for request messages on the server
-     * and for response messages on the client. Not used for messages that can
-     * be sent unilaterally.
+     * An object of this class stores the state for a scheduled message for
+     * for which at least one packet has been received. It is used both for
+     * request messages on the server and for response messages on the client.
+     * Not used for messages that can be sent unilaterally.
      */
     class ScheduledMessage {
       public:
@@ -281,22 +263,15 @@ class HomaTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(ScheduledMessage);
     };
 
-    class ClientRpc;
-    class ServerRpc;
-    /**
-     * An outgoing message that is either the request of a ClientRpc or the
-     * response of a ServerRpc.
-     */
+    // TODO
     class OutgoingMessage {
       public:
         /// Holds the contents of the message.
         Buffer* buffer;
 
-        /// This message is part of either a request or a response. Exactly
-        /// one of the two variables below will be non-NULL; it refers to data
-        /// about the containing RPC.
-        ClientRpc* clientRpc;
-        ServerRpc* serverRpc;
+        /// True means this message is the request of a ClientRpc; false means
+        /// it is the response of a ServerRpc.
+        const bool isRequest;
 
         /// Where to send the message.
         const Driver::Address* recipient;
@@ -326,15 +301,14 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->topOutgoingMessages.
         IntrusiveListHook outgoingMessageLinks;
 
+        // TODO: doc. dynamic throttling
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
-        OutgoingMessage(ClientRpc* clientRpc, ServerRpc* serverRpc,
-                HomaTransport* t, Buffer* buffer,
+        OutgoingMessage(bool isRequest, HomaTransport* t, Buffer* buffer,
                 const Driver::Address* recipient)
             : buffer(buffer)
-            , clientRpc(clientRpc)
-            , serverRpc(serverRpc)
+            , isRequest(isRequest)
             , recipient(recipient)
             , transmitOffset(0)
             , transmitPriority(0)
@@ -355,13 +329,13 @@ class HomaTransport : public Transport {
      * One object of this class exists for each outgoing RPC; it is used
      * to track the RPC through to completion.
      */
-    class ClientRpc {
+    class ClientRpc : public OutgoingMessage {
       public:
         /// The ClientSession on which to send/receive the RPC.
         Session* session;
 
         /// Request message for the RPC.
-        OutgoingMessage request;
+        Buffer* request;
 
         /// Will eventually hold the response for the RPC.
         Buffer* response;
@@ -380,12 +354,10 @@ class HomaTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
-        /// Holds state of partially-received multi-packet responses. Empty
-        /// if the response is single-packet.
+        /// Holds state of partially-received multi-packet responses.
         Tub<MessageAccumulator> accumulator;
 
-        /// Holds state of response messages that require scheduling. Empty
-        /// if the response is unscheduled.
+        /// Holds state of response messages that require scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->outgoingRequests.
@@ -393,8 +365,10 @@ class HomaTransport : public Transport {
 
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
-            : session(session)
-            , request(this, NULL, session->t, request, session->serverAddress)
+            : OutgoingMessage(true, session->t, request,
+                    session->serverAddress)
+            , session(session)
+            , request(request)
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
@@ -412,7 +386,7 @@ class HomaTransport : public Transport {
     /**
      * Holds server-side state for an RPC.
      */
-    class ServerRpc : public Transport::ServerRpc {
+    class ServerRpc : public Transport::ServerRpc, public OutgoingMessage {
       public:
         void sendReply();
         string getClientServiceLocator();
@@ -426,11 +400,12 @@ class HomaTransport : public Transport {
         /// sequence number is in rpcId.
         uint64_t sequence;
 
-        /// True if the RPC has been cancelled by the client. This is only
-        /// neccessary for the case where an RPC cannot be deleted immediately
-        /// (e.g., it's being executed); we use this flag to indicate that
-        /// this RPC should be removed at the server's earliest convenience.
+        /// True if the RPC has been cancelled by the client.
         bool cancelled;
+
+        // TODO: THIS FIELD IS NOW REDUNDANT; REMOVE IT AND USE response->recipient instead?
+        /// Where to send the response once the RPC has executed.
+        const Driver::Address* clientAddress;
 
         /// Unique identifier for this RPC.
         RpcId rpcId;
@@ -447,15 +422,10 @@ class HomaTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
-        /// Holds state of partially-received multi-packet requests. Empty if
-        /// the request is single-packet.
+        /// Holds state of partially-received multi-packet requests.
         Tub<MessageAccumulator> accumulator;
 
-        /// Response message for the RPC.
-        OutgoingMessage response;
-
-        /// Holds state of the request message that requires scheduling. Empty
-        /// if the request is unscheduled.
+        /// Holds state of request messages that require scheduling.
         Tub<ScheduledMessage> scheduledMessage;
 
         /// Used to link this object into t->serverTimerList.
@@ -466,15 +436,16 @@ class HomaTransport : public Transport {
 
         ServerRpc(HomaTransport* transport, uint64_t sequence,
                 const Driver::Address* clientAddress, RpcId rpcId)
-            : t(transport)
+            : OutgoingMessage(false, transport, &replyPayload, clientAddress)
+            , t(transport)
             , sequence(sequence)
             , cancelled(false)
+            , clientAddress(clientAddress)
             , rpcId(rpcId)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
             , accumulator()
-            , response(NULL, this, transport, &replyPayload, clientAddress)
             , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
@@ -496,7 +467,8 @@ class HomaTransport : public Transport {
         RESEND                 = 24,
         ACK                    = 25,
         ABORT                  = 26,
-        BOGUS                  = 27,      // Used only in unit tests.
+        PING                   = 27,
+        BOGUS                  = 28,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -659,14 +631,24 @@ class HomaTransport : public Transport {
 
     /**
      * Describes the wire format for ABORT packets. These packets are used
-     * to let the server know that the client has cancelled the RPC. They
-     * are neccessary to avoid spurious warning messages in the log.
+     * to let the server know that the client has cancelled the RPC.
      */
     struct AbortHeader {
         CommonHeader common;         // Common header fields.
 
         explicit AbortHeader(RpcId rpcId)
             : common(PacketOpcode::ABORT, rpcId, FROM_CLIENT) {}
+    } __attribute__((packed));
+
+    /**
+     * Describes the wire format for PING packets. These packets are used
+     * to check if a client or server is still alive.
+     */
+    struct PingHeader {
+        CommonHeader common;         // Common header fields.
+
+        explicit PingHeader(RpcId rpcId, uint8_t flags)
+            : common(PacketOpcode::PING, rpcId, flags) {}
     } __attribute__((packed));
 
     /**
@@ -678,16 +660,11 @@ class HomaTransport : public Transport {
         explicit Poller(Context* context, HomaTransport* t)
             : Dispatch::Poller(context->dispatch, "HomaTransport(" +
                     t->driver->getServiceLocator() + ")::Poller")
-            , t(t)
-            , lastPollTime(0) { }
+            , t(t) { }
         virtual int poll();
       private:
-        /// Transport on whose behalf this poller operates.
+        // Transport on whose behalf this poller operates.
         HomaTransport* t;
-
-        /// The most recent time that we polled the receive queue of the NIC,
-        /// in rdtsc ticks. Only used for diagnostic time tracing.
-        uint64_t lastPollTime;
         DISALLOW_COPY_AND_ASSIGN(Poller);
     };
 
@@ -708,8 +685,8 @@ class HomaTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void augmentTopOutgoingMessageSet();
-    void maintainTopOutgoingMessages(OutgoingMessage* candidate);
+    void updateTopOutgoingMessageSet(OutgoingMessage* candidate,
+            bool newMessage);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
@@ -722,10 +699,6 @@ class HomaTransport : public Transport {
     /// The Driver used to send and receive packets.
     Driver* driver;
 
-    /// Is this transport the owner of #driver? If yes, free the driver upon
-    /// destruction.
-    bool driverOwner;
-
     /// Service locator string of this transport.
     string locatorString;
 
@@ -733,24 +706,10 @@ class HomaTransport : public Transport {
     Poller poller;
 
     /// Maximum # bytes of message data that can fit in one packet.
-    CONST uint32_t maxDataPerPacket;
+    const uint32_t maxDataPerPacket;
 
-    /// Messages smaller than or equal to this many bytes are received in
-    /// a zero-copy fashion in their entireties, if the underlying driver
-    /// permits. The larger this number is set, the more hardware packet
-    /// buffers we will likely retain at any given time, and the more we
-    /// deviate from the SRPT policy. If this number is set too large, we
-    /// may run out of hardware packet buffers and have to stop receiving
-    /// packets (even worse, we can't complete any message to free up the
-    /// hardware packet buffers; thus, a deadlock!).
-    const uint32_t messageZeroCopyThreshold;
-
-    /// Maximum # bytes of a message that we consider as small. For small
-    /// messages, the tryToTransmitData mechanism takes more time then just
-    /// transmitting the packet. In order to be efficient on workloads with
-    /// lots of short messages, we only use tryToTransmitData for messages
-    /// of nontrivial length.
-    CONST uint32_t smallMessageThreshold;
+    /// Maximum # bytes of message that we support zero-copy reception.
+    const uint32_t maxZeroCopyMessage;
 
     /// Unique identifier for this client (used to provide unique
     /// identification for RPCs).
@@ -787,13 +746,14 @@ class HomaTransport : public Transport {
 
     /// Holds incoming messages we are about to grant. Always empty, except
     /// when the poll method is receiving and processing incoming packets.
-    std::vector<ScheduledMessage*> messagesToGrant;
+    std::vector<ScheduledMessage*> grantRecipients;
 
-    /// Holds multi-packet messages that are in the process of being deleted.
-    /// A multi-packet message was released inside ~MessageAccumulator at one
-    /// shot, but that caused significant jitters when the message is large.
-    /// Now the packets are gradually released in the poll method.
-    std::vector<MessageAccumulator::Payloads*> messagesToRelease;
+    /// Holds message buffers that are consist of payloads that are retained
+    /// and assembled by the MessageAccumulator. These retained payloads are
+    /// gradually released in the poll method so that the MessageAccumulator
+    /// doesn't have to release all its payloads at one shot in the destructor
+    /// and cause significant jitter.
+    std::vector<MessageAccumulator::MessageBuffer*> messageBuffers;
 
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
@@ -805,8 +765,16 @@ class HomaTransport : public Transport {
     /// response has not yet been completely received (we have sent
     /// at least part of the request, but not necessarily the entire
     /// request yet). Keys are RPC sequence numbers.
-    typedef HashMap<uint64_t, ClientRpc*> ClientRpcMap;
+    typedef ska::flat_hash_map<uint64_t, ClientRpc*> ClientRpcMap;
+    // FIXME: What about allocator? Why are we using malloc/free when we have ObjectPool?
+    // flat_hash_map never calls allocate(_, 1), so it looks like it is managing its own "pool"?
+    // which makes sense since it's an unordered map, this also explains why using my ObjectPoolAllocator
+    // doesn't make insertion faster because it's essentially replacing malloc with RC xmalloc...
+    // but then how the heck does the author achieve ~5 ns/insertion with reserve?
     ClientRpcMap outgoingRpcs;
+    // TODO: The way we are uing this map is quite inefficient!!!
+    // (e.g. frequently iterating the entire map) especially when there is
+    // a large number of outstanding RPCs
 
     /// Holds RPCs for which we are the client, and for which the
     /// request message has not yet been completely transmitted (once
@@ -817,21 +785,21 @@ class HomaTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    /// Holds the sender's top K outgoing messages with the fewest bytes
-    /// remaining to be transmitted. K varies dynamically but is limited to
-    /// a small constant so that scanning the list is efficient. This is used
-    /// to handle situations where there are very large numbers of outgoing
-    /// messages: the sender only needs to scan this list in the common case
-    /// of transmitting a message (i.e., at least one message in this list has
-    /// bytes ready to transmit).
+    /// A relatively small set of the sender's top K outgoing messages with
+    /// fewest bytes left. We keep this as a separate set so that the sender
+    /// doesn't have to consider all the outgoing messages in the common case.
+    /// K is dynamically adjusted based on the workload. The overall goal is
+    /// to keep K as small as possible while still ensuring that the sender
+    /// doesn't have to look outside this set when picking the next message
+    /// to transmit. Every time the sender decides to transmit a message
+    /// outside this set, we increment K by one.
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
     OutgoingMessageList topOutgoingMessages;
 
-    /// Is there any message outside t->topOutgoingMessages that has bytes
-    /// ready to be transmitted? If yes, when all messages in our top outgoing
-    /// message set are waiting for grants, we have to scan all outgoing
-    /// messages to find the next message to transmit.
+    /// False means we know that no message outside t->topOutgoingMessages
+    /// has grants available and there is no need to take the slow path in
+    /// #tryToTransmitData.
     bool transmitDataSlowPath;
 
     /// An RPC is in this map if (a) is one for which we are the server,
@@ -840,7 +808,8 @@ class HomaTransport : public Transport {
     /// to the driver.  Note: this map could get large if the server gets
     /// backed up, so that there are a large number of RPCs that have been
     /// received but haven't yet been assigned to worker threads.
-    typedef HashMap<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
+//    typedef std::unordered_map<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
+    typedef ska::flat_hash_map<RpcId, ServerRpc*, RpcId::Hasher> ServerRpcMap;
     ServerRpcMap incomingRpcs;
 
     /// Holds RPCs for which we are the server, and whose response is
@@ -866,6 +835,7 @@ class HomaTransport : public Transport {
     /// tries to keep at least this many bytes of unreceived data granted
     /// at all times, in order to utilize the full network bandwidth).
     uint32_t roundTripBytes;
+    // TODO: need to clean up the use of this field thoroughly
 
     /// How many bytes to extend the granted range in each new GRANT;
     /// a larger value avoids the overhead of sending and receiving
@@ -933,6 +903,77 @@ class HomaTransport : public Transport {
     /// Maximum # incoming messages that can be actively granted by the
     /// transport at any time.
     uint32_t maxGrantedMessages;
+
+    //--------------------
+    // Performance Monitor
+    //--------------------
+
+    /// The beginning of the current monitoring interval, in units of
+    /// rdtsc ticks.
+    uint64_t lastMeasureTime;
+
+    /// The value of `PerfStats::activeDispatchCycles` at `lastMeasureTime`.
+    uint64_t lastDispatchActiveCycles;
+
+    /// The start time of the last call to Dispatch::poll where
+    /// `numTimesGrantRunDry` increments.
+    uint64_t lastTimeGrantRunDry;
+
+    /// `monitorMillis` in units of rdtsc ticks.
+    uint64_t monitorInterval;
+
+    /// Specifies the period over which to log the performance metrics,
+    /// in milliseconds.
+    uint32_t monitorMillis;
+
+    /// # total packets received and processed in the current interval.
+    uint32_t numPacketsReceived;
+
+    /// # data packets received and processed in the current interval.
+    uint32_t numDataPacketsReceived;
+
+    /// # total control packets transmitted in the current interval.
+    uint32_t numControlPacketsSent;
+
+    /// # data packets transmitted in the current interval.
+    uint32_t numDataPacketsSent;
+
+    /// # times, in the current interval, we cannot transmit any message
+    /// because we are waiting for GRANTs and the transmit queue has run
+    /// dry.
+    uint32_t numTimesGrantRunDry;
+
+    /// Total # control bytes transmitted in the current interval.
+    uint32_t outputControlBytes;
+
+    /// Total # data bytes (excluding packet headers) transmitted in the
+    /// current interval.
+    uint32_t outputDataBytes;
+
+    /// Total # retransmitted data bytes (excluding packet headers) in the
+    /// current interval.
+    uint32_t outputResentBytes;
+
+    /// # performance monitor intervals we have experienced.
+    uint64_t perfMonitorIntervals;
+
+    // TODO
+    uint64_t processPacketCycles;
+
+    uint64_t timeoutCheckCycles;
+
+    uint64_t transmitDataCycles;
+
+    uint64_t transmitGrantCycles;
+
+    /// # times we have to look outside of t->topOutgoingMessages in order to
+    /// find a message to transmit in #tryToTransmitData.
+    uint32_t tryToTransmitDataCacheMisses;
+
+    /// Total # idle rdtsc ticks of the NIC's transmit queue in the
+    /// current interval.
+    uint64_t unusedBandwidth;
+
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
 
