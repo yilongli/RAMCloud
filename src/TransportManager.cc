@@ -69,7 +69,7 @@ static struct HomaUdpTransportFactory : public TransportFactory {
     Transport* createTransport(Context* context,
             const ServiceLocator* localServiceLocator) {
         return new HomaTransport(context, localServiceLocator,
-                new UdpDriver(context, localServiceLocator), true,
+                new UdpDriver(context, localServiceLocator),
                 generateRandom());
     }
 } homaUdpTransportFactory;
@@ -92,7 +92,7 @@ static struct HomaSolarFlareTransportFactory : public TransportFactory {
     Transport* createTransport(Context* context,
             const ServiceLocator* localServiceLocator) {
         return new HomaTransport(context, localServiceLocator,
-                new SolarFlareDriver(context, localServiceLocator), true,
+                new SolarFlareDriver(context, localServiceLocator),
                 generateRandom());
     }
 } homaSolarFlareTransportFactory;
@@ -116,7 +116,7 @@ static struct HomaInfUdTransportFactory : public TransportFactory {
     Transport* createTransport(Context* context,
             const ServiceLocator* localServiceLocator) {
         return new HomaTransport(context, localServiceLocator,
-                new InfUdDriver(context, localServiceLocator, false), true,
+                new InfUdDriver(context, localServiceLocator, false),
                 generateRandom());
     }
 } homaInfUdTransportFactory;
@@ -166,7 +166,7 @@ struct HomaDpdkTransportFactory : public TransportFactory {
                     "command-line option?)");
             throw TransportException(HERE, "DPDK is not enabled");
         }
-        return new HomaTransport(context, localServiceLocator, driver, false,
+        return new HomaTransport(context, localServiceLocator, driver,
                 generateRandom());
     }
     void setDpdkDriver(DpdkDriver* driver) {

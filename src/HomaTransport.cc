@@ -52,11 +52,6 @@ namespace {
     }
 }
 
-// FIXME: temporary hack to collapse priority levels (evaluation only)
-static int P = 1;
-#define SEND_PACKET(driver, addr, header, payload, prio) \
-    driver->sendPacket(addr, header, payload, prio / P)
-
 /**
  * Construct a new HomaTransport.
  * 
@@ -121,26 +116,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , inactiveMessages()
     , highestGrantedPrio(-1)
     , maxGrantedMessages()
-    , lastMeasureTime(0)
-    , lastDispatchActiveCycles(0)
-    , lastTimeGrantRunDry(0)
-    , monitorInterval()
-    , monitorMillis()
-    , numPacketsReceived(0)
-    , numDataPacketsReceived(0)
-    , numControlPacketsSent(0)
-    , numDataPacketsSent(0)
-    , numTimesGrantRunDry(0)
-    , outputControlBytes(0)
-    , outputDataBytes(0)
-    , outputResentBytes(0)
-    , perfMonitorIntervals(0)
-    , processPacketCycles(0)
-    , timeoutCheckCycles(0)
-    , transmitDataCycles(0)
-    , transmitGrantCycles(0)
-    , tryToTransmitDataCacheMisses(0)
-    , unusedBandwidth(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -148,10 +123,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // intervals result in unnecessary retransmissions.
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
-
-    // Measure network throughput at 1 ms intervals.
-    monitorMillis = 1;
-    monitorInterval = Cycles::fromMicroseconds(1000*monitorMillis);
 
     // FIXME: use context->options->getOption("configDir")?
     std::ifstream configFile("/shome/RAMCloud/config/transport.txt");
@@ -222,10 +193,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         }
     }
 
-    if (params && params->hasOption("dpdkPrio")) {
-        P = 8 / params->getOption<int>("dpdkPrio");
-    }
-
     // Set unscheduled priority cutoffs.
     string unschedMessageBrackets = "[0";
     int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
@@ -248,13 +215,12 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
             "roundTripMicros %u, roundTripBytes %u, grantIncrement %u, "
             "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
-            "monitorInterval %.2f ms, maxGrantedMessages %u, "
+            "maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
             "highestSchedPriority %d, unscheduedMessageBrackets %s",
             clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
-            Cycles::toSeconds(timerInterval)*1e3,
-            Cycles::toSeconds(monitorInterval)*1e3, maxGrantedMessages,
+            Cycles::toSeconds(timerInterval)*1e3, maxGrantedMessages,
             highestAvailPriority, lowestUnschedPrio, highestSchedPriority,
             unschedMessageBrackets.c_str());
 }
@@ -528,8 +494,7 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "server sending ALL_DATA, clientId %u, sequence %u, "
                     "priority %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, priority);
-            SEND_PACKET(driver, address, &header, &iter, priority);
-//            driver->sendPacket(address, &header, &iter, priority);
+            driver->sendPacket(address, &header, &iter, priority);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
                     unscheduledBytes, flags);
@@ -541,32 +506,10 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "offset %u, priority %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset,
                     priority);
-            SEND_PACKET(driver, address, &header, &iter, priority);
-//            driver->sendPacket(address, &header, &iter, priority);
-        }
-        uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
-        if (bytesQueuedAhead > 0) {
-            timeTrace(driver->getLastTransmitTime(),
-                    "sent data, clientId %u, sequence %u, offset %u, "
-                    "%u bytes queued ahead", rpcId.clientId, rpcId.sequence,
-                    curOffset, bytesQueuedAhead);
-        } else {
-            uint64_t idleInterval = driver->getTxQueueIdleInterval();
-            unusedBandwidth += idleInterval;
-            timeTrace(driver->getLastTransmitTime(),
-                    "sent data, clientId %u, sequence %u, offset %u, "
-                    "0 bytes queued ahead, idle time %u cyc",
-                    rpcId.clientId, rpcId.sequence, curOffset, idleInterval);
+            driver->sendPacket(address, &header, &iter, priority);
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
-
-        // Update performance monitor metrics.
-        numDataPacketsSent++;
-        outputDataBytes += bytesThisPacket;
-        if (flags & RETRANSMISSION) {
-            outputResentBytes += bytesThisPacket;
-        }
     }
 
     return bytesSent;
@@ -585,32 +528,7 @@ void
 HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
-//    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
-    SEND_PACKET(driver, recipient, packet, NULL, controlPacketPriority);
-    uint32_t bytesQueuedAhead = driver->getLastQueueingDelay();
-    uint64_t idleInterval = driver->getTxQueueIdleInterval();
-    if (std::is_same<T, GrantHeader>::value) {
-        const GrantHeader* grant = reinterpret_cast<const GrantHeader*>(packet);
-        const RpcId* rpcId = &grant->common.rpcId;
-        if (bytesQueuedAhead > 0) {
-            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
-                    "%u bytes queued ahead, idle time 0 cyc",
-                    rpcId->clientId, rpcId->sequence, grant->offset,
-                    bytesQueuedAhead);
-        } else {
-            timeTrace("sent GRANT, clientId %u, sequence %u, offset %u, "
-                    "0 bytes queued ahead, idle time %u cyc",
-                    rpcId->clientId, rpcId->sequence, grant->offset,
-                    idleInterval);
-        }
-    } else {
-        timeTrace("sent control packet, %u bytes queued ahead, "
-                "idle time %u cyc", bytesQueuedAhead, idleInterval);
-    }
-    unusedBandwidth += idleInterval;
-    outputControlBytes +=
-            static_cast<uint32_t>(sizeof(T)) + driver->getPacketOverhead();
-    numControlPacketsSent++;
+    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
 }
 
 /**
@@ -787,7 +705,6 @@ HomaTransport::tryToTransmitData()
 
         if (expect_false((NULL == message) && transmitDataSlowPath
                 && (numOutgoingMessages > topOutgoingMessages.size()))) {
-            tryToTransmitDataCacheMisses++;
             timeTrace("slow path taken, iterating over %u outgoing messages",
                     outgoingRequests.size() + outgoingResponses.size());
 
@@ -1102,10 +1019,8 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
         timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence,
                 clientRpc->transmitPriority);
-        SEND_PACKET(t->driver, serverAddress, &header, &iter,
+        t->driver->sendPacket(serverAddress, &header, &iter,
                 clientRpc->transmitPriority);
-//        t->driver->sendPacket(serverAddress, &header, &iter,
-//                clientRpc->transmitPriority);
         clientRpc->transmitOffset = length;
 //        clientRpc->lastTransmitTime = t->driver->getLastTransmitTime();
         clientRpc->transmitPending = false;
@@ -1137,9 +1052,6 @@ HomaTransport::handlePacket(Driver::Received* received)
         RAMCLOUD_CLOG(WARNING, "packet from %s too short (%u bytes)",
                 received->sender->toString().c_str(), received->len);
         return;
-    }
-    if (common->opcode == ALL_DATA || common->opcode == DATA) {
-        numDataPacketsReceived++;
     }
 
     if (!(common->flags & FROM_CLIENT)) {
@@ -1727,8 +1639,7 @@ HomaTransport::ServerRpc::sendReply()
         timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence,
                 transmitPriority);
-        SEND_PACKET(t->driver, clientAddress, &header, &iter, transmitPriority);
-//        t->driver->sendPacket(clientAddress, &header, &iter, transmitPriority);
+        t->driver->sendPacket(clientAddress, &header, &iter, transmitPriority);
 //        transmitOffset = length;
 //        lastTransmitTime = t->driver->getLastTransmitTime();
         t->deleteServerRpc(this);
@@ -1999,17 +1910,6 @@ HomaTransport::ScheduledMessage::compareTo(ScheduledMessage& other) const
     return r0 - r1;
 }
 
-// TODO: NOT SURE THIS IS THE RIGHT PLACE TO DEFINE IT.
-#if TIME_TRACE
-#define UPDATE_CYCLES(cycles) do { \
-    currentTime = Cycles::rdtsc(); \
-    cycles += currentTime - prevTime; \
-    prevTime = currentTime; \
-} while (0)
-#else
-#define UPDATE_CYCLES(x) do {} while (0)
-#endif
-
 /**
  * This method is invoked in the inner polling loop of the dispatcher;
  * it drives the operation of the transport.
@@ -2021,83 +1921,6 @@ int
 HomaTransport::Poller::poll()
 {
     int result = 0;
-
-#if TIME_TRACE
-    // See if we should compute the network throughput in the last interval.
-    if (owner->currentTime > t->lastMeasureTime + t->monitorInterval) {
-        t->perfMonitorIntervals++;
-//        if (t->perfMonitorIntervals % 100 == 0) {
-//            LOG(NOTICE, "%lu outgoing requests, %lu outgoing responses",
-//                    t->outgoingRequests.size(), t->outgoingResponses.size());
-//        }
-
-        t->unusedBandwidth +=
-                t->driver->getTxQueueIdleInterval(owner->currentTime);
-        uint32_t millis = t->monitorMillis;
-        uint64_t activeCycles = PerfStats::threadStats.dispatchActiveCycles
-                - t->lastDispatchActiveCycles;
-        uint64_t unusedBandwidthPct =
-                t->unusedBandwidth*100/t->monitorInterval;
-        uint64_t unusedUplinkBandwidth =
-                t->driver->getBandwidth()*unusedBandwidthPct/100;
-        uint32_t wastedGoodput = t->numTimesGrantRunDry *
-                t->driver->getMaxPacketSize()*8/1000/millis;
-        uint64_t now = Cycles::rdtsc();
-        timeTrace(now, "data packets goodput %u Mbps, "
-                "control packets throughput %u Mbps, "
-                "retransmission goodput %u Mbps",
-                t->outputDataBytes*8/1000/millis,
-                t->outputControlBytes*8/1000/millis,
-                t->outputResentBytes*8/1000/millis);
-        timeTrace(now, "data packet TX rate %u kpps, "
-                "control packet TX rate %u kpps, "
-                "data packet RX rate %u kpps, "
-                "control packet RX rate %u kpps,",
-                t->numDataPacketsSent/millis,
-                t->numControlPacketsSent/millis,
-                t->numDataPacketsReceived/millis,
-                (t->numPacketsReceived - t->numDataPacketsReceived)/millis);
-        timeTrace(now, "dispatch utilization %u%%, process packets %u%%, "
-                "transmit data %u%%, transmit grant %u%%",
-                activeCycles*100/t->monitorInterval,
-                t->processPacketCycles*100/t->monitorInterval,
-                t->transmitDataCycles*100/t->monitorInterval,
-                t->transmitGrantCycles*100/t->monitorInterval);
-        timeTrace(now, "unused uplink bandwidth %u%% (%u Mbps), "
-                "run out of grants %u times, wasted goodput <= %u Mbps",
-                unusedBandwidthPct, unusedUplinkBandwidth,
-                t->numTimesGrantRunDry, wastedGoodput);
-        timeTrace(now, "%u outgoing requests, %u outgoing responses, "
-                "%u top outgoing messages",
-                t->outgoingRequests.size(), t->outgoingResponses.size(),
-                t->topOutgoingMessages.size());
-        timeTrace(now, "check timeouts %u%%, tryToTxData cache misses %u",
-                t->timeoutCheckCycles*100/t->monitorInterval,
-                t->tryToTransmitDataCacheMisses);
-
-        t->lastMeasureTime = owner->currentTime;
-        t->lastDispatchActiveCycles =
-                PerfStats::threadStats.dispatchActiveCycles;
-        t->numPacketsReceived = 0;
-        t->numDataPacketsReceived = 0;
-        t->numControlPacketsSent = 0;
-        t->numDataPacketsSent = 0;
-        t->numTimesGrantRunDry = 0;
-        t->outputControlBytes = 0;
-        t->outputDataBytes = 0;
-        t->outputResentBytes = 0;
-        t->processPacketCycles = 0;
-        t->timeoutCheckCycles = 0;
-        t->transmitDataCycles = 0;
-        t->transmitGrantCycles = 0;
-        t->tryToTransmitDataCacheMisses = 0;
-        t->unusedBandwidth = 0;
-    }
-
-    uint64_t startTime = Cycles::rdtsc();
-    uint64_t prevTime = startTime, currentTime;
-    uint64_t lastIdleTime = t->driver->getRxQueueIdleTime();
-#endif
 
     // Process any available incoming packets.
 #define MAX_PACKETS 4
@@ -2121,9 +1944,7 @@ HomaTransport::Poller::poll()
         t->receivedPackets.clear();
         totalPackets += numPackets;
     } while (numPackets == MAX_PACKETS);
-    t->numPacketsReceived += totalPackets;
     result |= totalPackets;
-    UPDATE_CYCLES(t->processPacketCycles);
 
     // Send out GRANTs that are produced in the previous processing step
     // in a batch.
@@ -2142,9 +1963,6 @@ HomaTransport::Poller::poll()
                 grant.offset, grant.priority);
 
         t->sendControlPacket(recipient->senderAddress, &grant);
-    }
-    if (!t->grantRecipients.empty()) {
-        UPDATE_CYCLES(t->transmitGrantCycles);
     }
     t->grantRecipients.clear();
 
@@ -2176,14 +1994,12 @@ HomaTransport::Poller::poll()
             result = 1;
             t->nextTimeoutCheck = now + t->timerInterval;
             t->timeoutCheckDeadline = 0;
-            UPDATE_CYCLES(t->timeoutCheckCycles);
         }
     }
 
     // Transmit data packets if possible.
     uint32_t totalBytesSent = t->tryToTransmitData();
     result |= totalBytesSent;
-    UPDATE_CYCLES(t->transmitDataCycles);
 
     // Release a few retained payloads to the driver. As of 02/2017, releasing
     // one payload to the DpdkDriver takes ~65ns. If we haven't found anything
