@@ -27,7 +27,10 @@ namespace RAMCloud {
 #define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
-// conditionally compiled in or out by the TIME_TRACE #ifdef.
+// conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
+// are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
+// frequently cast their 64-bit arguments into uint32_t explicitly: we will
+// help perform the casting internally.
 namespace {
     inline void
     timeTrace(const char* format,
@@ -36,17 +39,6 @@ namespace {
     {
 #if TIME_TRACE
         TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
-                uint32_t(arg2), uint32_t(arg3));
-#endif
-    }
-
-    inline void
-    timeTrace(uint64_t timestamp, const char* format,
-            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
-            uint64_t arg3 = 0)
-    {
-#if TIME_TRACE
-        TimeTrace::record(timestamp, format, uint32_t(arg0), uint32_t(arg1),
                 uint32_t(arg2), uint32_t(arg3));
 #endif
     }
@@ -62,8 +54,10 @@ namespace {
  *      NULL means this transport is created on the client-side to handle
  *      outgoing requests.
  * \param driver
- *      Used to send and receive packets. This transport becomes owner
- *      of the driver and will free it in when this object is deleted.
+ *      Used to send and receive packets.
+ * \param driverOwner
+ *      True if this transport becomes owner of the driver and will free it
+ *      when this object is deleted.
  * \param clientId
  *      Identifier that identifies us in outgoing RPCs: must be unique across
  *      all servers and clients.
@@ -76,8 +70,18 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , locatorString("homa+"+driver->getServiceLocator())
     , poller(context, this)
     , maxDataPerPacket(driver->getMaxPacketSize() - sizeof32(DataHeader))
-    // TODO: document the choice of this parameter
+
+    // As of 09/2017, with this value set to 100*maxDataPerPacket, we haven't
+    // observed any message drop due to driver packet buffer exhaustion when
+    // running workloads W3, W4 and W5 that are used in the HomaTransport paper
+    // evaluation.
     , messageZeroCopyThreshold(100*maxDataPerPacket)
+
+    // As of 09/2017, we consider messages less than 300 bytes as small (which
+    // takes at most 240 ns to transmit on a 10Gbps network). This value is
+    // chosen experimentally so that we can run W3 in Homa paper at 80% load on
+    // a 10Gbps network/ and that no significant queueing delay at the TX queue
+    // is observed.
     , smallMessageThreshold(300)
     , clientId(clientId)
 
@@ -144,18 +148,22 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
             // leaving our locatorString as "homa+"
         }
     }
-    uint32_t value;
+    int value;
 
-    // As of 08/2017, The RTT in the m510 cluster is ~8us (5 us of data packet
-    // propagation delay plus 1 us of service time plus 1 us of grant packet
-    // propagation delay) in the unloaded case.
+    // To be precise, the RTT includes the one-way delay of a data packet,
+    // the server processing time and the one-way delay of a grant packet.
+    // As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of one-way
+    // delay of a full-size data packet plus 1 us of server processing time
+    // plus 2 us of grant packet one-way delay). Note: it's hacky to hardwire
+    // this number in the code; a proper implementation would need to measure
+    // and set the RTT dynamically.
     uint32_t roundTripMicros = 8;
     if (params && params->hasOption("rttMicros")) {
-        value = params->getOption<uint32_t>("rttMicros");
+        value = params->getOption<int>("rttMicros");
         if (value != 0) {
-            roundTripMicros = value;
+            roundTripMicros = downCast<uint32_t>(value);
         } else {
-            LOG(ERROR, "Bad HomaTransport rttMicros option value '%u' "
+            LOG(ERROR, "Bad HomaTransport rttMicros option value '%d' "
                     "(expected positive integer); ignoring option", value);
         }
     }
@@ -166,11 +174,11 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     int numPrio = highestAvailPriority + 1;
     lowestUnschedPrio = highestAvailPriority;
     if (params && params->hasOption("unschedPrio")) {
-        value = params->getOption<uint32_t>("unschedPrio");
+        value = params->getOption<int>("unschedPrio");
         if ((value > 0) && (value <= numPrio)) {
             lowestUnschedPrio = numPrio - value;
         } else {
-            LOG(ERROR, "Bad HomaTransport unschedPrio option value '%u' "
+            LOG(ERROR, "Bad HomaTransport unschedPrio option value '%d' "
                     "(expected positive integer < %d); ignoring option",
                     value, numPrio);
         }
@@ -187,9 +195,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         // and the degree of over-commitment so that the former could be less
         // than the latter.
         if ((value > 0) && (value <= numSchedPrio)) {
-            maxGrantedMessages = value;
+            maxGrantedMessages = downCast<uint32_t>(value);
         } else {
-            LOG(ERROR, "Bad HomaTransport degreeOC option value '%u' "
+            LOG(ERROR, "Bad HomaTransport degreeOC option value '%d' "
                     "(expected positive integer < %d); ignoring option",
                     value, numSchedPrio);
         }
@@ -197,14 +205,15 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
 
     // Set unscheduled priority cutoffs.
     string unschedMessageBrackets = "[0";
-    int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
+    uint32_t numUnschedPrio =
+            downCast<uint32_t>(highestAvailPriority - lowestUnschedPrio + 1);
     if (params && params->hasOption("unschedPrioCutoffs")) {
         std::stringstream sstream(params->getOption("unschedPrioCutoffs"));
         std::string cutoff;
         while (std::getline(sstream, cutoff, '.')) {
-            value = downCast<uint32_t>(stoi(cutoff));
-            unschedPrioCutoffs.push_back(value + 1);
-            unschedMessageBrackets += format(", %u] [%u", value, value + 1);
+            value = stoi(cutoff);
+            unschedPrioCutoffs.push_back(downCast<uint32_t>(value + 1));
+            unschedMessageBrackets += format(", %d] [%d", value, value + 1);
         }
     }
     if (unschedPrioCutoffs.size() + 1 != numUnschedPrio) {
@@ -256,10 +265,14 @@ HomaTransport::~HomaTransport()
     }
 
     // Release all retained payloads after reclaiming all RPC objects.
-    for (MessageAccumulator::Payloads* messageBuffer : messagesToRelease) {
-        for (char* payload : *messageBuffer) {
+    for (MessageAccumulator::Payloads* message : messagesToRelease) {
+        for (char* payload : *message) {
             driver->release(payload);
         }
+    }
+
+    if (driverOwner) {
+        delete driver;
     }
 }
 
@@ -282,7 +295,6 @@ HomaTransport::getServiceLocator()
 void
 HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
-    timeTrace("deleteClientRpc invoked");
     uint64_t sequence = clientRpc->rpcId.sequence;
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
@@ -309,11 +321,9 @@ HomaTransport::deleteClientRpc(ClientRpc* clientRpc)
 void
 HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
-    timeTrace("deleteServerRpc invoked");
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
-    // TODO: Profile how long it takes; might have to optimize it
     incomingRpcs.erase(serverRpc->rpcId);
     if (serverRpc->sendingResponse) {
         erase(outgoingResponses, *serverRpc);
@@ -449,7 +459,7 @@ HomaTransport::opcodeSymbol(uint8_t opcode) {
  *      the message length, then all of the remaining bytes in message,
  *      will be transmitted.
  * \param unscheduledBytes
- *      Unscheduled bytes sent unilaterally in this message.
+ *      Unscheduled bytes that will be sent unilaterally in this message.
  * \param priority
  *      Priority used to send the packets.
  * \param flags
@@ -485,6 +495,7 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
             }
             bytesThisPacket = maxBytes - bytesSent;
         }
+        QueueEstimator::TransmitQueueState txQueueState;
         if (bytesThisPacket == messageSize) {
             // Entire message fits in a single packet.
             AllDataHeader header(rpcId, flags,
@@ -496,7 +507,8 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "server sending ALL_DATA, clientId %u, sequence %u, "
                     "priority %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, priority);
-            driver->sendPacket(address, &header, &iter, priority);
+            driver->sendPacket(address, &header, &iter, priority,
+                    &txQueueState);
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
                     unscheduledBytes, flags);
@@ -508,7 +520,15 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "offset %u, priority %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset,
                     priority);
-            driver->sendPacket(address, &header, &iter, priority);
+            driver->sendPacket(address, &header, &iter, priority,
+                    &txQueueState);
+        }
+        if (txQueueState.outstandingBytes > 0) {
+            timeTrace("sent data, %u bytes queued ahead",
+                    txQueueState.outstandingBytes);
+        } else {
+            timeTrace("sent data, tx queue idle time %u cyc",
+                    txQueueState.idleTime);
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
@@ -518,7 +538,7 @@ HomaTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
 }
 
 /**
- * Send out a single control packet.
+ * Send a control packet.
  *
  * \param recipient
  *      Where to send the packet.
@@ -530,7 +550,12 @@ void
 HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
-    driver->sendPacket(recipient, packet, NULL, controlPacketPriority);
+    QueueEstimator::TransmitQueueState txQueueState;
+    driver->sendPacket(recipient, packet, NULL, controlPacketPriority,
+            &txQueueState);
+    timeTrace("sent control packet, opcode %u, %u bytes queued ahead, "
+            "tx queue idle time %u cyc", packet->common.opcode,
+            txQueueState.outstandingBytes, txQueueState.idleTime);
 }
 
 /**
@@ -588,10 +613,8 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
             }
             const HomaTransport::GrantHeader* grant =
                     static_cast<const HomaTransport::GrantHeader*>(packet);
-            result += format(", offset %u", grant->offset);
-            // TODO: change to the following and fix unit tests
-//            result += format(", offset %u, priority %u", grant->offset,
-//                    grant->priority);
+            result += format(", offset %u, priority %u", grant->offset,
+                    grant->priority);
             break;
         }
         case HomaTransport::PacketOpcode::LOG_TIME_TRACE:
@@ -814,7 +837,13 @@ HomaTransport::tryToTransmitData()
                     deleteServerRpc(serverRpc);
                 }
             } else if (!message->topChoice) {
-                updateTopOutgoingMessageSet(message, false);
+                // This message is taken from the slow path; see if we should
+                // include it to topOutgoingMessages so that we may avoid the
+                // slow path next time.
+                maintainTopOutgoingMessages(message);
+                if (!message->topChoice) {
+                    augmentTopOutgoingMessageSet();
+                }
             }
         } else {
             // There are no messages with data that can be transmitted.
@@ -941,50 +970,95 @@ HomaTransport::Session::getRpcInfo()
 }
 
 /**
- * Implements the logic of updating the top outgoing message set, if
- * appropriate, when a new message arrives or we transmit a few more bytes
- * of an existing message outside this set.
- *
- * \param candidate
- *      A message that might be included in the top outgoing message set.
- * \param newMessage
- *      True means this message was just included in the outgoing
- *      request/response set; false means the message was already in the
- *      system.
+ * Attempt to expand the size of the top outgoing message set by one. This
+ * method will scan all messages outside the top outgoing message set and
+ * select the one with the smallest remaining size to include. This method
+ * is invoked by #tryToTransmitData whenever it has to look outside the top
+ * outgoing message set to pick the next message to transmit.
  */
 void
-HomaTransport::updateTopOutgoingMessageSet(OutgoingMessage* candidate,
-        bool newMessage)
+HomaTransport::augmentTopOutgoingMessageSet()
 {
-    assert(!candidate->topChoice);
-#define LOW_WATERMARK 4
-    if (topOutgoingMessages.size() < LOW_WATERMARK) {
-        candidate->topChoice = true;
-        topOutgoingMessages.push_back(*candidate);
-    } else {
-        uint32_t maxBytesLeft =
-                candidate->buffer->size() - candidate->transmitOffset;
-        uint32_t bytesLeft;
-        OutgoingMessage* messageToReplace = NULL;
-        for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
-                it != topOutgoingMessages.end(); it++) {
-            OutgoingMessage* m = &(*it);
-            bytesLeft = m->buffer->size() - m->transmitOffset;
-            if (maxBytesLeft < bytesLeft) {
-                maxBytesLeft = bytesLeft;
-                messageToReplace = m;
+    // As of 09/2017, the maximum size of the top outgoing message set is
+    // limited to 4. During evaluation, we found that this value is large
+    // enough to ensure that the sender doesn't have to look outside this
+    // set very often when picking the next message to transmit.
+#define MAX_TOP_MESSAGES 4
+    if (topOutgoingMessages.size() == MAX_TOP_MESSAGES) {
+        return;
+    }
+
+    uint32_t minBytesLeft = ~0u;
+    OutgoingMessage* message = NULL;
+    for (OutgoingRequestList::iterator it = outgoingRequests.begin();
+                it != outgoingRequests.end(); it++) {
+        OutgoingMessage* request = &it->request;
+        if (!request->topChoice) {
+            uint32_t bytesLeft =
+                    request->buffer->size() - request->transmitOffset;
+            if (bytesLeft < minBytesLeft) {
+                minBytesLeft = bytesLeft;
+                message = request;
             }
         }
-        if (messageToReplace != NULL) {
-            messageToReplace->topChoice = false;
-            erase(topOutgoingMessages, *messageToReplace);
-            transmitDataSlowPath = true;
-            candidate->topChoice = true;
-            topOutgoingMessages.push_back(*candidate);
+    }
+
+    for (OutgoingResponseList::iterator it = outgoingResponses.begin();
+                it != outgoingResponses.end(); it++) {
+        OutgoingMessage* response = &it->response;
+        if (!response->topChoice) {
+            uint32_t bytesLeft = response->buffer->size() -
+                    response->transmitOffset;
+            if (bytesLeft < minBytesLeft) {
+                minBytesLeft = bytesLeft;
+                message = response;
+            }
         }
-        if (newMessage) {
-            transmitDataSlowPath = true;
+    }
+
+    message->topChoice = true;
+    topOutgoingMessages.push_back(*message);
+}
+
+/**
+ * Ensure that messages in our top outgoing message set still have the
+ * smallest remaining sizes in all outgoing messages. When a new outgoing
+ * message arrives or we just transmitted a few more bytes of an existing
+ * message outside this set, this method is invoked to check if this message
+ * should replace an existing top outgoing message.
+ *
+ * \param candidate
+ *      A message that might be added to the top outgoing message set.
+ */
+void
+HomaTransport::maintainTopOutgoingMessages(OutgoingMessage* candidate)
+{
+    assert(!candidate->topChoice);
+    uint32_t maxBytesLeft =
+            candidate->buffer->size() - candidate->transmitOffset;
+    uint32_t bytesLeft;
+    OutgoingMessage* messageToReplace = NULL;
+    for (OutgoingMessageList::iterator it = topOutgoingMessages.begin();
+            it != topOutgoingMessages.end(); it++) {
+        OutgoingMessage* m = &(*it);
+        bytesLeft = m->buffer->size() - m->transmitOffset;
+        if (maxBytesLeft < bytesLeft) {
+            maxBytesLeft = bytesLeft;
+            messageToReplace = m;
         }
+    }
+    OutgoingMessage* loser = candidate;
+    if (messageToReplace != NULL) {
+        loser = messageToReplace;
+        messageToReplace->topChoice = false;
+        erase(topOutgoingMessages, *messageToReplace);
+        candidate->topChoice = true;
+        topOutgoingMessages.push_back(*candidate);
+    }
+    if (loser->transmitOffset < loser->transmitLimit) {
+        // The loser, which ends up outside the top outgoing message set,
+        // has bytes ready to be transmitted.
+        transmitDataSlowPath = true;
     }
 }
 
@@ -1029,7 +1103,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
         bytesSent = length;
     } else {
         t->outgoingRequests.push_back(*clientRpc);
-        t->updateTopOutgoingMessageSet(&clientRpc->request, true);
+        t->maintainTopOutgoingMessages(&clientRpc->request);
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
@@ -1072,9 +1146,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                         "server %s for (unknown) sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
-                        "sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
+                TimeTrace::record("client received LOG_TIME_TRACE for "
+                        "clientId %u, sequence %u",
+                        (uint32_t)common->rpcId.clientId,
+                        (uint32_t)common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
             }
             TEST_LOG("Discarding unknown packet, sequence %lu",
@@ -1193,9 +1268,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                         "server %s for clientId %lu, sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.clientId, common->rpcId.sequence);
-                timeTrace("client received LOG_TIME_TRACE for clientId %u, "
-                        "sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
+                TimeTrace::record("client received LOG_TIME_TRACE for "
+                        "clientId %u, sequence %u",
+                        (uint32_t)common->rpcId.clientId,
+                        (uint32_t)common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1219,11 +1295,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                     if (!clientRpc->transmitPending) {
                         clientRpc->transmitPending = true;
                         outgoingRequests.push_back(*clientRpc);
-                        updateTopOutgoingMessageSet(&clientRpc->request, true);
+                        maintainTopOutgoingMessages(&clientRpc->request);
                     } else if (clientRpc->request.topChoice) {
                         clientRpc->request.topChoice = false;
                         erase(topOutgoingMessages, clientRpc->request);
-                        updateTopOutgoingMessageSet(&clientRpc->request, false);
+                        maintainTopOutgoingMessages(&clientRpc->request);
                     }
                     return;
                 }
@@ -1473,9 +1549,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                         "client %s for sequence %lu",
                         received->sender->toString().c_str(),
                         common->rpcId.sequence);
-                timeTrace("server received LOG_TIME_TRACE for clientId %u, "
-                        "sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
+                TimeTrace::record("server received LOG_TIME_TRACE for "
+                        "clientId %u, sequence %u",
+                        (uint32_t)common->rpcId.clientId,
+                        (uint32_t)common->rpcId.sequence);
                 TimeTrace::printToLogBackground(context->dispatch);
                 return;
             }
@@ -1650,7 +1727,7 @@ HomaTransport::ServerRpc::sendReply()
         sendingResponse = true;
         t->outgoingResponses.push_back(*this);
         t->serverTimerList.push_back(*this);
-        t->updateTopOutgoingMessageSet(&response, true);
+        t->maintainTopOutgoingMessages(&response);
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
@@ -2271,6 +2348,7 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
             newMessage->state == ScheduledMessage::INACTIVE);
 
     bool purgeOK = (oldMessage->grantOffset == oldMessage->totalLength);
+    IGNORE_RESULT(purgeOK);
 
     if (oldMessage == &activeMessages.front()) {
         // The top message is removed. Reclaim the highest granted priority.

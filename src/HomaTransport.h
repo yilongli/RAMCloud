@@ -720,8 +720,8 @@ class HomaTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void updateTopOutgoingMessageSet(OutgoingMessage* candidate,
-            bool newMessage);
+    void augmentTopOutgoingMessageSet();
+    void maintainTopOutgoingMessages(OutgoingMessage* candidate);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
