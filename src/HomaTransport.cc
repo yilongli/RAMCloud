@@ -1282,12 +1282,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - request->lastTransmitTime)*1e06;
                 // FIXME: W4 seems to have some spurious(?) retransmissions
-                RAMCLOUD_CLOG(NOTICE, "Retransmitting to server %s: "
-                        "sequence %lu, offset %u, length %u, elapsed "
-                        "time %.1f us",
+                LOG(NOTICE, "Retransmitting to server %s: "
+                        "sequence %lu, offset %u, length %u, priority %u, "
+                        "elapsed time %.1f us",
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
-                        header->length, elapsedMicros);
+                        header->length, header->priority, elapsedMicros);
                 // Resent bytes are passed directly to the NIC for simplicity;
                 // we expect retransmission to be rare enough so that this
                 // won't affect even the tail latency of other messages.
@@ -1518,6 +1518,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     timeTrace("server requesting restart, clientId %u, "
                             "sequence %u",
                             common->rpcId.clientId, common->rpcId.sequence);
+                    // FIXME: why priority 0?
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, 0, FROM_SERVER|RESTART);
                     sendControlPacket(received->sender, &resend);
@@ -1547,12 +1548,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - response->lastTransmitTime)*1e06;
-                RAMCLOUD_CLOG(NOTICE, "Retransmitting to client %s: "
-                        "sequence %lu, offset %u, length %u, elapsed "
-                        "time %.1f us",
+                LOG(NOTICE, "Retransmitting to client %s: "
+                        "sequence %lu, offset %u, length %u, priority %u, "
+                        "elapsed time %.1f us",
                         received->sender->toString().c_str(),
                         header->common.rpcId.sequence, header->offset,
-                        header->length, elapsedMicros);
+                        header->length, header->priority, elapsedMicros);
                 sendBytes(response->recipient,
                         serverRpc->rpcId, &serverRpc->replyPayload,
                         header->offset, header->length,
@@ -1594,6 +1595,15 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (serverRpc != NULL) {
                     AckHeader ack(common->rpcId, FROM_SERVER);
                     sendControlPacket(serverRpc->response.recipient, &ack);
+                } else {
+                    // Somehow the server is not aware of this RPC. Anyway,
+                    // just ask the client to restart the RPC from scratch.
+                    timeTrace("server requesting restart, clientId %u, "
+                            "sequence %u",
+                            common->rpcId.clientId, common->rpcId.sequence);
+                    ResendHeader resend(common->rpcId, 0, roundTripBytes, 0,
+                            FROM_SERVER|RESTART);
+                    sendControlPacket(received->sender, &resend);
                 }
                 return;
             }
@@ -2198,6 +2208,11 @@ HomaTransport::checkTimeouts()
         //     could process the RPC before the retransmitted data arrived.
         assert(serverRpc->sendingResponse || !serverRpc->requestComplete);
         if (serverRpc->silentIntervals >= timeoutIntervals) {
+            RAMCLOUD_LOG(WARNING, "aborting %s RPC from client %s, "
+                    "clientId %lu, sequence %lu: timeout",
+                    WireFormat::opcodeSymbol(&serverRpc->requestPayload),
+                    serverRpc->response.recipient->toString().c_str(),
+                    serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
             deleteServerRpc(serverRpc);
             continue;
         }
