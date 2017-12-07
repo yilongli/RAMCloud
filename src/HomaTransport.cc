@@ -1677,7 +1677,6 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     , assembledPayloads(new Payloads())
     , buffer(buffer)
     , fragments()
-    , packetLost(false)
 {
     assert(buffer->size() == 0);
 #define FRAGMENTS_HIGH_WATERMARK 64
@@ -1737,12 +1736,6 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         FragmentMap::iterator iter;
         std::tie(iter, retainPacket) = fragments.emplace(
                 uint32_t(header->offset), MessageFragment(header, length));
-        if (retainPacket && (fragments.size() == FRAGMENTS_HIGH_WATERMARK)) {
-            packetLost = true;
-            // FIXME: investigate why W4/5 produces so many false(?) alarms
-//            LOG(WARNING, "Packet might be lost, offset %u", buffer->size());
-            timeTrace("Packet might be lost, offset %u", buffer->size());
-        }
         return retainPacket;
     }
 
@@ -1769,7 +1762,6 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
             timeTrace("addPacket assembled %u unappended fragments",
                     numPayloads-1);
         }
-        packetLost = false;
         return true;
     } else {
         // This packet is redundant.
@@ -2449,13 +2441,7 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
         return;
     }
     for (ScheduledMessage& m : activeMessages) {
-        uint32_t estimatedReceivedBytes = downCast<uint32_t>(
-                m.accumulator->buffer->size() +
-                maxDataPerPacket * m.accumulator->fragments.size());
-        // When a packet might be lost, stop granting the message so that
-        // the size of message fragment map does not grow without bound.
-        if (!m.accumulator->packetLost &&
-                (m.grantOffset < estimatedReceivedBytes + roundTripBytes)) {
+        if (m.grantOffset < m.accumulator->buffer->size() + roundTripBytes) {
             messageToGrant = &m;
             break;
         }

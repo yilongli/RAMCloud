@@ -208,10 +208,6 @@ class HomaTransport : public Transport {
         typedef HashMap<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
 
-        // True if a packet might be lost (which prevents many message
-        // fragments from being assembled to the buffer).
-        bool packetLost;
-
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
     };
