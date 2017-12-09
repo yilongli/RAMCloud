@@ -122,6 +122,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , inactiveMessages()
     , highestGrantedPrio(-1)
     , maxGrantedMessages()
+    , cacheMisses(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -270,6 +271,8 @@ HomaTransport::~HomaTransport()
             driver->release(payload);
         }
     }
+
+    LOG(WARNING, "cacheMisses = %lu", cacheMisses);
 
     if (driverOwner) {
         delete driver;
@@ -930,6 +933,7 @@ HomaTransport::Session::getRpcInfo()
 void
 HomaTransport::augmentTopOutgoingMessageSet()
 {
+    cacheMisses++;
     // As of 09/2017, the maximum size of the top outgoing message set is
     // limited to 4. During evaluation, we found that this value is large
     // enough to ensure that the sender doesn't have to look outside this

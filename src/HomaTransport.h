@@ -946,6 +946,8 @@ class HomaTransport : public Transport {
     /// transport at any time.
     uint32_t maxGrantedMessages;
 
+    uint64_t cacheMisses;
+
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
 
