@@ -19,6 +19,7 @@
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
+#include "OptionParser.h"
 
 namespace RAMCloud {
 
@@ -130,8 +131,12 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
 
-    // FIXME: use context->options->getOption("configDir")?
-    std::ifstream configFile("/shome/RAMCloud/config/transport.txt");
+    // Read Homa configuration from the transport configuration file. Note
+    // that transport configurations are specified in the same format as
+    // service locators: "homa+dpdk:rttMicros=8,unschedPrio=4,degreeOC=4,
+    // dpdkPrio=8,unschedPrioCutoffs=469.5521.15267"
+    std::ifstream configFile(
+            context->options->getConfigDir() + "/transport.txt");
     Tub<ServiceLocator> params;
     if (configFile.is_open()) {
         std::string line;
@@ -143,13 +148,11 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
                     break;
                 }
             }
-        } catch (ServiceLocator::BadServiceLocatorException&) {
-            // FIXME: sometimes driver->getLocator can be empty...
-            // leaving our locatorString as "homa+"
-        }
+        } catch (ServiceLocator::BadServiceLocatorException&) {}
     }
     int value;
 
+    // Set the round trip time (RTT)
     // To be precise, the RTT includes the one-way delay of a data packet,
     // the server processing time and the one-way delay of a grant packet.
     // As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of one-way
@@ -357,9 +360,6 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator,
         uint32_t roundTripMicros)
 {
     uint32_t gBitsPerSec = 0;
-
-    // FIXME: I don't understand how options like "rttMicros" can be
-    // implemented this way since `locator` is always NULL on client-side.
     if (locator != NULL) {
         if (locator->hasOption("gbs")) {
             char* end;
@@ -1014,8 +1014,6 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
-    // TODO: set `transmitPriority` in ctor once OutgoingMessage is not implemented as a base class
-    clientRpc->request.transmitPriority = t->getUnschedTrafficPrio(length);
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
@@ -1255,7 +1253,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                     AckHeader ack(header->common.rpcId, FROM_CLIENT);
                     sendControlPacket(clientRpc->session->serverAddress, &ack);
                     return;
-
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - request->lastTransmitTime)*1e06;
@@ -1496,7 +1493,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                     timeTrace("server requesting restart, clientId %u, "
                             "sequence %u",
                             common->rpcId.clientId, common->rpcId.sequence);
-                    // FIXME: why priority 0?
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, 0, FROM_SERVER|RESTART);
                     sendControlPacket(received->sender, &resend);
@@ -1638,7 +1634,6 @@ HomaTransport::ServerRpc::sendReply()
     }
 
     uint32_t bytesSent;
-    response.transmitPriority = t->getUnschedTrafficPrio(length);
     if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
@@ -1787,6 +1782,9 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
  *      this is how many total bytes we should have received already).
  *      May be 0 if the sender never requested a grant (meaning that it
  *      planned to transmit the entire message unilaterally).
+ * \param priority
+ *      The priority we request the sender to use to transmit the lost
+ *      data. See docs for ResendHeader.
  * \param whoFrom
  *      Must be either FROM_CLIENT, indicating that we are the client, or
  *      FROM_SERVER, indicating that we are the server.
@@ -1798,7 +1796,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
 uint32_t
 HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
-        uint8_t whoFrom)
+        uint8_t priority, uint8_t whoFrom)
 {
     if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
         DIE("Bad fragment pointer: %p", &fragments);
@@ -1830,10 +1828,8 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
             "client requesting retransmission of bytes %u-%u, clientId %u, "
             "sequence %u";
     timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
-    // TODO: HOW TO DOCUMENT OUR CHOICE OF PRIO HERE?
-    uint32_t length = endOffset - buffer->size();
-    ResendHeader resend(rpcId, buffer->size(), length,
-            t->getUnschedTrafficPrio(length), whoFrom);
+    ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
+            priority, whoFrom);
     t->sendControlPacket(address, &resend);
     return endOffset;
 }
@@ -2145,10 +2141,12 @@ HomaTransport::checkTimeouts()
                 // response for higher priority messages, so request
                 // retransmission anyway.
                 if (clientRpc->silentIntervals % pingIntervals == 0) {
+                    uint8_t priority = scheduledMessage ?
+                            scheduledMessage->grantPriority : 0;
                     clientRpc->accumulator->requestRetransmission(this,
                             clientRpc->session->serverAddress,
                             RpcId(clientId, sequence), grantOffset,
-                            FROM_CLIENT);
+                            priority, FROM_CLIENT);
                 }
             }
         }
@@ -2215,9 +2213,11 @@ HomaTransport::checkTimeouts()
                 // responses.
                 serverRpc->silentIntervals = 0;
             } else {
+                uint8_t priority = scheduledMessage ?
+                        scheduledMessage->grantPriority : 0;
                 serverRpc->accumulator->requestRetransmission(this,
                         serverRpc->response.recipient, serverRpc->rpcId,
-                        grantOffset, FROM_SERVER);
+                        grantOffset, priority, FROM_SERVER);
             }
         } else {
             assert(serverRpc->sendingResponse);

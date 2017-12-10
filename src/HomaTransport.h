@@ -166,7 +166,7 @@ class HomaTransport : public Transport {
         bool addPacket(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(HomaTransport *t,
                 const Driver::Address* address, RpcId rpcId,
-                uint32_t grantOffset, uint8_t whoFrom);
+                uint32_t grantOffset, uint8_t priority, uint8_t whoFrom);
 
         /// Transport that is managing this object.
         HomaTransport* t;
@@ -337,7 +337,7 @@ class HomaTransport : public Transport {
             , serverRpc(serverRpc)
             , recipient(recipient)
             , transmitOffset(0)
-            , transmitPriority(0)
+            , transmitPriority(t->getUnschedTrafficPrio(buffer->size()))
             , transmitLimit(t->roundTripBytes)
             , topChoice(false)
             , lastTransmitTime(0)
@@ -778,7 +778,6 @@ class HomaTransport : public Transport {
 
     // The highest priority to use for scheduled traffic.
     int highestSchedPriority;
-    // FIXME: Priority -> Prio or the other way around?
 
     /// The packet priority used for sending control packets.
     const int controlPacketPriority;
