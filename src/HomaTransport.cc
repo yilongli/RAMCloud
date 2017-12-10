@@ -728,8 +728,20 @@ HomaTransport::tryToTransmitData()
         // Couldn't find a message to transmit from our top outgoing message
         // set; take the slow path
         if (expect_false((NULL == message) && transmitDataSlowPath)) {
+            // The slow path scans all messages outside the top outgoing
+            // message set to 1) find an message ready to transmit, and
+            // 2) select the next message to include in the top outgoing
+            // message set. The policy for both tasks is SRPT.
             timeTrace("slow path taken, iterating over %u outgoing messages",
                     outgoingRequests.size() + outgoingResponses.size());
+
+            cacheMisses++;
+            if (cacheMisses > 1000000 && cacheMisses < 1001000) {
+                LOG(DEBUG, "#top msgs %lu, #msgs %lu, iteration %lu",
+                    topOutgoingMessages.size(), outgoingRequests.size() + outgoingResponses.size(), context->dispatch->iteration);
+            }
+            uint32_t overallMinBytesLeft = ~0u;
+            OutgoingMessage* newTopMessage = NULL;
 
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                         it != outgoingRequests.end(); it++) {
@@ -737,6 +749,10 @@ HomaTransport::tryToTransmitData()
                 if (!request->topChoice) {
                     uint32_t bytesLeft =
                             request->buffer->size() - request->transmitOffset;
+                    if (bytesLeft < overallMinBytesLeft) {
+                        overallMinBytesLeft = bytesLeft;
+                        newTopMessage = request;
+                    }
                     if (request->transmitLimit <= request->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -754,6 +770,10 @@ HomaTransport::tryToTransmitData()
                 if (!response->topChoice) {
                     uint32_t bytesLeft = response->buffer->size() -
                             response->transmitOffset;
+                    if (bytesLeft < overallMinBytesLeft) {
+                        overallMinBytesLeft = bytesLeft;
+                        newTopMessage = response;
+                    }
                     if (response->transmitLimit <= response->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -768,6 +788,11 @@ HomaTransport::tryToTransmitData()
             if (message == NULL) {
                 // Can't find one outgoing message that is ready to transmit.
                 transmitDataSlowPath = false;
+            } else {
+                // Expand the size of the top outgoing message set by one
+                // so that we may avoid the slow path next time.
+                newTopMessage->topChoice = true;
+                topOutgoingMessages.push_back(*newTopMessage);
             }
         }
 
@@ -814,14 +839,6 @@ HomaTransport::tryToTransmitData()
                     // this approach is simpler and faster in the common case
                     // where data isn't lost.
                     deleteServerRpc(serverRpc);
-                }
-            } else if (!message->topChoice) {
-                // This message is taken from the slow path; see if we should
-                // include it to topOutgoingMessages so that we may avoid the
-                // slow path next time.
-                maintainTopOutgoingMessages(message);
-                if (!message->topChoice) {
-                    augmentTopOutgoingMessageSet();
                 }
             }
         } else {
@@ -924,58 +941,6 @@ HomaTransport::Session::getRpcInfo()
 }
 
 /**
- * Attempt to expand the size of the top outgoing message set by one. This
- * method will scan all messages outside the top outgoing message set and
- * select the one with the smallest remaining size to include. This method
- * is invoked by #tryToTransmitData whenever it has to look outside the top
- * outgoing message set to pick the next message to transmit.
- */
-void
-HomaTransport::augmentTopOutgoingMessageSet()
-{
-    cacheMisses++;
-    // As of 09/2017, the maximum size of the top outgoing message set is
-    // limited to 4. During evaluation, we found that this value is large
-    // enough to ensure that the sender doesn't have to look outside this
-    // set very often when picking the next message to transmit.
-#define MAX_TOP_MESSAGES 4
-    if (topOutgoingMessages.size() == MAX_TOP_MESSAGES) {
-        return;
-    }
-
-    uint32_t minBytesLeft = ~0u;
-    OutgoingMessage* message = NULL;
-    for (OutgoingRequestList::iterator it = outgoingRequests.begin();
-                it != outgoingRequests.end(); it++) {
-        OutgoingMessage* request = &it->request;
-        if (!request->topChoice) {
-            uint32_t bytesLeft =
-                    request->buffer->size() - request->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                message = request;
-            }
-        }
-    }
-
-    for (OutgoingResponseList::iterator it = outgoingResponses.begin();
-                it != outgoingResponses.end(); it++) {
-        OutgoingMessage* response = &it->response;
-        if (!response->topChoice) {
-            uint32_t bytesLeft = response->buffer->size() -
-                    response->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                message = response;
-            }
-        }
-    }
-
-    message->topChoice = true;
-    topOutgoingMessages.push_back(*message);
-}
-
-/**
  * Ensure that messages in our top outgoing message set still have the
  * smallest remaining sizes in all outgoing messages. When a new outgoing
  * message arrives or we just transmitted a few more bytes of an existing
@@ -1002,6 +967,22 @@ HomaTransport::maintainTopOutgoingMessages(OutgoingMessage* candidate)
             messageToReplace = m;
         }
     }
+
+    if ((topOutgoingMessages.size() < 4) && (messageToReplace != NULL)) {
+        // When the top outgoing message set is pretty small, it's probably
+        // better to include the candidate without removing the old message.
+        // If we don't do this, and we expand the top outgoing message set
+        // only after tryToTransmitData takes the slow path, we may find
+        // ourselves entering the slow path frequently just to refill a top
+        // outgoing message set that has usually zero or one messages.
+        // Unfortunately, it is way more expensive to refill the top outgoing
+        // message set in tryToTransmitData than here because that requires
+        // scanning all outgoing messages.
+        candidate->topChoice = true;
+        topOutgoingMessages.push_back(*candidate);
+        return;
+    }
+
     OutgoingMessage* loser = candidate;
     if (messageToReplace != NULL) {
         loser = messageToReplace;

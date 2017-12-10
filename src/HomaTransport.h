@@ -661,7 +661,7 @@ class HomaTransport : public Transport {
     /**
      * Describes the wire format for ABORT packets. These packets are used
      * to let the server know that the client has cancelled the RPC. They
-     * are neccessary to avoid spurious warning messages in the log.
+     * are necessary to avoid spurious warning messages in the log.
      */
     struct AbortHeader {
         CommonHeader common;         // Common header fields.
@@ -672,7 +672,12 @@ class HomaTransport : public Transport {
 
     /**
      * Describes the wire format for PING packets. These packets are used
-     * to check if a client or server is still alive.
+     * to check if a client or server is still alive. When one party of an
+     * RPC hasn't heard from its counterpart for a while, but it believes
+     * that the counterpart is responsible for handling the situation, it
+     * sends a PING packet, expecting to receive an ACK from the counterpart
+     * so that it can reset the timer (we can't simply reset the timer without
+     * knowing the counterpart is still alive).
      */
     struct PingHeader {
         CommonHeader common;         // Common header fields.
@@ -720,7 +725,6 @@ class HomaTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void augmentTopOutgoingMessageSet();
     void maintainTopOutgoingMessages(OutgoingMessage* candidate);
     bool tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
