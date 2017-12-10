@@ -122,7 +122,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , inactiveMessages()
     , highestGrantedPrio(-1)
     , maxGrantedMessages()
-    , cacheMisses(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -271,8 +270,6 @@ HomaTransport::~HomaTransport()
             driver->release(payload);
         }
     }
-
-    LOG(WARNING, "cacheMisses = %lu", cacheMisses);
 
     if (driverOwner) {
         delete driver;
@@ -732,17 +729,13 @@ HomaTransport::tryToTransmitData()
             // message set to 1) find an message ready to transmit, and
             // 2) select the next message to include in the top outgoing
             // message set. The policy for both tasks is SRPT.
-            timeTrace("slow path taken, iterating over %u outgoing messages",
-                    outgoingRequests.size() + outgoingResponses.size());
+            timeTrace("slow path taken, iterating over %u outgoing messages, "
+                    "topOutgoingMessages %u, iteration %u",
+                    outgoingRequests.size() + outgoingResponses.size(),
+                    topOutgoingMessages.size(), context->dispatch->iteration);
 
-            cacheMisses++;
-            if (cacheMisses > 1000000 && cacheMisses < 1001000) {
-                LOG(DEBUG, "#top msgs %lu, #msgs %lu, iteration %lu",
-                    topOutgoingMessages.size(), outgoingRequests.size() + outgoingResponses.size(), context->dispatch->iteration);
-            }
             uint32_t overallMinBytesLeft = ~0u;
             OutgoingMessage* newTopMessage = NULL;
-
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                         it != outgoingRequests.end(); it++) {
                 OutgoingMessage* request = &it->request;
