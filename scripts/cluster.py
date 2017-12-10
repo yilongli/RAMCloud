@@ -548,6 +548,8 @@ def run(
                                    # log files.  A separate subdirectory
                                    # will be created in this directory
                                    # for the log files from this run.
+        config_dir='config',       # Directory containing RAMCloud
+                                   # configuration files.
         client=None,               # Command-line to invoke for each client
                                    # additional arguments will be prepended
                                    # with configuration information such as
@@ -641,6 +643,11 @@ def run(
             master_args += ' --dpdkPort %d' % dpdk_port
             if client:
                 client += ' --dpdkPort %d' % dpdk_port
+        if config_dir is not None:
+            coordinator_args += ' --configDir %s' % config_dir
+            master_args += ' --configDir %s' % config_dir
+            if client:
+                client += ' --configDir %s' % config_dir
 
         if not coordinator_host:
             coordinator_host = cluster.hosts[-1]
@@ -743,6 +750,10 @@ if __name__ == '__main__':
             dest='log_dir',
             help='Top level directory for log files; the files for '
                  'each invocation will go in a subdirectory.')
+    parser.add_option('--configDir', default='config',
+            metavar='DIR',
+            dest='config_dir',
+            help='Directory containing RAMCloud configuration files.')
     parser.add_option('--masterArgs', metavar='ARGS', default='',
             dest='master_args',
             help='Additional command-line arguments to pass to '

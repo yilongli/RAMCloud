@@ -152,7 +152,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     }
     int value;
 
-    // Set the round trip time (RTT)
+    // Set the round-trip time (RTT) between two servers in the cluster.
     // To be precise, the RTT includes the one-way delay of a data packet,
     // the server processing time and the one-way delay of a grant packet.
     // As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of one-way
