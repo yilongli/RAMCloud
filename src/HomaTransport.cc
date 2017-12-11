@@ -121,7 +121,6 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , unschedPrioCutoffs()
     , activeMessages()
     , inactiveMessages()
-    , highestGrantedPrio(-1)
     , maxGrantedMessages()
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
@@ -2311,10 +2310,6 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
     bool purgeOK = (oldMessage->grantOffset == oldMessage->totalLength);
     IGNORE_RESULT(purgeOK);
 
-    if (oldMessage == &activeMessages.front()) {
-        // The top message is removed. Reclaim the highest granted priority.
-        highestGrantedPrio--;
-    }
     erase(activeMessages, *oldMessage);
     if (newMessage == NULL) {
 //        assert(purgeOK || cancelled);
@@ -2347,24 +2342,6 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
 
     if (newMessage) {
         adjustSchedulingPrecedence(newMessage);
-        if (newMessage == &activeMessages.front()
-                && highestGrantedPrio < highestSchedPriority) {
-            // This message is promoted to the top. Bump the highest granted
-            // priority if we haven't used up all the priorities for scheduled
-            // traffic.
-            highestGrantedPrio++;
-        } else if (highestGrantedPrio + 1 < int(activeMessages.size())) {
-            // The priorities we are granting for scheduled traffic is not
-            // enough to accommodate all the active messages.
-            highestGrantedPrio++;
-            assert(highestGrantedPrio + 1 == int(activeMessages.size()));
-        }
-    }
-
-    // Compress the priorities for scheduled packets when there is no enough
-    // message to buffer.
-    if (activeMessages.size() < maxGrantedMessages) {
-        highestGrantedPrio = int(activeMessages.size()) - 1;
     }
 
     assert(oldMessage->state == ScheduledMessage::INACTIVE ||
@@ -2411,12 +2388,6 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
         // has the same sender as one of the active messages.
         assert(newMessage);
         adjustSchedulingPrecedence(message);
-
-        // Bump the highest granted priority if we have not used up all
-        // scheduled priorities.
-        if (highestGrantedPrio < highestSchedPriority) {
-            highestGrantedPrio++;
-        }
     } else if (message->compareTo(activeMessages.back()) < 0) {
         // This message should replace the "worst" active message.
         replaceActiveMessage(&activeMessages.back(), message);
@@ -2462,11 +2433,8 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
     }
 
     // Find the first active message that could use a GRANT.
-    if (activeMessages.empty() && inactiveMessages.empty()) {
-        return;
-    }
     ScheduledMessage* messageToGrant = NULL;
-    int p = highestGrantedPrio;
+    int p = std::min(int(activeMessages.size()) - 1, highestSchedPriority);
     for (ScheduledMessage& m : activeMessages) {
         if (m.grantOffset < m.accumulator->buffer->size() + roundTripBytes) {
             messageToGrant = &m;

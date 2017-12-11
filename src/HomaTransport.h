@@ -937,13 +937,6 @@ class HomaTransport : public Transport {
             InactiveMessageList;
     InactiveMessageList inactiveMessages;
 
-    /// The highest priority currently granted to the incoming messages that
-    /// are scheduled by this transport. All priorities below this must also
-    /// be in use. The valid range of this value is [-1, highestSchedPriority].
-    /// -1 means no message is being scheduled by the transport.
-    int highestGrantedPrio;
-    // TODO: WHEN DOES IT GO UP? GO DOWN? WHAT'S THE BEST PLACE TO DOC. THIS?
-
     /// Maximum # incoming messages that can be actively granted by the
     /// receiver. Or, the "degree of overcommitment" in the Homa paper.
     uint32_t maxGrantedMessages;
