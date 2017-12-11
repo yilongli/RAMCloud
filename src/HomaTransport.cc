@@ -1887,6 +1887,9 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
 HomaTransport::ScheduledMessage::~ScheduledMessage()
 {
     if (state == ACTIVE) {
+        // Set grantOffset to a large number so that this message will be
+        // purged by replaceActiveMessage.
+        grantOffset = ~0u;
         accumulator->t->replaceActiveMessage(this, NULL);
     } else if (state == INACTIVE) {
         erase(accumulator->t->inactiveMessages, *this);
@@ -2104,8 +2107,6 @@ HomaTransport::checkTimeouts()
         }
 
         if (clientRpc->response->size() == 0) {
-            assert(clientRpc->transmitPending &&
-                    (request->transmitOffset == request->transmitLimit));
             // We haven't received any part of the response message. Normally,
             // it's the server's responsibility to request retransmission.
             // However, in case the whole request was lost (so the server is
@@ -2289,69 +2290,57 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 
 /**
  * Replace an active message by an non-active (new or inactive) one because
- * 1) our scheduling policy says it's a better choice, 2) the active message
- * has been fully granted or 3) the active message needs to be destroyed
- * (e.g. the RPC is cancelled).
+ * either our scheduling policy (in tryToSchedule) says it's a better choice
+ * or the the active message has been fully granted or cancelled. If the
+ * active message has been fully granted, we will purge it from the scheduler;
+ * otherwise, it will be moved to the inactive message list.
  *
  * \param oldMessage
- *      A currently active message that is about to be deactivated.
+ *      A currently active message that needs to be deactivated.
  * \param newMessage
- *      A non-active message that should be activated. NULL means this method
- *      is invoked because \p oldMessage must be purged and it is the duty
- *      of this method to pick a replacement from the inactive message list.
- *      Otherwise, this method is invoked because \p newMessage is a better
- *      choice compared to \p oldMessage.
+ *      A non-active message that should be activated. If the value is NULL,
+ *      it is the duty of this method to pick a replacement from the inactive
+ *      message list (this can happen when oldMessage is purged or cancelled).
  */
 void
 HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
         ScheduledMessage *newMessage)
 {
-    assert(oldMessage != newMessage);
-    assert(oldMessage->state == ScheduledMessage::ACTIVE);
-    assert(newMessage == NULL ||
-            newMessage->state == ScheduledMessage::NEW ||
-            newMessage->state == ScheduledMessage::INACTIVE);
-
-    bool purgeOK = (oldMessage->grantOffset == oldMessage->totalLength);
-    IGNORE_RESULT(purgeOK);
-
+    // Remove oldMessage from the active message list; put it back to the
+    // inactive message list if it has not been fully granted.
+    bool purgeOK = (oldMessage->grantOffset >= oldMessage->totalLength);
     erase(activeMessages, *oldMessage);
-    if (newMessage == NULL) {
-//        assert(purgeOK || cancelled);
+    if (purgeOK) {
         oldMessage->state = ScheduledMessage::PURGED;
-
-        // No designated message to promote. Pick one from the inactive
-        // messages.
-        for (ScheduledMessage& candidate : inactiveMessages) {
-            if (newMessage != NULL && newMessage->compareTo(candidate) <= 0) {
-                continue;
-            }
-
-            for (ScheduledMessage& m : activeMessages) {
-                if (m.senderHash == candidate.senderHash) {
-                    // Active messages must come from distinct senders. Move on
-                    // to check the next inactive message.
-                    goto tryNextCandidate;
-                }
-            }
-
-            newMessage = &candidate;
-            tryNextCandidate:
-            ;
-        }
     } else {
-        assert(!purgeOK);
         oldMessage->state = ScheduledMessage::INACTIVE;
         inactiveMessages.push_back(*oldMessage);
     }
 
+    // Find an inactive message to activate if none has not been designated.
+    if (NULL == newMessage) {
+        for (ScheduledMessage& message : inactiveMessages) {
+            if (newMessage != NULL && newMessage->compareTo(message) <= 0) {
+                continue;
+            }
+
+            // Make sure the candidate doesn't have the same sender as any of
+            // the active messages.
+            bool senderConflict = false;
+            for (ScheduledMessage& active : activeMessages) {
+                if (active.senderHash == message.senderHash) {
+                    senderConflict = true;
+                    break;
+                }
+            }
+            if (!senderConflict) {
+                newMessage = &message;
+            }
+        }
+    }
     if (newMessage) {
         adjustSchedulingPrecedence(newMessage);
     }
-
-    assert(oldMessage->state == ScheduledMessage::INACTIVE ||
-            oldMessage->state == ScheduledMessage::PURGED);
-    assert(newMessage == NULL || newMessage->state == ScheduledMessage::ACTIVE);
 }
 
 /**
