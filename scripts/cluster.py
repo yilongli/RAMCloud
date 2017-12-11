@@ -54,6 +54,8 @@ server_locator_templates = {
     'tcp-1g': 'tcp:host=%(host1g)s,port=%(port)d',
     'basic+udp': 'basic+udp:host=%(host)s,port=%(port)d',
     'basic+udp-1g': 'basic+udp:host=%(host1g)s,port=%(port)d',
+    'homa+udp': 'homa+udp:host=%(host)s,port=%(port)d',
+    'homa+udp-1g': 'homa+udp:host=%(host1g)s,port=%(port)d',
     'unreliable+udp': 'unreliable+udp:host=%(host)s,port=%(port)d',
     'infrc': 'infrc:host=%(host)s,port=%(port)d',
     'basic+infud': 'basic+infud:host=%(host1g)s',
@@ -68,6 +70,8 @@ coord_locator_templates = {
     'tcp-1g': 'tcp:host=%(host1g)s,port=%(port)d',
     'basic+udp': 'basic+udp:host=%(host)s,port=%(port)d',
     'basic+udp-1g': 'basic+udp:host=%(host1g)s,port=%(port)d',
+    'homa+udp': 'homa+udp:host=%(host)s,port=%(port)d',
+    'homa+udp-1g': 'homa+udp:host=%(host1g)s,port=%(port)d',
     'unreliable+udp': 'unreliable+udp:host=%(host)s,port=%(port)d',
     'infrc': 'infrc:host=%(host)s,port=%(port)d',
     # Coordinator uses udp even when rest of cluster uses infud

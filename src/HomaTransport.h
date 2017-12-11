@@ -726,10 +726,10 @@ class HomaTransport : public Transport {
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
     void maintainTopOutgoingMessages(OutgoingMessage* candidate);
-    bool tryToSchedule(ScheduledMessage* message);
+    void tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
-            ScheduledMessage* newMessage, bool cancelled = false);
+            ScheduledMessage* newMessage);
     void dataPacketArrive(ScheduledMessage* message);
 
     /// Shared RAMCloud information.
@@ -919,34 +919,33 @@ class HomaTransport : public Transport {
     /// MESSAGE SCHEDULER
     /// -----------------
 
-    /// Holds a list of scheduled messages that are sent from distinct senders
-    /// and receive grants regularly. The scheduler attempts to keep 1 RTT
-    /// in-flight packets from each of these messages. Once a message has
-    /// been granted in its entirety, it will be removed from the list.
-    /// This list always maintains an ordering of the messages based on the
-    /// comparison function defined in #ScheduledMessage.
+    /// Holds a list of scheduled messages that are from *distinct* senders
+    /// and being granted actively. The scheduler attempts to keep 1 RTT
+    /// in-flight packets from each of these messages. Once a message has been
+    /// fully granted, it will be removed from the list. The size of the list
+    /// is bounded by #maxGrantedMessages. This list is always sorted based on
+    /// ScheduledMessage::compareTo.
     INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
             ActiveMessageList;
     ActiveMessageList activeMessages;
 
-    /// Holds a list of scheduled messages that we have received at least one
-    /// packet for each of them, but haven't yet fully granted them and aren't
-    /// actively sending grants to them in order to avoid overloading the
-    /// network. One of these messages may be chosen to become an active message
-    /// when a former active message is granted completely. The list doesn't
+    /// Holds a list of scheduled messages that are not being granted by the
+    /// receiver actively. An inactive may be chosen to become active, when
+    /// a former active message has been granted completely. The list doesn't
     /// maintain any particular ordering of the messages within it.
     INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
             InactiveMessageList;
     InactiveMessageList inactiveMessages;
 
     /// The highest priority currently granted to the incoming messages that
-    /// are scheduled by this transport. The valid range of this value is
-    /// [-1, #highestSchedPriority]. -1 means no message is being scheduled
-    /// by the transport.
+    /// are scheduled by this transport. All priorities below this must also
+    /// be in use. The valid range of this value is [-1, highestSchedPriority].
+    /// -1 means no message is being scheduled by the transport.
     int highestGrantedPrio;
+    // TODO: WHEN DOES IT GO UP? GO DOWN? WHAT'S THE BEST PLACE TO DOC. THIS?
 
     /// Maximum # incoming messages that can be actively granted by the
-    /// transport at any time.
+    /// receiver. Or, the "degree of overcommitment" in the Homa paper.
     uint32_t maxGrantedMessages;
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);

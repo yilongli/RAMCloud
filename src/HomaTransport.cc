@@ -1876,7 +1876,7 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
 HomaTransport::ScheduledMessage::~ScheduledMessage()
 {
     if (state == ACTIVE) {
-        accumulator->t->replaceActiveMessage(this, NULL, true);
+        accumulator->t->replaceActiveMessage(this, NULL);
     } else if (state == INACTIVE) {
         erase(accumulator->t->inactiveMessages, *this);
     }
@@ -2238,10 +2238,11 @@ HomaTransport::checkTimeouts()
 }
 
 /**
- * A non-active (new or inactive) message needs to be inserted to the active
- * message list or an existing active message needs to move forward in the
- * list. Either case, put this message to the right place in the list that
- * reflects its precedence among the active messages.
+ * A message needs to be put in the right place of the (sorted) active message
+ * list that reflects its scheduling precedence. This message can be either a
+ * non-active (new or inactive) message that doesn't yet exist in the active
+ * message list or an existing active message that needs to move forward in the
+ * list.
  *
  * \param message
  *      A message that needs to be put at the right place in the active message
@@ -2251,29 +2252,27 @@ void
 HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 {
     assert(message->state != ScheduledMessage::PURGED);
-    bool alreadyActive = (message->state == ScheduledMessage::ACTIVE);
 
     // The following loop iterates over the active message list to find the
     // right place to insert the given message.
     ScheduledMessage* insertHere = NULL;
     for (ScheduledMessage& m : activeMessages) {
         if (&m == message) {
-            // This existing message is still in the right place: all preceding
-            // messages are smaller.
+            // This existing message is still in the right place:
+            // all preceding messages are smaller.
             return;
         }
 
         if (message->compareTo(m) < 0) {
-            if (alreadyActive) {
-                erase(activeMessages, *message);
-            }
             insertHere = &m;
             break;
         }
     }
 
-    // Insert the message.
-    if (message->state == ScheduledMessage::INACTIVE) {
+    // Relocate the message to its new place.
+    if (message->state == ScheduledMessage::ACTIVE) {
+        erase(activeMessages, *message);
+    } else if (message->state == ScheduledMessage::INACTIVE) {
         erase(inactiveMessages, *message);
     }
     message->state = ScheduledMessage::ACTIVE;
@@ -2298,13 +2297,10 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
  *      of this method to pick a replacement from the inactive message list.
  *      Otherwise, this method is invoked because \p newMessage is a better
  *      choice compared to \p oldMessage.
- * \param cancelled
- *      True means we are not interested in receiving \p oldMessage anymore;
- *      false, otherwise.
  */
 void
 HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
-        ScheduledMessage *newMessage, bool cancelled)
+        ScheduledMessage *newMessage)
 {
     assert(oldMessage != newMessage);
     assert(oldMessage->state == ScheduledMessage::ACTIVE);
@@ -2321,7 +2317,7 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
     }
     erase(activeMessages, *oldMessage);
     if (newMessage == NULL) {
-        assert(purgeOK || cancelled);
+//        assert(purgeOK || cancelled);
         oldMessage->state = ScheduledMessage::PURGED;
 
         // No designated message to promote. Pick one from the inactive
@@ -2365,7 +2361,7 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
         }
     }
 
-    // Packet the priorities for scheduled packets when there is no enough
+    // Compress the priorities for scheduled packets when there is no enough
     // message to buffer.
     if (activeMessages.size() < maxGrantedMessages) {
         highestGrantedPrio = int(activeMessages.size()) - 1;
@@ -2378,70 +2374,62 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
 
 /**
  * Attempts to schedule a message by placing it in the active message list.
- * This function is invoked when a new scheduled message arrives or an existing
+ * This method is invoked when a new scheduled message arrives or an existing
  * inactive message tries to step up to the active message list.
  *
  * \param message
- *      A message that cannot be completely sent as unscheduled bytes.
- * \return
- *      True if the message will start to receive grants regularly after this
- *      this method returns; false, otherwise.
+ *      A message that cannot be sent unilaterally in unscheduled bytes.
  */
-bool
+void
 HomaTransport::tryToSchedule(ScheduledMessage* message)
 {
     assert(message->state == ScheduledMessage::NEW ||
             message->state == ScheduledMessage::INACTIVE);
-    bool newMessageArrives = (message->state == ScheduledMessage::NEW);
+    bool newMessage = (message->state == ScheduledMessage::NEW);
 
     // The following loop handles the special case where some active message
-    // comes from the same sender as the new message to avoid violating the
-    // constraint that active messages must come from distinct senders.
+    // comes from the same sender as the new message.
     for (ScheduledMessage &m : activeMessages) {
         if (m.senderHash != message->senderHash) {
             continue;
         }
 
         if (message->compareTo(m) < 0) {
-            // The new message should replace an active message that is from
-            // the same sender.
             replaceActiveMessage(&m, message);
-        }
-        goto schedulingDone;
-    }
-
-    // From now on, we can assume that the new message has a different sender
-    // than the active messages.
-    if (activeMessages.size() < maxGrantedMessages) {
-        // We have not buffered enough messages. This also implies we have not
-        // used up our priority levels for scheduled packets. Bump the highest
-        // granted priority.
-        assert(newMessageArrives); // TODO: EXPLAIN THE ASSERTION
-        adjustSchedulingPrecedence(message);
-        highestGrantedPrio++;
-        assert(highestGrantedPrio <= highestSchedPriority);
-        assert(highestGrantedPrio + 1 == int(activeMessages.size()));
-    } else if (message->compareTo(activeMessages.back()) < 0) {
-        // The new message should replace the "worst" active message.
-        replaceActiveMessage(&activeMessages.back(), message);
-    }
-
-    schedulingDone:
-    if (message->state == ScheduledMessage::ACTIVE) {
-        return true;
-    } else {
-        if (newMessageArrives) {
+        } else if (newMessage) {
             message->state = ScheduledMessage::INACTIVE;
             inactiveMessages.push_back(*message);
         }
-        return false;
+        return;
+    }
+
+    // From now on, we can assume that this message has a different sender
+    // than the active messages.
+    if (activeMessages.size() < maxGrantedMessages) {
+        // We have not buffered enough messages. Note that this can only
+        // happen if this message is new and that every inactive message
+        // has the same sender as one of the active messages.
+        assert(newMessage);
+        adjustSchedulingPrecedence(message);
+
+        // Bump the highest granted priority if we have not used up all
+        // scheduled priorities.
+        if (highestGrantedPrio < highestSchedPriority) {
+            highestGrantedPrio++;
+        }
+    } else if (message->compareTo(activeMessages.back()) < 0) {
+        // This message should replace the "worst" active message.
+        replaceActiveMessage(&activeMessages.back(), message);
+    } else if (newMessage) {
+        message->state = ScheduledMessage::INACTIVE;
+        inactiveMessages.push_back(*message);
     }
 }
 
 /**
- * When a full data packet is received, this method is invoked to see
- * if the scheduler needs to 1) update its active message list and
- * 2) send out a GRANT.
+ * When we receive a DATA packet, this method is invoked to see if the
+ * scheduler needs to 1) update its active message list and 2) send out
+ * a GRANT.
  *
  * \param message
  *      NULL means the data packet belongs to a unscheduled message;
@@ -2451,7 +2439,7 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
 void
 HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
 {
-    // If this data packet belongs to a scheduled message, see if we need to
+    // If this DATA packet belongs to a scheduled message, see if we need to
     // adjust the scheduling precedence of this message.
     if (scheduledMessage) {
         switch (scheduledMessage->state) {
@@ -2462,9 +2450,9 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
                 tryToSchedule(scheduledMessage);
                 break;
             case ScheduledMessage::PURGED:
-                // A scheduled message will be purged from the scheduler as
-                // soon as it was fully granted. However, we will continue to
-                // receive data packets from it for a while.
+                // This can happen because a scheduled message will be purged
+                // from the scheduler as soon as it is fully granted, but we
+                // will continue to receive data from it for a while.
                 break;
             default:
                 LOG(ERROR, "unexpected message state %u",
@@ -2474,28 +2462,25 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
     }
 
     // Find the first active message that could use a GRANT.
-    ScheduledMessage* messageToGrant = NULL;
-    uint8_t priority;
-    if (highestGrantedPrio >= 0) {
-        priority = downCast<uint8_t>(highestGrantedPrio);
-    } else {
-        // No scheduled message.
-        assert(activeMessages.size() + inactiveMessages.size() == 0);
+    if (activeMessages.empty() && inactiveMessages.empty()) {
         return;
     }
+    ScheduledMessage* messageToGrant = NULL;
+    int p = highestGrantedPrio;
     for (ScheduledMessage& m : activeMessages) {
         if (m.grantOffset < m.accumulator->buffer->size() + roundTripBytes) {
             messageToGrant = &m;
             break;
         }
-        priority--;
+        p--;
     }
-
     if (messageToGrant == NULL) {
-        // All of the active messages (or, more precisely, their senders) have
-        // been granted for 1 RTT incoming bytes.
         return;
     }
+
+    // If we have more active messages than # scheduled priorities, squash
+    // the bottom few messages to the lowest priority level.
+    uint8_t priority = p >= 0 ? downCast<uint8_t>(p) : 0;
     if (messageToGrant->totalLength - messageToGrant->grantOffset
             <= roundTripBytes) {
         // For the last 1 RTT remaining bytes of a scheduled message
@@ -2507,10 +2492,8 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
 
     messageToGrant->grantOffset += grantIncrement;
     messageToGrant->grantPriority = priority;
-    if (messageToGrant->grantOffset >=
-            messageToGrant->totalLength) {
-        // Slow path: a message has been fully granted. Purge it from the
-        // scheduler.
+    if (messageToGrant->grantOffset >= messageToGrant->totalLength) {
+        // A message has been fully granted. Purge it from the scheduler.
         messageToGrant->grantOffset = messageToGrant->totalLength;
         replaceActiveMessage(messageToGrant, NULL);
     }
