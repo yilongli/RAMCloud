@@ -1167,6 +1167,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (retainPacket) {
                     uint32_t dummy;
                     received->steal(&dummy);
+                } else {
+                    LOG(DEBUG, "Redundant DATA from server, sequence %lu, "
+                            "offset %u, totalLength %u",
+                            header->common.rpcId.sequence, header->offset,
+                            header->totalLength);
                 }
                 return;
             }
@@ -1425,6 +1430,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (retainPacket) {
                     uint32_t dummy;
                     received->steal(&dummy);
+                } else {
+                    LOG(DEBUG, "Redundant DATA from client, clientId %lu, "
+                            "sequence %lu, offset %u, totalLength %u",
+                            header->common.rpcId.clientId,
+                            header->common.rpcId.sequence,
+                            header->offset, header->totalLength);
                 }
                 return;
             }
@@ -1633,6 +1644,7 @@ HomaTransport::ServerRpc::sendReply()
     }
 
     uint32_t bytesSent;
+    response.transmitPriority = t->getUnschedTrafficPrio(length);
     if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
@@ -2054,10 +2066,14 @@ HomaTransport::checkTimeouts()
             it != outgoingRpcs.end(); ) {
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
-        if (clientRpc->request.transmitOffset == 0) {
-            // We haven't started transmitting this RPC yet (our transmit
-            // queue is probably backed up), so no need to worry about whether
-            // we have heard from the server.
+        OutgoingMessage* request = &clientRpc->request;
+        if (request->transmitLimit > request->buffer->size()) {
+            request->transmitLimit = request->buffer->size();
+        }
+        if (request->transmitOffset < request->transmitLimit) {
+            // We haven't finished transmitting every granted byte of the
+            // request (our transmit queue is probably backed up), so no
+            // need to worry about whether we have heard from the server.
             it++;
             continue;
         }
@@ -2087,28 +2103,16 @@ HomaTransport::checkTimeouts()
             continue;
         }
 
-        if (clientRpc->transmitPending) {
-            // We haven't finished transmitting the request.
-            OutgoingMessage* request = &clientRpc->request;
-            if (request->transmitOffset == request->transmitLimit) {
-                // We have transmitted every granted byte. Ping the server
-                // to see if it's still alive. If yes, the server should
-                // eventually request retransmission.
-                PingHeader ping(clientRpc->rpcId, FROM_CLIENT);
-                sendControlPacket(request->recipient, &ping);
-            } else {
-                // We are probably too busy transmitting higher priority
-                // messages. Just reset the timer.
-                clientRpc->silentIntervals = 0;
-            }
-        } else if (clientRpc->response->size() == 0) {
-            // We have finished transmitting the request but haven't received
-            // any part of the response message. Normally, it's the server's
-            // responsibility to request retransmission. However, in case the
-            // whole request was lost (so the server is not aware of this RPC),
-            // we need to send occasional RESEND packets, which should produce
-            // some response from the server, so that we know it's still alive
-            // and working. Note: the wait time for this ping is longer than
+        if (clientRpc->response->size() == 0) {
+            assert(clientRpc->transmitPending &&
+                    (request->transmitOffset == request->transmitLimit));
+            // We haven't received any part of the response message. Normally,
+            // it's the server's responsibility to request retransmission.
+            // However, in case the whole request was lost (so the server is
+            // not aware of this RPC) or the server crashed, we need to send
+            // occasional RESEND packets, which should produce some response
+            // from the server, so that we know the server will take care of
+            // this situation. Note: the wait time for this ping is longer than
             // the server's wait time to request retransmission (first give the
             // server a chance to handle the problem).
             if (clientRpc->silentIntervals % pingIntervals == 0) {
@@ -2156,10 +2160,15 @@ HomaTransport::checkTimeouts()
     for (ServerTimerList::iterator it = serverTimerList.begin();
             it != serverTimerList.end(); ) {
         ServerRpc* serverRpc = &(*it);
+        OutgoingMessage* response = &serverRpc->response;
         if (serverRpc->sendingResponse &&
-                (serverRpc->response.transmitOffset == 0)) {
-            // Looks like the transmit queue has been too backed up to start
-            // sending the response, so no need to check for a timeout.
+                (response->transmitLimit > response->buffer->size())) {
+            response->transmitLimit = response->buffer->size();
+        }
+        if (response->transmitOffset < response->transmitLimit) {
+            // Looks like the transmit queue has been too backed up to finish
+            // transmitting every granted byte of the response, so no need to
+            // check for a timeout.
             it++;
             continue;
         }
@@ -2219,19 +2228,15 @@ HomaTransport::checkTimeouts()
                         grantOffset, priority, FROM_SERVER);
             }
         } else {
+            // We have transmitted every granted byte of the response.
+            // Ping the client to see if it's still alive. If yes, the
+            // client should eventually request retransmission.
             assert(serverRpc->sendingResponse);
-            OutgoingMessage* response = &serverRpc->response;
-            if (response->transmitOffset == response->transmitLimit) {
-                // We have transmitted every granted byte. Ping the client
-                // to see if it's still alive. If yes, the client should
-                // eventually request retransmission.
-                PingHeader ping(serverRpc->rpcId, FROM_SERVER);
-                sendControlPacket(response->recipient, &ping);
-            } else {
-                // We are probably too busy transmitting higher priority
-                // messages. Just reset the timer.
-                serverRpc->silentIntervals = 0;
-            }
+            assert(response->transmitOffset == response->transmitLimit);
+            // TODO: Shall we really (ab)use ResendHeader here?
+            // TODO: Shall we define PING packet only for server->client?
+            PingHeader ping(serverRpc->rpcId, FROM_SERVER);
+            sendControlPacket(response->recipient, &ping);
         }
     }
 }

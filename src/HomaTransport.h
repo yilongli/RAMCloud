@@ -337,7 +337,8 @@ class HomaTransport : public Transport {
             , serverRpc(serverRpc)
             , recipient(recipient)
             , transmitOffset(0)
-            , transmitPriority(t->getUnschedTrafficPrio(buffer->size()))
+            , transmitPriority(
+                    clientRpc ? t->getUnschedTrafficPrio(buffer->size()) : ~0u)
             , transmitLimit(t->roundTripBytes)
             , topChoice(false)
             , lastTransmitTime(0)
