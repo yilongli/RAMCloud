@@ -306,7 +306,8 @@ class HomaTransport : public Transport {
         uint32_t transmitOffset;
 
         /// Packet priority to use for transmitting the rest of the message up
-        /// to `transmitLimit`.
+        /// to `transmitLimit`. Initialized right before the first byte of this
+        /// message is sent.
         uint8_t transmitPriority;
 
         /// The number of bytes in the message that it's OK for us to transmit.
@@ -337,8 +338,7 @@ class HomaTransport : public Transport {
             , serverRpc(serverRpc)
             , recipient(recipient)
             , transmitOffset(0)
-            , transmitPriority(
-                    clientRpc ? t->getUnschedTrafficPrio(buffer->size()) : ~0u)
+            , transmitPriority(0)
             , transmitLimit(t->roundTripBytes)
             , topChoice(false)
             , lastTransmitTime(0)

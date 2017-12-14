@@ -1013,6 +1013,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
+    clientRpc->request.transmitPriority = t->getUnschedTrafficPrio(length);
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
@@ -2073,7 +2074,8 @@ HomaTransport::checkTimeouts()
         if (request->transmitLimit > request->buffer->size()) {
             request->transmitLimit = request->buffer->size();
         }
-        if (request->transmitOffset < request->transmitLimit) {
+        if (request->transmitOffset <
+                std::min(request->transmitLimit, request->buffer->size())) {
             // We haven't finished transmitting every granted byte of the
             // request (our transmit queue is probably backed up), so no
             // need to worry about whether we have heard from the server.
@@ -2162,11 +2164,8 @@ HomaTransport::checkTimeouts()
             it != serverTimerList.end(); ) {
         ServerRpc* serverRpc = &(*it);
         OutgoingMessage* response = &serverRpc->response;
-        if (serverRpc->sendingResponse &&
-                (response->transmitLimit > response->buffer->size())) {
-            response->transmitLimit = response->buffer->size();
-        }
-        if (response->transmitOffset < response->transmitLimit) {
+        if (serverRpc->sendingResponse && (response->transmitOffset <
+                std::min(response->transmitLimit, response->buffer->size()))) {
             // Looks like the transmit queue has been too backed up to finish
             // transmitting every granted byte of the response, so no need to
             // check for a timeout.
