@@ -85,11 +85,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // is observed.
     , smallMessageThreshold(300)
     , clientId(clientId)
-
-    // For now, assume we can use all the priorities supported by the driver.
-    , highestAvailPriority(driver->getHighestPacketPriority())
+    , highestAvailPriority(-1)
     , highestSchedPriority(-1)
-    , controlPacketPriority(highestAvailPriority)
     , lowestUnschedPrio(-1)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
@@ -171,44 +168,47 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     }
     roundTripBytes = getRoundTripBytes(locator, roundTripMicros);
 
-    // Assign priority levels to unscheduled and scheduled traffic.
-    // By default, use the highest priority for all unscheduled traffic.
-    int numPrio = highestAvailPriority + 1;
+    // Assign priority levels to unscheduled and scheduled traffic. By default,
+    // 1) use all priorities supported by the underlying driver;
+    // 2) use the highest priority for all unscheduled traffic.
+    int numPrio = driver->getHighestPacketPriority() + 1;
+    if (params && params->hasOption("numPrio")) {
+        numPrio = std::min(numPrio, params->getOption<int>("numPrio"));
+        if (numPrio <= 0) {
+            LOG(ERROR, "Bad HomaTransport numPrio option value '%d'; "
+                    "ignoring option", numPrio);
+        }
+    }
+    highestAvailPriority = numPrio - 1;
     lowestUnschedPrio = highestAvailPriority;
     if (params && params->hasOption("unschedPrio")) {
         value = params->getOption<int>("unschedPrio");
-        if ((value > 0) && (value <= numPrio)) {
+        if ((0 < value) && (value <= numPrio)) {
             lowestUnschedPrio = numPrio - value;
         } else {
             LOG(ERROR, "Bad HomaTransport unschedPrio option value '%d' "
-                    "(expected positive integer < %d); ignoring option",
-                    value, numPrio);
+                    "(0 < unschedPrio <= numPrio); ignoring option", value);
         }
     }
     highestSchedPriority = std::max(lowestUnschedPrio-1, 0);
 
-    // By default, set the degree of over-commitment to # scheduled
-    // priorities.
+    // By default, set the degree of over-commitment to # scheduled priorities
+    // (if it's not too small).
     int numSchedPrio = highestSchedPriority + 1;
-    maxGrantedMessages = downCast<uint32_t>(numSchedPrio);
+    maxGrantedMessages = std::max(4u, downCast<uint32_t>(numSchedPrio));
     if (params && params->hasOption("degreeOC")) {
         value = params->getOption<uint32_t>("degreeOC");
-        // FIXME: eventually, we would like to decouple # scheduled priorities
-        // and the degree of over-commitment so that the former could be less
-        // than the latter.
-        if ((value > 0) && (value <= numSchedPrio)) {
+        if (value > 0) {
             maxGrantedMessages = downCast<uint32_t>(value);
         } else {
             LOG(ERROR, "Bad HomaTransport degreeOC option value '%d' "
-                    "(expected positive integer < %d); ignoring option",
-                    value, numSchedPrio);
+                    "(expected positive integer); ignoring option", value);
         }
     }
 
     // Set unscheduled priority cutoffs.
     string unschedMessageBrackets = "[0";
-    uint32_t numUnschedPrio =
-            downCast<uint32_t>(highestAvailPriority - lowestUnschedPrio + 1);
+    uint32_t numUnschedPrio = downCast<uint32_t>(numPrio - lowestUnschedPrio);
     if (params && params->hasOption("unschedPrioCutoffs")) {
         std::stringstream sstream(params->getOption("unschedPrioCutoffs"));
         std::string cutoff;
@@ -550,7 +550,7 @@ HomaTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
     QueueEstimator::TransmitQueueState txQueueState;
-    driver->sendPacket(recipient, packet, NULL, controlPacketPriority,
+    driver->sendPacket(recipient, packet, NULL, highestAvailPriority,
             &txQueueState);
     timeTrace("sent control packet, opcode %u, %u bytes queued ahead, "
             "tx queue idle time %u cyc", packet->common.opcode,

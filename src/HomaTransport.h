@@ -775,13 +775,10 @@ class HomaTransport : public Transport {
 
     /// The highest packet priority that is supported by the underlying
     /// driver and available to us.
-    const int highestAvailPriority;
+    int highestAvailPriority;
 
     // The highest priority to use for scheduled traffic.
     int highestSchedPriority;
-
-    /// The packet priority used for sending control packets.
-    const int controlPacketPriority;
 
     /// The lowest priority to use for unscheduled traffic.
     int lowestUnschedPrio;
