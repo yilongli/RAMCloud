@@ -236,6 +236,9 @@ class HomaTransport : public Transport {
         /// Used to link this object into t->inactiveMessages.
         IntrusiveListHook inactiveMessageLinks;
 
+        /// Used to link this object into t->fifoMessages.
+        IntrusiveListHook fifoMessageLinks;
+
         /// Offset from the most recent GRANT packet we have sent for this
         /// incoming message, or # unscheduled bytes in this message if we
         /// haven't sent any GRANTs.
@@ -934,6 +937,14 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
             InactiveMessageList;
     InactiveMessageList inactiveMessages;
+
+    // FIXME
+    uint32_t grantCounter;
+
+    // FIXME
+    INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, fifoMessageLinks)
+            FifoMessageList;
+    FifoMessageList fifoMessages;
 
     /// Maximum # incoming messages that can be actively granted by the
     /// receiver. Or, the "degree of overcommitment" in the Homa paper.

@@ -118,6 +118,8 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , unschedPrioCutoffs()
     , activeMessages()
     , inactiveMessages()
+    , grantCounter(0)
+    , fifoMessages()
     , maxGrantedMessages()
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
@@ -1870,6 +1872,7 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
     : accumulator(accumulator)
     , activeMessageLinks()
     , inactiveMessageLinks()
+    , fifoMessageLinks()
     , grantOffset(unscheduledBytes)
     , grantPriority(0)
     , rpcId(rpcId)
@@ -1880,6 +1883,10 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
     , whoFrom(whoFrom)
 {
     accumulator->t->tryToSchedule(this);
+#define FIFO_MESSAGE_LENGTH 9000000
+    if (totalLength > FIFO_MESSAGE_LENGTH) {
+        accumulator->t->fifoMessages.push_back(*this);
+    }
 }
 
 /**
@@ -1894,6 +1901,9 @@ HomaTransport::ScheduledMessage::~ScheduledMessage()
         accumulator->t->replaceActiveMessage(this, NULL);
     } else if (state == INACTIVE) {
         erase(accumulator->t->inactiveMessages, *this);
+    }
+    if (totalLength > FIFO_MESSAGE_LENGTH) {
+        erase(accumulator->t->fifoMessages, *this);
     }
 }
 
@@ -2422,8 +2432,34 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
         }
     }
 
-    // Find the first active message that could use a GRANT.
     ScheduledMessage* messageToGrant = NULL;
+
+    grantCounter++;
+    bool grantFIFO = false;
+#define GRANT_INTERVAL 10
+    if (grantCounter % GRANT_INTERVAL == 0) {
+        // Find the oldest inactive message that could use a GRANT.
+        for (ScheduledMessage& m : fifoMessages) {
+//            if (m.state == ScheduledMessage::INACTIVE) {
+            if ((m.state == ScheduledMessage::INACTIVE) &&
+                    (m.grantOffset < m.accumulator->buffer->size() + roundTripBytes)) {
+                messageToGrant = &m;
+                m.grantOffset += grantIncrement;
+                m.grantPriority = 3;
+                if (m.grantOffset >= m.totalLength) {
+                    // A message has been fully granted. Purge it from the scheduler.
+                    m.grantOffset = m.totalLength;
+                    m.state = ScheduledMessage::PURGED;
+                    erase(inactiveMessages, m);
+                }
+                grantFIFO = true;
+                break;
+            }
+        }
+    }
+
+    if (!grantFIFO) {
+    // Find the first active message that could use a GRANT.
     int p = std::min(int(activeMessages.size()) - 1, highestSchedPriority);
     for (ScheduledMessage& m : activeMessages) {
         if (m.grantOffset < m.accumulator->buffer->size() + roundTripBytes) {
@@ -2454,6 +2490,8 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
         // A message has been fully granted. Purge it from the scheduler.
         messageToGrant->grantOffset = messageToGrant->totalLength;
         replaceActiveMessage(messageToGrant, NULL);
+    }
+
     }
 
     // Output a GRANT for the selected message.

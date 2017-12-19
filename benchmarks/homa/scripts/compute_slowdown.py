@@ -1,12 +1,13 @@
 #!/usr/bin/python
-# Usage: compute_slowdown.py baseline_data experiment_data
+# Usage: compute_slowdown.py baseline_data experiment_data [transport workload load_factor]
 #
 # Compute echo RPC slowdowns by normalizing the actual RPC times aginst the
-# best-case RPC times. The two arguments specify the names of the two files
-# that contain the best-case and actual RPC times, respectively.
-#
-# Note: This script is only designed to be invoked by `run_workload.sh` from
-# the directory where the two files containing RPC times reside.
+# best-case RPC times. The first two arguments specify the paths to the two
+# files that contain the best-case and actual RPC times, respectively. Three
+# more arguments can be provided optionally to specify the transport used to
+# run the experiment, the workload, and the load factor, respectively; when
+# absent, the script will try to infer these information from the filename of
+# `experiment_data`.
 
 from sys import argv
 
@@ -20,7 +21,11 @@ def is_number(s):
 def main():
     baseline_data = argv[1]
     experiment_data = argv[2]
-    experiment_name, workload, load_factor = experiment_data.split("_")[:3]
+    if len(argv) > 3:
+        transport, workload, load_factor = argv[3:]
+    else:
+        transport, workload, load_factor = \
+                experiment_data.split('/')[-1].split("_")[:3]
 
     # Read best-case RPC times of all message sizes from file
     rpc_time_min = {}
@@ -54,7 +59,7 @@ def main():
 
     # Print out RPC slowdowns
     for size in sorted(num_samples.iterkeys()):
-        print("%s %s %s %8d %5d %10.7f %8.2f %8.2f" % (experiment_name,
+        print("%s %s %s %8d %5d %10.7f %8.2f %8.2f" % (transport,
                 load_factor, workload, size, num_samples[size],
                 num_samples[size] / total_samples,
                 rpc_time_median[size] / rpc_time_min[size],
