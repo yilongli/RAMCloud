@@ -2071,9 +2071,6 @@ HomaTransport::checkTimeouts()
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
         OutgoingMessage* request = &clientRpc->request;
-        if (request->transmitLimit > request->buffer->size()) {
-            request->transmitLimit = request->buffer->size();
-        }
         if (request->transmitOffset <
                 std::min(request->transmitLimit, request->buffer->size())) {
             // We haven't finished transmitting every granted byte of the
