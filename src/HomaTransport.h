@@ -166,7 +166,7 @@ class HomaTransport : public Transport {
         bool addPacket(DataHeader *header, uint32_t length);
         uint32_t requestRetransmission(HomaTransport *t,
                 const Driver::Address* address, RpcId rpcId,
-                uint32_t grantOffset, uint8_t priority, uint8_t whoFrom);
+                uint32_t grantOffset, int priority, uint8_t whoFrom);
 
         /// Transport that is managing this object.
         HomaTransport* t;
@@ -241,9 +241,9 @@ class HomaTransport : public Transport {
         /// haven't sent any GRANTs.
         uint32_t grantOffset;
 
-        /// Packet priority embedded in the most recent GRANT packet we have
-        /// sent for this incoming message, or 0 if we haven't sent any GRANTS.
-        uint8_t grantPriority;
+        /// Packet priority to embed in the next GRANT packet for this incoming
+        /// message.
+        int grantPriority;
 
         /// Unique identifier for the RPC this message belongs to.
         RpcId rpcId;
@@ -257,16 +257,21 @@ class HomaTransport : public Transport {
 
         /// This enum defines the state field values for scheduled messages.
         enum State {
-            NEW,        // The message just arrives.
-            ACTIVE,     // The message is linked on t->activeMessages.
-            INACTIVE,   // The message is linked on t->inactiveMessages.
-            PURGED      // The message is purged from the scheduler.
+            NEW,            // The message object is being constructed and
+                            // we haven't decided where to place the message.
+                            // A message will never be in this state again
+                            // once the constructor finishes.
+            ACTIVE,         // The message is linked on t->activeMessages.
+            INACTIVE,       // The message is linked on t->inactiveMessages.
+            FULLY_GRANTED   // The message is now fully granted, and it has
+                            // been removed from both the active and inactive
+                            // message lists.
         };
 
-        /// The state of a scheduled messages is initialized to NEW by the
-        /// constructor. It can change between ACTIVE and INACTIVE several
-        /// times during the lifetime of the message. Finally, when the message
-        /// is fully granted, its state will be moved from ACTIVE to PURGED.
+        /// The state of a scheduled message is initialized to NEW by the
+        /// constructor. It can change between ACTIVE and INACTIVE many times
+        /// before the message is fully granted, which sets the state to
+        /// FULLY_GRANTED.
         State state;
 
         /// Total # bytes in the message.
@@ -620,11 +625,10 @@ class HomaTransport : public Transport {
                                      // the total message size.
         uint8_t priority;            // Packet priority to use; the sender
                                      // should transmit all lost data using
-                                     // this priority unless the entire message
-                                     // needs to be resent (in such case this
-                                     // field is unused and the sender simply
-                                     // starts sending unscheduled bytes as
-                                     // normal).
+                                     // this priority unless the RESTART flag
+                                     // is present (in such case this field is
+                                     // ignored and the sender simply starts
+                                     // sending unscheduled bytes as normal).
 
         ResendHeader(RpcId rpcId, uint32_t offset, uint32_t length,
                 uint8_t priority, uint8_t flags)
@@ -777,11 +781,14 @@ class HomaTransport : public Transport {
     /// driver and available to us.
     int highestAvailPriority;
 
+    /// The lowest priority to use for unscheduled traffic. When there is
+    /// more than one priority available (i.e. highestAvailPriority > 0),
+    /// this field is always equal to (highestSchedPriority + 1); otherwise,
+    /// it's set to zero (same as highestSchedPriority).
+    int lowestUnschedPrio;
+
     // The highest priority to use for scheduled traffic.
     int highestSchedPriority;
-
-    /// The lowest priority to use for unscheduled traffic.
-    int lowestUnschedPrio;
 
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
@@ -908,9 +915,13 @@ class HomaTransport : public Transport {
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
 
-    /// If the number at index i is the first element that is larger than the
-    /// size of a message, then the sender should use the (i+1)-th highest
-    /// priority for the entire unscheduled portion of the message.
+    /// If the number at index i is the first element that is greater than or
+    /// equal to the size of a message, then the sender should use the (i+1)-th
+    /// highest priority for the entire unscheduled portion of the message.
+    /// For example, if this vector is {469, 5521, 15267, ~0u}, the size
+    /// brackets it represents are [0, 469), [469, 5521), [5521, 15267), and
+    /// [15267, +Inf). Therefore, the unscheduled portion of a 469-byte message
+    /// would be sent using the second highest priority available.
     vector<uint32_t> unschedPrioCutoffs;
 
     /// -----------------
@@ -922,15 +933,16 @@ class HomaTransport : public Transport {
     /// in-flight packets from each of these messages. Once a message has been
     /// fully granted, it will be removed from the list. The size of the list
     /// is bounded by #maxGrantedMessages. This list is always sorted based on
-    /// ScheduledMessage::compareTo.
+    /// ScheduledMessage::compareTo (higher priority messages are earlier in
+    /// the list).
     INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, activeMessageLinks)
             ActiveMessageList;
     ActiveMessageList activeMessages;
 
     /// Holds a list of scheduled messages that are not being granted by the
-    /// receiver actively. An inactive may be chosen to become active, when
-    /// a former active message has been granted completely. The list doesn't
-    /// maintain any particular ordering of the messages within it.
+    /// receiver actively. An inactive message may be chosen to become active,
+    /// when a former active message has been granted completely. The list
+    /// doesn't keep any particular ordering of the messages within it.
     INTRUSIVE_LIST_TYPEDEF(ScheduledMessage, inactiveMessageLinks)
             InactiveMessageList;
     InactiveMessageList inactiveMessages;

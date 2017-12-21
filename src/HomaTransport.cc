@@ -85,9 +85,9 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     // is observed.
     , smallMessageThreshold(300)
     , clientId(clientId)
-    , highestAvailPriority(-1)
-    , highestSchedPriority(-1)
-    , lowestUnschedPrio(-1)
+    , highestAvailPriority()
+    , lowestUnschedPrio()
+    , highestSchedPriority()
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
@@ -127,35 +127,39 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     timerInterval = Cycles::fromMicroseconds(2000);
     nextTimeoutCheck = Cycles::rdtsc() + timerInterval;
 
-    // Read Homa configuration from the transport configuration file. Note
-    // that transport configurations are specified in the same format as
-    // service locators: "homa+dpdk:rttMicros=8,unschedPrio=4,degreeOC=4,
-    // dpdkPrio=8,unschedPrioCutoffs=469.5521.15267"
+    // Read Homa configuration from the transport configuration file
+    // (check out that file for documentation).
     std::ifstream configFile(
             context->options->getConfigDir() + "/transport.txt");
     Tub<ServiceLocator> params;
     if (configFile.is_open()) {
         std::string line;
+        ServiceLocator localSl(locatorString);
         try {
-            ServiceLocator localSL(locatorString);
             while (std::getline(configFile, line)) {
-                if (line.find(localSL.getProtocol()) != string::npos) {
-                    params.construct(line);
-                    break;
+                if ((line.find("#") == 0) ||
+                        (line.find(localSl.getProtocol()) == string::npos)) {
+                    // Skip comments and irrelevant lines.
+                    continue;
                 }
+                params.construct(line);
+                break;
             }
-        } catch (ServiceLocator::BadServiceLocatorException&) {}
+        } catch (ServiceLocator::BadServiceLocatorException&) {
+            LOG(ERROR, "Ignored bad transport configuration: '%s'",
+                    line.c_str());
+        }
     }
     int value;
 
     // Set the round-trip time (RTT) between two servers in the cluster.
-    // To be precise, the RTT includes the one-way delay of a data packet,
-    // the server processing time and the one-way delay of a grant packet.
-    // As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of one-way
-    // delay of a full-size data packet plus 1 us of server processing time
-    // plus 2 us of grant packet one-way delay). Note: it's hacky to hardwire
-    // this number in the code; a proper implementation would need to measure
-    // and set the RTT dynamically.
+    // To be precise, the RTT includes the one-way delay of a full-size data
+    // packet, the server processing time and the one-way delay of a grant
+    // packet. As of 11/17, the RTT on CloudLab m510 nodes is ~8us (5 us of
+    // one-way delay of a full-size data packet plus 1 us of server processing
+    // time plus 2 us of grant packet one-way delay). Note: it's hacky to
+    // hardcode this number in the code; a proper implementation would need to
+    // measure and set the RTT dynamically.
     uint32_t roundTripMicros = 8;
     if (params && params->hasOption("rttMicros")) {
         value = params->getOption<int>("rttMicros");
@@ -213,9 +217,20 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
         std::stringstream sstream(params->getOption("unschedPrioCutoffs"));
         std::string cutoff;
         while (std::getline(sstream, cutoff, '.')) {
-            value = stoi(cutoff);
-            unschedPrioCutoffs.push_back(downCast<uint32_t>(value + 1));
-            unschedMessageBrackets += format(", %d] [%d", value, value + 1);
+            try {
+                value = stoi(cutoff);
+            } catch (std::exception e) {
+                LOG(ERROR, "Bad priority cutoff value: '%s'; ignoring cutoff",
+                        cutoff.c_str());
+                continue;
+            }
+            if (value <= int(unschedPrioCutoffs.back())) {
+                LOG(ERROR, "Bad priority cutoff bracket: [%u, %d); "
+                        "ignoring cutoff", unschedPrioCutoffs.back(), value);
+                continue;
+            }
+            unschedPrioCutoffs.push_back(downCast<uint32_t>(value));
+            unschedMessageBrackets += format(", %d] [%d", value-1, value);
         }
     }
     if (unschedPrioCutoffs.size() + 1 != numUnschedPrio) {
@@ -230,7 +245,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
             "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
             "maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
-            "highestSchedPriority %d, unscheduedMessageBrackets %s",
+            "highestSchedPriority %d, unscheduledMessageBrackets %s",
             clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3, maxGrantedMessages,
@@ -398,13 +413,14 @@ HomaTransport::getRoundTripBytes(const ServiceLocator* locator,
  */
 uint8_t
 HomaTransport::getUnschedTrafficPrio(uint32_t messageSize) {
-    int numUnschedPrio = highestAvailPriority - lowestUnschedPrio + 1;
-    for (int i = 0; i < numUnschedPrio - 1; i++) {
-        if (messageSize < unschedPrioCutoffs[i]) {
-            return downCast<uint8_t>(highestAvailPriority - i);
+    int priority = highestAvailPriority;
+    for (uint32_t cutoff : unschedPrioCutoffs) {
+        if (messageSize < cutoff) {
+            return downCast<uint8_t>(priority);
         }
+        priority--;
     }
-    return downCast<uint8_t>(lowestUnschedPrio);
+    return downCast<uint8_t>(priority);
 }
 
 /**
@@ -725,7 +741,7 @@ HomaTransport::tryToTransmitData()
         // set; take the slow path
         if (expect_false((NULL == message) && transmitDataSlowPath)) {
             // The slow path scans all messages outside the top outgoing
-            // message set to 1) find an message ready to transmit, and
+            // message set to 1) find a message ready to transmit, and
             // 2) select the next message to include in the top outgoing
             // message set. The policy for both tasks is SRPT.
             timeTrace("slow path taken, iterating over %u outgoing messages, "
@@ -1261,7 +1277,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - request->lastTransmitTime)*1e06;
-                // FIXME: W4 seems to have some spurious(?) retransmissions
+                // As of 2017/12, running W4 and W5 with 8 priorities under
+                // high load will generate some spurious retransmission
+                // messages in the log. The spurious retransmission seems to
+                // happen when some bytes of a large message sent with the
+                // lowest priorities gets stuck at the TOR switch queue for
+                // too long.
                 LOG(NOTICE, "Retransmitting to server %s: "
                         "sequence %lu, offset %u, length %u, priority %u, "
                         "elapsed time %.1f us",
@@ -1808,7 +1829,7 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
 uint32_t
 HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         const Driver::Address* address, RpcId rpcId, uint32_t grantOffset,
-        uint8_t priority, uint8_t whoFrom)
+        int priority, uint8_t whoFrom)
 {
     if ((reinterpret_cast<uint64_t>(&fragments) < 0x1000lu)) {
         DIE("Bad fragment pointer: %p", &fragments);
@@ -1841,7 +1862,7 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
             "sequence %u";
     timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
-            priority, whoFrom);
+            downCast<uint8_t>(priority), whoFrom);
     t->sendControlPacket(address, &resend);
     return endOffset;
 }
@@ -1871,7 +1892,7 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
     , activeMessageLinks()
     , inactiveMessageLinks()
     , grantOffset(unscheduledBytes)
-    , grantPriority(0)
+    , grantPriority()
     , rpcId(rpcId)
     , senderAddress(senderAddress)
     , senderHash(std::hash<std::string>{}(senderAddress->toString()))
@@ -2144,7 +2165,7 @@ HomaTransport::checkTimeouts()
                 // response for higher priority messages, so request
                 // retransmission anyway.
                 if (clientRpc->silentIntervals % pingIntervals == 0) {
-                    uint8_t priority = scheduledMessage ?
+                    int priority = scheduledMessage ?
                             scheduledMessage->grantPriority : 0;
                     clientRpc->accumulator->requestRetransmission(this,
                             clientRpc->session->serverAddress,
@@ -2218,7 +2239,7 @@ HomaTransport::checkTimeouts()
                 // responses.
                 serverRpc->silentIntervals = 0;
             } else {
-                uint8_t priority = scheduledMessage ?
+                int priority = scheduledMessage ?
                         scheduledMessage->grantPriority : 0;
                 serverRpc->accumulator->requestRetransmission(this,
                         serverRpc->response.recipient, serverRpc->rpcId,
@@ -2252,7 +2273,7 @@ HomaTransport::checkTimeouts()
 void
 HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 {
-    assert(message->state != ScheduledMessage::PURGED);
+    assert(message->state != ScheduledMessage::FULLY_GRANTED);
 
     // The following loop iterates over the active message list to find the
     // right place to insert the given message.
@@ -2307,13 +2328,13 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
     bool purgeOK = (oldMessage->grantOffset >= oldMessage->totalLength);
     erase(activeMessages, *oldMessage);
     if (purgeOK) {
-        oldMessage->state = ScheduledMessage::PURGED;
+        oldMessage->state = ScheduledMessage::FULLY_GRANTED;
     } else {
         oldMessage->state = ScheduledMessage::INACTIVE;
         inactiveMessages.push_back(*oldMessage);
     }
 
-    // Find an inactive message to activate if none has not been designated.
+    // Find an inactive message to activate if none has been designated.
     if (NULL == newMessage) {
         for (ScheduledMessage& message : inactiveMessages) {
             if (newMessage != NULL && newMessage->compareTo(message) <= 0) {
@@ -2342,7 +2363,9 @@ HomaTransport::replaceActiveMessage(ScheduledMessage *oldMessage,
 /**
  * Attempts to schedule a message by placing it in the active message list.
  * This method is invoked when a new scheduled message arrives or an existing
- * inactive message tries to step up to the active message list.
+ * inactive message tries to step up to the active message list. If the message
+ * doesn't make it to the active message list, it will remain or get placed in
+ * the inactive message list.
  *
  * \param message
  *      A message that cannot be sent unilaterally in unscheduled bytes.
@@ -2382,8 +2405,12 @@ HomaTransport::tryToSchedule(ScheduledMessage* message)
         // This message should replace the "worst" active message.
         replaceActiveMessage(&activeMessages.back(), message);
     } else if (newMessage) {
+        // Place the new message in the inactive message list.
         message->state = ScheduledMessage::INACTIVE;
         inactiveMessages.push_back(*message);
+    } else {
+        // This is an existing inactive message. Do nothing.
+        assert(message->state == ScheduledMessage::INACTIVE);
     }
 }
 
@@ -2401,7 +2428,8 @@ void
 HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
 {
     // If this DATA packet belongs to a scheduled message, see if we need to
-    // adjust the scheduling precedence of this message.
+    // adjust the scheduling precedence of this message (since the remaining
+    // size of this message is decreased).
     if (scheduledMessage) {
         switch (scheduledMessage->state) {
             case ScheduledMessage::ACTIVE:
@@ -2410,7 +2438,7 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
             case ScheduledMessage::INACTIVE:
                 tryToSchedule(scheduledMessage);
                 break;
-            case ScheduledMessage::PURGED:
+            case ScheduledMessage::FULLY_GRANTED:
                 // This can happen because a scheduled message will be purged
                 // from the scheduler as soon as it is fully granted, but we
                 // will continue to receive data from it for a while.
@@ -2422,7 +2450,8 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
         }
     }
 
-    // Find the first active message that could use a GRANT.
+    // Find the first active message that could use a GRANT and compute the
+    // priority to use for it.
     ScheduledMessage* messageToGrant = NULL;
     int p = std::min(int(activeMessages.size()) - 1, highestSchedPriority);
     for (ScheduledMessage& m : activeMessages) {
@@ -2438,7 +2467,7 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
 
     // If we have more active messages than # scheduled priorities, squash
     // the bottom few messages to the lowest priority level.
-    uint8_t priority = p >= 0 ? downCast<uint8_t>(p) : 0;
+    int priority = std::max(p, 0);
     if (messageToGrant->totalLength - messageToGrant->grantOffset
             <= roundTripBytes) {
         // For the last 1 RTT remaining bytes of a scheduled message
