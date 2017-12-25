@@ -189,7 +189,7 @@ class HomaTransport : public Transport {
             /// Driver::steal.
             DataHeader *header;
 
-            /// # of bytes of message data available at payload.
+            /// # bytes of message data available at payload.
             uint32_t length;
 
             MessageFragment()
@@ -317,7 +317,7 @@ class HomaTransport : public Transport {
 
         /// The number of bytes in the message that it's OK for us to transmit.
         /// Bytes after this cannot be transmitted until we receive a GRANT for
-        /// them.
+        /// them. Must be always smaller than or equal to the message size.
         uint32_t transmitLimit;
 
         /// True means this message is among the sender's top outgoing
@@ -344,7 +344,7 @@ class HomaTransport : public Transport {
             , recipient(recipient)
             , transmitOffset(0)
             , transmitPriority(0)
-            , transmitLimit(t->roundTripBytes)
+            , transmitLimit()
             , topChoice(false)
             , lastTransmitTime(0)
             , outgoingMessageLinks()

@@ -809,8 +809,8 @@ HomaTransport::tryToTransmitData()
             // if appropriate.
             ClientRpc* clientRpc = message->clientRpc;
             ServerRpc* serverRpc = message->serverRpc;
-            uint32_t maxBytes = std::min(message->transmitLimit,
-                    message->buffer->size()) - message->transmitOffset;
+            uint32_t maxBytes =
+                    message->transmitLimit - message->transmitOffset;
             maxBytes = std::min(maxBytes,
                     static_cast<uint32_t>(transmitQueueSpace));
 
@@ -1030,6 +1030,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
     clientRpc->request.transmitPriority = t->getUnschedTrafficPrio(length);
+    clientRpc->request.transmitLimit = std::min(t->roundTripBytes, length);
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
@@ -1242,7 +1243,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                 if (header->common.flags & RESTART) {
                     clientRpc->response->reset();
                     request->transmitOffset = 0;
-                    request->transmitLimit = header->length;
+                    request->transmitLimit =
+                            std::min(header->length, request->buffer->size());
                     clientRpc->accumulator.destroy();
                     clientRpc->scheduledMessage.destroy();
                     if (!clientRpc->transmitPending) {
@@ -1256,7 +1258,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                     }
                     return;
                 }
-                uint32_t resendEnd = header->offset + header->length;
+                uint32_t resendEnd = std::min(header->offset + header->length,
+                        request->buffer->size());
                 if (resendEnd > request->transmitLimit) {
                     // Needed in case a GRANT packet was lost.
                     request->transmitLimit = resendEnd;
@@ -1530,8 +1533,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     sendControlPacket(received->sender, &resend);
                     return;
                 }
-                uint32_t resendEnd = header->offset + header->length;
                 OutgoingMessage* response = &serverRpc->response;
+                uint32_t resendEnd = std::min(header->offset + header->length,
+                        response->buffer->size());
                 if (resendEnd > response->transmitLimit) {
                     // Needed in case GRANT packet was lost.
                     response->transmitLimit = resendEnd;
@@ -1667,6 +1671,7 @@ HomaTransport::ServerRpc::sendReply()
 
     uint32_t bytesSent;
     response.transmitPriority = t->getUnschedTrafficPrio(length);
+    response.transmitLimit = std::min(t->roundTripBytes, length);
     if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
@@ -1854,7 +1859,9 @@ HomaTransport::MessageAccumulator::requestRetransmission(HomaTransport *t,
         // the normal grant mechanism should kick in if it's still needed.
         endOffset = t->roundTripBytes;
     }
-    assert(endOffset > buffer->size());
+    if (endOffset <= buffer->size()) {
+        LOG(ERROR, "Bad endOffset %u, offset %u", endOffset, buffer->size());
+    }
     const char* fmt = (whoFrom == FROM_SERVER) ?
             "server requesting retransmission of bytes %u-%u, clientId %u, "
             "sequence %u" :
@@ -1988,7 +1995,7 @@ HomaTransport::Poller::poll()
         uint8_t whoFrom = (recipient->whoFrom == FROM_CLIENT) ?
                 FROM_SERVER : FROM_CLIENT;
         GrantHeader grant(recipient->rpcId, recipient->grantOffset,
-                recipient->grantPriority, whoFrom);
+                downCast<uint8_t>(recipient->grantPriority), whoFrom);
         const char* fmt = (whoFrom == FROM_CLIENT) ?
                 "client sending GRANT, clientId %u, sequence %u, offset %u, "
                 "priority %u" :
@@ -2092,8 +2099,7 @@ HomaTransport::checkTimeouts()
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
         OutgoingMessage* request = &clientRpc->request;
-        if (request->transmitOffset <
-                std::min(request->transmitLimit, request->buffer->size())) {
+        if (request->transmitOffset < request->transmitLimit) {
             // We haven't finished transmitting every granted byte of the
             // request (our transmit queue is probably backed up), so no
             // need to worry about whether we have heard from the server.
@@ -2182,8 +2188,8 @@ HomaTransport::checkTimeouts()
             it != serverTimerList.end(); ) {
         ServerRpc* serverRpc = &(*it);
         OutgoingMessage* response = &serverRpc->response;
-        if (serverRpc->sendingResponse && (response->transmitOffset <
-                std::min(response->transmitLimit, response->buffer->size()))) {
+        if (serverRpc->sendingResponse &&
+                (response->transmitOffset < response->transmitLimit)) {
             // Looks like the transmit queue has been too backed up to finish
             // transmitting every granted byte of the response, so no need to
             // check for a timeout.
