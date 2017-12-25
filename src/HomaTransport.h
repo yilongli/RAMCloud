@@ -500,10 +500,9 @@ class HomaTransport : public Transport {
         GRANT                  = 22,
         LOG_TIME_TRACE         = 23,
         RESEND                 = 24,
-        ACK                    = 25,
+        BUSY                   = 25,
         ABORT                  = 26,
-        PING                   = 27,
-        BOGUS                  = 28,      // Used only in unit tests.
+        BOGUS                  = 27,      // Used only in unit tests.
         // If you add a new opcode here, you must also do the following:
         // * Change BOGUS so it is the highest opcode
         // * Add support for the new opcode in opcodeSymbol and headerToString
@@ -652,15 +651,15 @@ class HomaTransport : public Transport {
     } __attribute__((packed));
 
     /**
-     * Describes the wire format for ACK packets. These packets are used
+     * Describes the wire format for BUSY packets. These packets are used
      * to let the recipient know that the sender is still alive; they
      * don't trigger any actions on the receiver except resetting timers.
      */
-    struct AckHeader {
+    struct BusyHeader {
         CommonHeader common;         // Common header fields.
 
-        explicit AckHeader(RpcId rpcId, uint8_t flags)
-            : common(PacketOpcode::ACK, rpcId, flags) {}
+        explicit BusyHeader(RpcId rpcId, uint8_t flags)
+            : common(PacketOpcode::BUSY, rpcId, flags) {}
     } __attribute__((packed));
 
     /**
@@ -673,22 +672,6 @@ class HomaTransport : public Transport {
 
         explicit AbortHeader(RpcId rpcId)
             : common(PacketOpcode::ABORT, rpcId, FROM_CLIENT) {}
-    } __attribute__((packed));
-
-    /**
-     * Describes the wire format for PING packets. These packets are used
-     * to check if a client or server is still alive. When one party of an
-     * RPC hasn't heard from its counterpart for a while, but it believes
-     * that the counterpart is responsible for handling the situation, it
-     * sends a PING packet, expecting to receive an ACK from the counterpart
-     * so that it can reset the timer (we can't simply reset the timer without
-     * knowing the counterpart is still alive).
-     */
-    struct PingHeader {
-        CommonHeader common;         // Common header fields.
-
-        explicit PingHeader(RpcId rpcId, uint8_t flags)
-            : common(PacketOpcode::PING, rpcId, flags) {}
     } __attribute__((packed));
 
     /**

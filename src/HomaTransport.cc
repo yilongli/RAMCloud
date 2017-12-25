@@ -444,12 +444,10 @@ HomaTransport::opcodeSymbol(uint8_t opcode) {
             return "LOG_TIME_TRACE";
         case HomaTransport::PacketOpcode::RESEND:
             return "RESEND";
-        case HomaTransport::PacketOpcode::ACK:
-            return "ACK";
+        case HomaTransport::PacketOpcode::BUSY:
+            return "BUSY";
         case HomaTransport::PacketOpcode::ABORT:
             return "ABORT";
-        case HomaTransport::PacketOpcode::PING:
-            return "PING";
     }
 
     return format("%d", opcode);
@@ -652,8 +650,8 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
                             ? ", RESTART" : "");
             break;
         }
-        case HomaTransport::PacketOpcode::ACK: {
-            headerLength = sizeof32(HomaTransport::AckHeader);
+        case HomaTransport::PacketOpcode::BUSY: {
+            headerLength = sizeof32(HomaTransport::BusyHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -661,13 +659,6 @@ HomaTransport::headerToString(const void* packet, uint32_t packetLength)
         }
         case HomaTransport::PacketOpcode::ABORT: {
             headerLength = sizeof32(HomaTransport::AbortHeader);
-            if (packetLength < headerLength) {
-                goto packetTooShort;
-            }
-            break;
-        }
-        case HomaTransport::PacketOpcode::PING: {
-            headerLength = sizeof32(HomaTransport::PingHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -1272,10 +1263,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // must be other outgoing traffic with higher priority)
                     // or (b) we transmitted data recently. In either case,
                     // it's unlikely that bytes have been lost, so don't
-                    // retransmit; just return an ACK so the server knows
+                    // retransmit; just return an BUSY so the server knows
                     // we're still alive.
-                    AckHeader ack(header->common.rpcId, FROM_CLIENT);
-                    sendControlPacket(clientRpc->session->serverAddress, &ack);
+                    BusyHeader busy(header->common.rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress,
+                            &busy);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1304,22 +1296,11 @@ HomaTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
-            // ACK from server
-            case PacketOpcode::ACK: {
+            // BUSY from server
+            case PacketOpcode::BUSY: {
                 // Nothing to do.
-                timeTrace("client received ACK, clientId %u, sequence %u",
+                timeTrace("client received BUSY, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
-                return;
-            }
-
-            // PING from server
-            case PacketOpcode::PING: {
-                timeTrace("client received PING, clientId %u, sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
-                if (clientRpc != NULL) {
-                    AckHeader ack(common->rpcId, FROM_CLIENT);
-                    sendControlPacket(clientRpc->session->serverAddress, &ack);
-                }
                 return;
             }
 
@@ -1550,10 +1531,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // or (b) we transmitted data recently, so it might have
                     // crossed paths with the RESEND request. In either case,
                     // it's unlikely that bytes have been lost, so don't
-                    // retransmit; just return an ACK so the client knows
+                    // retransmit; just return an BUSY so the client knows
                     // we're still alive.
-                    AckHeader ack(serverRpc->rpcId, FROM_SERVER);
-                    sendControlPacket(response->recipient, &ack);
+                    BusyHeader busy(serverRpc->rpcId, FROM_SERVER);
+                    sendControlPacket(response->recipient, &busy);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1573,10 +1554,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
-            // ACK from client
-            case PacketOpcode::ACK: {
+            // BUSY from client
+            case PacketOpcode::BUSY: {
                 // Nothing to do.
-                timeTrace("server received ACK, clientId %u, sequence %u",
+                timeTrace("server received BUSY, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
                 return;
             }
@@ -1594,26 +1575,6 @@ HomaTransport::handlePacket(Driver::Received* received)
                     } else {
                         serverRpc->cancelled = true;
                     }
-                }
-                return;
-            }
-
-            // PING from client
-            case PacketOpcode::PING: {
-                timeTrace("server received PING, clientId %u, sequence %u",
-                        common->rpcId.clientId, common->rpcId.sequence);
-                if (serverRpc != NULL) {
-                    AckHeader ack(common->rpcId, FROM_SERVER);
-                    sendControlPacket(serverRpc->response.recipient, &ack);
-                } else {
-                    // Somehow the server is not aware of this RPC. Anyway,
-                    // just ask the client to restart the RPC from scratch.
-                    timeTrace("server requesting restart, clientId %u, "
-                            "sequence %u",
-                            common->rpcId.clientId, common->rpcId.sequence);
-                    ResendHeader resend(common->rpcId, 0, roundTripBytes, 0,
-                            FROM_SERVER|RESTART);
-                    sendControlPacket(received->sender, &resend);
                 }
                 return;
             }
@@ -2161,9 +2122,12 @@ HomaTransport::checkTimeouts()
             if (grantOffset == clientRpc->response->size()) {
                 // The client has received every granted byte but hasn't got
                 // around to grant more because there are higher priority
-                // responses.
+                // responses. Send BUSY to tell the server don't time out on
+                // this RPC.
                 assert(scheduledMessage);
                 clientRpc->silentIntervals = 0;
+                BusyHeader busy(RpcId(clientId, sequence), FROM_CLIENT);
+                sendControlPacket(clientRpc->session->serverAddress, &busy);
             } else {
                 // The client expects to receive more but the server
                 // has gone silent, this must mean packets were lost,
@@ -2251,16 +2215,6 @@ HomaTransport::checkTimeouts()
                         serverRpc->response.recipient, serverRpc->rpcId,
                         grantOffset, priority, FROM_SERVER);
             }
-        } else {
-            // We have transmitted every granted byte of the response.
-            // Ping the client to see if it's still alive. If yes, the
-            // client should eventually request retransmission.
-            assert(serverRpc->sendingResponse);
-            assert(response->transmitOffset == response->transmitLimit);
-            // TODO: Shall we really (ab)use ResendHeader here?
-            // TODO: Shall we define PING packet only for server->client?
-            PingHeader ping(serverRpc->rpcId, FROM_SERVER);
-            sendControlPacket(response->recipient, &ping);
         }
     }
 }
@@ -2312,7 +2266,7 @@ HomaTransport::adjustSchedulingPrecedence(ScheduledMessage* message)
 }
 
 /**
- * Replace an active message by an non-active (new or inactive) one because
+ * Replace an active message by a non-active (new or inactive) one because
  * either our scheduling policy (in tryToSchedule) says it's a better choice
  * or the the active message has been fully granted or cancelled. If the
  * active message has been fully granted, we will purge it from the scheduler;
