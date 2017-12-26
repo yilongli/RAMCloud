@@ -386,6 +386,13 @@ class HomaTransport : public Transport {
         /// transmitted (and this object is linked on t->outgoingRequests).
         bool transmitPending;
 
+        /// Must be either INCAST_CONTROL or 0. INCAST_CONTROL means the
+        /// client has too many outstanding RPCs and may suffer from
+        /// large-scale incast later, so we should set the INCAST_CONTROL
+        /// bit of this RPC to ask the server to use a lower limit for
+        /// unscheduled bytes in the response message.
+        uint8_t incastControl;
+
         /// Holds state of partially-received multi-packet responses. Empty
         /// if the response is single-packet.
         Tub<MessageAccumulator> accumulator;
@@ -406,6 +413,7 @@ class HomaTransport : public Transport {
             , rpcId(session->t->clientId, sequence)
             , silentIntervals(0)
             , transmitPending(true)
+            , incastControl(0)
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
@@ -536,10 +544,17 @@ class HomaTransport : public Transport {
     //                           the server has no knowledge of this request,
     //                           so the client should reset its state to
     //                           indicate that everything needs to be resent.
+    // INCAST_CONTROL:           Used in ALL_DATA/DATA packets from client to
+    //                           to server: indicates that the client has quite
+    //                           a few outstanding RPCs (which makes it
+    //                           vulnerable to incasts, so the server should
+    //                           use a lower limit for unscheduled bytes in the
+    //                           response message.
     static const uint8_t FROM_CLIENT =    1;
     static const uint8_t FROM_SERVER =    0;
     static const uint8_t RETRANSMISSION = 2;
     static const uint8_t RESTART =        4;
+    static const uint8_t INCAST_CONTROL = 8;
 
     /**
      * Describes the wire format for an ALL_DATA packet, which contains an
@@ -770,8 +785,12 @@ class HomaTransport : public Transport {
     /// it's set to zero (same as highestSchedPriority).
     int lowestUnschedPrio;
 
-    // The highest priority to use for scheduled traffic.
+    /// The highest priority to use for scheduled traffic.
     int highestSchedPriority;
+
+    /// # bytes that can be sent unilaterally by the server in the response
+    /// message when the RPC is marked with the INCAST_CONTROL flag.
+    const uint32_t limitedUnscheduledBytes;
 
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).

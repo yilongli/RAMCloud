@@ -883,6 +883,7 @@ simple_tests = [
     Test("basic", basic),
     Test("broadcast", broadcast),
     Test("echo_basic", echo),
+    Test("echo_incast", echo),
     Test("multiRead_colocation", default),
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),

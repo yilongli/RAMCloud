@@ -43,6 +43,17 @@ namespace {
                 uint32_t(arg2), uint32_t(arg3));
 #endif
     }
+
+    inline void
+    timeTrace(uint64_t ts, const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(ts, format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
 }
 
 /**
@@ -88,6 +99,10 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , highestAvailPriority()
     , lowestUnschedPrio()
     , highestSchedPriority()
+
+    // By limiting the response unscheduled bytes to one full-size data packet
+    // (~1500B), a 1000-fold incast will consume at most 1.5MB in the TOR.
+    , limitedUnscheduledBytes(maxDataPerPacket)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
@@ -806,11 +821,12 @@ HomaTransport::tryToTransmitData()
                     static_cast<uint32_t>(transmitQueueSpace));
 
             RpcId rpcId = clientRpc ? clientRpc->rpcId : serverRpc->rpcId;
-            uint8_t whoFrom = clientRpc ? FROM_CLIENT : FROM_SERVER;
+            uint8_t flags = clientRpc ?
+                    (FROM_CLIENT|clientRpc->incastControl) : FROM_SERVER;
             uint32_t bytesSent = sendBytes(message->recipient, rpcId,
                     message->buffer, message->transmitOffset, maxBytes,
                     message->unscheduledBytes, message->transmitPriority,
-                    whoFrom);
+                    flags);
             if (bytesSent == 0) {
                 // We can't transmit any more data because the remaining queue
                 // space is too small.
@@ -1021,7 +1037,12 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
     clientRpc->request.transmitPriority = t->getUnschedTrafficPrio(length);
-    clientRpc->request.transmitLimit = std::min(t->roundTripBytes, length);
+    clientRpc->request.transmitLimit =
+            std::min(clientRpc->request.unscheduledBytes, length);
+#define INCAST_CONTROL_THRESHOLD 50
+    if (t->outgoingRpcs.size() > INCAST_CONTROL_THRESHOLD) {
+        clientRpc->incastControl = INCAST_CONTROL;
+    }
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
@@ -1029,7 +1050,8 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     if (length < t->smallMessageThreshold) {
         RpcId rpcId = clientRpc->rpcId;
         assert(length <= t->maxDataPerPacket);
-        AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
+        AllDataHeader header(rpcId, FROM_CLIENT|clientRpc->incastControl,
+                uint16_t(length));
         Buffer::Iterator iter(request, 0, length);
         timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence,
@@ -1170,6 +1192,12 @@ HomaTransport::handlePacket(Driver::Received* received)
                         clientRpc->response->truncate(header->totalLength);
                     }
                     clientRpc->notifier->completed();
+//                    if (*clientRpc->response->getStart<Status>() != STATUS_OK) {
+//                        LOG(WARNING, "ClientRpc status not OK: %u, %p, sequence %lu",
+//                            *clientRpc->response->getStart<Status>(), clientRpc->response, clientRpc->rpcId.sequence);
+//                    }
+//                    LOG(NOTICE, "ClientRpc status: %u, %p, sequence %lu",
+//                        *clientRpc->response->getStart<Status>(), clientRpc->response, clientRpc->rpcId.sequence);
                     deleteClientRpc(clientRpc);
                 }
 
@@ -1232,6 +1260,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->offset, header->length);
                 OutgoingMessage* request = &clientRpc->request;
                 if (header->common.flags & RESTART) {
+                    LOG(NOTICE, "Restarting RPC to server %s: sequence %lu",
+                            received->sender->toString().c_str(),
+                            header->common.rpcId.sequence);
                     clientRpc->response->reset();
                     request->transmitOffset = 0;
                     request->transmitLimit =
@@ -1291,7 +1322,8 @@ HomaTransport::handlePacket(Driver::Received* received)
                         header->common.rpcId, clientRpc->request.buffer,
                         header->offset, header->length,
                         request->unscheduledBytes, header->priority,
-                        FROM_CLIENT|RETRANSMISSION, true);
+                        FROM_CLIENT|RETRANSMISSION|clientRpc->incastControl,
+                        true);
                 request->lastTransmitTime = driver->getLastTransmitTime();
                 return;
             }
@@ -1355,6 +1387,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                 serverRpc = serverRpcPool.construct(this,
                         nextServerSequenceNumber, received->sender,
                         header->common.rpcId);
+                if (header->common.flags & INCAST_CONTROL) {
+                    serverRpc->response.unscheduledBytes =
+                            limitedUnscheduledBytes;
+                }
                 nextServerSequenceNumber++;
                 incomingRpcs[header->common.rpcId] = serverRpc;
                 Driver::PayloadChunk::appendToBuffer(&serverRpc->requestPayload,
@@ -1388,6 +1424,10 @@ HomaTransport::handlePacket(Driver::Received* received)
                     serverRpc = serverRpcPool.construct(this,
                             nextServerSequenceNumber, received->sender,
                             header->common.rpcId);
+                    if (header->common.flags & INCAST_CONTROL) {
+                        serverRpc->response.unscheduledBytes =
+                                limitedUnscheduledBytes;
+                    }
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
@@ -1468,7 +1508,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                 OutgoingMessage* response = &serverRpc->response;
                 if (header->offset > response->transmitLimit) {
                     response->transmitLimit = header->offset;
-                    response->transmitPriority = header->priority;		    
+                    response->transmitPriority = header->priority;
                     if (!response->topChoice) {
                         transmitDataSlowPath = true;
                     }
@@ -1632,7 +1672,7 @@ HomaTransport::ServerRpc::sendReply()
 
     uint32_t bytesSent;
     response.transmitPriority = t->getUnschedTrafficPrio(length);
-    response.transmitLimit = std::min(t->roundTripBytes, length);
+    response.transmitLimit = std::min(response.unscheduledBytes, length);
     if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
@@ -1748,6 +1788,13 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         MessageFragment fragment(header, length);
         do {
             char* payload = reinterpret_cast<char*>(fragment.header);
+            // FIXME: this is seriously wrong? should use PayloadChunk::appendToBuffer?
+            // FIXME: On the server-side, it's OK that we (HomaTransport) takes
+            // ownership of the payloads in the request (that is, using appendExternal + assembledPayloads)
+            // and release them when we finish process the RPC
+            // but that's not going to work on the client-side. The payloads always belong
+            // to the response buffer, and it's the client app's call to release them.
+            // Definitely not HomaTransport.
             buffer->appendExternal(payload + sizeof32(DataHeader),
                     fragment.length);
             assembledPayloads->push_back(payload);
@@ -1876,14 +1923,18 @@ HomaTransport::ScheduledMessage::ScheduledMessage(RpcId rpcId,
  */
 HomaTransport::ScheduledMessage::~ScheduledMessage()
 {
+    HomaTransport* t = accumulator->t;
     if (state == ACTIVE) {
         // Set grantOffset to a large number so that this message will be
         // purged by replaceActiveMessage.
         grantOffset = ~0u;
-        accumulator->t->replaceActiveMessage(this, NULL);
+        t->replaceActiveMessage(this, NULL);
     } else if (state == INACTIVE) {
-        erase(accumulator->t->inactiveMessages, *this);
+        erase(t->inactiveMessages, *this);
     }
+    // TODO:
+    t->messagesToGrant.erase(std::remove(t->messagesToGrant.begin(),
+            t->messagesToGrant.end(), this), t->messagesToGrant.end());
 }
 
 /**
@@ -2060,6 +2111,10 @@ HomaTransport::checkTimeouts()
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
         OutgoingMessage* request = &clientRpc->request;
+//        LOG(NOTICE, "clientRpc, sequence %lu, transmitOffset %u, transmitLimit %u, silentIntervals %u, "
+//                "response size %u",
+//                sequence, request->transmitOffset, request->transmitLimit, clientRpc->silentIntervals,
+//                clientRpc->response->size());
         if (request->transmitOffset < request->transmitLimit) {
             // We haven't finished transmitting every granted byte of the
             // request (our transmit queue is probably backed up), so no
@@ -2106,11 +2161,11 @@ HomaTransport::checkTimeouts()
             if (clientRpc->silentIntervals % pingIntervals == 0) {
                 timeTrace("client sending RESEND for clientId %u, "
                         "sequence %u", clientId, sequence);
-                ResendHeader resend(RpcId(clientId, sequence), 0,
-                        roundTripBytes, getUnschedTrafficPrio(roundTripBytes),
-                        FROM_CLIENT);
-                sendControlPacket(clientRpc->session->serverAddress,
-                        &resend);
+                uint32_t length = clientRpc->incastControl ?
+                        limitedUnscheduledBytes : roundTripBytes;
+                ResendHeader resend(RpcId(clientId, sequence), 0, length,
+                        getUnschedTrafficPrio(roundTripBytes), FROM_CLIENT);
+                sendControlPacket(clientRpc->session->serverAddress, &resend);
             }
         } else {
             // We have received part of the response.

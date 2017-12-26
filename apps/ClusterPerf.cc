@@ -3127,7 +3127,74 @@ echo_workload()
         printf("\n");
     }
     fflush(stdout);
+}
 
+// TODO: try to create incast situation.
+void
+echo_incast()
+{
+#if !HOMA_BENCHMARK
+    LOG(WARNING, "To achieve best performance, compile ClusterPerf "
+            "and RAMCloud with -DHOMA_BENCHMARK");
+#endif
+
+    if (clientIndex > 0) {
+        return;
+    }
+
+    // Get all servers available in the cluster.
+    vector<string> serverLocators;
+    using ServerMap = std::map<uint64_t, std::pair<string, ServiceMask>>;
+    ServerMap servers;
+    getServerList(&servers);
+    ServerMap::iterator it;
+    for (it = servers.begin(); it != servers.end(); it++) {
+        if (it->second.second.has(WireFormat::MASTER_SERVICE)) {
+            serverLocators.push_back(it->second.first);
+        }
+    }
+    LOG(NOTICE, "%lu servers available", servers.size());
+
+    Buffer statsBefore, statsAfter;
+    if (clientIndex == 0) {
+        cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsBefore);
+    }
+
+    // TODO
+    const uint32_t echoLength = 10 * 1000;
+    vector<EchoRpc*> rpcs;
+    int totalNumRpcs = 1000;
+    while (totalNumRpcs > 0) {
+        for (string sl : serverLocators) {
+            EchoRpc* rpc = new EchoRpc(cluster, sl.c_str(), "", 0, echoLength);
+            rpcs.push_back(rpc);
+            totalNumRpcs--;
+            if (totalNumRpcs == 0) {
+                break;
+            }
+        }
+    }
+
+    // Wait for all RPCs to complete.
+    for (EchoRpc* rpc : rpcs) {
+        rpc->wait();
+        delete rpc;
+    }
+    rpcs.clear();
+
+    if (clientIndex == 0) {
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsAfter);
+        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
+                .c_str());
+    }
+
+    // Output the times (several comma-separated values on each line) for
+    // single-packet messages.
+    Logger::get().sync();
+    fflush(stdout);
 }
 
 /**
@@ -7301,6 +7368,7 @@ TestInfo tests[] = {
     {"basic", basic},
     {"broadcast", broadcast},
     {"echo_basic", echo_basic},
+    {"echo_incast", echo_incast},
     {"echo_workload", echo_workload},
     {"indexBasic", indexBasic},
     {"indexRange", indexRange},

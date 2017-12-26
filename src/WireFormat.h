@@ -574,7 +574,7 @@ struct Echo {
     struct Response {
         ResponseCommon common;
         uint32_t length;            // Length of the echo message.
-        char padding[4];            // Ensure Request and Response have
+        char padding[7];            // Ensure Request and Response have
                                     // the same size.
     } __attribute__((packed));
     static_assert(sizeof(Request) == sizeof(Response), "");

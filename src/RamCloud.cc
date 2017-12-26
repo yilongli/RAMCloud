@@ -615,8 +615,11 @@ EchoRpc::wait()
     const WireFormat::Echo::Response* respHdr(
             getResponseHeader<WireFormat::Echo>());
 
-    if (respHdr->common.status != STATUS_OK)
-        ClientException::throwException(HERE, respHdr->common.status);
+    if (respHdr->common.status != STATUS_OK) {
+//        ClientException::throwException(HERE, respHdr->common.status);
+        LOG(WARNING, "unexpected status %u, length %u, size %u, resp %p, status %u",
+            respHdr->common.status, respHdr->length, response->size(), response, *response->getStart<Status>());
+    }
 
     // Truncate the response Buffer so that it consists of nothing
     // but the echo data.

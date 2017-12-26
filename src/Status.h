@@ -33,7 +33,7 @@ namespace RAMCloud {
  * 0 means success; anything else means that an error occurred.
  * Not all status values can be returned by all operations.
  */
-typedef enum Status {
+typedef enum Status : uint8_t {
     /// Default return value when an operation was successful.
     STATUS_OK                           = 0,
 
