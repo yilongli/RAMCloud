@@ -79,36 +79,6 @@ namespace {
 
 constexpr uint16_t DpdkDriver::PRIORITY_TO_PCP[8];
 
-#if TESTING
-/*
- * Construct a mock DpdkDriver, used for testing only.
- */
-DpdkDriver::DpdkDriver()
-    : context(NULL)
-    , packetBufPool()
-    , packetBufsUtilized(0)
-    , locatorString()
-    , localMac()
-    , portId(0)
-    , mbufPool(NULL)
-    , loopbackRing(NULL)
-    , hasHardwareFilter(true)
-    , bandwidthMbps(10000)
-    , fileLogger(NOTICE, "DPDK: ")
-{
-    localMac.construct("01:23:45:67:89:ab");
-    queueEstimator.setBandwidth(bandwidthMbps);
-    maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthMbps)
-            * MAX_DRAIN_TIME / 8000.0);
-    uint32_t maxPacketSize = getMaxPacketSize();
-    if (maxTransmitQueueSize < 2*maxPacketSize) {
-        // Make sure that we advertise enough space in the transmit queue to
-        // prepare the next packet while the current one is transmitting.
-        maxTransmitQueueSize = 2*maxPacketSize;
-    }
-}
-#endif
-
 /*
  * Construct a DpdkDriver.
  *
@@ -464,12 +434,7 @@ DpdkDriver::sendPacket(const Address* addr,
     uint32_t frameLength = etherPayloadLength + ETHER_VLAN_HDR_LEN;
     uint32_t physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
 
-#if TESTING
-    struct rte_mbuf mockMbuf;
-    struct rte_mbuf* mbuf = &mockMbuf;
-#else
     struct rte_mbuf* mbuf = rte_pktmbuf_alloc(mbufPool);
-#endif
     if (unlikely(NULL == mbuf)) {
         uint32_t numMbufsAvail = rte_mempool_avail_count(mbufPool);
         uint32_t numMbufsInUse = rte_mempool_in_use_count(mbufPool);
@@ -480,12 +445,7 @@ DpdkDriver::sendPacket(const Address* addr,
         return;
     }
 
-#if TESTING
-    uint8_t mockEtherFrame[ETHER_MAX_VLAN_FRAME_LEN] = {};
-    char* data = reinterpret_cast<char*>(mockEtherFrame);
-#else
     char* data = rte_pktmbuf_append(mbuf, downCast<uint16_t>(frameLength));
-#endif
     if (unlikely(NULL == data)) {
         RAMCLOUD_CLOG(NOTICE,
                 "rte_pktmbuf_append call failed; dropping packet");
@@ -521,16 +481,6 @@ DpdkDriver::sendPacket(const Address* addr,
     }
     timeTrace("about to enqueue outgoing packet");
 
-#if TESTING
-    string hexEtherHeader;
-    for (unsigned i = 0; i < ETHER_VLAN_HDR_LEN; i++) {
-        char hex[3];
-        snprintf(hex, sizeof(hex), "%02x", mockEtherFrame[i]);
-        hexEtherHeader += hex;
-    }
-    LOG(NOTICE, "Ethernet frame header %s, payload %s", hexEtherHeader.c_str(),
-            &mockEtherFrame[ETHER_VLAN_HDR_LEN]);
-#else
     // loopback if src mac == dst mac
     if (!memcmp(static_cast<const MacAddress*>(addr)->address,
             localMac->address, 6)) {
@@ -554,7 +504,6 @@ DpdkDriver::sendPacket(const Address* addr,
         return;
     }
     timeTrace("outgoing packet enqueued");
-#endif
     lastTransmitTime = Cycles::rdtsc();
     queueEstimator.packetQueued(physPacketLength, lastTransmitTime,
             txQueueState);

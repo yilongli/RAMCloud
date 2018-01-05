@@ -607,19 +607,18 @@ EchoRpc::getLength() {
 void
 EchoRpc::wait()
 {
-    waitInternal(ramcloud->clientContext->dispatch);
+    bool result = waitInternal(ramcloud->clientContext->dispatch, Cycles::rdtsc()+Cycles::fromSeconds(10));
+    if (!result) {
+        throw TransportException(HERE, "aborted");
+    }
     if (getState() != RpcState::FINISHED) {
         throw TransportException(HERE);
     }
 
     const WireFormat::Echo::Response* respHdr(
             getResponseHeader<WireFormat::Echo>());
-
-    if (respHdr->common.status != STATUS_OK) {
-//        ClientException::throwException(HERE, respHdr->common.status);
-        LOG(WARNING, "unexpected status %u, length %u, size %u, resp %p, status %u",
-            respHdr->common.status, respHdr->length, response->size(), response, *response->getStart<Status>());
-    }
+    if (respHdr->common.status != STATUS_OK)
+        ClientException::throwException(HERE, respHdr->common.status);
 
     // Truncate the response Buffer so that it consists of nothing
     // but the echo data.

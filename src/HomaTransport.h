@@ -461,6 +461,9 @@ class HomaTransport : public Transport {
         /// to send a response.
         bool sendingResponse;
 
+        /// FIXME
+        bool responseComplete;
+
         /// Holds state of partially-received multi-packet requests. Empty if
         /// the request is single-packet.
         Tub<MessageAccumulator> accumulator;
@@ -471,6 +474,9 @@ class HomaTransport : public Transport {
         /// Holds state of the request message that requires scheduling. Empty
         /// if the request is unscheduled.
         Tub<ScheduledMessage> scheduledMessage;
+
+        /// Used to link this object into t->serverRetentionList.
+        IntrusiveListHook retentionLinks;
 
         /// Used to link this object into t->serverTimerList.
         IntrusiveListHook timerLinks;
@@ -487,9 +493,11 @@ class HomaTransport : public Transport {
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
+            , responseComplete(false)
             , accumulator()
             , response(NULL, this, transport, &replyPayload, clientAddress)
             , scheduledMessage()
+            , retentionLinks()
             , timerLinks()
             , outgoingResponseLinks()
         {}
@@ -715,6 +723,7 @@ class HomaTransport : public Transport {
     void checkTimeouts();
     void deleteClientRpc(ClientRpc* clientRpc);
     void deleteServerRpc(ServerRpc* serverRpc);
+    void retireServerRpc(ServerRpc* serverRpc);
     uint32_t getRoundTripBytes(const ServiceLocator* locator,
             uint32_t roundTripMicros);
     uint8_t getUnschedTrafficPrio(uint32_t messageSize);
@@ -872,6 +881,10 @@ class HomaTransport : public Transport {
     INTRUSIVE_LIST_TYPEDEF(ServerRpc, outgoingResponseLinks)
             OutgoingResponseList;
     OutgoingResponseList outgoingResponses;
+
+    /// FIXME
+    INTRUSIVE_LIST_TYPEDEF(ServerRpc, retentionLinks) ServerRetentionList;
+    ServerRetentionList serverRetentionList;
 
     /// Subset of the objects in incomingRpcs that require monitoring by
     /// the timer. We keep this as a separate list so that the timer doesn't

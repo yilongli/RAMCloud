@@ -3163,13 +3163,28 @@ echo_incast()
     }
 
     // TODO
-    const uint32_t echoLength = 10 * 1000;
+//    const uint32_t echoLength = 10 * 1000;
+    const uint32_t echoLength = 0;
     vector<EchoRpc*> rpcs;
-    int totalNumRpcs = 1000;
+    uint64_t prevDispatchTime = Cycles::rdtsc();
+    int prevPollResult = 0;
+//    int totalNumRpcs = 1000;
+    int totalNumRpcs = 200;
     while (totalNumRpcs > 0) {
         for (string sl : serverLocators) {
             EchoRpc* rpc = new EchoRpc(cluster, sl.c_str(), "", 0, echoLength);
             rpcs.push_back(rpc);
+
+            // Invoke the main polling function.
+            int r = context->dispatch->poll();
+            uint64_t currentTime = context->dispatch->currentTime;
+            if (prevPollResult > 0) {
+                PerfStats::threadStats.dispatchActiveCycles +=
+                        currentTime - prevDispatchTime;
+            }
+            prevPollResult = r;
+            prevDispatchTime = currentTime;
+
             totalNumRpcs--;
             if (totalNumRpcs == 0) {
                 break;
@@ -3178,8 +3193,15 @@ echo_incast()
     }
 
     // Wait for all RPCs to complete.
+    int i = 0;
     for (EchoRpc* rpc : rpcs) {
-        rpc->wait();
+        i++;
+//        LOG(NOTICE, "waiting for RPC %d", i++);
+        try {
+            rpc->wait();
+        } catch (...) {
+            break;
+        }
         delete rpc;
     }
     rpcs.clear();

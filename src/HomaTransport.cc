@@ -25,7 +25,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -116,6 +116,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , transmitDataSlowPath(true)
     , incomingRpcs()
     , outgoingResponses()
+    , serverRetentionList()
     , serverTimerList()
     , roundTripBytes()
     , grantIncrement(maxDataPerPacket)
@@ -363,12 +364,34 @@ HomaTransport::deleteServerRpc(ServerRpc* serverRpc)
     if (serverRpc->sendingResponse || !serverRpc->requestComplete) {
         erase(serverTimerList, *serverRpc);
     }
+    if (serverRpc->responseComplete) {
+        erase(serverRetentionList, *serverRpc);
+    }
     if (serverRpc->response.topChoice) {
         erase(topOutgoingMessages, serverRpc->response);
     }
     serverRpcPool.destroy(serverRpc);
-    timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
-            serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
+    timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs, %u retained RPCs",
+            serverRpc->rpcId.clientId, sequence, incomingRpcs.size(), serverRetentionList.size());
+//    timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
+//            serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
+//    LOG(NOTICE, "deleted server RPC, clientId %lu, sequence %lu, %u incoming RPCs",
+//            serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
+}
+
+void
+HomaTransport::retireServerRpc(ServerRpc* serverRpc)
+{
+    if (serverRpc->sendingResponse) {
+        serverRpc->sendingResponse = false;
+        erase(serverTimerList, *serverRpc);
+        erase(outgoingResponses, *serverRpc);
+    }
+    if (serverRpc->response.topChoice) {
+        erase(topOutgoingMessages, serverRpc->response);
+    }
+    serverRpc->responseComplete = true;
+    serverRetentionList.push_back(*serverRpc);
 }
 
 /**
@@ -853,7 +876,8 @@ HomaTransport::tryToTransmitData()
                     // retransmit it (the whole RPC will be retried). However,
                     // this approach is simpler and faster in the common case
                     // where data isn't lost.
-                    deleteServerRpc(serverRpc);
+//                    deleteServerRpc(serverRpc);
+                    retireServerRpc(serverRpc);
                 }
             }
         } else {
@@ -1039,8 +1063,8 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     clientRpc->request.transmitPriority = t->getUnschedTrafficPrio(length);
     clientRpc->request.transmitLimit =
             std::min(clientRpc->request.unscheduledBytes, length);
-#define INCAST_CONTROL_THRESHOLD 50
-    if (t->outgoingRpcs.size() > INCAST_CONTROL_THRESHOLD) {
+#define INCAST_CONTROL_THRESHOLD 0
+    if (t->outgoingRpcs.size() >= INCAST_CONTROL_THRESHOLD) {
         clientRpc->incastControl = INCAST_CONTROL;
     }
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
@@ -1549,6 +1573,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     timeTrace("server requesting restart, clientId %u, "
                             "sequence %u",
                             common->rpcId.clientId, common->rpcId.sequence);
+                    LOG(NOTICE, "server requesting restart, clientId %lu, "
+                            "sequence %lu",
+                            common->rpcId.clientId, common->rpcId.sequence);
                     ResendHeader resend(header->common.rpcId, 0,
                             roundTripBytes, 0, FROM_SERVER|RESTART);
                     sendControlPacket(received->sender, &resend);
@@ -1561,8 +1588,9 @@ HomaTransport::handlePacket(Driver::Received* received)
                     // Needed in case GRANT packet was lost.
                     response->transmitLimit = resendEnd;
                 }
-                if (!serverRpc->sendingResponse
-                        || (header->offset >= response->transmitOffset)
+//                if (!(serverRpc->sendingResponse || serverRpc->responseComplete)
+//                        || (header->offset >= response->transmitOffset)
+                if ((resendEnd > response->transmitOffset)
                         || ((Cycles::rdtsc() - response->lastTransmitTime)
                         < timerInterval)) {
                     // One of two things has happened: either (a) we haven't
@@ -1682,6 +1710,8 @@ HomaTransport::ServerRpc::sendReply()
         t->driver->sendPacket(response.recipient, &header, &iter,
                 response.transmitPriority);
         t->deleteServerRpc(this);
+        // TODO: should we retain RPC with short reply? It doesn't affect the incast benchmark
+//        t->retireServerRpc(this);
         bytesSent = length;
     } else {
         sendingResponse = true;
@@ -1733,7 +1763,7 @@ HomaTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->release(fragment.header);
     }
     fragments.clear();
-    t->messagesToRelease.push_back(assembledPayloads);
+//    t->messagesToRelease.push_back(assembledPayloads);
 }
 
 /**
@@ -1795,9 +1825,12 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
             // but that's not going to work on the client-side. The payloads always belong
             // to the response buffer, and it's the client app's call to release them.
             // Definitely not HomaTransport.
-            buffer->appendExternal(payload + sizeof32(DataHeader),
-                    fragment.length);
-            assembledPayloads->push_back(payload);
+            Driver::PayloadChunk::appendToBuffer(buffer,
+                    payload + sizeof32(DataHeader), fragment.length,
+                    t->driver, payload);
+//            buffer->appendExternal(payload + sizeof32(DataHeader),
+//                    fragment.length);
+//            assembledPayloads->push_back(payload);
 
             FragmentMap::iterator it = fragments.find(buffer->size());
             if (it == fragments.end()) {
@@ -2054,6 +2087,13 @@ HomaTransport::Poller::poll()
     // Transmit data packets if possible.
     uint32_t totalBytesSent = t->tryToTransmitData();
     result = totalBytesSent > 0 ? 1 : result;
+
+    // TODO: this policy is dumb and won't work in practice; just a hack for incast benchmark for now.
+#define MAX_RETAINED_SERVERRPC 2000
+    while (t->serverRetentionList.size() > MAX_RETAINED_SERVERRPC) {
+        t->deleteServerRpc(&t->serverRetentionList.front());
+        t->serverRetentionList.pop_front();
+    }
 
     // See if we should release a few retained payloads to the driver.
     // As of 02/2017, releasing one payload to the DpdkDriver takes ~65ns.
@@ -2483,14 +2523,15 @@ HomaTransport::dataPacketArrive(ScheduledMessage* scheduledMessage)
     // If we have more active messages than # scheduled priorities, squash
     // the bottom few messages to the lowest priority level.
     int priority = std::max(p, 0);
-    if (messageToGrant->totalLength - messageToGrant->grantOffset
-            <= roundTripBytes) {
-        // For the last 1 RTT remaining bytes of a scheduled message
-        // with size (1+a)RTT, use the same priority as an unscheduled
-        // message that has size min{1, a}*RTT.
-        priority = getUnschedTrafficPrio(std::min(roundTripBytes,
-                messageToGrant->totalLength - roundTripBytes));
-    }
+    // TODO: How does it interact with the incast control mechanism?
+//    if (messageToGrant->totalLength - messageToGrant->grantOffset
+//            <= roundTripBytes) {
+//        // For the last 1 RTT remaining bytes of a scheduled message
+//        // with size (1+a)RTT, use the same priority as an unscheduled
+//        // message that has size min{1, a}*RTT.
+//        priority = getUnschedTrafficPrio(std::min(roundTripBytes,
+//                messageToGrant->totalLength - roundTripBytes));
+//    }
 
     messageToGrant->grantOffset += grantIncrement;
     messageToGrant->grantPriority = priority;
