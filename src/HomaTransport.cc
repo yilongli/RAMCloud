@@ -101,8 +101,12 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , highestSchedPriority()
 
     // By limiting the response unscheduled bytes to one full-size data packet
-    // (~1500B), a 1000-fold incast will consume at most 1.5MB in the TOR.
+    // (~1500B), a 1000-fold incast will consume only 1.5MB in the TOR switch
+    // buffer.
     , limitedUnscheduledBytes(maxDataPerPacket)
+    // Suppose the roundTripBytes is ~10KB, a 100-fold incast will consume only
+    // 1MB in the TOR switch buffer.
+    , incastControlThreshold(100)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
     , receivedPackets()
@@ -135,6 +139,7 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     , activeMessages()
     , inactiveMessages()
     , maxGrantedMessages()
+    , redundantDataBytes(0)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -256,17 +261,24 @@ HomaTransport::HomaTransport(Context* context, const ServiceLocator* locator,
     unschedPrioCutoffs.push_back(~0u);
     unschedMessageBrackets += format(", %u]", ~0u);
 
+    // Set incast control threshold.
+    if (params && params->hasOption("incastThreshold")) {
+        incastControlThreshold =
+                params->getOption<uint32_t>("incastThreshold");
+    }
+
     LOG(NOTICE, "HomaTransport parameters: clientId %lu, maxDataPerPacket %u, "
             "roundTripMicros %u, roundTripBytes %u, grantIncrement %u, "
             "pingIntervals %d, timeoutIntervals %d, timerInterval %.2f ms, "
             "maxGrantedMessages %u, "
             "highestAvailPriority %d, lowestUnschedPriority %d, "
-            "highestSchedPriority %d, unscheduledMessageBrackets %s",
+            "highestSchedPriority %d, unscheduledMessageBrackets %s,"
+            "incastControlThreshold %u",
             clientId, maxDataPerPacket, roundTripMicros, roundTripBytes,
             grantIncrement, pingIntervals, timeoutIntervals,
             Cycles::toSeconds(timerInterval)*1e3, maxGrantedMessages,
             highestAvailPriority, lowestUnschedPrio, highestSchedPriority,
-            unschedMessageBrackets.c_str());
+            unschedMessageBrackets.c_str(), incastControlThreshold);
 }
 
 /**
@@ -276,6 +288,7 @@ HomaTransport::~HomaTransport()
 {
     // This cleanup is mostly for the benefit of unit tests: in production,
     // this destructor is unlikely ever to get called.
+    LOG(NOTICE, "redundant DATA bytes %u", redundantDataBytes);
 
     // Reclaim all of the RPC objects.
     for (ServerRpcMap::iterator it = incomingRpcs.begin();
@@ -1063,8 +1076,7 @@ HomaTransport::Session::sendRequest(Buffer* request, Buffer* response,
     clientRpc->request.transmitPriority = t->getUnschedTrafficPrio(length);
     clientRpc->request.transmitLimit =
             std::min(clientRpc->request.unscheduledBytes, length);
-#define INCAST_CONTROL_THRESHOLD 0
-    if (t->outgoingRpcs.size() >= INCAST_CONTROL_THRESHOLD) {
+    if (t->outgoingRpcs.size() > t->incastControlThreshold) {
         clientRpc->incastControl = INCAST_CONTROL;
     }
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
@@ -1229,6 +1241,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     uint32_t dummy;
                     received->steal(&dummy);
                 } else {
+                    redundantDataBytes += received->len;
                     LOG(DEBUG, "Redundant DATA from server, sequence %lu, "
                             "offset %u, totalLength %u",
                             header->common.rpcId.sequence, header->offset,
@@ -1501,6 +1514,7 @@ HomaTransport::handlePacket(Driver::Received* received)
                     uint32_t dummy;
                     received->steal(&dummy);
                 } else {
+                    redundantDataBytes += received->len;
                     LOG(DEBUG, "Redundant DATA from client, clientId %lu, "
                             "sequence %lu, offset %u, totalLength %u",
                             header->common.rpcId.clientId,
@@ -1717,8 +1731,11 @@ HomaTransport::ServerRpc::sendReply()
         sendingResponse = true;
         t->outgoingResponses.push_back(*this);
         t->serverTimerList.push_back(*this);
+//        timeTrace("about to maintainTopOutgoingMessages");
         t->maintainTopOutgoingMessages(&response);
+        timeTrace("about to iterate %u top outgoing messages", t->topOutgoingMessages.size());
         bytesSent = t->tryToTransmitData();
+//        timeTrace("sendReply finished tryToTransmitData");
     }
     if (bytesSent > 0) {
         timeTrace("sendReply transmitted %u bytes", bytesSent);

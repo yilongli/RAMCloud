@@ -3129,7 +3129,11 @@ echo_workload()
     fflush(stdout);
 }
 
-// TODO: try to create incast situation.
+// Generate a large number (e.g. 1000) of echo RPCs that spread evenly across
+// a number of servers. The echo RPCs are configured to have 0-byte requests
+// and roughly RTTBytes-byte responses (this setting generates significant
+// unscheduled incast traffic with very little client uplink bandwidth). This
+// experiment tests how well the underlying transport handles large incasts.
 void
 echo_incast()
 {
@@ -3153,7 +3157,6 @@ echo_incast()
             serverLocators.push_back(it->second.first);
         }
     }
-    LOG(NOTICE, "%lu servers available", servers.size());
 
     Buffer statsBefore, statsAfter;
     if (clientIndex == 0) {
@@ -3162,46 +3165,39 @@ echo_incast()
                 &statsBefore);
     }
 
-    // TODO
-//    const uint32_t echoLength = 10 * 1000;
-    const uint32_t echoLength = 0;
+    // Send out a large number of echo RPCs as fast as possible.
+    // TODO: Justify how these numbers are chosen to overflow the TOR switch buffer.
+    // Suppose the size of the TOR switch buffer is 10MB, that is around 1000
     vector<EchoRpc*> rpcs;
-    uint64_t prevDispatchTime = Cycles::rdtsc();
-    int prevPollResult = 0;
-//    int totalNumRpcs = 1000;
-    int totalNumRpcs = 200;
-    while (totalNumRpcs > 0) {
+    const int numRpcs = 1000;
+    const uint32_t responseBytes = 10 * 1000;
+    LOG(NOTICE, "echo_incast starts, %lu servers, %d outgoing echo RPCs, "
+            "response size %u", servers.size(), numRpcs, responseBytes);
+    for (int i = 0; i < numRpcs;) {
         for (string sl : serverLocators) {
-            EchoRpc* rpc = new EchoRpc(cluster, sl.c_str(), "", 0, echoLength);
+            EchoRpc* rpc = new EchoRpc(cluster, sl.c_str(), "", 0,
+                    responseBytes);
             rpcs.push_back(rpc);
+            i++;
 
             // Invoke the main polling function.
-            int r = context->dispatch->poll();
-            uint64_t currentTime = context->dispatch->currentTime;
-            if (prevPollResult > 0) {
-                PerfStats::threadStats.dispatchActiveCycles +=
-                        currentTime - prevDispatchTime;
-            }
-            prevPollResult = r;
-            prevDispatchTime = currentTime;
-
-            totalNumRpcs--;
-            if (totalNumRpcs == 0) {
-                break;
-            }
+            context->dispatch->poll();
         }
     }
 
     // Wait for all RPCs to complete.
-    int i = 0;
+    vector<uint64_t> times;
+    int id = 0;
     for (EchoRpc* rpc : rpcs) {
-        i++;
-//        LOG(NOTICE, "waiting for RPC %d", i++);
         try {
             rpc->wait();
-        } catch (...) {
+        } catch (Exception& e) {
+            LOG(ERROR, "exception thrown while waiting for RPC %d, %s",
+                    id, e.what());
             break;
         }
+        id++;
+        times.push_back(rpc->getCompletionTime());
         delete rpc;
     }
     rpcs.clear();
@@ -3213,10 +3209,43 @@ echo_incast()
                 .c_str());
     }
 
-    // Output the times (several comma-separated values on each line) for
-    // single-packet messages.
-    Logger::get().sync();
-    fflush(stdout);
+    // Continue polling for a short period of time to make sure the network
+    // is empty again.
+    uint64_t now = Cycles::rdtsc();
+    while (Cycles::rdtsc() - now <= Cycles::fromSeconds(1)) {
+        context->dispatch->poll();
+    }
+
+    // If the underlying transport doesn't have good support for incasts,
+    // the large incast traffic will overflow the TOR switch buffer and cause
+    // packet lost. In this case, there will be a lot of retransmission and
+    // actual input bytes received by the client will be much larger than
+    // the total response bytes.
+    LOG(NOTICE, "total network input bytes %lu, estimated incast bytes %d",
+            PerfStats::threadStats.networkInputBytes,
+            numRpcs * responseBytes);
+
+    // Print echo RPC completion times.
+    TimeDist dist;
+    getDist(times, &dist);
+    char name[50], description[50];
+    snprintf(description, sizeof(description),
+            "send %uB message, receive %uB message", 0, responseBytes);
+    snprintf(name, sizeof(name), "echoIncast");
+    printf("%-20s %s     %s median\n", name, formatTime(dist.p50).c_str(),
+            description);
+    snprintf(name, sizeof(name), "echoIncast.min");
+    printf("%-20s %s     %s minimum\n", name, formatTime(dist.min).c_str(),
+            description);
+    snprintf(name, sizeof(name), "echoIncast.9");
+    printf("%-20s %s     %s 90%%\n", name, formatTime(dist.p90).c_str(),
+            description);
+    snprintf(name, sizeof(name), "echoIncast.99");
+    printf("%-20s %s     %s 99%%\n", name, formatTime(dist.p99).c_str(),
+            description);
+    snprintf(name, sizeof(name), "echoIncast.999");
+    printf("%-20s %s     %s 99.9%%\n", name, formatTime(dist.p999).c_str(),
+            description);
 }
 
 /**

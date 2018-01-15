@@ -801,6 +801,11 @@ class HomaTransport : public Transport {
     /// message when the RPC is marked with the INCAST_CONTROL flag.
     const uint32_t limitedUnscheduledBytes;
 
+    /// If the number of outstanding RPCs exceeds this number, we will mark
+    /// future outgoing RPCs with the INCAST_CONTROL bit to limit the
+    /// unscheduled bytes in their response messages.
+    uint32_t incastControlThreshold;
+
     /// The sequence number to use in the next outgoing RPC (i.e., one
     /// higher than the highest number ever used in the past).
     uint64_t nextClientSequenceNumber;
@@ -965,6 +970,14 @@ class HomaTransport : public Transport {
     /// Maximum # incoming messages that can be actively granted by the
     /// receiver. Or, the "degree of overcommitment" in the Homa paper.
     uint32_t maxGrantedMessages;
+
+    /// ---------------------
+    /// Debugging & Profiling
+    /// ---------------------
+
+    /// # bytes in DATA packets that are redundant. Used for debugging only
+    /// (e.g. detecting spurious retransmission).
+    uint32_t redundantDataBytes;
 
     DISALLOW_COPY_AND_ASSIGN(HomaTransport);
 };
