@@ -654,7 +654,6 @@ class BasicTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void augmentTopOutgoingMessageSet();
     void maintainTopOutgoingMessages(OutgoingMessage* candidate);
 
     /// Shared RAMCloud information.

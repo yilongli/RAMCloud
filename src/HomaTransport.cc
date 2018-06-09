@@ -1935,9 +1935,10 @@ HomaTransport::Poller::poll()
     // Log the beginning of poll() here so that timetrace entries do not
     // go back in time.
     if (numPackets > 0) {
-        uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
-        timeTrace(startTime, "start of polling iteration %u, "
-                "last poll was %u ns ago", owner->iteration, ns);
+        uint32_t ns = downCast<uint32_t>(
+                Cycles::toNanoseconds(startTime - lastPollTime));
+        TimeTrace::record(startTime, "start of polling iteration %u, "
+                "last poll was %u ns ago", uint32_t(owner->iteration), ns);
     }
     lastPollTime = Cycles::rdtsc();
 #endif

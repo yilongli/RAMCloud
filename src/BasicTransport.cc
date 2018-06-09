@@ -79,7 +79,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // As of 09/2017, we consider messages less than 300 bytes as small (which
     // takes at most 240 ns to transmit on a 10Gbps network). This value is
     // chosen experimentally so that we can run W3 in Homa paper at 80% load on
-    // a 10Gbps network/ and that no significant queueing delay at the TX queue
+    // a 10Gbps network and that no significant queueing delay at the TX queue
     // is observed.
     , smallMessageThreshold(300)
     , clientId(clientId)
@@ -998,6 +998,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // driver a chance to copy out the contents of the
                     // underlying NIC packet buffer and then release it.
                     driver->releaseHwPacketBuf(received);
+                    timeTrace("response buffer %p, payload %p");
                     header = received->getOffset<DataHeader>(0);
                 }
                 if (!clientRpc->accumulator) {
@@ -1752,9 +1753,10 @@ BasicTransport::Poller::poll()
     // Log the beginning of poll() here so that timetrace entries do not
     // go back in time.
     if (numPackets > 0) {
-        uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
-        timeTrace(startTime, "start of polling iteration %u, "
-                "last poll was %u ns ago", owner->iteration, ns);
+        uint32_t ns = downCast<uint32_t>(
+                Cycles::toNanoseconds(startTime - lastPollTime));
+        TimeTrace::record(startTime, "start of polling iteration %u, "
+                "last poll was %u ns ago", uint32_t(owner->iteration), ns);
     }
     lastPollTime = Cycles::rdtsc();
 #endif
@@ -1992,6 +1994,8 @@ BasicTransport::checkTimeouts()
                     "clientId %lu, sequence %lu: timeout",
                     WireFormat::opcodeSymbol(&serverRpc->requestPayload),
                     serverRpc->response.recipient->toString().c_str(),
+                    serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
+            timeTrace("aborting %s RPC from client, clientId %u, sequence %u: timeout",
                     serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
             deleteServerRpc(serverRpc);
             continue;
