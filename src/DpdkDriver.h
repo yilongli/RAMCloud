@@ -66,6 +66,7 @@ class DpdkDriver : public Driver
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void release(char *payload);
+    virtual void releaseHint(int maxCount);
     virtual void releaseHwPacketBuf(Driver::Received* received);
     virtual void sendPacket(const Address* addr,
                             const void* header,
@@ -132,6 +133,11 @@ class DpdkDriver : public Driver
     /// Holds packet buffers that are no longer in use, for use in future
     /// requests; saves the overhead of calling malloc/free for each request.
     ObjectPool<PacketBuf> packetBufPool;
+
+    /// Holds packet buffers that the transport has done processing and
+    /// returned. These packet buffers should be recycled incrementally to
+    /// avoid jitters.
+    std::vector<char*> payloadsToRelease;
 
     /// Tracks number of outstanding allocated payloads.  For detecting leaks.
     int packetBufsUtilized;

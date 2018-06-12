@@ -86,6 +86,7 @@ constexpr uint16_t DpdkDriver::PRIORITY_TO_PCP[8];
 DpdkDriver::DpdkDriver()
     : context(NULL)
     , packetBufPool()
+    , payloadsToRelease()
     , packetBufsUtilized(0)
     , locatorString()
     , localMac()
@@ -123,6 +124,7 @@ DpdkDriver::DpdkDriver()
 DpdkDriver::DpdkDriver(Context* context, int port)
     : context(context)
     , packetBufPool()
+    , payloadsToRelease()
     , packetBufsUtilized(0)
     , locatorString()
     , localMac()
@@ -292,6 +294,7 @@ DpdkDriver::DpdkDriver(Context* context, int port)
  */
 DpdkDriver::~DpdkDriver()
 {
+    releaseHint(-1);
     if (packetBufsUtilized != 0)
         LOG(ERROR, "DpdkDriver deleted with %d packets still in use",
             packetBufsUtilized);
@@ -421,17 +424,38 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
 void
 DpdkDriver::release(char *payload)
 {
+    // TODO: this method might still be too expensive for 15MB msgs (10000 pkts, 5ns * 10000 = 50 us).
+    // To optimize this, Buffer will somehow need to keep all its PayloadChunks as a vector<char*>
+    // and pass that vector in instead)
+
     // Must sync with the dispatch thread, since this method could potentially
     // be invoked in a worker.
+    // TODO: I don't see how a worker thread could invoke this method?
+    // According to InfUdDriver::release, worker threads may invoke this
+    // method to return packet buffers. However, on the server side, the packet
+    // buffers of a request is kept in Transport::ServerRpc::requestPayload,
+    // whose destructor can only be called in the dispatch thread, no?
     Dispatch::Lock _(context->dispatch);
+    payloadsToRelease.push_back(payload);
+}
 
-    packetBufsUtilized--;
-    assert(packetBufsUtilized >= 0);
-    if (packet_buf_type(payload) == DPDK_MBUF) {
-        rte_pktmbuf_free(payload_to_mbuf(payload));
-    } else {
-        packetBufPool.destroy(reinterpret_cast<PacketBuf*>(
-                payload - OFFSET_OF(PacketBuf, payload)));
+// See docs in Driver class.
+void
+DpdkDriver::releaseHint(int maxCount)
+{
+    while ((maxCount != 0) && !payloadsToRelease.empty()) {
+        maxCount--;
+        char* payload = payloadsToRelease.back();
+        payloadsToRelease.pop_back();
+
+        packetBufsUtilized--;
+        assert(packetBufsUtilized >= 0);
+        if (packet_buf_type(payload) == DPDK_MBUF) {
+            rte_pktmbuf_free(payload_to_mbuf(payload));
+        } else {
+            packetBufPool.destroy(reinterpret_cast<PacketBuf*>(
+                    payload - OFFSET_OF(PacketBuf, payload)));
+        }
     }
 }
 
@@ -482,8 +506,8 @@ DpdkDriver::sendPacket(const Address* addr,
         uint32_t numMbufsInUse = rte_mempool_in_use_count(mbufPool);
         RAMCLOUD_CLOG(WARNING,
                 "Failed to allocate a packet buffer; dropping packet; "
-                "%u mbufs available, %u mbufs in use",
-                numMbufsAvail, numMbufsInUse);
+                "%u mbufs available, %u mbufs in use, %lu payloads to release",
+                numMbufsAvail, numMbufsInUse, payloadsToRelease.size());
         return;
     }
 
