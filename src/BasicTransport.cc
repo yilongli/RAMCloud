@@ -306,8 +306,8 @@ BasicTransport::opcodeSymbol(uint8_t opcode) {
             return "LOG_TIME_TRACE";
         case BasicTransport::PacketOpcode::RESEND:
             return "RESEND";
-        case BasicTransport::PacketOpcode::ACK:
-            return "ACK";
+        case BasicTransport::PacketOpcode::BUSY:
+            return "BUSY";
         case BasicTransport::PacketOpcode::ABORT:
             return "ABORT";
     }
@@ -502,8 +502,8 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
                             ? ", RESTART" : "");
             break;
         }
-        case BasicTransport::PacketOpcode::ACK: {
-            headerLength = sizeof32(BasicTransport::AckHeader);
+        case BasicTransport::PacketOpcode::BUSY: {
+            headerLength = sizeof32(BasicTransport::BusyHeader);
             if (packetLength < headerLength) {
                 goto packetTooShort;
             }
@@ -584,7 +584,7 @@ BasicTransport::tryToTransmitData()
         // set; take the slow path
         if (expect_false((NULL == message) && transmitDataSlowPath)) {
             // The slow path scans all messages outside the top outgoing
-            // message set to 1) find an message ready to transmit, and
+            // message set to 1) find a message ready to transmit, and
             // 2) select the next message to include in the top outgoing
             // message set. The policy for both tasks is SRPT.
             timeTrace("slow path taken, iterating over %u outgoing messages, "
@@ -652,8 +652,8 @@ BasicTransport::tryToTransmitData()
             // if appropriate.
             ClientRpc* clientRpc = message->clientRpc;
             ServerRpc* serverRpc = message->serverRpc;
-            uint32_t maxBytes = std::min(message->transmitLimit,
-                    message->buffer->size()) - message->transmitOffset;
+            uint32_t maxBytes =
+                    message->transmitLimit - message->transmitOffset;
             maxBytes = std::min(maxBytes,
                     static_cast<uint32_t>(transmitQueueSpace));
 
@@ -871,6 +871,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     response->reset();
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
+    clientRpc->request.transmitLimit = std::min(t->roundTripBytes, length);
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
@@ -990,7 +991,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // driver a chance to copy out the contents of the
                     // underlying NIC packet buffer and then release it.
                     driver->releaseHwPacketBuf(received);
-                    timeTrace("response buffer %p, payload %p");
                     header = received->getOffset<DataHeader>(0);
                 }
                 if (!clientRpc->accumulator) {
@@ -1037,6 +1037,11 @@ BasicTransport::handlePacket(Driver::Received* received)
                 if (retainPacket) {
                     uint32_t dummy;
                     received->steal(&dummy);
+                } else {
+                    LOG(DEBUG, "Redundant DATA from server, sequence %lu, "
+                            "offset %u, totalLength %u",
+                            header->common.rpcId.sequence, header->offset,
+                            header->totalLength);
                 }
                 return;
             }
@@ -1053,7 +1058,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->offset);
                 OutgoingMessage* request = &clientRpc->request;
                 if (header->offset > request->transmitLimit) {
-                    request->transmitLimit = header->offset;
+                    request->transmitLimit =
+                            std::min(header->offset, request->buffer->size());
                     transmitDataSlowPath |= !request->topChoice;
                 }
                 return;
@@ -1095,7 +1101,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                         erase(topOutgoingMessages, clientRpc->request);
                     }
                     request->transmitOffset = 0;
-                    request->transmitLimit = header->length;
+                    request->transmitLimit =
+                            std::min(header->length, request->buffer->size());
                     maintainTopOutgoingMessages(request);
                     clientRpc->response->reset();
                     clientRpc->accumulator.destroy();
@@ -1105,7 +1112,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                 uint32_t resendEnd = header->offset + header->length;
                 if (resendEnd > request->transmitLimit) {
                     // Needed in case a GRANT packet was lost.
-                    request->transmitLimit = resendEnd;
+                    request->transmitLimit =
+                            std::min(resendEnd, request->buffer->size());
                     transmitDataSlowPath |= !request->topChoice;
                 }
                 if ((header->offset >= request->transmitOffset)
@@ -1116,10 +1124,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // must be other outgoing traffic with higher priority)
                     // or (b) we transmitted data recently. In either case,
                     // it's unlikely that bytes have been lost, so don't
-                    // retransmit; just return an ACK so the server knows
+                    // retransmit; just return an BUSY so the server knows
                     // we're still alive.
-                    AckHeader ack(header->common.rpcId, FROM_CLIENT);
-                    sendControlPacket(clientRpc->session->serverAddress, &ack);
+                    BusyHeader busy(header->common.rpcId, FROM_CLIENT);
+                    sendControlPacket(clientRpc->session->serverAddress, &busy);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1142,10 +1150,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
-            // ACK from server
-            case PacketOpcode::ACK: {
+            // BUSY from server
+            case PacketOpcode::BUSY: {
                 // Nothing to do.
-                timeTrace("client received ACK, clientId %u, sequence %u",
+                timeTrace("client received BUSY, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
                 return;
             }
@@ -1297,6 +1305,12 @@ BasicTransport::handlePacket(Driver::Received* received)
                 if (retainPacket) {
                     uint32_t dummy;
                     received->steal(&dummy);
+                } else {
+                    LOG(DEBUG, "Redundant DATA from client, clientId %lu, "
+                            "sequence %lu, offset %u, totalLength %u",
+                            header->common.rpcId.clientId,
+                            header->common.rpcId.sequence,
+                            header->offset, header->totalLength);
                 }
                 return;
             }
@@ -1322,7 +1336,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                 }
                 OutgoingMessage* response = &serverRpc->response;
                 if (header->offset > response->transmitLimit) {
-                    response->transmitLimit = header->offset;
+                    response->transmitLimit =
+                            std::min(header->offset, response->buffer->size());
                     transmitDataSlowPath |= !response->topChoice;
                 }
                 return;
@@ -1366,11 +1381,12 @@ BasicTransport::handlePacket(Driver::Received* received)
                     sendControlPacket(received->sender, &resend);
                     return;
                 }
-                uint32_t resendEnd = header->offset + header->length;
                 OutgoingMessage* response = &serverRpc->response;
+                uint32_t resendEnd = header->offset + header->length;
                 if (resendEnd > response->transmitLimit) {
                     // Needed in case GRANT packet was lost.
-                    response->transmitLimit = resendEnd;
+                    response->transmitLimit =
+                            std::min(resendEnd, response->buffer->size());
                     transmitDataSlowPath |= !response->topChoice;
                 }
                 if (!serverRpc->sendingResponse
@@ -1383,10 +1399,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // or (b) we transmitted data recently, so it might have
                     // crossed paths with the RESEND request. In either case,
                     // it's unlikely that bytes have been lost, so don't
-                    // retransmit; just return an ACK so the client knows
+                    // retransmit; just return an BUSY so the client knows
                     // we're still alive.
-                    AckHeader ack(serverRpc->rpcId, FROM_SERVER);
-                    sendControlPacket(response->recipient, &ack);
+                    BusyHeader busy(serverRpc->rpcId, FROM_SERVER);
+                    sendControlPacket(response->recipient, &busy);
                     return;
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
@@ -1406,10 +1422,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 return;
             }
 
-            // ACK from client
-            case PacketOpcode::ACK: {
+            // BUSY from client
+            case PacketOpcode::BUSY: {
                 // Nothing to do.
-                timeTrace("server received ACK, clientId %u, sequence %u",
+                timeTrace("server received BUSY, clientId %u, sequence %u",
                         common->rpcId.clientId, common->rpcId.sequence);
                 return;
             }
@@ -1483,6 +1499,7 @@ BasicTransport::ServerRpc::sendReply()
     }
 
     uint32_t bytesSent;
+    response.transmitLimit = std::min(t->roundTripBytes, length);
     if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
@@ -1657,7 +1674,9 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         // the normal grant mechanism should kick in if it's still needed.
         endOffset = t->roundTripBytes;
     }
-    assert(endOffset > buffer->size());
+    if (endOffset <= buffer->size()) {
+        LOG(ERROR, "Bad endOffset %u, offset %u", endOffset, buffer->size());
+    }
     const char* fmt = (whoFrom == FROM_SERVER) ?
             "server requesting retransmission of bytes %u-%u, clientId %u, "
             "sequence %u" :
@@ -1847,8 +1866,7 @@ BasicTransport::checkTimeouts()
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
         OutgoingMessage* request = &clientRpc->request;
-        if (request->transmitOffset <
-                std::min(request->transmitLimit, request->buffer->size())) {
+        if (request->transmitOffset < request->transmitLimit) {
             // We haven't finished transmitting every granted byte of the
             // request (our transmit queue is probably backed up), so no
             // need to worry about whether we have heard from the server.
@@ -1907,23 +1925,19 @@ BasicTransport::checkTimeouts()
             uint32_t grantOffset = scheduledMessage ?
                     scheduledMessage->grantOffset : 0;
             if (grantOffset == clientRpc->response->size()) {
-                // The client has received every granted byte but hasn't got
-                // around to grant more because there are higher priority
-                // responses.
-                assert(scheduledMessage);
-                clientRpc->silentIntervals = 0;
-            } else {
-                // The client expects to receive more but the server
-                // has gone silent, this must mean packets were lost,
-                // grants were lost, or the server has preempted this
-                // response for higher priority messages, so request
-                // retransmission anyway.
-                if (clientRpc->silentIntervals % pingIntervals == 0) {
-                    clientRpc->accumulator->requestRetransmission(this,
-                            clientRpc->session->serverAddress,
-                            RpcId(clientId, sequence), grantOffset,
-                            FROM_CLIENT);
-                }
+                // This should never happen because we don't limit the degree
+                // of overcommitment in BasicTransport.
+                assert(grantOffset > 0);
+                LOG(ERROR, "Bad grant offset %u", grantOffset);
+            }
+            // The client expects to receive more but the server has gone
+            // silent, this must mean packets were lost, grants were lost,
+            // or the server has preempted this response for higher priority
+            // messages, so request retransmission anyway.
+            if (clientRpc->silentIntervals % pingIntervals == 0) {
+                clientRpc->accumulator->requestRetransmission(this,
+                        clientRpc->session->serverAddress,
+                        RpcId(clientId, sequence), grantOffset, FROM_CLIENT);
             }
         }
     }
@@ -1934,8 +1948,8 @@ BasicTransport::checkTimeouts()
             it != serverTimerList.end(); ) {
         ServerRpc* serverRpc = &(*it);
         OutgoingMessage* response = &serverRpc->response;
-        if (serverRpc->sendingResponse && (response->transmitOffset <
-                std::min(response->transmitLimit, response->buffer->size()))) {
+        if (serverRpc->sendingResponse &&
+                (response->transmitOffset < response->transmitLimit)) {
             // Looks like the transmit queue has been too backed up to finish
             // transmitting every granted byte of the response, so no need to
             // check for a timeout.
@@ -1980,23 +1994,21 @@ BasicTransport::checkTimeouts()
         }
 
         if (!serverRpc->requestComplete) {
-            // See if we need to request retransmission for part of the request
-            // message.
+            // Request retransmission for part of the request message.
             ScheduledMessage* scheduledMessage =
                     serverRpc->scheduledMessage.get();
             uint32_t grantOffset =
                     scheduledMessage ? scheduledMessage->grantOffset : 0;
             if (scheduledMessage &&
                     (grantOffset == serverRpc->requestPayload.size())) {
-                // The server has received every granted byte but hasn't got
-                // around to grant more because there are higher priority
-                // responses.
-                serverRpc->silentIntervals = 0;
-            } else {
-                serverRpc->accumulator->requestRetransmission(this,
-                        serverRpc->response.recipient, serverRpc->rpcId,
-                        grantOffset, FROM_SERVER);
+                // This should never happen because we don't limit the degree
+                // of overcommitment in BasicTransport.
+                LOG(ERROR, "Bad grant offset %u", grantOffset);
             }
+            serverRpc->accumulator->requestRetransmission(this,
+                    serverRpc->response.recipient, serverRpc->rpcId,
+                    grantOffset, FROM_SERVER);
+
         }
     }
 }
