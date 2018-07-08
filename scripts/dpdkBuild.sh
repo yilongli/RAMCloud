@@ -13,7 +13,7 @@ DPDK_OPTIONS+=" CONFIG_RTE_BUILD_SHARED_LIB=n"
 if [ "$MLNX_DPDK" != "y" ];
 then
     # Use DPDK community release.
-    DPDK_VER="16.11"
+    DPDK_VER="18.02"
     DPDK="dpdk-${DPDK_VER}"
     DPDK_SRC="http://dpdk.org/browse/dpdk/snapshot/${DPDK}.tar.gz"
 else
@@ -27,10 +27,10 @@ if [ ! -d ./deps ]; then mkdir deps; fi
 
 if [ ! -d ./deps/${DPDK} ];
 then
-	cd deps;
-	wget --no-clobber ${DPDK_SRC}
-	tar zxvf ${DPDK}.tar.gz
-	cd ..
+    cd deps;
+    wget --no-clobber ${DPDK_SRC}
+    tar zxvf ${DPDK}.tar.gz
+    cd ..
 fi
 ln -sfn deps/${DPDK} dpdk
 

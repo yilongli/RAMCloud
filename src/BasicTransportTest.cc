@@ -491,30 +491,6 @@ TEST_F(BasicTransportTest, Session_getRpcInfo) {
             "READ, PING to server at mock:node=3") == 0));
 }
 
-TEST_F(BasicTransportTest, augmentTopOutgoingMessageSet) {
-    driver->transmitQueueSpace = 0;
-    MockWrapper wrapper1("0123456789");
-    MockWrapper wrapper2("0123456789");
-    MockWrapper wrapper3("0123456789");
-    MockWrapper wrapper4("0123456789");
-    session->sendRequest(&wrapper1.request, &wrapper1.response, &wrapper1);
-    session->sendRequest(&wrapper2.request, &wrapper2.response, &wrapper2);
-    session->sendRequest(&wrapper3.request, &wrapper3.response, &wrapper3);
-    session->sendRequest(&wrapper4.request, &wrapper4.response, &wrapper4);
-    transport.outgoingRpcs[1]->request.transmitOffset = 0;
-    transport.outgoingRpcs[2]->request.transmitOffset = 1;
-    transport.outgoingRpcs[3]->request.transmitOffset = 7;
-    transport.outgoingRpcs[4]->request.transmitOffset = 8;
-    transport.outgoingRpcs[3]->request.topChoice = true;
-    transport.outgoingRpcs[4]->request.topChoice = true;
-    transport.topOutgoingMessages.push_back(
-            transport.outgoingRpcs[3]->request);
-    transport.topOutgoingMessages.push_back(
-            transport.outgoingRpcs[4]->request);
-    transport.augmentTopOutgoingMessageSet();
-    EXPECT_EQ(3u, transport.topOutgoingMessages.size());
-    EXPECT_TRUE(transport.outgoingRpcs[2]->request.topChoice);
-}
 TEST_F(BasicTransportTest, maintainTopOutgoingMessages) {
     driver->transmitQueueSpace = 0;
     MockWrapper wrapper1("0123456789");

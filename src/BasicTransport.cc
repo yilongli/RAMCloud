@@ -79,7 +79,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // As of 09/2017, we consider messages less than 300 bytes as small (which
     // takes at most 240 ns to transmit on a 10Gbps network). This value is
     // chosen experimentally so that we can run W3 in Homa paper at 80% load on
-    // a 10Gbps network/ and that no significant queueing delay at the TX queue
+    // a 10Gbps network and that no significant queueing delay at the TX queue
     // is observed.
     , smallMessageThreshold(300)
     , clientId(clientId)
@@ -583,15 +583,27 @@ BasicTransport::tryToTransmitData()
         // Couldn't find a message to transmit from our top outgoing message
         // set; take the slow path
         if (expect_false((NULL == message) && transmitDataSlowPath)) {
-            timeTrace("slow path taken, iterating over %u outgoing messages",
-                    outgoingRequests.size() + outgoingResponses.size());
+            // The slow path scans all messages outside the top outgoing
+            // message set to 1) find an message ready to transmit, and
+            // 2) select the next message to include in the top outgoing
+            // message set. The policy for both tasks is SRPT.
+            timeTrace("slow path taken, iterating over %u outgoing messages, "
+                    "topOutgoingMessages %u, iteration %u",
+                    outgoingRequests.size() + outgoingResponses.size(),
+                    topOutgoingMessages.size(), context->dispatch->iteration);
 
+            uint32_t overallMinBytesLeft = ~0u;
+            OutgoingMessage* newTopMessage = NULL;
             for (OutgoingRequestList::iterator it = outgoingRequests.begin();
                         it != outgoingRequests.end(); it++) {
                 OutgoingMessage* request = &it->request;
                 if (!request->topChoice) {
                     uint32_t bytesLeft =
                             request->buffer->size() - request->transmitOffset;
+                    if (bytesLeft < overallMinBytesLeft) {
+                        overallMinBytesLeft = bytesLeft;
+                        newTopMessage = request;
+                    }
                     if (request->transmitLimit <= request->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -609,6 +621,10 @@ BasicTransport::tryToTransmitData()
                 if (!response->topChoice) {
                     uint32_t bytesLeft = response->buffer->size() -
                             response->transmitOffset;
+                    if (bytesLeft < overallMinBytesLeft) {
+                        overallMinBytesLeft = bytesLeft;
+                        newTopMessage = response;
+                    }
                     if (response->transmitLimit <= response->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -623,6 +639,11 @@ BasicTransport::tryToTransmitData()
             if (message == NULL) {
                 // Can't find one outgoing message that is ready to transmit.
                 transmitDataSlowPath = false;
+            } else {
+                // Expand the size of the top outgoing message set by one
+                // so that we may avoid the slow path next time.
+                newTopMessage->topChoice = true;
+                topOutgoingMessages.push_back(*newTopMessage);
             }
         }
 
@@ -668,14 +689,6 @@ BasicTransport::tryToTransmitData()
                     // this approach is simpler and faster in the common case
                     // where data isn't lost.
                     deleteServerRpc(serverRpc);
-                }
-            } else if (!message->topChoice) {
-                // This message is taken from the slow path; see if we should
-                // include it to topOutgoingMessages so that we may avoid the
-                // slow path next time.
-                maintainTopOutgoingMessages(message);
-                if (!message->topChoice) {
-                    augmentTopOutgoingMessageSet();
                 }
             }
         } else {
@@ -778,57 +791,6 @@ BasicTransport::Session::getRpcInfo()
 }
 
 /**
- * Attempt to expand the size of the top outgoing message set by one. This
- * method will scan all messages outside the top outgoing message set and
- * select the one with the smallest remaining size to include. This method
- * is invoked by #tryToTransmitData whenever it has to look outside the top
- * outgoing message set to pick the next message to transmit.
- */
-void
-BasicTransport::augmentTopOutgoingMessageSet()
-{
-    // As of 09/2017, the maximum size of the top outgoing message set is
-    // limited to 4. During evaluation, we found that this value is large
-    // enough to ensure that the sender doesn't have to look outside this
-    // set very often when picking the next message to transmit.
-#define MAX_TOP_MESSAGES 4
-    if (topOutgoingMessages.size() == MAX_TOP_MESSAGES) {
-        return;
-    }
-
-    uint32_t minBytesLeft = ~0u;
-    OutgoingMessage* message = NULL;
-    for (OutgoingRequestList::iterator it = outgoingRequests.begin();
-                it != outgoingRequests.end(); it++) {
-        OutgoingMessage* request = &it->request;
-        if (!request->topChoice) {
-            uint32_t bytesLeft =
-                    request->buffer->size() - request->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                message = request;
-            }
-        }
-    }
-
-    for (OutgoingResponseList::iterator it = outgoingResponses.begin();
-                it != outgoingResponses.end(); it++) {
-        OutgoingMessage* response = &it->response;
-        if (!response->topChoice) {
-            uint32_t bytesLeft = response->buffer->size() -
-                    response->transmitOffset;
-            if (bytesLeft < minBytesLeft) {
-                minBytesLeft = bytesLeft;
-                message = response;
-            }
-        }
-    }
-
-    message->topChoice = true;
-    topOutgoingMessages.push_back(*message);
-}
-
-/**
  * Ensure that messages in our top outgoing message set still have the
  * smallest remaining sizes in all outgoing messages. When a new outgoing
  * message arrives or we just transmitted a few more bytes of an existing
@@ -855,6 +817,22 @@ BasicTransport::maintainTopOutgoingMessages(OutgoingMessage* candidate)
             messageToReplace = m;
         }
     }
+
+    if ((topOutgoingMessages.size() < 4) && (messageToReplace != NULL)) {
+        // When the top outgoing message set is pretty small, it's probably
+        // better to include the candidate without removing the old message.
+        // If we don't do this, and we expand the top outgoing message set
+        // only after tryToTransmitData takes the slow path, we may find
+        // ourselves entering the slow path frequently just to refill a top
+        // outgoing message set that has usually zero or one messages.
+        // Unfortunately, it is way more expensive to refill the top outgoing
+        // message set in tryToTransmitData than here because that requires
+        // scanning all outgoing messages.
+        candidate->topChoice = true;
+        topOutgoingMessages.push_back(*candidate);
+        return;
+    }
+
     OutgoingMessage* loser = candidate;
     if (messageToReplace != NULL) {
         loser = messageToReplace;
@@ -1012,6 +990,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // driver a chance to copy out the contents of the
                     // underlying NIC packet buffer and then release it.
                     driver->releaseHwPacketBuf(received);
+                    timeTrace("response buffer %p, payload %p");
                     header = received->getOffset<DataHeader>(0);
                 }
                 if (!clientRpc->accumulator) {
@@ -1142,7 +1121,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                     AckHeader ack(header->common.rpcId, FROM_CLIENT);
                     sendControlPacket(clientRpc->session->serverAddress, &ack);
                     return;
-
                 }
                 double elapsedMicros = Cycles::toSeconds(Cycles::rdtsc()
                         - request->lastTransmitTime)*1e06;
@@ -1424,7 +1402,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->offset, header->length,
                         response->unscheduledBytes,
                         RETRANSMISSION|FROM_SERVER, true);
-                response->lastTransmitTime = Cycles::rdtsc();
+                response->lastTransmitTime = driver->getLastTransmitTime();
                 return;
             }
 
@@ -1756,9 +1734,10 @@ BasicTransport::Poller::poll()
     // Log the beginning of poll() here so that timetrace entries do not
     // go back in time.
     if (numPackets > 0) {
-        uint64_t ns = Cycles::toNanoseconds(startTime - lastPollTime);
-        timeTrace(startTime, "start of polling iteration %u, "
-                "last poll was %u ns ago", owner->iteration, ns);
+        uint32_t ns = downCast<uint32_t>(
+                Cycles::toNanoseconds(startTime - lastPollTime));
+        TimeTrace::record(startTime, "start of polling iteration %u, "
+                "last poll was %u ns ago", uint32_t(owner->iteration), ns);
     }
     lastPollTime = Cycles::rdtsc();
 #endif
@@ -1867,10 +1846,12 @@ BasicTransport::checkTimeouts()
             it != outgoingRpcs.end(); ) {
         uint64_t sequence = it->first;
         ClientRpc* clientRpc = it->second;
-        if (clientRpc->request.transmitOffset == 0) {
-            // We haven't started transmitting this RPC yet (our transmit
-            // queue is probably backed up), so no need to worry about whether
-            // we have heard from the server.
+        OutgoingMessage* request = &clientRpc->request;
+        if (request->transmitOffset <
+                std::min(request->transmitLimit, request->buffer->size())) {
+            // We haven't finished transmitting every granted byte of the
+            // request (our transmit queue is probably backed up), so no
+            // need to worry about whether we have heard from the server.
             it++;
             continue;
         }
@@ -1894,16 +1875,22 @@ BasicTransport::checkTimeouts()
             continue;
         }
 
+        if (clientRpc->silentIntervals < 2) {
+            // Make sure the clientRpc has experienced at least one full
+            // timerInterval before we start to deal with it.
+            continue;
+        }
+
         if (clientRpc->response->size() == 0) {
             // We haven't received any part of the response message. Normally,
             // it's the server's responsibility to request retransmission.
             // However, in case the whole request was lost (so the server is
             // not aware of this RPC) or the server crashed, we need to send
             // occasional RESEND packets, which should produce some response
-            // from the server, so that we know it's still alive and working.
-            // Note: the wait time for this ping is longer than the server's
-            // wait time to request retransmission (first give the server a
-            // chance to handle the problem).
+            // from the server, so that we know the server will take care of
+            // this situation. Note: the wait time for this ping is longer than
+            // the server's wait time to request retransmission (first give the
+            // server a chance to handle the problem).
             if (clientRpc->silentIntervals % pingIntervals == 0) {
                 timeTrace("client sending RESEND for clientId %u, "
                         "sequence %u", clientId, sequence);
@@ -1946,10 +1933,12 @@ BasicTransport::checkTimeouts()
     for (ServerTimerList::iterator it = serverTimerList.begin();
             it != serverTimerList.end(); ) {
         ServerRpc* serverRpc = &(*it);
-        if (serverRpc->sendingResponse &&
-                (serverRpc->response.transmitOffset == 0)) {
-            // Looks like the transmit queue has been too backed up to start
-            // sending the response, so no need to check for a timeout.
+        OutgoingMessage* response = &serverRpc->response;
+        if (serverRpc->sendingResponse && (response->transmitOffset <
+                std::min(response->transmitLimit, response->buffer->size()))) {
+            // Looks like the transmit queue has been too backed up to finish
+            // transmitting every granted byte of the response, so no need to
+            // check for a timeout.
             it++;
             continue;
         }
@@ -1973,13 +1962,26 @@ BasicTransport::checkTimeouts()
         //     could process the RPC before the retransmitted data arrived.
         assert(serverRpc->sendingResponse || !serverRpc->requestComplete);
         if (serverRpc->silentIntervals >= timeoutIntervals) {
+            RAMCLOUD_LOG(WARNING, "aborting %s RPC from client %s, "
+                    "clientId %lu, sequence %lu: timeout",
+                    WireFormat::opcodeSymbol(&serverRpc->requestPayload),
+                    serverRpc->response.recipient->toString().c_str(),
+                    serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
+            timeTrace("aborting %s RPC from client, clientId %u, sequence %u: timeout",
+                    serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
             deleteServerRpc(serverRpc);
             continue;
         }
 
-        // See if we need to request retransmission for part of the request
-        // message.
-        if ((serverRpc->silentIntervals >= 2) && !serverRpc->requestComplete) {
+        if (serverRpc->silentIntervals < 2) {
+            // Make sure the serverRpc has experienced at least one full
+            // timerInterval before we start to deal with it.
+            continue;
+        }
+
+        if (!serverRpc->requestComplete) {
+            // See if we need to request retransmission for part of the request
+            // message.
             ScheduledMessage* scheduledMessage =
                     serverRpc->scheduledMessage.get();
             uint32_t grantOffset =
