@@ -865,12 +865,12 @@ TEST_F(BasicTransportTest, handlePacket_resendFromServer_resend) {
     EXPECT_EQ(1001010lu, transport.outgoingRpcs[1]->request.lastTransmitTime);
     Cycles::mockTscValue = 0;
 }
-TEST_F(BasicTransportTest, handlePacket_ackFromServer) {
+TEST_F(BasicTransportTest, handlePacket_busyFromServer) {
     MockWrapper wrapper("message1");
     session->sendRequest(&wrapper.request, &wrapper.response, &wrapper);
     driver->outputLog.clear();
     transport.outgoingRpcs[1]->silentIntervals = 2;
-    handlePacket("mock:server=1", BasicTransport::AckHeader(
+    handlePacket("mock:server=1", BasicTransport::BusyHeader(
             BasicTransport::RpcId(666, 1), BasicTransport::FROM_SERVER));
     EXPECT_EQ(0u, transport.outgoingRpcs[1]->silentIntervals);
 }
@@ -1179,10 +1179,10 @@ TEST_F(BasicTransportTest, handlePacket_resendFromClient_sendBytes) {
     EXPECT_EQ(1001010lu, serverRpc->response.lastTransmitTime);
     Cycles::mockTscValue = 0;
 }
-TEST_F(BasicTransportTest, handlePacket_ackFromClient) {
+TEST_F(BasicTransportTest, handlePacket_busyFromClient) {
     BasicTransport::ServerRpc* serverRpc = prepareToRespond();
     serverRpc->silentIntervals = 2;
-    handlePacket("mock:client=1", BasicTransport::AckHeader(
+    handlePacket("mock:client=1", BasicTransport::BusyHeader(
             BasicTransport::RpcId(100, 101), BasicTransport::FROM_CLIENT));
     EXPECT_EQ(0u, serverRpc->silentIntervals);
 }
@@ -1428,9 +1428,9 @@ TEST_F(BasicTransportTest, poll_callCheckTimeouts) {
     // Second call: timerInterval reached, but lots of input packets
     Cycles::mockTscValue = 103000;
     transport.poller.owner->currentTime = Cycles::rdtsc();
-    BasicTransport::AckHeader ack(BasicTransport::RpcId(1000, 1001),
+    BasicTransport::BusyHeader busy(BasicTransport::RpcId(1000, 1001),
             BasicTransport::FROM_CLIENT);
-    createInputPackets(8, &ack);
+    createInputPackets(8, &busy);
     result = transport.poller.poll();
     EXPECT_EQ(0u, clientRpc->silentIntervals);
     EXPECT_EQ(1, result);
@@ -1446,7 +1446,7 @@ TEST_F(BasicTransportTest, poll_callCheckTimeouts) {
 
     // Fourth call: deadline reached, lots of input packets; call
     // checkTimeouts anyway.
-    createInputPackets(8, &ack);
+    createInputPackets(8, &busy);
     Cycles::mockTscValue = 105000;
     transport.poller.owner->currentTime = Cycles::rdtsc();
     transport.timeoutCheckDeadline = 105000;
