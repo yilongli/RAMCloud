@@ -93,18 +93,25 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
     }
 
     // Decide on the time of the first event to be included in the output.
-    // This is most recent of the oldest times in all the traces (an empty
-    // trace has an "oldest time" of 0). The idea here is to make sure
-    // that there's no missing data in what we print (if trace A goes back
-    // farther than trace B, skip the older events in trace A, since there
+    // This is most recent of the oldest times in all the traces (a trace that
+    // never fills the buffer has an "oldest time" of 0). The idea here is to
+    // make sure that there's no missing data in what we print (if trace A goes
+    // back farther than trace B, skip the older events in trace A, since there
     // might have been related events that were once in trace B but have since
     // been overwritten).
     uint64_t startTime = 0;
+    uint64_t minStartTime = ~0ul;
     for (uint32_t i = 0; i < buffers->size(); i++) {
         Event* event = &buffers->at(i)->events[current[i]];
-        if ((event->format != NULL) && (event->timestamp > startTime)) {
-            startTime = event->timestamp;
+        minStartTime = std::min(minStartTime, event->timestamp);
+        if (current[i] > 0) {
+            if ((event->format != NULL) && (event->timestamp > startTime)) {
+                startTime = event->timestamp;
+            }
         }
+    }
+    if (startTime == 0) {
+        startTime = minStartTime;
     }
     RAMCLOUD_LOG(NOTICE, "Starting TSC %lu, cyclesPerSec %.0f", startTime,
             Cycles::perSecond());

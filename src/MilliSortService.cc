@@ -19,8 +19,35 @@
 #include "AllShuffle.h"
 #include "Broadcast.h"
 #include "Gather.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
+
+// Change 0 -> 1 in the following line to compile detailed time tracing in
+// this transport.
+#define TIME_TRACE 1
+
+// Provides a cleaner way of invoking TimeTrace::record, with the code
+// conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
+// are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
+// frequently cast their 64-bit arguments into uint32_t explicitly: we will
+// help perform the casting internally.
+namespace {
+    inline void
+    timeTrace(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+}
+
+// Change 0 -> 1 in the following line to log intermediate computation result at
+// each stage of the algorithm.
+#define LOG_INTERMEDIATE_RESULT 0
 
 /**
  * Construct an MilliSortService.
@@ -37,9 +64,9 @@ MilliSortService::MilliSortService(Context* context,
     : context(context)
     , serverConfig(serverConfig)
     , communicationGroupTable()
+    , ongoingMilliSort()
     , pivotServerRank(-1)
     , isPivotServer()
-    , stage(UNINITIALIZED)
     , numDataTuples(-1)
     , numPivotServers(-1)
     , keys()
@@ -117,12 +144,13 @@ void
 MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr,
         WireFormat::InitMilliSort::Response* respHdr, Rpc* rpc)
 {
-    // FIXME: use timetrace
-//    LOG(NOTICE, "Received INIT_MILLISORT request, fromClient = %u, "
-//            "# tuples = %u", reqHdr->fromClient, reqHdr->dataTuplesPerServer);
+    timeTrace("initMilliSort invoked, dataTuplesPerServer %u, "
+              "nodesPerPivotServer %u, fromClient %u",
+              reqHdr->dataTuplesPerServer, reqHdr->nodesPerPivotServer,
+              reqHdr->fromClient);
 
     // We are busy serving another sorting request.
-    if ((READY_TO_START < stage) && (stage < FINISHED)) {
+    if (ongoingMilliSort != NULL) {
         respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
         return;
     }
@@ -149,19 +177,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                     result->read<WireFormat::InitMilliSort::Response>(
                     &offset)->numNodesInited;
         }
-
-//        for (int i = 0; i < world->size(); i++) {
-//            // TODO: not sure if I can send RPC to myself in RAMCloud
-////            if (serverId == world->getNode(i)) {
-////                continue;
-////            }
-//            InitMilliSortRpc initRpc(context, world->getNode(i),
-//                    reqHdr->dataTuplesPerServer, reqHdr->nodesPerPivotServer,
-//                    false);
-//            initRpc.wait();
-//            respHdr->numNodesInited += initRpc.getNodesInited();
-//        }
-
         return;
     }
 
@@ -199,6 +214,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     }
 
     // Generate data tuples.
+    keys.clear();
     for (int i = 0; i < numDataTuples; i++) {
         // TODO: generate random keys
 //        keys.push_back(rand() % 10000);
@@ -207,7 +223,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     sortedKeys.clear();
 
     //
-    stage = READY_TO_START;
     localPivots.clear();
     dataBucketBoundaries.clear();
     gatheredPivots.clear();
@@ -232,10 +247,9 @@ void
 MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqHdr,
         WireFormat::StartMilliSort::Response* respHdr, Rpc* rpc)
 {
-    if (stage == UNINITIALIZED) {
-        respHdr->common.status = STATUS_MILLISORT_UNINITIALIZED;
-        return;
-    } else if (stage > READY_TO_START) {
+    timeTrace("startMilliSort invoked, fromClient %u", reqHdr->fromClient);
+
+    if (ongoingMilliSort != NULL) {
         respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
         return;
     }
@@ -262,7 +276,11 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     }
 
     // Kick start the sorting process.
+    ongoingMilliSort = rpc;
     localSortAndPickPivots();
+    ongoingMilliSort = NULL;
+
+    // FIXME: what should I do for non-root pivot servers? Should I busy wait here?
 }
 
 void
@@ -293,12 +311,10 @@ MilliSortService::partition(std::vector<SortKey>* keys, int numPartitions,
 void
 MilliSortService::localSortAndPickPivots()
 {
-    // FIXME: use time trace
-    LOG(WARNING, "localSortAndPickPivots started");
-
-    stage = LOCAL_SORT_AND_PICK_PIVOTS;
+    timeTrace("=== Stage 1: localSortAndPickPivots started");
     std::sort(keys.begin(), keys.end());
     partition(&keys, std::min((int)keys.size(), world->size()), &localPivots);
+    debugLogKeys("local pivots: ", &localPivots);
 
     // Merge pivots from slave nodes as they arrive.
     auto merger = [this] (Buffer* pivotsBuffer) {
@@ -307,25 +323,28 @@ MilliSortService::localSortAndPickPivots()
                 gatheredPivots.push_back(*pivotsBuffer->read<SortKey>(&offset));
             }
             std::sort(gatheredPivots.begin(), gatheredPivots.end());
+            timeTrace("merged %u pivots", pivotsBuffer->size() / KeySize);
     };
 
     // Initiate the gather op that collects pivots to the pivot server.
-    // FIXME: if all we gonna do is to call and wait, we might as well use
-    // invokeCollectiveOp and do the collectiveOpTable cleanup inside.
+    timeTrace("sorted %u data tuples, picked %u local pivots, about to gather "
+            "pivots", keys.size(), localPivots.size());
     Tub<FlatGather> gatherPivots;
     invokeCollectiveOp<FlatGather>(gatherPivots, GATHER_PIVOTS, context,
             myPivotServerGroup.get(), 0, (uint32_t) localPivots.size(),
             localPivots.data(), &merger);
     gatherPivots->wait();
+    // TODO: the cleanup is not very nice; how to do RAII?
     collectiveOpTable.erase(GATHER_PIVOTS);
 
     // Pivot servers will advance to pick super pivots when the gather op
     // completes. Normal nodes will wait to receive data bucket boundaries.
     if (isPivotServer) {
-        LOG(WARNING, "#localPivots %lu, #gatheredPivots %lu",
-                localPivots.size(), gatheredPivots.size());
+        timeTrace("gathered %u pivots from %u nodes", gatheredPivots.size(),
+                uint(myPivotServerGroup->size()));
         pickSuperPivots();
     } else {
+        timeTrace("sent %u local pivots", localPivots.size());
         pickDataBucketBoundaries();
     }
 }
@@ -333,11 +352,11 @@ MilliSortService::localSortAndPickPivots()
 void
 MilliSortService::pickSuperPivots()
 {
-    LOG(WARNING, "pickSuperPivots started");
+    timeTrace("=== Stage 2: pickSuperPivots started");
 
     assert(isPivotServer);
-    stage = PICK_SUPER_PIVOTS;
     partition(&gatheredPivots, allPivotServers->size(), &superPivots);
+    debugLogKeys("super-pivots: ", &superPivots);
 
     // Merge super pivots from pivot servers as they arrive.
     auto merger = [this] (Buffer* pivotsBuf) {
@@ -346,9 +365,12 @@ MilliSortService::pickSuperPivots()
                 globalSuperPivots.push_back(*pivotsBuf->read<SortKey>(&offset));
             }
             std::sort(globalSuperPivots.begin(), globalSuperPivots.end());
+            timeTrace("merged %u super-pivots", pivotsBuf->size() / KeySize);
     };
 
     // Initiate the gather op that collects super pivots to the root node.
+    timeTrace("picked %u super-pivots, about to gather super-pivots",
+            superPivots.size());
     Tub<FlatGather> gatherSuperPivots;
     invokeCollectiveOp<FlatGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
             context, allPivotServers.get(), 0, (uint32_t) superPivots.size(),
@@ -361,41 +383,43 @@ MilliSortService::pickSuperPivots()
     // gather op completes. Other pivot servers will wait to receive pivot
     // bucket boundaries.
     if (world->rank == 0) {
+        timeTrace("gathered %u super-pivots from %u pivot servers",
+                globalSuperPivots.size(), uint(allPivotServers->size()));
         pickPivotBucketBoundaries();
+    } else {
+        timeTrace("sent %u super-pivots", superPivots.size());
     }
 }
 
 void
 MilliSortService::pickPivotBucketBoundaries()
 {
-    LOG(WARNING, "pickPivotBucketBoundaries started");
-
+    timeTrace("=== Stage 3: pickPivotBucketBoundaries started");
     assert(world->rank == 0);
-    stage = PICK_PIVOT_BUCKET_BOUNDARIES;
     partition(&globalSuperPivots, allPivotServers->size(),
             &pivotBucketBoundaries);
+    debugLogKeys("pivot bucket boundaries: ", &pivotBucketBoundaries);
 
     // Broadcast computed pivot bucket boundaries to the other pivot servers
     // (excluding ourselves).
     // TODO: can we unify the API of broadcast and other collective op?
+    timeTrace("picked %u pivot bucket boundaries, about to broadcast");
     TreeBcast bcast(context, allPivotServers.get());
     bcast.send<SendDataRpc>(BROADCAST_PIVOT_BUCKET_BOUNDARIES,
             // TODO: simplify the SendDataRpc api?
-            downCast<uint32_t>(sizeof(SortKey) * pivotBucketBoundaries.size()),
+            downCast<uint32_t>(KeySize * pivotBucketBoundaries.size()),
             pivotBucketBoundaries.data());
     bcast.wait();
 
+    timeTrace("broadcast to %u pivot servers", uint(allPivotServers->size()));
     pivotBucketSort();
 }
 
 void
 MilliSortService::pivotBucketSort()
 {
-    LOG(WARNING, "pivotBucketSort started, #pivotBucketBoundaries %lu",
-            pivotBucketBoundaries.size());
-
+    timeTrace("=== Stage 4: pivotBucketSort started");
     assert(isPivotServer);
-    stage = PIVOT_BUCKET_SORT;
 
     // Merge pivots from pivot servers as they arrive.
     auto merger = [this] (Buffer* data) {
@@ -408,10 +432,12 @@ MilliSortService::pivotBucketSort()
 
         // FIXME: this should really be an in-place parallel merge operation
         std::sort(sortedGatheredPivots.begin(), sortedGatheredPivots.end());
+        timeTrace("merged %u pivots", (data->size() - 8) / KeySize);
     };
 
     // Send pivots to their designated pivot servers determined by the pivot
     // bucket boundaries.
+    timeTrace("about to shuffle pivots");
     Tub<AllShuffle> pivotsShuffle;
     invokeCollectiveOp<AllShuffle>(pivotsShuffle, ALLSHUFFLE_PIVOTS, context,
             allPivotServers.get(), &merger);
@@ -438,18 +464,18 @@ MilliSortService::pivotBucketSort()
     }
     pivotsShuffle->wait();
     collectiveOpTable.erase(ALLSHUFFLE_PIVOTS);
+    debugLogKeys("sorted pivots (local portion): ", &sortedGatheredPivots);
 
     // Pivot servers will advance to pick data bucket boundaries when the
     // shuffle completes.
+    timeTrace("finished pivot shuffle");
     pickDataBucketBoundaries();
 }
 
 void
 MilliSortService::pickDataBucketBoundaries()
 {
-    LOG(WARNING, "pickDataBucketBoundaries started");
-
-    stage = PICK_DATA_BUCKET_BOUNDARIES;
+    timeTrace("=== Stage 5: pickDataBucketBoundaries started");
     if (isPivotServer) {
         // TODO: doc. that it's copied from sortAndPartition and modified.
         int s = numPivotsInTotal / world->size();
@@ -475,18 +501,19 @@ MilliSortService::pickDataBucketBoundaries()
             uint32_t offset = 0;
             while (offset < pivotsBuffer->size()) {
                 SortKey boundary = *pivotsBuffer->read<SortKey>(&offset);
-//                LOG(WARNING, "boundary %d", boundary);
                 dataBucketBoundaries.push_back(boundary);
             }
             std::sort(dataBucketBoundaries.begin(), dataBucketBoundaries.end());
+            // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
+            // are sorted globally, we know exactly where to insert even they come!
+            timeTrace("merged %u data bucket boundaries",
+                    pivotsBuffer->size() / KeySize);
     };
 
-    // TODO: I accidentally used ruleEngine.createAndSchedule<AllGather> and
-    // spent 30 mins debugging. How to prevent this kind of error?
+    // Gather data bucket boundaries from pivot servers to all nodes.
+    timeTrace("about to all-gather data bucket boundaries");
     Tub<AllGather> allGather;
     if (isPivotServer) {
-        LOG(WARNING, "# partialDataBucketBoundaries %lu",
-                partialDataBucketBoundaries.size());
         invokeCollectiveOp<AllGather>(allGather,
                 ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
                 allPivotServers.get(), world.get(),
@@ -498,23 +525,19 @@ MilliSortService::pickDataBucketBoundaries()
     }
     allGather->wait();
     collectiveOpTable.erase(ALLGATHER_DATA_BUCKET_BOUNDARIES);
+    debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
 
     // All nodes will advance to the final data shuffle when the all-gather
     // completes.
+    timeTrace("gathered %u data bucket boundaries",
+            dataBucketBoundaries.size());
     dataBucketSort();
 }
 
 void
 MilliSortService::dataBucketSort()
 {
-    LOG(WARNING, "dataBucketSort started, # dataBucketBoundaries %lu",
-            dataBucketBoundaries.size());
-    // FIXME: add assertions at each step.
-
-    stage = DATA_BUCKET_SORT;
-    // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
-    // are sorted globally, we know exactly where to insert even they come!
-    std::sort(dataBucketBoundaries.begin(), dataBucketBoundaries.end());
+    timeTrace("=== Stage 6: dataBucketSort started");
 
     // Merge data from other nodes as they arrive.
     auto merger = [this] (Buffer* data) {
@@ -524,10 +547,12 @@ MilliSortService::dataBucketSort()
         }
         // FIXME: this should really be an in-place parallel merge operation
         std::sort(sortedKeys.begin(), sortedKeys.end());
+        timeTrace("merged %u keys", data->size() / KeySize);
     };
 
     // Send data to their designated nodes determined by the data bucket
     // boundaries.
+    timeTrace("about to shuffle data tuples");
     Tub<AllShuffle> dataShuffle;
     invokeCollectiveOp<AllShuffle>(dataShuffle, ALLSHUFFLE_DATA, context,
             world.get(), &merger);
@@ -543,16 +568,27 @@ MilliSortService::dataBucketSort()
     }
     dataShuffle->wait();
     collectiveOpTable.erase(ALLSHUFFLE_DATA);
+    timeTrace("millisort finished");
 
-    stage = FINISHED;
-    string sortResult;
-    for (SortKey& key : sortedKeys) {
-        sortResult += std::to_string(key);
-        sortResult += " ";
+    if (ongoingMilliSort) {
+        ongoingMilliSort->sendReply();
+        ongoingMilliSort = NULL;
     }
-    LOG(WARNING, "result: %s", sortResult.c_str());
+    debugLogKeys("final result: ", &sortedKeys);
 }
 
+void
+MilliSortService::debugLogKeys(const char* prefix, vector<SortKey>* keys)
+{
+#if LOG_INTERMEDIATE_RESULT
+    string result;
+    for (SortKey& key : *keys) {
+        result += std::to_string(key);
+        result += " ";
+    }
+    LOG(NOTICE, "%s%s", prefix, result.c_str());
+#endif
+}
 
 void
 MilliSortService::treeBcast(const WireFormat::TreeBcast::Request* reqHdr,
@@ -601,6 +637,9 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
                     pivotBucketBoundaries.push_back(
                             *request->read<SortKey>(&offset));
                 }
+                timeTrace("received %u pivot bucket boundaries",
+                        pivotBucketBoundaries.size());
+
                 rpc->sendReply();
                 pivotBucketSort();
             }

@@ -204,25 +204,11 @@ class MilliSortService : public Service {
         ALLSHUFFLE_PIVOTS,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_DATA,
-        FINISH_SORTING,
-        INVALID_OP_ID
-    };
-
-
-    enum Stage {
-        UNINITIALIZED                   = 0,
-        READY_TO_START                  = 1,
-        LOCAL_SORT_AND_PICK_PIVOTS      = 2,
-        PICK_SUPER_PIVOTS               = 3,
-        PICK_PIVOT_BUCKET_BOUNDARIES    = 4,
-        PIVOT_BUCKET_SORT               = 5,
-        PICK_DATA_BUCKET_BOUNDARIES     = 6,
-        DATA_BUCKET_SORT                = 7,
-        FINISHED
     };
 
     ///
     using SortKey = int;
+    static constexpr uint32_t KeySize = sizeof(SortKey);
 
     // ----------------------
     // Computation steps
@@ -236,12 +222,16 @@ class MilliSortService : public Service {
     void pivotBucketSort();
     void pickDataBucketBoundaries();
     void dataBucketSort();
+    void debugLogKeys(const char* prefix, vector<SortKey>* keys);
 
     enum CommunicationGroupId {
         WORLD                   = 0,
         MY_PIVOT_SERVER_GROUP   = 1,
         ALL_PIVOT_SERVERS       = 2
     };
+
+    /// MilliSort request in progress. NULL means the service is idle.
+    Service::Rpc* ongoingMilliSort;
 
     /// Rank of the pivot server this node belongs to. -1 means unknown.
     int pivotServerRank;
@@ -251,10 +241,6 @@ class MilliSortService : public Service {
     bool isPivotServer;
 
     // -------- Node state --------
-    /// Which #Stage the node is in (or, the next task to perform).
-    // FIXME: remove this variable; replace it with logging
-    Stage stage;
-
     /// # data tuples on each node initially. -1 means unknown.
     int numDataTuples;
 

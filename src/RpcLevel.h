@@ -63,11 +63,10 @@ class RpcLevel {
             // relationships, so levels were not properly assigned. The
             // solution is to update the table in genLevels.py.
 //            RAMCLOUD_LOG(ERROR, "Unexpected RPC from %s to %s creates "
-            RAMCLOUD_LOG(NOTICE, "Unexpected RPC from %s to %s creates "
-                    "potential for deadlock; must update 'callees' table in "
-                    "scripts/genLevels.py",
-                    WireFormat::opcodeSymbol(currentOpcode),
-                    WireFormat::opcodeSymbol(opcode));
+//                    "potential for deadlock; must update 'callees' table in "
+//                    "scripts/genLevels.py",
+//                    WireFormat::opcodeSymbol(currentOpcode),
+//                    WireFormat::opcodeSymbol(opcode));
         }
     }
 

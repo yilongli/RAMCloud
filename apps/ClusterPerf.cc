@@ -7311,20 +7311,22 @@ millisort()
     CoordinatorClient::getServerList(context, &list);
     serverList.applyServerList(list);
 
-    // Initialize the experiment.
-    InitMilliSortRpc initRpc(context, rootServer, dataTuplesPerServer,
-            nodesPerGroup);
-    initRpc.wait();
-    LOG(NOTICE, "Initialized %d millisort service nodes",
-            initRpc.getNodesInited());
+    for (int i = 0; i < count; i++) {
+        // Initialize the experiment.
+        InitMilliSortRpc initRpc(context, rootServer, dataTuplesPerServer,
+                nodesPerGroup);
+        initRpc.wait();
+        LOG(NOTICE, "Initialized %d millisort service nodes",
+                initRpc.getNodesInited());
 
-    //
-    uint64_t startTime = Cycles::rdtsc();
-    StartMilliSortRpc startRpc(context, rootServer);
-    startRpc.wait();
-    uint64_t totalCycles = Cycles::rdtsc() - startTime;
-    printf("MilliSort request finished in %.1f us\n",
-            Cycles::toSeconds(totalCycles) * 1e6);
+        //
+        uint64_t startTime = Cycles::rdtsc();
+        StartMilliSortRpc startRpc(context, rootServer);
+        startRpc.wait();
+        uint64_t totalCycles = Cycles::rdtsc() - startTime;
+        printf("MilliSort request finished in %.1f us\n",
+                Cycles::toSeconds(totalCycles) * 1e6);
+    }
 }
 
 // The following struct and table define each performance test in terms of
