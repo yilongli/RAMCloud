@@ -67,21 +67,24 @@ MilliSortClient::startMilliSort(Context* context, ServerId serverId,
 }
 
 StartMilliSortRpc::StartMilliSortRpc(Context* context, ServerId serverId,
-        bool fromClient)
+        int requestId, bool fromClient)
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::StartMilliSort::Response))
 {
     WireFormat::StartMilliSort::Request* reqHdr(
             allocHeader<WireFormat::StartMilliSort>());
+    reqHdr->requestId = requestId;
     reqHdr->fromClient = fromClient;
     send();
 }
 
 void
-StartMilliSortRpc::appendRequest(Buffer* request, bool fromClient)
+StartMilliSortRpc::appendRequest(Buffer* request, int requestId,
+        bool fromClient)
 {
     WireFormat::StartMilliSort::Request* reqHdr(
             RpcWrapper::allocHeader<WireFormat::StartMilliSort>(request));
+    reqHdr->requestId = requestId;
     reqHdr->fromClient = fromClient;
 }
 

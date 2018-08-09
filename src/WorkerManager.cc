@@ -150,6 +150,9 @@ WorkerManager::~WorkerManager()
 void
 WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 {
+    // TODO: also useful for ramcloud?
+    rpc->arriveTime = context->dispatch->currentTime;
+
     // Find the service for this RPC.
     const WireFormat::RequestCommon* header;
     header = rpc->requestPayload.getStart<WireFormat::RequestCommon>();
@@ -242,8 +245,9 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
                 levels[level].waitingRpcs.push(rpc);
                 rpcsWaiting++;
                 timeTrace("RPC deferred; threads busy");
-                LOG(WARNING, "RPC deferred; threads busy, busyThreads %lu, maxCores %u",
-                        busyThreads.size(), maxCores);
+//                LOG(WARNING, "%s deferred; busyThreads %lu, maxCores %u",
+//                        WireFormat::opcodeSymbol(header->opcode),
+//                        busyThreads.size(), maxCores);
                 return;
             }
         }
@@ -295,6 +299,15 @@ WorkerManager::poll()
 {
     // TODO: kind of a hack for collective op
     for (auto collectiveOpRpc : collectiveOpRpcs) {
+        uint32_t delayMicros = static_cast<uint32_t>(
+                Cycles::toSeconds(Cycles::rdtsc() -
+                collectiveOpRpc->arriveTime) * 1e6);
+        auto opcode = collectiveOpRpc->requestPayload
+                .getStart<WireFormat::RequestCommon>()->opcode;
+        if (delayMicros > 2) {
+            TimeTrace::record("opcode %u was delayed %u us; collective op not "
+                    "ready", opcode, delayMicros);
+        }
         handleRpc(collectiveOpRpc);
     }
     collectiveOpRpcs.clear();
@@ -357,7 +370,14 @@ WorkerManager::poll()
                     level->requestsRunning++;
                     worker->level = i;
                     worker->handoff(level->waitingRpcs.front());
+                    uint32_t delayMicros = static_cast<uint32_t>(
+                            Cycles::toSeconds(Cycles::rdtsc() -
+                            level->waitingRpcs.back()->arriveTime) * 1e6);
                     level->waitingRpcs.pop();
+                    if (delayMicros > 2) {
+                        TimeTrace::record("opcode %u was delayed %u us; busy "
+                                "threads", worker->opcode, delayMicros);
+                    }
                     startedNewRpc = true;
                     break;
                 }
@@ -389,6 +409,8 @@ WorkerManager::poll()
             busyThreads.pop_back();
             worker->busyIndex = -1;
             idleThreads.push_back(worker);
+//            TimeTrace::record("finished opcode %u by worker thread %u",
+//                    worker->opcode, worker->threadId);
         }
     }
     return foundWork;
@@ -498,7 +520,22 @@ WorkerManager::workerMain(Worker* worker)
 
             // Update performance statistics.
             uint64_t current = Cycles::rdtsc();
-            PerfStats::threadStats.workerActiveCycles += (current - lastIdle);
+            uint64_t activeCycles = current - lastIdle;
+            PerfStats::threadStats.workerActiveCycles += activeCycles;
+            // FIXME: I don't understand why converting cyc to millis requires
+            // floating-point computation. Should be as simple as "divided by
+            // cyclesPerMillis"
+            double elapsedMs = Cycles::toSeconds(activeCycles)*1e3;
+            if (elapsedMs > 1) {
+//                LOG(WARNING, "Worker thread %d spent %.1f ms on opcode %u; "
+//                        "thread preempted?", worker->threadId, elapsedMs,
+//                        worker->opcode);
+                TimeTrace::record("worker thread %u spent %u us to complete "
+                        "opcode %u; thread preempted?",
+                        (uint32_t)worker->threadId,
+                        (uint32_t)Cycles::toMicroseconds(activeCycles),
+                        worker->opcode);
+            }
             lastIdle = current;
         }
         TEST_LOG("exiting");
@@ -558,6 +595,8 @@ Worker::handoff(Transport::ServerRpc* newRpc)
     assert(rpc == NULL);
     rpc = newRpc;
     Fence::leave();
+//    TimeTrace::record("handing off opcode %u to worker thread %u",
+//            opcode, threadId);
 #ifdef SMTT
     if (rpc != WORKER_EXIT) {
         TimeTrace::record("handing off opcode %d to worker thread %d",

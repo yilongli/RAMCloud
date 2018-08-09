@@ -78,6 +78,7 @@ class Transport {
             , replyPayload()
             , epoch(0)
             , activities(~0)
+            , arriveTime(0)
             , outstandingRpcListHook()
         {}
 
@@ -147,6 +148,10 @@ class Transport {
          * matters to anyone.
          */
         int activities;
+
+        /// Time (in rdtsc ticks) when this ServerRpc is handed to
+        /// WorkerManager.
+        uint64_t arriveTime;
 
         /**
          * Bit values for activities above.

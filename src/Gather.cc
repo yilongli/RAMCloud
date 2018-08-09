@@ -52,8 +52,8 @@ FlatGather::handleRpc(const WireFormat::FlatGather::Request* reqHdr,
     // Chop off the FlatGather header and incorporate the data.
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
     if (merger) {
-        timeTrace("about to merge gathered payload from server %u (rank %u)",
-                group->getNode(senderId).indexNumber(), senderId + 1);
+        timeTrace("FlatGather: about to merge payload from server %u (rank %u)",
+                group->getNode(senderId).indexNumber(), senderId);
         merger(rpc->requestPayload);
     }
 

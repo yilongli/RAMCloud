@@ -233,6 +233,10 @@ class MilliSortService : public Service {
     /// MilliSort request in progress. NULL means the service is idle.
     Service::Rpc* ongoingMilliSort;
 
+    uint64_t startTime;
+
+    uint64_t endTime;
+
     /// Rank of the pivot server this node belongs to. -1 means unknown.
     int pivotServerRank;
 

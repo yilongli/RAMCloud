@@ -363,6 +363,10 @@ def run_test(
         client_args['--targetOps'] = options.targetOps
     if options.maxSessions:
         client_args['--maxSessions'] = options.maxSessions
+    if options.nodesPerPivotServer:
+        client_args['--nodesPerPivotServer'] = options.nodesPerPivotServer
+    if options.dataTuplesPerNode:
+        client_args['--dataTuplesPerNode'] = options.dataTuplesPerNode
     if options.txSpan != None:
         client_args['--txSpan'] = options.txSpan
     if options.asyncReplication != None:
@@ -1018,6 +1022,10 @@ if __name__ == '__main__':
                  ' pair. This is useful to reduce head-of-line blocking in '
                  'running transport benchmarks using stream-based protocols '
                  '(e.g., tcp, infrc)')
+    parser.add_option('--nodesPerPivotServer', type=int, default=4,
+            help='Number of nodes a pivot server manages in MilliSort')
+    parser.add_option('--dataTuplesPerNode', type=int, default=100,
+            help='Number of data tuples a node initially holds in MilliSort')
     parser.add_option('--targetOps', type=int,
             help='Operations per second that each load generating client '
             'will try to achieve')

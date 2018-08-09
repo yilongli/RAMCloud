@@ -117,6 +117,24 @@ PerfStats::collectStats(PerfStats* total)
         total->migrationPhase1Cycles += stats->migrationPhase1Cycles;
         total->networkInputBytes += stats->networkInputBytes;
         total->networkOutputBytes += stats->networkOutputBytes;
+        total->millisortTime += stats->millisortTime;
+        total->localSortLatency += stats->localSortLatency;
+//        total->localSortCycles += stats->localSortCycles;
+        total->gatherPivotsCycles += stats->gatherPivotsCycles;
+        total->gatherPivotsOutputBytes += stats->gatherPivotsOutputBytes;
+        total->gatherPivotsInputBytes += stats->gatherPivotsInputBytes;
+        total->mergePivotsCycles += stats->mergePivotsCycles;
+        total->gatherSuperPivotsCycles += stats->gatherSuperPivotsCycles;
+        total->mergeSuperPivotsCycles += stats->mergeSuperPivotsCycles;
+        total->bcastPivotBucketBoundariesCycles +=
+                stats->bcastPivotBucketBoundariesCycles;
+        total->bucketSortPivotsCycles += stats->bucketSortPivotsCycles;
+        total->mergePivotsInBucketSortCycles +=
+                stats->mergePivotsInBucketSortCycles;
+        total->allGatherPivotsCycles += stats->allGatherPivotsCycles;
+        total->allGatherPivotsMergeCycles += stats->allGatherPivotsMergeCycles;
+        total->bucketSortDataCycles += stats->bucketSortDataCycles;
+        total->bucketSortDataMergeCycles += stats->bucketSortDataMergeCycles;
         total->temp1 += stats->temp1;
         total->temp2 += stats->temp2;
         total->temp3 += stats->temp3;
@@ -162,158 +180,200 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
                 diff["writeObjectBytes"][i] + diff["writeKeyBytes"][i]);
     }
 
-    result.append(format("%-30s %s\n", "Server index",
+    result.append(format("%-40s %s\n", "Server index",
             formatMetric(&diff, "serverId", " %8.0f").c_str()));
-    result.append(format("%-30s %s\n", "Elapsed time (sec)",
+/*
+    result.append(format("%-40s %s\n", "Elapsed time (sec)",
             formatMetricRatio(&diff, "collectionTime", "cyclesPerSecond",
             " %8.3f").c_str()));
-    result.append(format("%-30s %s\n", "Dispatcher load factor",
+    result.append(format("%-40s %s\n", "Dispatcher load factor",
             formatMetricRatio(&diff, "dispatchActiveCycles", "collectionTime",
             " %8.3f").c_str()));
-    result.append(format("%-30s %s\n", "Worker load factor",
+    result.append(format("%-40s %s\n", "Worker load factor",
             formatMetricRatio(&diff, "workerActiveCycles", "collectionTime",
             " %8.3f").c_str()));
 
     result.append("\nReads:\n");
-    result.append(format("%-30s %s\n", "  Objects read (K)",
+    result.append(format("%-40s %s\n", "  Objects read (K)",
             formatMetric(&diff, "readCount", " %8.1f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Total MB (objects & keys)",
+    result.append(format("%-40s %s\n", "  Total MB (objects & keys)",
             formatMetric(&diff, "readBytesObjectsAndKeys",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Average object size (bytes)",
+    result.append(format("%-40s %s\n", "  Average object size (bytes)",
             formatMetricRatio(&diff, "readObjectBytes", "readCount",
             " %8.1f").c_str()));
-    result.append(format("%-30s %s\n", "  Average key data (bytes)",
+    result.append(format("%-40s %s\n", "  Average key data (bytes)",
             formatMetricRatio(&diff, "readKeyBytes", "readCount",
             " %8.1f").c_str()));
-    result.append(format("%-30s %s\n", "  Objects/second (K)",
+    result.append(format("%-40s %s\n", "  Objects/second (K)",
             formatMetricRate(&diff, "readCount", " %8.1f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Total MB/s (objects & keys)",
+    result.append(format("%-40s %s\n", "  Total MB/s (objects & keys)",
             formatMetricRate(&diff, "readBytesObjectsAndKeys",
             " %8.2f", 1e-6).c_str()));
 
     result.append("\nWrites:\n");
-    result.append(format("%-30s %s\n", "  Objects written (K)",
+    result.append(format("%-40s %s\n", "  Objects written (K)",
             formatMetric(&diff, "writeCount", " %8.1f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Total MB (objects & keys)",
+    result.append(format("%-40s %s\n", "  Total MB (objects & keys)",
             formatMetric(&diff, "writeBytesObjectsAndKeys",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Average object size (bytes)",
+    result.append(format("%-40s %s\n", "  Average object size (bytes)",
             formatMetricRatio(&diff, "writeObjectBytes", "writeCount",
             " %8.1f").c_str()));
-    result.append(format("%-30s %s\n", "  Average key data (bytes)",
+    result.append(format("%-40s %s\n", "  Average key data (bytes)",
             formatMetricRatio(&diff, "writeKeyBytes", "writeCount",
             " %8.1f").c_str()));
-    result.append(format("%-30s %s\n", "  Objects/second (K)",
+    result.append(format("%-40s %s\n", "  Objects/second (K)",
             formatMetricRate(&diff, "writeCount", " %8.1f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Total MB/s (objects & keys)",
+    result.append(format("%-40s %s\n", "  Total MB/s (objects & keys)",
             formatMetricRate(&diff, "writeBytesObjectsAndKeys",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Log bytes appended (MB/s)",
+    result.append(format("%-40s %s\n", "  Log bytes appended (MB/s)",
             formatMetricRate(&diff, "logBytesAppended",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Replication RPCs/write",
+    result.append(format("%-40s %s\n", "  Replication RPCs/write",
             formatMetricRatio(&diff, "replicationRpcs", "writeCount",
             " %8.2f").c_str()));
-    result.append(format("%-30s %s\n", "  Log sync load factor",
+    result.append(format("%-40s %s\n", "  Log sync load factor",
             formatMetricRatio(&diff, "logSyncCycles",
             "collectionTime", " %8.2f").c_str()));
-    result.append(format("%-30s %s\n", "  Segment unopened time (%)",
+    result.append(format("%-40s %s\n", "  Segment unopened time (%)",
             formatMetricRatio(&diff, "segmentUnopenedCycles",
             "collectionTime", " %8.2f", 100).c_str()));
 
     result.append("\nLog cleaner:\n");
-    result.append(format("%-30s %s\n", "  Compactor load factor",
+    result.append(format("%-40s %s\n", "  Compactor load factor",
             formatMetricRatio(&diff, "compactorActiveCycles",
             "collectionTime", " %8.3f").c_str()));
-    result.append(format("%-30s %s\n", "  Cleaner load factor",
+    result.append(format("%-40s %s\n", "  Cleaner load factor",
             formatMetricRatio(&diff, "cleanerActiveCycles",
             "collectionTime", " %8.3f").c_str()));
-    result.append(format("%-30s %s\n", "  Compactor input (MB)",
+    result.append(format("%-40s %s\n", "  Compactor input (MB)",
             formatMetric(&diff, "compactorInputBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Compactor survivor data (MB)",
+    result.append(format("%-40s %s\n", "  Compactor survivor data (MB)",
             formatMetric(&diff, "compactorSurvivorBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Compactor utilization",
+    result.append(format("%-40s %s\n", "  Compactor utilization",
             formatMetricRatio(&diff, "compactorSurvivorBytes",
             "compactorInputBytes", " %8.3f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Cleaner memory input (MB)",
+    result.append(format("%-40s %s\n", "  Cleaner memory input (MB)",
             formatMetric(&diff, "cleanerInputMemoryBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Cleaner disk input (MB)",
+    result.append(format("%-40s %s\n", "  Cleaner disk input (MB)",
             formatMetric(&diff, "cleanerInputDiskBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Cleaner survivor data (MB)",
+    result.append(format("%-40s %s\n", "  Cleaner survivor data (MB)",
             formatMetric(&diff, "cleanerSurvivorBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Cleaner utilization",
+    result.append(format("%-40s %s\n", "  Cleaner utilization",
             formatMetricRatio(&diff, "cleanerSurvivorBytes",
             "cleanerInputDiskBytes", " %8.3f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Cleaner survivor rate (MB/s)",
+    result.append(format("%-40s %s\n", "  Cleaner survivor rate (MB/s)",
             formatMetricRate(&diff, "cleanerSurvivorBytes",
             " %8.2f", 1e-6).c_str()));
 
     result.append("\nIndex B+ Tree Operations:\n");
-    result.append(format("%-30s %s\n", "  Node reads",
+    result.append(format("%-40s %s\n", "  Node reads",
             formatMetric(&diff, "btreeNodeReads", " %8.0f").c_str()));
-    result.append(format("%-30s %s\n", "  Node writes",
+    result.append(format("%-40s %s\n", "  Node writes",
             formatMetric(&diff, "btreeNodeWrites", " %8.0f").c_str()));
-    result.append(format("%-30s %s\n", "  Bytes read for nodes (KB)",
+    result.append(format("%-40s %s\n", "  Bytes read for nodes (KB)",
             formatMetric(&diff, "btreeBytesRead", " %8.3f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Bytes written for nodes (KB)",
+    result.append(format("%-40s %s\n", "  Bytes written for nodes (KB)",
             formatMetric(&diff, "btreeBytesWritten", " %8.3f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Node splits",
+    result.append(format("%-40s %s\n", "  Node splits",
             formatMetric(&diff, "btreeNodeSplits", " %8.0f").c_str()));
-    result.append(format("%-30s %s\n", "  Node coalesces",
+    result.append(format("%-40s %s\n", "  Node coalesces",
             formatMetric(&diff, "btreeNodeCoalesces", " %8.0f").c_str()));
-    result.append(format("%-30s %s\n", "  Node re-balances",
+    result.append(format("%-40s %s\n", "  Node re-balances",
             formatMetric(&diff, "btreeRebalances", " %8.0f").c_str()));
 
     result.append("\nBackup service:\n");
-    result.append(format("%-30s %s\n", "  Backup bytes received (MB/s)",
+    result.append(format("%-40s %s\n", "  Backup bytes received (MB/s)",
             formatMetricRate(&diff, "backupBytesReceived",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Storage writes (MB/s)",
+    result.append(format("%-40s %s\n", "  Storage writes (MB/s)",
             formatMetricRate(&diff, "backupWriteBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Storage write ops/sec",
+    result.append(format("%-40s %s\n", "  Storage write ops/sec",
             formatMetricRate(&diff, "backupWriteOps",
             " %8.1f").c_str()));
-    result.append(format("%-30s %s\n", "  KB per storage write",
+    result.append(format("%-40s %s\n", "  KB per storage write",
             formatMetricRatio(&diff, "backupWriteBytes", "backupWriteOps",
             " %8.2f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Storage write load factor",
+    result.append(format("%-40s %s\n", "  Storage write load factor",
             formatMetricRatio(&diff, "backupWriteActiveCycles",
             "collectionTime", " %8.3f").c_str()));
-    result.append(format("%-30s %s\n", "  Storage reads (MB/s)",
+    result.append(format("%-40s %s\n", "  Storage reads (MB/s)",
             formatMetricRate(&diff, "backupReadBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Storage read ops/sec",
+    result.append(format("%-40s %s\n", "  Storage read ops/sec",
             formatMetricRate(&diff, "backupReadOps",
             " %8.1f").c_str()));
-    result.append(format("%-30s %s\n", "  KB per storage read",
+    result.append(format("%-40s %s\n", "  KB per storage read",
             formatMetricRatio(&diff, "backupReadBytes", "backupReadOps",
             " %8.2f", 1e-3).c_str()));
-    result.append(format("%-30s %s\n", "  Storage read load factor",
+    result.append(format("%-40s %s\n", "  Storage read load factor",
             formatMetricRatio(&diff, "backupReadActiveCycles",
             "collectionTime", " %8.3f").c_str()));
 
     result.append("\nMigration:\n");
-    result.append(format("%-30s %s\n", "  P1 migrated bytes (MB/s)",
+    result.append(format("%-40s %s\n", "  P1 migrated bytes (MB/s)",
             formatMetricRate(&diff, "migrationPhase1Bytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  P1 load factor",
+    result.append(format("%-40s %s\n", "  P1 load factor",
             formatMetricRatio(&diff, "migrationPhase1Cycles",
             "collectionTime", " %8.3f").c_str()));
 
     result.append("\nNetwork:\n");
-    result.append(format("%-30s %s\n", "  Input bytes (MB/s)",
+    result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
             formatMetricRate(&diff, "networkInputBytes",
             " %8.2f", 1e-6).c_str()));
-    result.append(format("%-30s %s\n", "  Output bytes (MB/s)",
+    result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
             formatMetricRate(&diff, "networkOutputBytes",
             " %8.2f", 1e-6).c_str()));
+*/
+    result.append("\nMilliSort:\n");
+    result.append(format("%-40s %s\n", "Elapsed time (us)",
+            formatMetricRatio(&diff, "millisortTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Local sort (us)",
+            formatMetricRatio(&diff, "localSortLatency", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Gather pivots (us)",
+            formatMetricRatio(&diff, "gatherPivotsCycles", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Merge pivots (us)",
+            formatMetricRatio(&diff, "mergePivotsCycles", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Gather super-pivots (us)",
+            formatMetricRatio(&diff, "gatherSuperPivotsCycles", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Merge super-pivots (us)",
+            formatMetricRatio(&diff, "mergeSuperPivotsCycles", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Bcast pivot bucket boundaries (us)",
+            formatMetricRatio(&diff, "bcastPivotBucketBoundariesCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Bucket sort pivots (us)",
+            formatMetricRatio(&diff, "bucketSortPivotsCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Merge pivots in bucket sort (us)",
+            formatMetricRatio(&diff, "mergePivotsInBucketSortCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  All-gather pivots (us)",
+            formatMetricRatio(&diff, "allGatherPivotsCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Merge in all-gather pivots (us)",
+            formatMetricRatio(&diff, "allGatherPivotsMergeCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Bucket sort data (us)",
+            formatMetricRatio(&diff, "bucketSortDataCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Merge in bucket sort data (us)",
+            formatMetricRatio(&diff, "bucketSortDataMergeCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
     return result;
 }
 
@@ -363,6 +423,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         // match the declaration order in PerfStats.h.
         (*diff)["serverId"].push_back(static_cast<double>(i));
         (*diff)["cyclesPerSecond"].push_back(p1.cyclesPerSecond);
+        (*diff)["cyclesPerMicros"].push_back(p1.cyclesPerSecond * 1e-6);
         ADD_METRIC(collectionTime);
         ADD_METRIC(readCount);
         ADD_METRIC(readObjectBytes);
@@ -401,6 +462,22 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(migrationPhase1Cycles);
         ADD_METRIC(networkInputBytes);
         ADD_METRIC(networkOutputBytes);
+        ADD_METRIC(millisortTime);
+        ADD_METRIC(localSortLatency);
+//        ADD_METRIC(localSortCycles);
+        ADD_METRIC(gatherPivotsCycles);
+        ADD_METRIC(gatherPivotsOutputBytes);
+        ADD_METRIC(gatherPivotsInputBytes);
+        ADD_METRIC(mergePivotsCycles);
+        ADD_METRIC(gatherSuperPivotsCycles);
+        ADD_METRIC(mergeSuperPivotsCycles);
+        ADD_METRIC(bcastPivotBucketBoundariesCycles);
+        ADD_METRIC(bucketSortPivotsCycles);
+        ADD_METRIC(mergePivotsInBucketSortCycles);
+        ADD_METRIC(allGatherPivotsCycles);
+        ADD_METRIC(allGatherPivotsMergeCycles);
+        ADD_METRIC(bucketSortDataCycles);
+        ADD_METRIC(bucketSortDataMergeCycles);
         ADD_METRIC(temp1);
         ADD_METRIC(temp2);
         ADD_METRIC(temp3);

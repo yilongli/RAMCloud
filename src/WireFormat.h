@@ -281,6 +281,10 @@ struct StartMilliSort {
     static const ServiceType service = MILLISORT_SERVICE;
     struct Request {
         RequestCommon common;
+
+        /// Identifier of the millisort request set by the client.
+        int32_t requestId;
+
         /// True if this RPC is initiated from an external client outside the
         /// MilliSort service nodes.
         bool fromClient;

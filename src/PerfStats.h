@@ -265,6 +265,64 @@ struct PerfStats {
     uint64_t logUsedBytesInBackups;
 
     //--------------------------------------------------------------------
+    // Statistics for MilliSort follow below.
+    //--------------------------------------------------------------------
+
+    // FIXME: so which of these are aggregation-based? and which are not?
+
+    /// Time (in cycles) spent by the worker thread to server millisort
+    /// requests. This is the end-to-end time that millisort takes.
+    uint64_t millisortTime;
+
+    /// Time (in cycles) spent by the worker thread that invokes the local sort
+    /// subroutine waiting for the sorting to complete. This is the end-to-end
+    /// time that the local sort takes.
+    uint64_t localSortLatency;
+
+    /// Total time (in cycles) spent by worker threads sorting the keys (i.e.
+    /// if 2 threads are working at once, this counter advances at twice real
+    /// time).
+//    uint64_t localSortCycles;
+
+    /// Time (in cycles) spent by the worker thread waiting for the
+    /// gather-pivots operation to complete.
+    uint64_t gatherPivotsCycles;
+
+    /// Total bytes transmitted on the network by the gather-pivots operation.
+    uint64_t gatherPivotsOutputBytes;
+
+    /// Total bytes received from the network by the gather-pivots operation.
+    uint64_t gatherPivotsInputBytes;
+
+    /// Time (in cycles) spent by worker threads merging the pivots received
+    /// from the gather-pivots operation.
+    uint64_t mergePivotsCycles;
+
+    /// Time (in cycles) spent by the worker thread waiting for the
+    /// gather-super-pivots operation to complete.
+    uint64_t gatherSuperPivotsCycles;
+
+    /// Time (in cycles) spent by worker threads merging the super-pivots
+    /// received from the gather-super-pivots operation.
+    uint64_t mergeSuperPivotsCycles;
+
+    /// Time (in cycles) spent by the worker thread waiting for the
+    /// broadcast-pivot-bucket-boundaries operation to complete.
+    uint64_t bcastPivotBucketBoundariesCycles;
+
+    uint64_t bucketSortPivotsCycles;
+
+    uint64_t mergePivotsInBucketSortCycles;
+
+    uint64_t allGatherPivotsCycles;
+
+    uint64_t allGatherPivotsMergeCycles;
+
+    uint64_t bucketSortDataCycles;
+
+    uint64_t bucketSortDataMergeCycles;
+
+    //--------------------------------------------------------------------
     // Temporary counters. The values below have no pre-defined use;
     // they are intended for temporary use during debugging or performance
     // analysis. Committed code in the repo should not set these counters.

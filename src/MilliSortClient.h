@@ -71,11 +71,11 @@ class InitMilliSortRpc : public ServerIdRpcWrapper {
  */
 class StartMilliSortRpc : public ServerIdRpcWrapper {
   public:
-    StartMilliSortRpc(Context* context, ServerId serverId,
+    StartMilliSortRpc(Context* context, ServerId serverId, int requestId,
             bool fromClient = true);
     ~StartMilliSortRpc() {}
 
-    static void appendRequest(Buffer* request, bool fromClient);
+    static void appendRequest(Buffer* request, int requestId, bool fromClient);
 
     /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
     void wait() {waitAndCheckErrors();}

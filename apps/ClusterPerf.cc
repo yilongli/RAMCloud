@@ -90,6 +90,9 @@ static int objectSize;
 // determine the number of objects that should be part of a given operation.
 static int numObjects;
 
+static int dataTuplesPerNode;
+static int nodesPerPivotServer;
+
 // Value of the "--numTables" command-line option: used by some tests
 // to specify the number of tables to create.
 static int numTables;
@@ -7301,8 +7304,6 @@ void
 millisort()
 {
     ServerId rootServer(1, 0);
-    uint32_t dataTuplesPerServer = 100;
-    uint32_t nodesPerGroup = 4;
 
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7311,21 +7312,29 @@ millisort()
     CoordinatorClient::getServerList(context, &list);
     serverList.applyServerList(list);
 
+    // Start performance counters.
+    cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
+
     for (int i = 0; i < count; i++) {
         // Initialize the experiment.
-        InitMilliSortRpc initRpc(context, rootServer, dataTuplesPerServer,
-                nodesPerGroup);
+        InitMilliSortRpc initRpc(context, rootServer,
+                downCast<uint32_t>(dataTuplesPerNode),
+                downCast<uint32_t>(nodesPerPivotServer));
         initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
                 initRpc.getNodesInited());
 
-        //
-        uint64_t startTime = Cycles::rdtsc();
-        StartMilliSortRpc startRpc(context, rootServer);
+        Buffer statsBefore, statsAfter;
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsBefore);
+
+        StartMilliSortRpc startRpc(context, rootServer, i);
         startRpc.wait();
-        uint64_t totalCycles = Cycles::rdtsc() - startTime;
-        printf("MilliSort request finished in %.1f us\n",
-                Cycles::toSeconds(totalCycles) * 1e6);
+
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsAfter);
+        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
+                .c_str());
     }
 }
 
@@ -7409,6 +7418,11 @@ try
                 "Size of objects (in bytes) to use for test")
         ("numObjects", po::value<int>(&numObjects)->default_value(1),
                 "Number of object per operation to use for test")
+        ("dataTuplesPerNode", po::value<int>(&dataTuplesPerNode)->default_value(100),
+                "Number of data tuples a server holds initially in MilliSort")
+        ("nodesPerPivotServer", po::value<int>(&nodesPerPivotServer)->default_value(4),
+                "Number of nodes (including itself) a pivot server manages in "
+                "MilliSort")
         ("numTables", po::value<int>(&numTables)->default_value(10),
                 "Number of tables to use for test")
         ("testName", po::value<vector<string>>(&testNames),

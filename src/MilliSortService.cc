@@ -65,6 +65,8 @@ MilliSortService::MilliSortService(Context* context,
     , serverConfig(serverConfig)
     , communicationGroupTable()
     , ongoingMilliSort()
+    , startTime()
+    , endTime()
     , pivotServerRank(-1)
     , isPivotServer()
     , numDataTuples(-1)
@@ -247,7 +249,9 @@ void
 MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqHdr,
         WireFormat::StartMilliSort::Response* respHdr, Rpc* rpc)
 {
-    timeTrace("startMilliSort invoked, fromClient %u", reqHdr->fromClient);
+    startTime = Cycles::rdtsc();
+    timeTrace("startMilliSort invoked, requestId %u, fromClient %u",
+            uint(reqHdr->requestId), reqHdr->fromClient);
 
     if (ongoingMilliSort != NULL) {
         respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
@@ -264,7 +268,7 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
 
         // Start broadcasting the start request.
         TreeBcast startBcast(context, world.get());
-        startBcast.send<StartMilliSortRpc>(false);
+        startBcast.send<StartMilliSortRpc>(reqHdr->requestId, false);
 
         // FIXME: I am throwing away an entire worker thread here; should I use
         // sleep? Arachne?
@@ -312,12 +316,18 @@ void
 MilliSortService::localSortAndPickPivots()
 {
     timeTrace("=== Stage 1: localSortAndPickPivots started");
-    std::sort(keys.begin(), keys.end());
+
+    {
+        CycleCounter<> _(&PerfStats::threadStats.localSortLatency);
+        std::sort(keys.begin(), keys.end());
+    }
+
     partition(&keys, std::min((int)keys.size(), world->size()), &localPivots);
     debugLogKeys("local pivots: ", &localPivots);
 
     // Merge pivots from slave nodes as they arrive.
     auto merger = [this] (Buffer* pivotsBuffer) {
+            CycleCounter<> _(&PerfStats::threadStats.mergePivotsCycles);
             uint32_t offset = 0;
             while (offset < pivotsBuffer->size()) {
                 gatheredPivots.push_back(*pivotsBuffer->read<SortKey>(&offset));
@@ -329,13 +339,22 @@ MilliSortService::localSortAndPickPivots()
     // Initiate the gather op that collects pivots to the pivot server.
     timeTrace("sorted %u data tuples, picked %u local pivots, about to gather "
             "pivots", keys.size(), localPivots.size());
-    Tub<FlatGather> gatherPivots;
-    invokeCollectiveOp<FlatGather>(gatherPivots, GATHER_PIVOTS, context,
-            myPivotServerGroup.get(), 0, (uint32_t) localPivots.size(),
-            localPivots.data(), &merger);
-    gatherPivots->wait();
-    // TODO: the cleanup is not very nice; how to do RAII?
-    collectiveOpTable.erase(GATHER_PIVOTS);
+    {
+        CycleCounter<> _(&PerfStats::threadStats.gatherPivotsCycles);
+        Tub<FlatGather> gatherPivots;
+        invokeCollectiveOp<FlatGather>(gatherPivots, GATHER_PIVOTS, context,
+                myPivotServerGroup.get(), 0, (uint32_t) localPivots.size(),
+                localPivots.data(), &merger);
+        gatherPivots->wait();
+        // TODO: the cleanup is not very nice; how to do RAII?
+        collectiveOpTable.erase(GATHER_PIVOTS);
+
+        // FIXME: seems wrong division of responsibility; should I move this
+        // into Gather class? Also this assumes a particular implementation of
+        // Gather.
+        PerfStats::threadStats.gatherPivotsOutputBytes +=
+                localPivots.size() * KeySize;
+    }
 
     // Pivot servers will advance to pick super pivots when the gather op
     // completes. Normal nodes will wait to receive data bucket boundaries.
@@ -360,6 +379,7 @@ MilliSortService::pickSuperPivots()
 
     // Merge super pivots from pivot servers as they arrive.
     auto merger = [this] (Buffer* pivotsBuf) {
+            CycleCounter<> _(&PerfStats::threadStats.mergeSuperPivotsCycles);
             uint32_t offset = 0;
             while (offset < pivotsBuf->size()) {
                 globalSuperPivots.push_back(*pivotsBuf->read<SortKey>(&offset));
@@ -371,13 +391,16 @@ MilliSortService::pickSuperPivots()
     // Initiate the gather op that collects super pivots to the root node.
     timeTrace("picked %u super-pivots, about to gather super-pivots",
             superPivots.size());
-    Tub<FlatGather> gatherSuperPivots;
-    invokeCollectiveOp<FlatGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
-            context, allPivotServers.get(), 0, (uint32_t) superPivots.size(),
-            superPivots.data(), &merger);
-    // fixme: this is duplicated everywhere
-    gatherSuperPivots->wait();
-    collectiveOpTable.erase(GATHER_SUPER_PIVOTS);
+    {
+        CycleCounter<> _(&PerfStats::threadStats.gatherSuperPivotsCycles);
+        Tub<FlatGather> gatherSuperPivots;
+        invokeCollectiveOp<FlatGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
+                context, allPivotServers.get(), 0,
+                (uint32_t) superPivots.size(), superPivots.data(), &merger);
+        // fixme: this is duplicated everywhere
+        gatherSuperPivots->wait();
+        collectiveOpTable.erase(GATHER_SUPER_PIVOTS);
+    }
 
     // The root node will advance to pick pivot bucket boundaries when the
     // gather op completes. Other pivot servers will wait to receive pivot
@@ -403,13 +426,17 @@ MilliSortService::pickPivotBucketBoundaries()
     // Broadcast computed pivot bucket boundaries to the other pivot servers
     // (excluding ourselves).
     // TODO: can we unify the API of broadcast and other collective op?
-    timeTrace("picked %u pivot bucket boundaries, about to broadcast");
-    TreeBcast bcast(context, allPivotServers.get());
-    bcast.send<SendDataRpc>(BROADCAST_PIVOT_BUCKET_BOUNDARIES,
-            // TODO: simplify the SendDataRpc api?
-            downCast<uint32_t>(KeySize * pivotBucketBoundaries.size()),
-            pivotBucketBoundaries.data());
-    bcast.wait();
+    timeTrace("picked %u pivot bucket boundaries, about to broadcast",
+            pivotBucketBoundaries.size());
+    {
+        CycleCounter<> _(&PerfStats::threadStats.bcastPivotBucketBoundariesCycles);
+        TreeBcast bcast(context, allPivotServers.get());
+        bcast.send<SendDataRpc>(BROADCAST_PIVOT_BUCKET_BOUNDARIES,
+                // TODO: simplify the SendDataRpc api?
+                downCast<uint32_t>(KeySize * pivotBucketBoundaries.size()),
+                pivotBucketBoundaries.data());
+        bcast.wait();
+    }
 
     timeTrace("broadcast to %u pivot servers", uint(allPivotServers->size()));
     pivotBucketSort();
@@ -423,6 +450,7 @@ MilliSortService::pivotBucketSort()
 
     // Merge pivots from pivot servers as they arrive.
     auto merger = [this] (Buffer* data) {
+        CycleCounter<> _(&PerfStats::threadStats.mergePivotsInBucketSortCycles);
         uint32_t offset = 0;
         numSmallerPivots += *data->read<uint32_t>(&offset);
         numPivotsInTotal += *data->read<uint32_t>(&offset);
@@ -438,33 +466,38 @@ MilliSortService::pivotBucketSort()
     // Send pivots to their designated pivot servers determined by the pivot
     // bucket boundaries.
     timeTrace("about to shuffle pivots");
-    Tub<AllShuffle> pivotsShuffle;
-    invokeCollectiveOp<AllShuffle>(pivotsShuffle, ALLSHUFFLE_PIVOTS, context,
-            allPivotServers.get(), &merger);
-    uint32_t k = 0;
-    for (int rank = 0; rank < int(pivotBucketBoundaries.size()); rank++) {
-        // Prepare the data to send to node `rank`.
-        uint32_t numSmallerPivots = k;
-        uint32_t numPivots = downCast<uint32_t>(gatheredPivots.size());
+    {
+        CycleCounter<> _(&PerfStats::threadStats.bucketSortPivotsCycles);
+        Tub<AllShuffle> pivotsShuffle;
+        invokeCollectiveOp<AllShuffle>(pivotsShuffle, ALLSHUFFLE_PIVOTS,
+                context,
+                allPivotServers.get(), &merger);
+        uint32_t k = 0;
+        for (int rank = 0; rank < int(pivotBucketBoundaries.size()); rank++) {
+            // Prepare the data to send to node `rank`.
+            uint32_t numSmallerPivots = k;
+            uint32_t numPivots = downCast<uint32_t>(gatheredPivots.size());
 
-        // The data message starts with two 32-bit numbers: the number of pivots
-        // smaller than the current bucket and the total number of pivots this
-        // pivot server has. They are used to compute the data bucket boundaries
-        // in the next step.
-        Buffer* buffer = pivotsShuffle->getSendBuffer(rank);
-        buffer->appendCopy(&numSmallerPivots);
-        buffer->appendCopy(&numPivots);
+            // The data message starts with two 32-bit numbers: the number of pivots
+            // smaller than the current bucket and the total number of pivots this
+            // pivot server has. They are used to compute the data bucket boundaries
+            // in the next step.
+            Buffer* buffer = pivotsShuffle->getSendBuffer(rank);
+            buffer->appendCopy(&numSmallerPivots);
+            buffer->appendCopy(&numPivots);
 
-        SortKey boundary = pivotBucketBoundaries[rank];
-        while ((k < gatheredPivots.size()) && (gatheredPivots[k] <= boundary)) {
-            buffer->appendCopy(&gatheredPivots[k]);
-            k++;
+            SortKey boundary = pivotBucketBoundaries[rank];
+            while ((k < gatheredPivots.size()) &&
+                   (gatheredPivots[k] <= boundary)) {
+                buffer->appendCopy(&gatheredPivots[k]);
+                k++;
+            }
+            pivotsShuffle->closeSendBuffer(rank);
         }
-        pivotsShuffle->closeSendBuffer(rank);
+        pivotsShuffle->wait();
+        collectiveOpTable.erase(ALLSHUFFLE_PIVOTS);
+        debugLogKeys("sorted pivots (local portion): ", &sortedGatheredPivots);
     }
-    pivotsShuffle->wait();
-    collectiveOpTable.erase(ALLSHUFFLE_PIVOTS);
-    debugLogKeys("sorted pivots (local portion): ", &sortedGatheredPivots);
 
     // Pivot servers will advance to pick data bucket boundaries when the
     // shuffle completes.
@@ -498,6 +531,7 @@ MilliSortService::pickDataBucketBoundaries()
 
     // Merge data bucket boundaries from pivot servers as they arrive.
     auto merger = [this] (Buffer* pivotsBuffer) {
+            CycleCounter<> _(&PerfStats::threadStats.allGatherPivotsMergeCycles);
             uint32_t offset = 0;
             while (offset < pivotsBuffer->size()) {
                 SortKey boundary = *pivotsBuffer->read<SortKey>(&offset);
@@ -512,20 +546,23 @@ MilliSortService::pickDataBucketBoundaries()
 
     // Gather data bucket boundaries from pivot servers to all nodes.
     timeTrace("about to all-gather data bucket boundaries");
-    Tub<AllGather> allGather;
-    if (isPivotServer) {
-        invokeCollectiveOp<AllGather>(allGather,
-                ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
-                allPivotServers.get(), world.get(),
-                (uint32_t) partialDataBucketBoundaries.size(),
-                partialDataBucketBoundaries.data(), &merger);
-    } else {
-        invokeCollectiveOp<AllGather>(allGather,
-                ALLGATHER_DATA_BUCKET_BOUNDARIES, context, &merger);
+    {
+        CycleCounter<> _(&PerfStats::threadStats.allGatherPivotsCycles);
+        Tub<AllGather> allGather;
+        if (isPivotServer) {
+            invokeCollectiveOp<AllGather>(allGather,
+                    ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
+                    allPivotServers.get(), world.get(),
+                    (uint32_t) partialDataBucketBoundaries.size(),
+                    partialDataBucketBoundaries.data(), &merger);
+        } else {
+            invokeCollectiveOp<AllGather>(allGather,
+                    ALLGATHER_DATA_BUCKET_BOUNDARIES, context, &merger);
+        }
+        allGather->wait();
+        collectiveOpTable.erase(ALLGATHER_DATA_BUCKET_BOUNDARIES);
+        debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
     }
-    allGather->wait();
-    collectiveOpTable.erase(ALLGATHER_DATA_BUCKET_BOUNDARIES);
-    debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
 
     // All nodes will advance to the final data shuffle when the all-gather
     // completes.
@@ -541,6 +578,7 @@ MilliSortService::dataBucketSort()
 
     // Merge data from other nodes as they arrive.
     auto merger = [this] (Buffer* data) {
+        CycleCounter<> _(&PerfStats::threadStats.bucketSortDataMergeCycles);
         uint32_t offset = 0;
         while (offset < data->size()) {
             sortedKeys.push_back(*data->read<SortKey>(&offset));
@@ -553,21 +591,27 @@ MilliSortService::dataBucketSort()
     // Send data to their designated nodes determined by the data bucket
     // boundaries.
     timeTrace("about to shuffle data tuples");
-    Tub<AllShuffle> dataShuffle;
-    invokeCollectiveOp<AllShuffle>(dataShuffle, ALLSHUFFLE_DATA, context,
-            world.get(), &merger);
-    uint32_t k = 0;
-    for (int rank = 0; rank < int(dataBucketBoundaries.size()); rank++) {
-        Buffer* buffer = dataShuffle->getSendBuffer(rank);
-        SortKey boundary = dataBucketBoundaries[rank];
-        while ((k < keys.size()) && (keys[k] <= boundary)) {
-            buffer->appendCopy(&keys[k]);
-            k++;
+    {
+        CycleCounter<> _(&PerfStats::threadStats.bucketSortDataCycles);
+        Tub<AllShuffle> dataShuffle;
+        invokeCollectiveOp<AllShuffle>(dataShuffle, ALLSHUFFLE_DATA, context,
+                world.get(), &merger);
+        uint32_t k = 0;
+        for (int rank = 0; rank < int(dataBucketBoundaries.size()); rank++) {
+            Buffer* buffer = dataShuffle->getSendBuffer(rank);
+            SortKey boundary = dataBucketBoundaries[rank];
+            while ((k < keys.size()) && (keys[k] <= boundary)) {
+                buffer->appendCopy(&keys[k]);
+                k++;
+            }
+            dataShuffle->closeSendBuffer(rank);
         }
-        dataShuffle->closeSendBuffer(rank);
+        dataShuffle->wait();
+        collectiveOpTable.erase(ALLSHUFFLE_DATA);
     }
-    dataShuffle->wait();
-    collectiveOpTable.erase(ALLSHUFFLE_DATA);
+
+    endTime = Cycles::rdtsc();
+    PerfStats::threadStats.millisortTime += endTime - startTime;
     timeTrace("millisort finished");
 
     if (ongoingMilliSort) {

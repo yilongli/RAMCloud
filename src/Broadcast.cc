@@ -1,7 +1,30 @@
 #include "Broadcast.h"
 #include "MilliSortService.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
+
+// Change 0 -> 1 in the following line to compile detailed time tracing in
+// this transport.
+#define TIME_TRACE 1
+
+// Provides a cleaner way of invoking TimeTrace::record, with the code
+// conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
+// are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
+// frequently cast their 64-bit arguments into uint32_t explicitly: we will
+// help perform the casting internally.
+namespace {
+    inline void
+    timeTrace(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+}
 
 /// This table records the structure of a 100-node k-nomial-tree with node 0
 /// being the root. To be more precise, the i-th (i >= 0) element of the first-
@@ -71,6 +94,8 @@ TreeBcast::TreeBcast(Context* context,
     , payloadRpc()
     , serviceRpc(rpc)
 {
+    timeTrace("TreeBcast: received request, rank %u", uint32_t(group->rank));
+
     // Copy out the payload request (from network packet buffers) to make it
     // contiguous. TreeBcast is not meant for large messages anyway.
     payloadRequest.append(rpc->requestPayload, sizeof(*reqHdr), ~0u);

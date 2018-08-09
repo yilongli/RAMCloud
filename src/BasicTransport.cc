@@ -1221,6 +1221,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
+                // TODO: might be useful later; delete it eventually
+//                if (header->common.rpcId.clientId == clientId) {
+//                    TimeTrace::record("about to handle pseudo RPC!!!!!!");
+//                }
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
