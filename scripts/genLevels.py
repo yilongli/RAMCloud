@@ -79,8 +79,9 @@ callees = {
     "WRITE":                 ["BACKUP_WRITE", "INSERT_INDEX_ENTRY",
                               "REMOVE_INDEX_ENTRY"],
     # FIXME: Not sure we want to fix those RpcLevel::checkCall warnings.
+    "BCAST_TREE":            ["GATHER_FLAT", "ALL_GATHER"],
     # "INIT_MILLISORT":        ["INIT_MILLISORT"],
-    # "START_MILLISORT":       ["START_MILLISORT"],
+    "START_MILLISORT":       ["BCAST_TREE"],
 }
 
 # The following dictionary maps from the name of an opcode to its

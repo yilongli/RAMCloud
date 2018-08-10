@@ -55,6 +55,10 @@ WorkerManager::timeTrace(const char* format,
 #endif
 }
 
+// Change the following from 0 -> 1 to enable log statements for debugging
+// distributed deadlocks in worker threads.
+#define DEBUG_DEADLOCK 0
+
 /**
  * Default object used to make system calls.
  */
@@ -207,10 +211,10 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     if ((header->opcode >= WireFormat::GATHER_FLAT) &&
             (header->opcode <= WireFormat::ALL_SHUFFLE)) {
         MilliSortService* millisort = context->getMilliSortService();
-        WireFormat::RequestCommonWithOpId* reqHdr =
-                rpc->requestPayload.getStart<WireFormat::RequestCommonWithOpId>();
+        uint32_t opId = reinterpret_cast<
+                const WireFormat::RequestCommonWithOpId*>(header)->opId;
         Service::CollectiveOpRecord* record =
-                millisort->getCollectiveOpRecord(reqHdr->opId);
+                millisort->getCollectiveOpRecord(opId);
         if (record->op == NULL) {
             record->serverRpcList.push_back(rpc);
 //            LOG(WARNING, "%s RPC from op %u arrives early, record %p, op %p",
@@ -245,9 +249,10 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
                 levels[level].waitingRpcs.push(rpc);
                 rpcsWaiting++;
                 timeTrace("RPC deferred; threads busy");
-//                LOG(WARNING, "%s deferred; busyThreads %lu, maxCores %u",
-//                        WireFormat::opcodeSymbol(header->opcode),
-//                        busyThreads.size(), maxCores);
+#if DEBUG_DEADLOCK
+                LOG(NOTICE, "%s %p at level %d defered; threads busy",
+                        WireFormat::opcodeSymbol(header->opcode), rpc, level);
+#endif
                 return;
             }
         }
@@ -302,8 +307,7 @@ WorkerManager::poll()
         uint32_t delayMicros = static_cast<uint32_t>(
                 Cycles::toSeconds(Cycles::rdtsc() -
                 collectiveOpRpc->arriveTime) * 1e6);
-        auto opcode = collectiveOpRpc->requestPayload
-                .getStart<WireFormat::RequestCommon>()->opcode;
+        auto opcode = collectiveOpRpc->getOpcode();
         if (delayMicros > 2) {
             TimeTrace::record("opcode %u was delayed %u us; collective op not "
                     "ready", opcode, delayMicros);
@@ -368,11 +372,14 @@ WorkerManager::poll()
                     }
                     rpcsWaiting--;
                     level->requestsRunning++;
+                    Transport::ServerRpc* waitingRpc =
+                            level->waitingRpcs.front();
+                    worker->opcode = waitingRpc->getOpcode();
                     worker->level = i;
-                    worker->handoff(level->waitingRpcs.front());
+                    worker->handoff(waitingRpc);
                     uint32_t delayMicros = static_cast<uint32_t>(
-                            Cycles::toSeconds(Cycles::rdtsc() -
-                            level->waitingRpcs.back()->arriveTime) * 1e6);
+                            1e6 * Cycles::toSeconds(Cycles::rdtsc() -
+                            waitingRpc->arriveTime));
                     level->waitingRpcs.pop();
                     if (delayMicros > 2) {
                         TimeTrace::record("opcode %u was delayed %u us; busy "
@@ -393,9 +400,8 @@ WorkerManager::poll()
                     rpc->replyPayload.size());
 #endif
             rpc->sendReply();
-            timeTrace("sent reply for opcode %d, thread %d",
-                    worker->threadId, worker->opcode);
-
+            timeTrace("sent reply for opcode %u, thread %d",
+                    worker->opcode, worker->threadId);
         }
 
         // If the worker is idle, remove it from busyThreads (fill its
@@ -409,8 +415,6 @@ WorkerManager::poll()
             busyThreads.pop_back();
             worker->busyIndex = -1;
             idleThreads.push_back(worker);
-//            TimeTrace::record("finished opcode %u by worker thread %u",
-//                    worker->opcode, worker->threadId);
         }
     }
     return foundWork;
@@ -512,6 +516,10 @@ WorkerManager::workerMain(Worker* worker)
             Service::Rpc rpc(worker, &worker->rpc->requestPayload,
                     &worker->rpc->replyPayload);
             Service::handleRpc(worker->context, &rpc);
+#if DEBUG_DEADLOCK
+            LOG(NOTICE, "worker thread %d finished %s %p", worker->threadId,
+                    WireFormat::opcodeSymbol(worker->opcode), worker->rpc);
+#endif
 
             // Pass the RPC back to the dispatch thread for completion.
             Fence::leave();
@@ -599,6 +607,10 @@ Worker::handoff(Transport::ServerRpc* newRpc)
     Fence::leave();
 //    TimeTrace::record("handing off opcode %u to worker thread %u",
 //            opcode, threadId);
+#if DEBUG_DEADLOCK
+    LOG(NOTICE, "handing off %s %p to worker thread %d",
+            WireFormat::opcodeSymbol(opcode), newRpc, threadId);
+#endif
 #ifdef SMTT
     if (rpc != WORKER_EXIT) {
         TimeTrace::record("handing off opcode %d to worker thread %d",

@@ -1,0 +1,41 @@
+for i in $(ls server*); do echo $i; grep "handing off" $i  | wc -l; grep "finished" $i | wc -l; done
+
+
+
+
+
+
+
+
+
+Server 2 has 3 blocking RPCs!!!!!!!!!!!!!!!
+
+1533937990.100514976 WorkerManager.cc:613 in handoff NOTICE[1]: handing off BCAST_TREE 0x7f1da2fdc810 to worker thread 8 !!!!!!!!!!!!!!
+1533937990.100524359 WorkerManager.cc:613 in handoff NOTICE[1]: handing off START_MILLISORT 0x7f1da2fdd220 to worker thread 7 !!!!!!!!!!!!!!!!!
+
+
+1533937990.101458164 WorkerManager.cc:613 in handoff NOTICE[1]: handing off BCAST_TREE 0x3fa25010 to worker thread 6 !!!!!!!!!!!!!!!!!!!
+1533937990.102178360 WorkerManager.cc:613 in handoff NOTICE[1]: handing off ALL_GATHER 0x3fa25a20 to worker thread 4
+1533937990.102415476 WorkerManager.cc:522 in workerMain NOTICE[4]: worker thread 4 finished ALL_GATHER 0x3fa25a20
+
+
+1533937990.102714781 WorkerManager.cc:252 in handleRpc NOTICE[1]: BCAST_TREE 0x3fa26e40 at level 1 defered; threads busy !!!!!!!!!!!!!!!!!!!!!11
+
+
+
+Server 6 also has 3 blocking RPCs, WHY????????????????????
+
+1533937990.100505713 WorkerManager.cc:613 in handoff NOTICE[1]: handing off BCAST_TREE 0x7f0ada79bc10 to worker thread 7
+1533937990.100511371 WorkerManager.cc:613 in handoff NOTICE[1]: handing off START_MILLISORT 0x7f0ad9f5b410 to worker thread 6
+
+
+1533937990.101437570 WorkerManager.cc:613 in handoff NOTICE[1]: handing off BCAST_TREE 0x7f0ad9f5be20 to worker thread 5
+1533937990.102158195 WorkerManager.cc:252 in handleRpc NOTICE[1]: BCAST_TREE 0x7f0ad9f5c830 at level 1 defered; threads busy
+1533937990.102725293 WorkerManager.cc:613 in handoff NOTICE[1]: handing off ALL_GATHER 0x7f0ad9f5d240 to worker thread 3
+1533937990.102965681 WorkerManager.cc:522 in workerMain NOTICE[3]: worker thread 3 finished ALL_GATHER 0x7f0ad9f5d240
+
+
+
+
+
+

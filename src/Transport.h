@@ -24,6 +24,7 @@
 #include "Buffer.h"
 #include "CodeLocation.h"
 #include "Exception.h"
+#include "WireFormat.h"
 
 namespace RAMCloud {
 class ServiceLocator;
@@ -109,6 +110,15 @@ class Transport {
          * used only off of the fast path).
          */
         virtual string getClientServiceLocator() = 0;
+
+        /**
+         * Return the opcode field in the RPC header.
+         */
+        WireFormat::Opcode getOpcode()
+        {
+            return WireFormat::Opcode(requestPayload
+                    .getStart<WireFormat::RequestCommon>()->opcode);
+        }
 
         /**
          * Returns false if the epoch was not set, else true. Used to assert
