@@ -288,6 +288,23 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
 }
 
 void
+MilliSortService::inplaceMerge(std::vector<SortKey>& keys,
+        size_t sizeOfFirstSortedRange)
+{
+    auto middle = keys.begin();
+    std::advance(middle, sizeOfFirstSortedRange);
+    std::inplace_merge(keys.begin(), middle, keys.end());
+}
+
+void
+MilliSortService::sort(std::vector<SortKey>& keys)
+{
+    if (!std::is_sorted(keys.begin(), keys.end())) {
+        std::sort(keys.begin(), keys.end());
+    }
+}
+
+void
 MilliSortService::partition(std::vector<SortKey>* keys, int numPartitions,
         std::vector<SortKey>* pivots)
 {
@@ -319,7 +336,7 @@ MilliSortService::localSortAndPickPivots()
 
     {
         CycleCounter<> _(&PerfStats::threadStats.localSortLatency);
-        std::sort(keys.begin(), keys.end());
+        sort(keys);
     }
 
     partition(&keys, std::min((int)keys.size(), world->size()), &localPivots);
@@ -329,10 +346,11 @@ MilliSortService::localSortAndPickPivots()
     auto merger = [this] (Buffer* pivotsBuffer) {
             CycleCounter<> _(&PerfStats::threadStats.mergePivotsCycles);
             uint32_t offset = 0;
+            size_t oldSize = gatheredPivots.size();
             while (offset < pivotsBuffer->size()) {
                 gatheredPivots.push_back(*pivotsBuffer->read<SortKey>(&offset));
             }
-            std::sort(gatheredPivots.begin(), gatheredPivots.end());
+            inplaceMerge(gatheredPivots, oldSize);
             timeTrace("merged %u pivots", pivotsBuffer->size() / KeySize);
     };
 
@@ -381,10 +399,11 @@ MilliSortService::pickSuperPivots()
     auto merger = [this] (Buffer* pivotsBuf) {
             CycleCounter<> _(&PerfStats::threadStats.mergeSuperPivotsCycles);
             uint32_t offset = 0;
+            size_t oldSize = globalSuperPivots.size();
             while (offset < pivotsBuf->size()) {
                 globalSuperPivots.push_back(*pivotsBuf->read<SortKey>(&offset));
             }
-            std::sort(globalSuperPivots.begin(), globalSuperPivots.end());
+            inplaceMerge(globalSuperPivots, oldSize);
             timeTrace("merged %u super-pivots", pivotsBuf->size() / KeySize);
     };
 
@@ -452,6 +471,7 @@ MilliSortService::pivotBucketSort()
     auto merger = [this] (Buffer* data) {
         CycleCounter<> _(&PerfStats::threadStats.mergePivotsInBucketSortCycles);
         uint32_t offset = 0;
+        size_t oldSize = sortedGatheredPivots.size();
         numSmallerPivots += *data->read<uint32_t>(&offset);
         numPivotsInTotal += *data->read<uint32_t>(&offset);
         while (offset < data->size()) {
@@ -459,7 +479,7 @@ MilliSortService::pivotBucketSort()
         }
 
         // FIXME: this should really be an in-place parallel merge operation
-        std::sort(sortedGatheredPivots.begin(), sortedGatheredPivots.end());
+        inplaceMerge(sortedGatheredPivots, oldSize);
         timeTrace("merged %u pivots", (data->size() - 8) / KeySize);
     };
 
@@ -533,11 +553,12 @@ MilliSortService::pickDataBucketBoundaries()
     auto merger = [this] (Buffer* pivotsBuffer) {
             CycleCounter<> _(&PerfStats::threadStats.allGatherPivotsMergeCycles);
             uint32_t offset = 0;
+            size_t oldSize = dataBucketBoundaries.size();
             while (offset < pivotsBuffer->size()) {
                 SortKey boundary = *pivotsBuffer->read<SortKey>(&offset);
                 dataBucketBoundaries.push_back(boundary);
             }
-            std::sort(dataBucketBoundaries.begin(), dataBucketBoundaries.end());
+            inplaceMerge(dataBucketBoundaries, oldSize);
             // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
             // are sorted globally, we know exactly where to insert even they come!
             timeTrace("merged %u data bucket boundaries",
@@ -580,11 +601,11 @@ MilliSortService::dataBucketSort()
     auto merger = [this] (Buffer* data) {
         CycleCounter<> _(&PerfStats::threadStats.bucketSortDataMergeCycles);
         uint32_t offset = 0;
+        size_t oldSize = sortedKeys.size();
         while (offset < data->size()) {
             sortedKeys.push_back(*data->read<SortKey>(&offset));
         }
-        // FIXME: this should really be an in-place parallel merge operation
-        std::sort(sortedKeys.begin(), sortedKeys.end());
+        inplaceMerge(sortedKeys, oldSize);
         timeTrace("merged %u keys", data->size() / KeySize);
     };
 

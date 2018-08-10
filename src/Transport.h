@@ -149,8 +149,10 @@ class Transport {
          */
         int activities;
 
-        /// Time (in rdtsc ticks) when this ServerRpc is handed to
-        /// WorkerManager.
+        /**
+         * Cycles::rdtsc time when this ServerRpc is passed to WorkerManager for
+         * processing via WorkerManager::handleRpc.
+         */
         uint64_t arriveTime;
 
         /**

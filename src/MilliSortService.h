@@ -214,6 +214,8 @@ class MilliSortService : public Service {
     // Computation steps
     // ----------------------
 
+    void inplaceMerge(vector<SortKey>& keys, size_t sizeOfFirstSortedRange);
+    void sort(vector<SortKey>& keys);
     void partition(std::vector<SortKey>* keys, int numPartitions,
             std::vector<SortKey>* pivots);
     void localSortAndPickPivots();

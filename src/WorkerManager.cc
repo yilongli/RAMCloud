@@ -457,6 +457,8 @@ void
 WorkerManager::workerMain(Worker* worker)
 {
     worker->threadId = ThreadId::get();
+    LOG(NOTICE, "Worker thread %d started on core %d", worker->threadId,
+            sched_getcpu());
     PerfStats::registerStats(&PerfStats::threadStats);
 
     // Cycles::rdtsc time that's updated continuously when this thread is idle.
@@ -526,14 +528,14 @@ WorkerManager::workerMain(Worker* worker)
             // floating-point computation. Should be as simple as "divided by
             // cyclesPerMillis"
             double elapsedMs = Cycles::toSeconds(activeCycles)*1e3;
-            if (elapsedMs > 1) {
+            if (elapsedMs > 0.1) {
 //                LOG(WARNING, "Worker thread %d spent %.1f ms on opcode %u; "
 //                        "thread preempted?", worker->threadId, elapsedMs,
 //                        worker->opcode);
                 TimeTrace::record("worker thread %u spent %u us to complete "
                         "opcode %u; thread preempted?",
                         (uint32_t)worker->threadId,
-                        (uint32_t)Cycles::toMicroseconds(activeCycles),
+                        uint32_t(elapsedMs * 1e3),
                         worker->opcode);
             }
             lastIdle = current;
