@@ -26,6 +26,11 @@
 #include "TableManager.h"
 #include "TransportManager.h"
 #include "WorkerManager.h"
+#include "Arachne/Arachne.h"
+#include "Arachne/CorePolicy.h"
+#include "Arachne/DefaultCorePolicy.h"
+#include "FileLogger.h"
+#include "PerfUtils/Util.h"
 
 /**
  * \file
@@ -46,7 +51,7 @@ using namespace RAMCloud;
  *      nonzero means an error occurred.
  */
 int
-main(int argc, char *argv[])
+realMain(int argc, char *argv[])
 {
     Logger::installCrashBacktraceHandlers();
     string localLocator("???");
@@ -98,7 +103,7 @@ main(int argc, char *argv[])
 
         Context context(true, &optionParser.options);
 
-        context.workerManager = new WorkerManager(&context, maxCores-1);
+        context.workerManager = new WorkerManager(&context);
 
         pinAllMemory();
         localLocator = optionParser.options.getCoordinatorLocator();
@@ -160,4 +165,24 @@ main(int argc, char *argv[])
         Logger::get().sync();
         return 1;
     }
+}
+int
+main(int argc, const char *argv[]) {
+    FileLogger arachneLogger(NOTICE, "ARACHNE: ");
+    Arachne::setErrorStream(arachneLogger.getFile());
+
+    Arachne::minNumCores = 8;
+    Arachne::maxNumCores = 8;
+    Arachne::initCore = [] () {
+        PerfStats::registerStats(&PerfStats::threadStats);
+    };
+    Arachne::init(&argc, argv);
+    // Invoke realMain outside of Arachne for now so we can defer handling of
+    // the fact that the dispatch thread does not yield or terminate until we
+    // are ready to do that experiment.
+    PerfUtils::Util::pinAvailableCore();
+    Arachne::createThreadWithClass(
+            Arachne::DefaultCorePolicy::EXCLUSIVE,
+            &realMain, argc, const_cast<char**>(argv));
+    Arachne::waitForTermination();
 }

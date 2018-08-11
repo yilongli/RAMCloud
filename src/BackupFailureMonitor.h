@@ -17,10 +17,10 @@
 #define RAMCLOUD_BACKUPFAILUREMONITOR_H
 
 #include <condition_variable>
-#include <thread>
 
 #include "ServerTracker.h"
 #include "Tub.h"
+#include "Arachne/Arachne.h"
 
 namespace RAMCloud {
 
@@ -61,38 +61,20 @@ class BackupFailureMonitor
 
     /**
      * Used by start()/halt() to inform the main() loop of when it should
-     * exit.  Protected by #mutex and changes are notified through
-     * #changesOrExit.
+     * exit.  Protected by #mutex.
      */
     bool running;
-
-    /**
-     * Used to inform the main() loop of when it should wake up which happens
-     * in two cases: 1) running has been changed, or 2) changes have been
-     * enqueued in the change list of #tracker.
-     */
-    std::condition_variable changesOrExit;
 
     /**
      * Protects all fields in this class so methods can safely communicate
      * with the loop running in main().
      */
-    std::mutex mutex;
+    Arachne::SpinLock mutex;
 
     /**
-     * unique_lock is used to lock #mutex since the lock needs to be
-     * relinquished when waiting on #changesOrExit.
+     * Convenience type for acquiring the mutex above.
      */
-    typedef std::unique_lock<std::mutex> Lock;
-
-    /**
-     * Waits for notifications of changes to #tracker which indicates backup
-     * failure and dispatches those changes to #replicaManager for it to take
-     * corrective actions. #thread will ensure the corrective actions take
-     * place in a timely manner (by driving the re-replication process, if
-     * needed, and ensuring it completes).
-     */
-    Tub<std::thread> thread;
+    typedef std::unique_lock<Arachne::SpinLock> Lock;
 
     typedef ServerTracker<void> FailureTracker;
     /**

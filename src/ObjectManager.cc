@@ -97,10 +97,7 @@ ObjectManager::ObjectManager(Context* context, ServerId* serverId,
     , mutex("ObjectManager::mutex")
     , tombstoneRemover(this, &objectMap)
     , tombstoneProtectorCount(0)
-{
-    for (size_t i = 0; i < arrayLength(hashTableBucketLocks); i++)
-        hashTableBucketLocks[i].setName("hashTableBucketLock");
-}
+{ }
 
 /**
  * The destructor does nothing particularly interesting right now.
@@ -347,9 +344,6 @@ ObjectManager::readObject(Key& key, Buffer* outBuffer,
         if (status != STATUS_OK)
             return status;
     }
-
-    // Ensure the object being read is replicated durably.
-    log.syncTo(reference);
 
     Object object(buffer);
     if (valueOnly) {
@@ -1127,11 +1121,16 @@ ObjectManager::replaySegment(SideLog* sideLog, SegmentIterator& it,
  * the change is committed to stable storage. Prior to invoking this, no
  * guarantees are made about the consistency of backup and master views of the
  * log since the previous syncChanges() operation.
+ *
+ * \param reference
+ *      TODO:  Ask Henry why this is here.
+ * \param rpcId
+ *      rpcId of calling RPC.
  */
 void
-ObjectManager::syncChanges()
+ObjectManager::syncChanges(Log::Reference reference, uint32_t rpcId)
 {
-    log.sync();
+    log.sync(rpcId);
 }
 
 /**
@@ -1172,6 +1171,10 @@ ObjectManager::syncChanges()
  *      linearizability.
  * \param[out] rpcResultPtr
  *      If non-NULL, pointer to the RpcResult in log is returned.
+ * \param logReference
+ *      TODO:  Ask Henry why this is here.
+ * \param rpcId
+ *      rpcId of calling RPC.
  * \return
  *      STATUS_OK if the object was written. Otherwise, for example,
  *      STATUS_UKNOWN_TABLE may be returned.
@@ -1179,7 +1182,8 @@ ObjectManager::syncChanges()
 Status
 ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
                 uint64_t* outVersion, Buffer* removedObjBuffer,
-                RpcResult* rpcResult, uint64_t* rpcResultPtr)
+                RpcResult* rpcResult, uint64_t* rpcResultPtr,
+                Log::Reference* logReference, uint32_t rpcId)
 {
     uint16_t keyLength = 0;
     const void *keyString = newObject.getKey(0, &keyLength);
@@ -1195,6 +1199,7 @@ ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
     }
     if (tablet.state != TabletManager::NORMAL) {
         if (tablet.state == TabletManager::LOCKED_FOR_MIGRATION)
+            RAMCLOUD_LOG(DEBUG, "Tablet is locked for migration");
             throw RetryException(HERE, 1000, 2000,
                     "Tablet is currently locked for migration!");
         return STATUS_UNKNOWN_TABLET;
@@ -1275,6 +1280,7 @@ ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
     // Note: only check for enough space for the object (tombstones
     // don't get included in the limit, since they can be cleaned).
     if (!log.hasSpaceFor(appends[0].buffer.size())) {
+        RAMCLOUD_LOG(DEBUG, "RETRY: Memory capacity exceeded");
         throw RetryException(HERE, 1000, 2000, "Memory capacity exceeded");
     }
 
@@ -1292,11 +1298,23 @@ ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
         appends[rpcResultIndex].type = LOG_ENTRY_TYPE_RPCRESULT;
     }
 
-    if (!log.append(appends, (tombstone ? 2 : 1) + (rpcResult ? 1 : 0))) {
+    #if TIME_TRACE
+    if (rpcId)
+        TimeTrace::record("ID %u: Before append on Core %d", rpcId,
+            Arachne::core.kernelThreadId);
+    #endif
+    if (!log.append(appends, (tombstone ? 2 : 1) + (rpcResult ? 1 : 0),
+     rpcId)) {
         // The log is out of space. Tell the client to retry and hope
         // that the cleaner makes space soon.
+        RAMCLOUD_LOG(DEBUG, "RETRY: Log is out of space, must wait for cleaner");
         throw RetryException(HERE, 1000, 2000, "Must wait for cleaner");
     }
+    #if TIME_TRACE
+    if (rpcId)
+        TimeTrace::record("ID %u: Finished log append on Core %d",
+                rpcId, Arachne::core.kernelThreadId);
+    #endif
 
     if (tombstone) {
         currentHashTableEntry.setReference(appends[0].reference.toInteger());
@@ -1304,9 +1322,17 @@ ObjectManager::writeObject(Object& newObject, RejectRules* rejectRules,
     } else {
         objectMap.insert(key.getHash(), appends[0].reference.toInteger());
     }
+    #if TIME_TRACE
+    if (rpcId)
+        TimeTrace::record("ID %u: Finished updating hash table Core %d",
+                rpcId, Arachne::core.kernelThreadId);
+    #endif
 
     if (rpcResult && rpcResultPtr)
         *rpcResultPtr = appends[rpcResultIndex].reference.toInteger();
+
+    if (logReference)
+        *logReference = appends[rpcResultIndex].reference;
 
     tabletManager->incrementWriteCount(key);
     ++PerfStats::threadStats.writeCount;
@@ -1370,6 +1396,7 @@ ObjectManager::writePrepareFail(RpcResult* rpcResult, uint64_t* rpcResultPtr)
     av.type = LOG_ENTRY_TYPE_RPCRESULT;
 
     if (!log.hasSpaceFor(av.buffer.size()) || !log.append(&av, 1)) {
+        RAMCLOUD_LOG(DEBUG, "RETRY: Log is out of space");
         throw RetryException(HERE, 1000, 2000,
                 "Log is out of space! Transaction abort-vote wasn't logged.");
     }

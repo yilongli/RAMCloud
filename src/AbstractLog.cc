@@ -21,8 +21,11 @@
 #include "PerfStats.h"
 #include "ServerConfig.h"
 #include "ShortMacros.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
+
+#define TIME_TRACE 0
 
 /**
  * Constructor for AbstractLog.
@@ -49,7 +52,7 @@ AbstractLog::AbstractLog(LogEntryHandlers* entryHandlers,
       replicaManager(replicaManager),
       segmentSize(segmentSize),
       head(NULL),
-      appendLock("AbstractLog::appendLock"),
+      appendLock(),
       totalLiveBytes(0),
       maxLiveBytes(0),
       metrics()
@@ -74,15 +77,22 @@ AbstractLog::AbstractLog(LogEntryHandlers* entryHandlers,
  *      are also returned here.
  * \param numAppends
  *      Number of entries in the appends array.
+ * \param rpcId
+ *      Id of the RPC in which this is called.
  * \return
  *      True if the append succeeded, false if there was insufficient space
  *      to complete the operation.
  */
 bool
-AbstractLog::append(AppendVector* appends, uint32_t numAppends)
+AbstractLog::append(AppendVector* appends, uint32_t numAppends, uint32_t rpcId)
 {
     CycleCounter<uint64_t> _(&metrics.totalAppendTicks);
-    SpinLock::Guard lock(appendLock);
+    Lock lock(appendLock);
+#if TIME_TRACE
+    if (rpcId)
+        TimeTrace::record("ID %u: Acquired appendLock on Core %d",
+                rpcId, Arachne::core.kernelThreadId);
+#endif
     metrics.totalAppendCalls++;
 
     uint32_t lengths[numAppends];
@@ -134,7 +144,7 @@ AbstractLog::append(Buffer *logBuffer, Reference *references,
                     uint32_t numEntries)
 {
     CycleCounter<uint64_t> _(&metrics.totalAppendTicks);
-    SpinLock::Guard lock(appendLock);
+    Lock lock(appendLock);
     metrics.totalAppendCalls++;
 
     if (head == NULL || !head->hasSpaceFor(logBuffer->size())) {
@@ -371,7 +381,7 @@ AbstractLog::getSegment(Reference reference)
  *      to complete the operation.
  */
 bool
-AbstractLog::append(const SpinLock::Guard& lock,
+AbstractLog::append(const Lock& lock,
             LogEntryType type,
             const void* buffer,
             uint32_t length,
@@ -453,7 +463,7 @@ AbstractLog::append(const SpinLock::Guard& lock,
  *      to complete the operation.
  */
 bool
-AbstractLog::append(const SpinLock::Guard& lock,
+AbstractLog::append(const Lock& lock,
             const void* buffer,
             uint32_t *entryLength,
             Reference* outReference,
@@ -540,7 +550,7 @@ AbstractLog::append(const SpinLock::Guard& lock,
  *      complete the operation.
  */
 bool
-AbstractLog::append(const SpinLock::Guard& lock,
+AbstractLog::append(const Lock& lock,
             LogEntryType type,
             Buffer& buffer,
             Reference* outReference,

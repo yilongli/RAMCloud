@@ -18,10 +18,13 @@
 #include "ReplicatedSegment.h"
 #include "Segment.h"
 #include "ShortMacros.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 
 uint64_t ReplicatedSegment::recoveryStart = 0;
+
+// #define TIME_TRACE 1
 
 /**
  * Toggles ordering constraints on log replication operations. This must be
@@ -88,7 +91,7 @@ ReplicatedSegment::ReplicatedSegment(Context* context,
                                      uint32_t& freeRpcsInFlight,
                                      UpdateReplicationEpochTask&
                                                             replicationEpoch,
-                                     std::mutex& dataMutex,
+                                     Arachne::SleepLock& dataMutex,
                                      uint64_t segmentId,
                                      const Segment* segment,
                                      bool normalLogSegment,
@@ -123,6 +126,7 @@ ReplicatedSegment::ReplicatedSegment(Context* context,
     , listEntries()
     , replicationCounter(replicationCounter)
     , unopenedStartCycles(Cycles::rdtsc())
+    , syncingRpcId(0)
     , replicas(numReplicas)
 {
     openLen = segment->getAppendedLength(&openingWriteCertificate);
@@ -373,16 +377,22 @@ ReplicatedSegment::handleBackupFailure(ServerId failedId, bool useMinCopysets)
  *      length and certificate. This is sometimes necessary when one thread is
  *      syncing a segment, but does not want to block other threads from
  *      appending to it.
+ * \param rpcId
+ *      rpcId of calling RPC.
  */
 void
-ReplicatedSegment::sync(uint32_t offset, SegmentCertificate* certificate)
+ReplicatedSegment::sync(
+        uint32_t offset, SegmentCertificate* certificate, uint32_t rpcId)
 {
     CycleCounter<RawMetric> _(&metrics->master.replicaManagerTicks);
     TEST_LOG("syncing segment %lu to offset %u", segmentId, offset);
 
-    Lock syncLock(syncMutex);
+    std::lock_guard<Arachne::SleepLock> syncLock(syncMutex);
+
     Tub<Lock> lock;
     lock.construct(dataMutex);
+
+    syncingRpcId = rpcId;
 
     // Definition of synced changes if this segment isn't durably closed
     // and is recovering from a lost replica.  In that case the data
@@ -425,10 +435,10 @@ ReplicatedSegment::sync(uint32_t offset, SegmentCertificate* certificate)
             if (!normalLogSegment || precedingSegmentCloseCommitted) {
                 if (offset == ~0u) {
                     if (getCommitted().close)
-                        return;
+                        break;
                 } else {
                     if (getCommitted().bytes >= offset)
-                        return;
+                        break;
                 }
             }
         }
@@ -439,6 +449,9 @@ ReplicatedSegment::sync(uint32_t offset, SegmentCertificate* certificate)
             dumpProgress();
             syncStartTicks = Cycles::rdtsc();
         }
+
+        lock.destroy();
+        Arachne::yield();
         lock.construct(dataMutex);
     }
 }
@@ -677,7 +690,8 @@ ReplicatedSegment::performFree(Replica& replica)
         } else {
             // Issue a free rpc for this replica, reschedule to wait on it.
             replica.freeRpc.construct(context, replica.backupId,
-                                      masterId, segmentId);
+                                      masterId, segmentId,
+                                      Arachne::getThreadId());
             ++freeRpcsInFlight;
             schedule();
             return;
@@ -746,6 +760,15 @@ ReplicatedSegment::performWrite(Replica& replica)
             // Wait for it to complete if it is ready.
             try {
                 replica.writeRpc->wait();
+                #if TIME_TRACE
+                uint64_t address = reinterpret_cast<uint64_t>(&replica.writeRpc);
+                if (syncingRpcId)
+                    TimeTrace::record("ID %u: Completed replication Rpc 0x%x%08x "
+                        "on Core %d", syncingRpcId,
+                        static_cast<uint32_t>(address >> 32),
+                        static_cast<uint32_t>(address & 0xffffffff),
+                        Arachne::core.kernelThreadId);
+                #endif
                 TEST_LOG("Write RPC finished for replica slot %ld",
                          &replica - &replicas[0]);
                 if (replica.acked.open && !replica.sent.open) {
@@ -859,7 +882,8 @@ ReplicatedSegment::performWrite(Replica& replica)
             replica.writeRpc.construct(context, replica.backupId,
                                        masterId, segmentId, queued.epoch,
                                        segment, 0, length, certificateToSend,
-                                       true, false, replicaIsPrimary(replica));
+                                       true, false, replicaIsPrimary(replica),
+                                       Arachne::getThreadId());
             if (replicaIsPrimary(replica)) {
                 PerfStats::threadStats.replicationRpcs++;
             }
@@ -936,12 +960,33 @@ ReplicatedSegment::performWrite(Replica& replica)
 
             TEST_LOG("Sending write to backup %s",
                      replica.backupId.toString().c_str());
+            #if TIME_TRACE
+            if (syncingRpcId) {
+                uint64_t address = reinterpret_cast<uint64_t>(&replica.writeRpc);
+                TimeTrace::record("ID %u: About to send replication Rpc 0x%x%08x on Core %d",
+                    syncingRpcId,
+                    static_cast<uint32_t>(address >> 32),
+                    static_cast<uint32_t>(address & 0xffffffff),
+                    Arachne::core.kernelThreadId);
+            }
+            #endif
             replica.writeRpc.construct(context, replica.backupId, masterId,
                                        segmentId, queued.epoch,
                                        segment, offset, length,
                                        certificateToSend,
                                        false, sendClose,
-                                       replicaIsPrimary(replica));
+                                       replicaIsPrimary(replica),
+                                       Arachne::getThreadId());
+            #if TIME_TRACE
+            if (syncingRpcId) {
+                uint64_t address = reinterpret_cast<uint64_t>(&replica.writeRpc);
+                TimeTrace::record("ID %u: Sent replication Rpc 0x%x%08x on Core %d",
+                    syncingRpcId,
+                    static_cast<uint32_t>(address >> 32),
+                    static_cast<uint32_t>(address & 0xffffffff),
+                    Arachne::core.kernelThreadId);
+            }
+            #endif
             if (replicaIsPrimary(replica)) {
                 PerfStats::threadStats.replicationRpcs++;
             }
@@ -983,6 +1028,13 @@ ReplicatedSegment::dumpProgress()
         masterId.toString().c_str(), segmentId,
         queued.open, queued.bytes, queued.close,
         getCommitted().open, getCommitted().bytes, getCommitted().close);
+    if (followingSegment) {
+        info.append(format(
+        "    followingSegment: %p, isOpen: %d\n",
+        followingSegment, followingSegment->getCommitted().open));
+    } else {
+        info.append(format("followingSegment = NULL"));
+    }
     uint32_t i = 0;
     foreach (const auto& replica, replicas) {
         string backupLocator = "<unknown>";

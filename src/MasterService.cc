@@ -43,7 +43,26 @@
 
 namespace RAMCloud {
 
-// struct MasterService::Replica
+// Uncomment to enable TimeTraces for this file.
+// #define TIME_TRACE 1
+
+// Provides a cleaner way of invoking TimeTrace::record, with the code
+// conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
+// are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
+// frequently cast their 64-bit arguments into uint32_t explicitly: we will
+// help perform the casting internally.
+namespace {
+    inline void
+    timeTrace(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+}
 
 /**
  * Constructor.
@@ -1312,6 +1331,7 @@ MasterService::multiIncrement(const WireFormat::MultiOp::Request* reqHdr,
             &currentResp->version, &currentResp->status);
         currentResp->newValue.asInt64 = asInt64;
         currentResp->newValue.asDouble = asDouble;
+        Arachne::yield();
     }
 
     // All of the individual increments were done asynchronously. We must sync
@@ -1400,7 +1420,7 @@ MasterService::multiRead(const WireFormat::MultiOp::Request* reqHdr,
         currentResp->status = objectManager.readObject(
                 key, rpc->replyPayload, &rejectRules,
                 &currentResp->version);
-
+        Arachne::yield();
         if (currentResp->status != STATUS_OK)
             continue;
 
@@ -1478,6 +1498,7 @@ MasterService::multiRemove(const WireFormat::MultiOp::Request* reqHdr,
         catch (RetryException& e) {
             currentResp->status = STATUS_RETRY;
         }
+        Arachne::yield();
     }
 
     // All of the individual removes were done asynchronously. We must sync
@@ -1569,6 +1590,7 @@ MasterService::multiWrite(const WireFormat::MultiOp::Request* reqHdr,
             currentResp->status = STATUS_RETRY;
         }
         reqOffset += currentReq->length;
+        Arachne::yield();
     }
 
     // By design, our response will be shorter than the request. This ensures
@@ -1718,8 +1740,10 @@ MasterService::read(const WireFormat::Read::Request* reqHdr,
         WireFormat::Read::Response* respHdr,
         Rpc* rpc)
 {
+    timeTrace("ID %u, starting MasterService::read", rpc->worker->rpc->id);
     using RAMCloud::Perf::ReadRPC_MetricSet;
     ReadRPC_MetricSet::Interval _(&ReadRPC_MetricSet::readRpcTime);
+
 
     uint32_t reqOffset = sizeof32(*reqHdr);
     const void* stringKey = rpc->requestPayload->getRange(
@@ -1743,6 +1767,7 @@ MasterService::read(const WireFormat::Read::Request* reqHdr,
         return;
 
     respHdr->length = rpc->replyPayload->size() - initialLength;
+    timeTrace("ID %u, leaving MasterService::read", rpc->worker->rpc->id);
 }
 
 /**
@@ -3145,6 +3170,7 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
         WireFormat::Write::Response* respHdr,
         Rpc* rpc)
 {
+    timeTrace("ID %u, starting MasterService::write", rpc->worker->rpc->id);
     assert(reqHdr->rpcId > 0);
     UnackedRpcHandle rh(&unackedRpcResults,
                         reqHdr->lease, reqHdr->rpcId, reqHdr->ackId);
@@ -3183,12 +3209,17 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
             respHdr, sizeof(*respHdr));
 
     // Write the object.
+    Log::Reference logReference;
     respHdr->common.status = objectManager.writeObject(
             object, &rejectRules, &respHdr->version, &oldObjectBuffer,
-            &rpcResult, &rpcResultPtr);
+            &rpcResult, &rpcResultPtr, &logReference, rpc->worker->rpc->id);
 
+    timeTrace("ID %u: Wrote object, waiting for sync on Core %d",
+            rpc->worker->rpc->id, Arachne::core.kernelThreadId);
     if (respHdr->common.status == STATUS_OK) {
-        objectManager.syncChanges();
+        objectManager.syncChanges(logReference, rpc->worker->rpc->id);
+        timeTrace("ID %u: Finished syncing on Core %d",
+                rpc->worker->rpc->id, Arachne::core.kernelThreadId);
         rh.recordCompletion(rpcResultPtr); // Complete only if RpcResult is
                                            // written.
                                            // Otherwise, RPC state should reset
@@ -3202,6 +3233,8 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
         objectManager.writeRpcResultOnly(&rpcResult, &rpcResultPtr);
         rh.recordCompletion(rpcResultPtr);
     }
+    timeTrace("ID %u: Finished recording completion on Core %d",
+            rpc->worker->rpc->id, Arachne::core.kernelThreadId);
 
     // If this is a overwrite, delete old index entries if any (this can
     // be done asynchronously after sending a reply).
@@ -3212,6 +3245,7 @@ MasterService::write(const WireFormat::Write::Request* reqHdr,
             requestRemoveIndexEntries(oldObject);
         }
     }
+    timeTrace("ID %u, leaving MasterService::write", rpc->worker->rpc->id);
 }
 
 ///////////////////////////////////////////////////////////////////////////////

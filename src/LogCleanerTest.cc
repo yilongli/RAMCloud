@@ -128,7 +128,8 @@ class LogCleanerTest : public ::testing::Test {
     void getNewCandidates() {
         LogSegmentVector newCandidates;
         segmentManager.cleanableSegments(newCandidates);
-        SpinLock::Guard guard(cleaner.cleanableSegments.lock);
+        std::lock_guard<Arachne::SpinLock>
+            guard(cleaner.cleanableSegments.lock);
         foreach (LogSegment* segment, newCandidates) {
             segment->cachedCleaningCostBenefitScore =
                     cleaner.cleanableSegments.computeCleaningCostBenefitScore(
@@ -266,7 +267,8 @@ TEST_F(LogCleanerTest, doWork_notifyConditionVariable) {
 
     // First try: bump activeThreads so cleaner looks busy.
     cleaner.activeThreads = 1;
-    std::thread thread(disableThread, &cleaner);
+    Arachne::ThreadId newThread =
+        Arachne::createThread(disableThread, &cleaner);
     while (cleaner.disableCount == 0) {
         // Wait for the thread to acquire the lock and sleep.
     }
@@ -274,7 +276,7 @@ TEST_F(LogCleanerTest, doWork_notifyConditionVariable) {
     Cycles::sleep(1000);
     EXPECT_EQ("", TestLog::get());
 
-    // Second try: cleaner is really idle.
+    // // Second try: cleaner is really idle.
     cleaner.activeThreads = 0;
     cleaner.doWork(&threadState);
     for (int i = 0; i < 1000; i++) {
@@ -284,7 +286,7 @@ TEST_F(LogCleanerTest, doWork_notifyConditionVariable) {
         }
     }
     EXPECT_EQ("disableThread: cleaner idle", TestLog::get());
-    thread.join();
+    Arachne::join(newThread);
 }
 
 // There are currently no meaningful tests for doMemoryCleaning;

@@ -21,9 +21,12 @@
 #include "RpcWrapper.h"
 #include "ShortMacros.h"
 #include "WireFormat.h"
+#include "Arachne/Arachne.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 
+#define TIME_TRACE 0
 /**
  * Constructor for RpcWrapper objects.
  * \param responseHeaderLength
@@ -46,6 +49,7 @@ RpcWrapper::RpcWrapper(uint32_t responseHeaderLength, Buffer* response)
     , retryTime(0)
     , responseHeaderLength(responseHeaderLength)
     , responseHeader(NULL)
+    , ownerThreadId()
 {
     if (response == NULL) {
         defaultResponse.construct();
@@ -107,6 +111,18 @@ RpcWrapper::completed() {
     // state. Don't add any more functionality to this method
     // unless you carefully review all of the synchronization
     // properties of RpcWrappers!
+    Fence::sfence();
+    // Not all clients block, so we must signal before setting the state to
+    // avoid a race where the entire Rpc gets cleaned up before we read the
+    // ThreadId for signaling.
+    if (ownerThreadId != Arachne::NullThread) {
+        Arachne::signal(ownerThreadId);
+#if TIME_TRACE
+        TimeTrace::record("Signaled for Core %d, IdInCore %d",
+                ownerThreadId.context->coreId,
+                ownerThreadId.context->idInCore);
+#endif
+    }
     state.store(FINISHED, std::memory_order_release);
 }
 
@@ -115,6 +131,9 @@ RpcWrapper::completed() {
 void
 RpcWrapper::failed() {
     // See comment in completed: the same warning applies here.
+    Fence::sfence();
+    if (ownerThreadId != Arachne::NullThread)
+        Arachne::signal(ownerThreadId);
     state.store(FAILED, std::memory_order_release);
 }
 
@@ -377,6 +396,8 @@ RpcWrapper::waitInternal(Dispatch* dispatch, uint64_t abortTime)
     while (!isReady()) {
         if (isDispatchThread)
             dispatch->poll();
+        else
+            Arachne::yield();
         if (dispatch->currentTime > abortTime)
             return false;
     }

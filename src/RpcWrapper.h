@@ -21,6 +21,7 @@
 #include "ServerId.h"
 #include "Transport.h"
 #include "WireFormat.h"
+#include "Arachne/Arachne.h"
 
 namespace RAMCloud {
 class Context;
@@ -99,7 +100,6 @@ class RpcWrapper : public Transport::RpcNotifier {
     allocHeader()
     {
         assert(request.size() == 0);
-        RpcLevel::checkCall(RpcType::opcode);
         typename RpcType::Request* reqHdr =
                 request.emplaceAppend<typename RpcType::Request>();
         // Don't allow this method to be used for RPCs that use
@@ -136,7 +136,6 @@ class RpcWrapper : public Transport::RpcNotifier {
     allocHeader(ServerId targetId)
     {
         assert(request.size() == 0);
-        RpcLevel::checkCall(RpcType::opcode);
         typename RpcType::Request* reqHdr =
                 request.emplaceAppend<typename RpcType::Request>();
         memset(reqHdr, 0, sizeof(*reqHdr));
@@ -260,6 +259,11 @@ class RpcWrapper : public Transport::RpcNotifier {
     /// least responseHeaderLength bytes if the RPC succeeds.
     const WireFormat::ResponseCommon* responseHeader;
 
+  public:
+    /// The owning ThreadId, when this Rpc is started by an Arachne thread.
+    Arachne::ThreadId ownerThreadId;
+
+  PROTECTED:
     DISALLOW_COPY_AND_ASSIGN(RpcWrapper);
 };
 

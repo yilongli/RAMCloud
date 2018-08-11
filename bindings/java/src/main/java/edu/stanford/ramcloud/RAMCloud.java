@@ -18,6 +18,7 @@ import static edu.stanford.ramcloud.ClientException.*;
 import edu.stanford.ramcloud.multiop.*;
 
 import java.nio.*;
+import java.io.UnsupportedEncodingException;
 
 /**
  * This class provides Java bindings for RAMCloud. Right now it is a rather
@@ -117,10 +118,15 @@ public class RAMCloud {
      *            "--clusterName" command-line option given to the coordinator
      *            when it started.
      */
-    public RAMCloud(String locator, String clusterName) {
+    public RAMCloud(String locator, String clusterName, String logFile) {
         byteBuffer = ByteBuffer.allocateDirect(bufferCapacity);
         byteBuffer.order(ByteOrder.LITTLE_ENDIAN);
         byteBufferPointer = cppGetByteBufferPointer(byteBuffer);
+        // Set the log file
+        if (logFile != null) {
+            setLogFile(logFile);
+        }
+        byteBuffer.rewind();
         byteBuffer.putInt(locator.length())
                 .put(locator.getBytes())
                 .put((byte) 0)
@@ -139,7 +145,7 @@ public class RAMCloud {
      * @see #RAMCloud(String, String)
      */
     public RAMCloud(String locator) {
-        this(locator, "main");
+        this(locator, "main", null);
     }
 
     /**
@@ -520,6 +526,20 @@ public class RAMCloud {
         multiRemoveHandler.handle(data);
     }
 
+    public void setLogFile(String fileName) {
+        byteBuffer.rewind();
+        try {
+            byteBuffer.put(fileName.getBytes("US-ASCII"))
+                .put((byte) 0);
+        } catch (UnsupportedEncodingException e) {
+            e.printStackTrace();
+            System.exit(1);
+        }
+        cppSetLogFile(byteBufferPointer);
+        byteBuffer.rewind();
+        checkStatus(byteBuffer.getInt());
+    }
+
     // Declarations for native methods in c++ file
     private static native long cppGetByteBufferPointer(ByteBuffer byteBuffer);
 
@@ -544,4 +564,6 @@ public class RAMCloud {
                                               byte[][] objects,
                                               long[] versions,
                                               int[] statuses);
+
+    private static native void cppSetLogFile(long byteBufferPointer);
 }

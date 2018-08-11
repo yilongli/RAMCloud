@@ -28,6 +28,9 @@ OBJSUFFIX := $(shell git symbolic-ref -q HEAD | \
 
 OBJDIR	:= obj$(OBJSUFFIX)
 
+ARACHNEDIR := arachne-all/Arachne
+PERFUTILSDIR := arachne-all/PerfUtils
+
 TOP	:= $(shell echo $${PWD-`pwd`})
 GTEST_DIR ?= $(TOP)/gtest
 
@@ -125,7 +128,7 @@ CXXWARNS := $(COMWARNS) -Wno-non-template-friend -Woverloaded-virtual \
 		-Wcast-qual \
 		-Wcast-align -Wconversion
 ifeq ($(COMPILER),gnu)
-CXXWARNS += -Weffc++
+#CXXWARNS += -weffc++
 endif
 # Too many false positives list:
 # -Wunreachable-code
@@ -133,6 +136,9 @@ endif
 # -Winline
 
 LIBS := $(EXTRALIBS) $(LOGCABIN_LIB) $(ZOOKEEPER_LIB) \
+    -L$(TOP)/arachne-all/Arachne/lib -lArachne \
+    -L$(TOP)/arachne-all/PerfUtils/lib -lPerfUtils \
+    -L$(TOP)/arachne-all/CoreArbiter/lib -lCoreArbiter \
 	-lpcrecpp -lboost_program_options \
 	-lprotobuf -lrt -lboost_filesystem -lboost_system \
 	-lpthread -lssl -lcrypto
@@ -144,6 +150,8 @@ endif
 INCLUDES := -I$(TOP)/src \
             -I$(TOP)/$(OBJDIR) \
             -I$(GTEST_DIR)/include \
+            -I$(TOP)/arachne-all/Arachne/include \
+            -I$(TOP)/arachne-all/PerfUtils/include \
             -I/usr/local/openonload-201405/src/include \
              $(NULL)
 ifeq ($(LOGCABIN),yes)
@@ -428,6 +436,8 @@ INSTALL_BINS := \
 INSTALL_LIBS := \
     $(OBJDIR)/libramcloud.so \
     $(OBJDIR)/libramcloud.a \
+    $(ARACHNEDIR)/lib/libArachne.a \
+    $(PERFUTILSDIR)/lib/libPerfUtils.a \
     $(NULL)
 
 # Rebuild the Java bindings
@@ -500,6 +510,11 @@ install: all java
 	cp $(INSTALL_BINS) $(INSTALL_DIR)/bin
 	mkdir -p $(INSTALL_DIR)/include/ramcloud
 	cp $(INSTALL_INCLUDES) $(INSTALL_DIR)/include/ramcloud
+	mkdir -p $(INSTALL_DIR)/include/ramcloud/Arachne
+	cp -r $(ARACHNEDIR)/include/* $(INSTALL_DIR)/include/ramcloud/
+	mkdir -p $(INSTALL_DIR)/include/ramcloud/PerfUtils
+	cp -r $(PERFUTILSDIR)/include/* $(INSTALL_DIR)/include/ramcloud/Arachne/
+	cp -r $(PERFUTILSDIR)/include/* $(INSTALL_DIR)/include/ramcloud/
 	mkdir -p $(INSTALL_DIR)/lib/ramcloud
 	cp $(INSTALL_LIBS) $(INSTALL_DIR)/lib/ramcloud
 	cp bindings/java/build/install/ramcloud/lib/* $(INSTALL_DIR)/lib/ramcloud
