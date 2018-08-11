@@ -28,6 +28,7 @@
 #include "Transport.h"
 #include "TaskQueue.h"
 #include "VarLenArray.h"
+#include "Arachne/Arachne.h"
 
 namespace RAMCloud {
 
@@ -342,7 +343,8 @@ class ReplicatedSegment : public Task {
     bool isSynced() const;
     void close();
     void handleBackupFailure(ServerId failedId, bool useMinCopysets);
-    void sync(uint32_t offset = ~0u, SegmentCertificate* certificate = NULL);
+    void sync(uint32_t offset = ~0u, SegmentCertificate* certificate = NULL,
+        uint32_t rpcId = 0);
     const Segment* swapSegment(const Segment* newSegment);
 
     /**
@@ -376,7 +378,7 @@ class ReplicatedSegment : public Task {
                       uint32_t& writeRpcsInFlight,
                       uint32_t& freeRpcsInFlight,
                       UpdateReplicationEpochTask& replicationEpoch,
-                      std::mutex& dataMutex,
+                      Arachne::SleepLock& dataMutex,
                       uint64_t segmentId,
                       const Segment* segment,
                       bool normalLogSegment,
@@ -456,8 +458,8 @@ class ReplicatedSegment : public Task {
      * ReplicaManager::dataMutex; there are many subtleties to the locking
      * in this module.
      */
-    std::mutex& dataMutex;
-    typedef std::lock_guard<std::mutex> Lock;
+    Arachne::SleepLock& dataMutex;
+    typedef std::lock_guard<Arachne::SleepLock> Lock;
 
     /**
      * Used to select a "winner" thread that is allowed to sync. Once some
@@ -469,7 +471,7 @@ class ReplicatedSegment : public Task {
      * See ReplicaManager::dataMutex; there are many subtleties to the locking
      * in this module.
      */
-    std::mutex syncMutex;
+    Arachne::SleepLock syncMutex;
 
     /**
      * Segment to be replicated.
@@ -609,6 +611,11 @@ class ReplicatedSegment : public Task {
      * was constructed.
      */
     uint64_t unopenedStartCycles;
+
+    /**
+     * Track the rpcId of the Rpc that currently holds the syncLock.
+     */
+    uint32_t syncingRpcId;
 
     /**
      * An array of #ReplicaManager::replica backups on which the segment is

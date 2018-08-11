@@ -57,9 +57,11 @@ BackupClient::freeSegment(Context* context, ServerId backupId,
  *      The id of the master that created the segment to be freed.
  * \param segmentId
  *      The id of the segment to be freed.
+ * \param ownerThreadId
+ *      Arachne::ThreadId of owning thread.
  */
 FreeSegmentRpc::FreeSegmentRpc(Context* context, ServerId backupId,
-        ServerId masterId, uint64_t segmentId)
+        ServerId masterId, uint64_t segmentId, Arachne::ThreadId ownerThreadId)
     : ServerIdRpcWrapper(context, backupId,
             sizeof(WireFormat::BackupFree::Response))
 {
@@ -67,6 +69,7 @@ FreeSegmentRpc::FreeSegmentRpc(Context* context, ServerId backupId,
             allocHeader<WireFormat::BackupFree>(backupId));
     reqHdr->masterId = masterId.getId();
     reqHdr->segmentId = segmentId;
+    this->ownerThreadId = ownerThreadId;
     send();
 }
 
@@ -602,6 +605,8 @@ BackupClient::writeSegment(Context* context,
  *      Whether this particular replica should be loaded and filtered at the
  *      start of master recovery (as opposed to having it loaded and filtered
  *      on demand. May be reset on each subsequent write.
+ * \param ownerThreadId
+ *      Arachne::ThreadId of owning thread.
  */
 WriteSegmentRpc::WriteSegmentRpc(Context* context,
                                  ServerId backupId,
@@ -614,7 +619,8 @@ WriteSegmentRpc::WriteSegmentRpc(Context* context,
                                  const SegmentCertificate* certificate,
                                  bool open,
                                  bool close,
-                                 bool primary)
+                                 bool primary,
+                                 Arachne::ThreadId ownerThreadId)
     : ServerIdRpcWrapper(context, backupId,
                          sizeof(WireFormat::BackupWrite::Response))
 {
@@ -636,6 +642,7 @@ WriteSegmentRpc::WriteSegmentRpc(Context* context,
     if (segment)
         segment->appendToBuffer(request, offset, length);
     CycleCounter<RawMetric> _(&metrics->master.replicationPostingWriteRpcTicks);
+    this->ownerThreadId = ownerThreadId;
     send();
 }
 

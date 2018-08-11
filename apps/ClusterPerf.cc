@@ -7053,8 +7053,8 @@ writeThroughputMaster(int numObjects, int size, uint16_t keyLength)
     fillTable(dataTable, numObjects, keyLength, size);
     Cycles::sleep(2000000);
     string stats[5];
-    for (int numSlaves = 1; numSlaves < numClients; numSlaves++) {
-        sendCommand("run", "running", numSlaves, 1);
+    for (int numSlaves = numClients - 1; numSlaves < numClients; numSlaves++) {
+        sendCommand("run", "running", 1, numSlaves);
         Buffer statsBuffer;
         Buffer beforeStats;
         cluster->serverControlAll(WireFormat::ControlOp::GET_PERF_STATS,
@@ -7188,13 +7188,16 @@ writeThroughput()
                 objectsWritten = 0;
                 uint64_t checkTime = startTime + Cycles::fromSeconds(1.0);
                 do {
+                    // TimeTrace::record("Before making key");
                     char key[keyLength];
                     char value[objectSize];
                     makeKey(downCast<int>(generateRandom() % numObjects),
                             keyLength, key);
                     Util::genRandomString(value, objectSize);
+                    // TimeTrace::record("After making key");
                     cluster->write(dataTable, key, keyLength, value, objectSize,
                             NULL, NULL, asyncReplication);
+                    // TimeTrace::record("Finished cluster write");
                     ++objectsWritten;
                 } while (Cycles::rdtsc() < checkTime);
             } else if (strcmp(command, "done") == 0) {

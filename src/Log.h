@@ -81,8 +81,8 @@ class Log : public AbstractLog {
     void disableCleaner();
     LogPosition getHead();
     void getMetrics(ProtoBuf::LogMetrics& m);
-    void sync();
-    void syncTo(Log::Reference reference);
+    void sync(uint32_t rpcId = 0);
+    void syncTo(Log::Reference reference, uint32_t rpcId = 0);
     LogPosition rollHeadOver();
 
   PRIVATE:
@@ -107,7 +107,14 @@ class Log : public AbstractLog {
     ///
     /// If both this lock and the AbstractLog::appendLock need to be taken,
     /// this one must be acquired first to avoid deadlock.
-    SpinLock syncLock;
+    Arachne::SpinLock syncLock;
+
+    /// This protects the collection of threads that are waiting on the current
+    /// sync to complete. It must be held to modify the collection only.
+    Arachne::SpinLock waitingThreadLock;
+
+    /// This collection of threads is waiting on the current sync to complete.
+    std::vector<Arachne::ThreadId> waitingThreads;
 
     /// Various event counters and performance measurements taken during log
     /// operation.

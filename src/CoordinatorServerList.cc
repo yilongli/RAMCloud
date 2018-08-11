@@ -53,7 +53,7 @@ CoordinatorServerList::CoordinatorServerList(Context* context)
     , updates()
     , hasUpdatesOrStop()
     , listUpToDate()
-    , updaterThread()
+    , updaterThread(Arachne::NullThread)
     , activeRpcs()
     , spareRpcs()
     , maxConfirmedVersion(0)
@@ -872,7 +872,7 @@ CoordinatorServerList::pushUpdate(const Lock& lock, Entry* entry)
     entry->serialize(update->incremental.add_server());
 
     // Wake up the updater, if it was sleeping.
-    hasUpdatesOrStop.notify_one();
+    hasUpdatesOrStop.notifyOne();
 }
 
 /**
@@ -927,13 +927,13 @@ CoordinatorServerList::haltUpdater()
     // Signal stop
     Lock lock(mutex);
     stopUpdater = true;
-    hasUpdatesOrStop.notify_one();
+    hasUpdatesOrStop.notifyOne();
     lock.unlock();
 
     // Wait for Thread stop
-    if (updaterThread && updaterThread->joinable()) {
-        updaterThread->join();
-        updaterThread.destroy();
+    if (updaterThread != Arachne::NullThread) {
+        Arachne::join(updaterThread);
+        updaterThread = Arachne::NullThread;
     }
 }
 
@@ -947,16 +947,19 @@ CoordinatorServerList::startUpdater()
     Lock _(mutex);
 
     // Start thread if not started
-    if (!updaterThread) {
+    if (updaterThread == Arachne::NullThread) {
         lastScan.noWorkFoundForEpoch = 0;
         lastScan.searchIndex = 0;
         lastScan.minVersion = version;
         stopUpdater = false;
-        updaterThread.construct(&CoordinatorServerList::updateLoop, this);
+        updaterThread =
+          Arachne::createThread(&CoordinatorServerList::updateLoop, this);
+    } else {
+        stopUpdater = false;
     }
 
     // Tell it to start work regardless
-    hasUpdatesOrStop.notify_one();
+    hasUpdatesOrStop.notifyOne();
 }
 
 /**
@@ -1061,7 +1064,7 @@ CoordinatorServerList::pruneUpdates(const Lock& lock)
     }
 
     if (updates.empty())    // Empty list = no updates to send
-        listUpToDate.notify_all();
+        listUpToDate.notifyAll();
 }
 
 /**

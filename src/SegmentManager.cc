@@ -138,7 +138,7 @@ SegmentManager::~SegmentManager()
 void
 SegmentManager::getMetrics(ProtoBuf::LogMetrics_SegmentMetrics& m)
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
     segmentsOnDiskHistogram.serialize(
                 *m.mutable_segments_on_disk_histogram());
@@ -170,7 +170,7 @@ SegmentManager::getMetrics(ProtoBuf::LogMetrics_SegmentMetrics& m)
 uint32_t
 SegmentManager::getSegmentsOnDisk()
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
     return segmentsOnDisk;
 }
 
@@ -204,7 +204,7 @@ SegmentManager::getAllocator() const
 LogSegment*
 SegmentManager::allocHeadSegment(uint32_t flags)
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
     LogSegment* prevHead = getHeadSegment();
     LogSegment* newHead = alloc(ALLOC_HEAD,
@@ -304,7 +304,7 @@ SegmentManager::allocSideSegment(uint32_t flags, LogSegment* replacing)
 {
     assert(replacing == NULL || states[replacing->slot] == CLEANABLE);
 
-    Tub<SpinLock::Guard> guard;
+    Tub<Guard> guard;
     LogSegment* s = NULL;
 
     uint32_t reportSeconds = 5;
@@ -345,7 +345,7 @@ SegmentManager::allocSideSegment(uint32_t flags, LogSegment* replacing)
         }
 
         // Reduce monitor lock contention.
-        usleep(100);
+        Arachne::sleep(100000);
     }
     assert(guard);
 
@@ -382,7 +382,7 @@ void
 SegmentManager::cleaningComplete(LogSegmentVector& clean,
                                  LogSegmentVector& survivors)
 {
-    SpinLock::Guard guard(lock);
+    Guard guard(lock);
 
     // Sanity check: the cleaner must not have used more seglets than it freed.
     uint32_t segletsUsed = 0;
@@ -421,7 +421,7 @@ void
 SegmentManager::compactionComplete(LogSegment* oldSegment,
                                    LogSegment* newSegment)
 {
-    SpinLock::Guard guard(lock);
+    Guard guard(lock);
 
     // Update the previous version's ReplicatedSegment to use the new, compacted
     // segment in the event of a backup failure.
@@ -451,7 +451,7 @@ SegmentManager::compactionComplete(LogSegment* oldSegment,
 void
 SegmentManager::injectSideSegments(LogSegmentVector& segments)
 {
-    SpinLock::Guard guard(lock);
+    Guard guard(lock);
     foreach (LogSegment* segment, segments)
         injectSideSegment(segment, CLEANABLE_PENDING_DIGEST, guard);
 }
@@ -471,7 +471,7 @@ SegmentManager::injectSideSegments(LogSegmentVector& segments)
 void
 SegmentManager::freeUnusedSideSegments(LogSegmentVector& segments)
 {
-    SpinLock::Guard guard(lock);
+    Guard guard(lock);
     foreach (LogSegment* segment, segments)
         freeSegment(segment, false, guard);
 }
@@ -487,7 +487,7 @@ SegmentManager::freeUnusedSideSegments(LogSegmentVector& segments)
 void
 SegmentManager::cleanableSegments(LogSegmentVector& out)
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
     SegmentList& newlyCleanable = segmentsByState[NEWLY_CLEANABLE];
     while (!newlyCleanable.empty()) {
@@ -515,7 +515,7 @@ void
 SegmentManager::getActiveSegments(uint64_t minSegmentId,
                                   LogSegmentVector& outList)
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
     // Walk the lists to collect the closed Segments. Since the cleaner
     // is locked out of inserting survivor segments and freeing cleaned
@@ -552,7 +552,7 @@ SegmentManager::getActiveSegments(uint64_t minSegmentId,
 bool
 SegmentManager::initializeSurvivorReserve(uint32_t numSegments)
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
     if (survivorSlotsReserved != 0)
         return false;
@@ -604,7 +604,7 @@ SegmentManager::operator[](SegmentSlot slot)
 bool
 SegmentManager::doesIdExist(uint64_t id)
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
     return contains(idToSlotMap, id);
 }
 
@@ -624,7 +624,7 @@ int SegmentManager::mockMemoryUtilization = 0;
 int
 SegmentManager::getSegmentUtilization()
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
 #ifdef TESTING
     if (mockSegmentUtilization)
@@ -641,7 +641,7 @@ SegmentManager::getSegmentUtilization()
 int
 SegmentManager::getMemoryUtilization()
 {
-    SpinLock::Guard _(lock);
+    Guard _(lock);
 
 #ifdef TESTING
     if (mockMemoryUtilization)
@@ -730,7 +730,7 @@ SegmentManager::raiseSafeVersion(uint64_t minimum) {
 void
 SegmentManager::injectSideSegment(LogSegment* segment,
                                   State nextState,
-                                  const SpinLock::Guard& lock)
+                                  const Guard& lock)
 {
     assert(states[segment->slot] == SIDELOG);
     assert(nextState == CLEANABLE_PENDING_DIGEST ||
@@ -762,7 +762,7 @@ SegmentManager::injectSideSegment(LogSegment* segment,
  */
 void
 SegmentManager::freeSegment(LogSegment* segment, bool waitForDigest,
-                            const SpinLock::Guard& lock)
+                            const Guard& lock)
 {
     assert(states[segment->slot] == CLEANABLE ||
            states[segment->slot] == SIDELOG);

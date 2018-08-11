@@ -146,6 +146,11 @@ class Context {
     const void* masterZeroCopyRegion;
 
     /**
+     * Returns whether the context belongs to a client.
+     */
+    bool isClient();
+
+    /**
      * Returns the BackupService associated with this context, if
      * there is one, or NULL if there is none.
      */

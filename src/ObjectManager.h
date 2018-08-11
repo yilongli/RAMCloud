@@ -84,10 +84,12 @@ class ObjectManager : public LogEntryHandlers,
     void replaySegment(SideLog* sideLog, SegmentIterator& it,
                 std::unordered_map<uint64_t, uint64_t>* nextNodeIdMap);
     void replaySegment(SideLog* sideLog, SegmentIterator& it);
-    void syncChanges();
+    void syncChanges(Log::Reference reference = Log::Reference(),
+                uint32_t rpcId = 0);
     Status writeObject(Object& newObject, RejectRules* rejectRules,
                 uint64_t* outVersion, Buffer* removedObjBuffer = NULL,
-                RpcResult* rpcResult = NULL, uint64_t* rpcResultPtr = NULL);
+                RpcResult* rpcResult = NULL, uint64_t* rpcResultPtr = NULL,
+                Log::Reference* logReference = NULL, uint32_t rpcId = 0);
     bool keyPointsAtReference(Key& k, AbstractLog::Reference oldReference);
     void writePrepareFail(RpcResult* rpcResult, uint64_t* rpcResultPtr);
     void writeRpcResultOnly(RpcResult* rpcResult, uint64_t* rpcResultPtr);
@@ -229,7 +231,7 @@ class ObjectManager : public LogEntryHandlers,
 
         /// The hash table bucket spinlock this object acquired in the
         /// constructor and will release in the destructor.
-        SpinLock* lock;
+        Arachne::SleepLock* lock;
 
         DISALLOW_COPY_AND_ASSIGN(HashTableBucketLock);
     };
@@ -392,7 +394,7 @@ class ObjectManager : public LogEntryHandlers,
      * regular, parallel RPC operations from one another and from the log
      * cleaner.
      */
-    UnnamedSpinLock hashTableBucketLocks[1024];
+    Arachne::SleepLock hashTableBucketLocks[1024];
 
     /**
      * Locks objects during transactions.

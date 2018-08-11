@@ -31,6 +31,11 @@
 #include "ShortMacros.h"
 #include "TransportManager.h"
 #include "WorkerTimer.h"
+#include "Arachne/Arachne.h"
+#include "Arachne/CorePolicy.h"
+#include "Arachne/DefaultCorePolicy.h"
+#include "FileLogger.h"
+#include "PerfUtils/Util.h"
 
 using namespace RAMCloud;
 
@@ -92,7 +97,7 @@ class StatsLogger : WorkerTimer {
 };
 
 int
-main(int argc, char *argv[])
+realMain(int argc, char *argv[])
 {
     signal(SIGTERM, Perf::terminationHandler);
     Logger::installCrashBacktraceHandlers();
@@ -254,7 +259,8 @@ main(int argc, char *argv[])
             args.append(argv[i]);
         }
         LOG(NOTICE, "Command line: %s", args.c_str());
-        LOG(NOTICE, "Server process id: %u", getpid());
+        LOG(NOTICE, "Server process id: %u on core %d",
+            getpid(), sched_getcpu());
 
         Context context(true, &optionParser.options);
 
@@ -358,4 +364,20 @@ main(int argc, char *argv[])
         Logger::get().sync();
         return 1;
     }
+}
+int
+main(int argc, const char *argv[]) {
+    FileLogger arachneLogger(NOTICE, "ARACHNE: ");
+    Arachne::setErrorStream(arachneLogger.getFile());
+
+    Arachne::minNumCores = 3;
+    Arachne::maxNumCores = 8;
+    Arachne::initCore = [] () {
+        PerfStats::registerStats(&PerfStats::threadStats);
+    };
+    Arachne::init(&argc, argv);
+    Arachne::createThreadWithClass(
+            Arachne::DefaultCorePolicy::EXCLUSIVE,
+            &realMain, argc, const_cast<char**>(argv));
+    Arachne::waitForTermination();
 }

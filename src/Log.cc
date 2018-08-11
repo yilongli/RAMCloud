@@ -21,6 +21,7 @@
 #include "PerfStats.h"
 #include "ServerConfig.h"
 #include "ShortMacros.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 
@@ -66,7 +67,9 @@ Log::Log(Context* context,
                   config->segmentSize),
       context(context),
       cleaner(NULL),
-      syncLock("Log::syncLock"),
+      syncLock(),
+      waitingThreadLock(),
+      waitingThreads(),
       metrics()
 {
     cleaner = new LogCleaner(context,
@@ -123,7 +126,7 @@ Log::getMetrics(ProtoBuf::LogMetrics& m)
  */
 LogPosition
 Log::getHead() {
-    SpinLock::Guard _(appendLock);
+    Lock _(appendLock);
     return LogPosition(head->id, head->getAppendedLength());
 }
 
@@ -151,12 +154,16 @@ Log::getHead() {
  * large ones anyway.
  */
 void
-Log::sync()
+Log::sync(uint32_t rpcId)
 {
     CycleCounter<uint64_t> __(&PerfStats::threadStats.logSyncCycles);
 
-    Tub<SpinLock::Guard> lock;
+    Tub<Lock> lock;
     lock.construct(appendLock);
+    #if TIME_TRACE
+    if (rpcId) TimeTrace::record("ID %u: Log::sync acquired appendLock on "
+        "Core %d", rpcId, Arachne::core.kernelThreadId);
+    #endif
     metrics.totalSyncCalls++;
 
     // The only time 'head' should be NULL is after construction and before the
@@ -187,27 +194,81 @@ Log::sync()
     // log while we wait. Once we grab the sync lock, take the append lock again
     // to ensure our new view of the head is consistent.
     lock.destroy();
-    SpinLock::Guard _(syncLock);
-    lock.construct(appendLock);
+    bool didWeSync = false;
+    do {
+        // Do this check without the lock, since syncedLength is atomic.
+        uint32_t syncedLength = originalHead->syncedLength;
+        if (appendedLength <= syncedLength) {
+            if (!didWeSync) {
+                TEST_LOG("sync not needed: already fully replicated");
+            }
+            break;
+        }
+        // Won the leader election for syncing
+        if (syncLock.try_lock()) {
+            #if TIME_TRACE
+            if (rpcId) TimeTrace::record("ID %u: Starting replication on "
+                "Core %d appendedLength %u syncedLength %u",
+                rpcId, Arachne::core.kernelThreadId,
+                appendedLength, syncedLength);
+            #endif
+            // See if we still have work to do. It's possible that another
+            // thread already did the syncing we needed for us.
+            lock.construct(appendLock);
+            #if TIME_TRACE
+            if (rpcId) TimeTrace::record("ID %u: Log::sync reacquired "
+                "appendLock on Core %d", rpcId,
+                Arachne::core.kernelThreadId);
+            #endif
 
-    // See if we still have work to do. It's possible that another thread
-    // already did the syncing we needed for us.
-    if (appendedLength > originalHead->syncedLength) {
-        // Get the latest segment length and certificate. This allows us to
-        // batch up other appends that came in while we were waiting.
-        SegmentCertificate certificate;
-        appendedLength = originalHead->getAppendedLength(&certificate);
+            // Get the latest segment length and certificate. This allows us
+            // to batch up other appends that came in while we were waiting.
+            SegmentCertificate certificate;
+            appendedLength = originalHead->getAppendedLength(&certificate);
 
-        // Drop the append lock. We don't want to block other appending threads
-        // while we sync.
-        lock.destroy();
+            // Drop the append lock. We don't want to block other appending
+            // threads while we sync.
+            lock.destroy();
 
-        originalHead->replicatedSegment->sync(appendedLength, &certificate);
-        originalHead->syncedLength = appendedLength;
-        TEST_LOG("log synced");
-    } else {
-        TEST_LOG("sync not needed: already fully replicated");
-    }
+            originalHead->replicatedSegment->sync(appendedLength, &certificate,
+                rpcId);
+            originalHead->syncedLength = appendedLength;
+            TEST_LOG("log synced");
+            didWeSync = true;
+            #if TIME_TRACE
+            if (rpcId) TimeTrace::record("ID %u: Finished replication on "
+                "Core %d appendedLength %u syncedLength %u", rpcId,
+                Arachne::core.kernelThreadId, appendedLength, syncedLength);
+            #endif
+            syncLock.unlock();
+            // Now notify all the other threads waiting. At this point, this
+            // lock should not be contended, since all the threads that would
+            // be taking this lock would be peacefully blocked.
+            std::lock_guard<Arachne::SpinLock> _(waitingThreadLock);
+            for (size_t i = 0; i < waitingThreads.size(); i++) {
+                Arachne::signal(waitingThreads[i]);
+            }
+            waitingThreads.clear();
+        } else {
+            // Lost the leader election for syncing, so we wait until the next
+            // sync finishes without serializing.
+            {
+                std::lock_guard<Arachne::SpinLock> _(waitingThreadLock);
+                waitingThreads.push_back(Arachne::getThreadId());
+            }
+            // If the syncLock is available here, then it is possible that the
+            // current holder has already.exited, so it is not safe to block.
+            // If the syncLock is not available, then we successfully beat the
+            // current holder of the syncLock to the waitingThreadLock, since
+            // it must release the syncLock before acquiring the
+            // waitingThreadLock.
+            if (syncLock.try_lock()) {
+                syncLock.unlock();
+                continue;
+            }
+            Arachne::block();
+        }
+    } while (true);
 }
 
 /**
@@ -218,7 +279,7 @@ Log::sync()
  * Like sync(), this method is also thread-safe.
  */
 void
-Log::syncTo(Log::Reference reference)
+Log::syncTo(Log::Reference reference, uint32_t rpcId)
 {
     CycleCounter<uint64_t> __(&PerfStats::threadStats.logSyncCycles);
     metrics.totalSyncCalls++;
@@ -239,37 +300,82 @@ Log::syncTo(Log::Reference reference)
     segment->getEntry(offset, NULL, &lengthWithMetadata);
     uint32_t desiredSyncedLength = offset + lengthWithMetadata;
 
-    // See if we still have work to do. It's possible that another thread
-    // already did the syncing we needed for us.
-    if (desiredSyncedLength > segment->syncedLength) {
-        SpinLock::Guard _(syncLock);
-        // Check whether we need to sync once again after grabbing the syncLock.
-        // Previous sync may have synced the desired portion already.
-        if (desiredSyncedLength <= segment->syncedLength) {
-            return;
+    #if TIME_TRACE
+    if (rpcId) TimeTrace::record("ID %u: Log::sync computed desires on Core %d",
+            rpcId, Arachne::core.kernelThreadId);
+    #endif
+
+    bool didWeSync = false;
+    do {
+        // Do this check without the lock, since appendedLength is atomic.
+        uint32_t syncedLength = head->syncedLength;
+        if (desiredSyncedLength <= syncedLength) {
+            if (!didWeSync) {
+                TEST_LOG("sync not needed: entry is already replicated");
+            }
+            break;
         }
+        if (syncLock.try_lock()) {
+            // Won the leader election for syncing
+            #if TIME_TRACE
+            if (rpcId) TimeTrace::record("ID %u: Starting replication on "
+                "Core %d", rpcId, Arachne::core.kernelThreadId);
+            #endif
+            // See if we still have work to do. It's possible that another
+            // thread already did the syncing we needed for us.
+            Tub<Lock> lock;
+            lock.construct(appendLock);
+            #if TIME_TRACE
+            if (rpcId) TimeTrace::record("ID %u: Log::sync reacquired "
+                "appendLock on Core %d", rpcId, Arachne::core.kernelThreadId);
+            #endif
 
-        Tub<SpinLock::Guard> lock;
-        lock.construct(appendLock);
+            // Get the latest segment length and certificate. This allows us to
+            // batch up other appends that came in while we were waiting.
+            SegmentCertificate certificate;
+            uint32_t appendedLength = head->getAppendedLength(&certificate);
 
-        // Get the latest segment length and certificate. This allows us to
-        // batch up other appends that came in while we were waiting.
-        SegmentCertificate certificate;
-        // If segment != head, segment must have been closed and its replication
-        // is queued already. Forcing sync of head segment will also make sure
-        // that the closed segment is fully replicated.
-        uint32_t appendedLength = head->getAppendedLength(&certificate);
+            // Drop the append lock. We don't want to block other appending
+            // threads while we sync.
+            lock.destroy();
 
-        // Drop the append lock. We don't want to block other appending
-        // threads while we sync.
-        lock.destroy();
-
-        head->replicatedSegment->sync(appendedLength, &certificate);
-        head->syncedLength = appendedLength;
-        TEST_LOG("log synced");
-        return;
-    }
-    TEST_LOG("sync not needed: entry is already replicated");
+            head->replicatedSegment->sync(appendedLength, &certificate, rpcId);
+            head->syncedLength = appendedLength;
+            didWeSync = true;
+            TEST_LOG("log synced");
+            #if TIME_TRACE
+            if (rpcId) TimeTrace::record("ID %u: Finished replication on "
+                "Core %d", rpcId, Arachne::core.kernelThreadId);
+            #endif
+            syncLock.unlock();
+            // Now notify all the other threads waiting. At this point, this
+            // lock should not be contended, since all the threads that would
+            // be taking this lock would be peacefully blocked.
+            std::lock_guard<Arachne::SpinLock> _(waitingThreadLock);
+            for (size_t i = 0; i < waitingThreads.size(); i++) {
+                Arachne::signal(waitingThreads[i]);
+            }
+            waitingThreads.clear();
+        } else {
+            // Lost the leader election for syncing, so we wait until the next
+            // sync finishes without serializing.
+            {
+                std::lock_guard<Arachne::SpinLock> _(waitingThreadLock);
+                waitingThreads.push_back(Arachne::getThreadId());
+            }
+            // If the syncLock is available here, then it is possible that the
+            // current holder has already.exited, so it is not safe to block.
+            // If the syncLock is not available, then we successfully beat the
+            // current holder of the syncLock to the waitingThreadLock, since
+            // it must release the syncLock before acquiring the
+            // waitingThreadLock.
+            if (syncLock.try_lock()) {
+                syncLock.unlock();
+                continue;
+            }
+            Arachne::block();
+        }
+    } while (true);
 }
 
 /**
@@ -291,8 +397,8 @@ Log::syncTo(Log::Reference reference)
 LogPosition
 Log::rollHeadOver()
 {
-    SpinLock::Guard lock(syncLock);
-    SpinLock::Guard lock2(appendLock);
+    std::lock_guard<Arachne::SpinLock> lock(syncLock);
+    Lock lock2(appendLock);
 
     // Allocate the new head and sync the log. This will ensure that the
     // position returned is stable on backups. This is paricularly important

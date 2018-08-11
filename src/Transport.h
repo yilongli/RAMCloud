@@ -80,6 +80,9 @@ class Transport {
             , epoch(0)
             , activities(~0)
             , arriveTime(0)
+            , id(0)
+            , finished(0)
+            , header(NULL)
             , outstandingRpcListHook()
         {}
 
@@ -172,6 +175,24 @@ class Transport {
          */
         static const int READ_ACTIVITY = 1;
         static const int APPEND_ACTIVITY = 2;
+
+        /**
+         * An ID to track this Rpc as it migrates from the dispatch thread to
+         * the worker threads and back.
+         */
+        uint32_t id;
+
+        /**
+          * A flag which the dispatch thread checks to determine if this Rpc
+          * has finished being handled by the worker thread.
+          */
+        std::atomic<bool> finished;
+
+        /**
+          * Cache the header so that we don't have to pay 100 ns to extract it
+          * multiple times.
+          */
+        const WireFormat::RequestCommon* header;
 
         /**
          * Hook for the list of active server RPCs that the ServerRpcPool class
