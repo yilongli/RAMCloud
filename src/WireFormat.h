@@ -352,8 +352,8 @@ struct AllGather {
     static const ServiceType service = MILLISORT_SERVICE;
     struct Request {
         RequestCommonWithOpId common;
-        uint32_t numSenders;
-        uint32_t senderId;
+        int32_t phase;
+        int32_t senderId;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;

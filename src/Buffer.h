@@ -151,6 +151,8 @@ class Buffer {
         memcpy(alloc(sizeof(T)), object, sizeof(T));
     }
 
+    void appendCopy(Buffer* src, uint32_t offset = 0, uint32_t length = ~0u);
+
     /**
      * Extend the buffer with a block of external data. The data is not
      * copied; the buffer will refer to the source block, so the caller must

@@ -253,6 +253,28 @@ Buffer::append(Buffer* src, uint32_t offset, uint32_t length)
 
 /*
  * Append to this buffer a range of bytes from another buffer. The append
+ * is done by copy.
+ *
+ * \param src
+ *      Buffer from which data is to be shared.
+ * \param offset
+ *      Index in src of the first byte of data to be added to the current
+ *      buffer.
+ * \param length
+ *      Total number of bytes of data to append.
+ */
+void
+Buffer::appendCopy(Buffer* src, uint32_t offset, uint32_t length)
+{
+    Iterator it(src, offset, length);
+    while (!it.isDone()) {
+        appendCopy(it.getData(), it.getLength());
+        it.next();
+    }
+}
+
+/*
+ * Append to this buffer a range of bytes from another buffer. The append
  * is done virtually, in that the chunks of this buffer will refer to the
  * same data as the chunks from the other buffer. Use this method carefully:
  * it can result in subtle bugs if the source buffer changes after this

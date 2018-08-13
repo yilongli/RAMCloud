@@ -1,13 +1,13 @@
 #ifndef GRANULARCOMPUTING_ALLGATHER_H
 #define GRANULARCOMPUTING_ALLGATHER_H
 
-#include <boost/dynamic_bitset.hpp>
+#include <cmath>
 
-#include "Broadcast.h"
 #include "Buffer.h"
 #include "CommunicationGroup.h"
 #include "RpcWrapper.h"
 #include "RuleEngine.h"
+#include "ServerIdRpcWrapper.h"
 #include "Service.h"
 #include "WireFormat.h"
 
@@ -21,67 +21,45 @@ class AllGather {
     /**
      * Constructor used by nodes who are senders in the all-gather operation.
      *
-     * \tparam T
      * \tparam Merger
      * \param opId
      * \param context
-     * \param senderGroup
-     *      Nodes responsible for sending data in the all-gather operation.
-     * \param receiverGroup
-     *      Nodes responsible for receiving data in the all-gather operation.
+     * \param group
      * \param numElements
      * \param elements
      * \param merger
      */
-    template <typename T, typename Merger>
-    explicit AllGather(int opId, Context* context,
-            CommunicationGroup* senderGroup, CommunicationGroup* receiverGroup,
-            int numElements, const T* elements, Merger* merger)
-        // FIXME: right now, we assume a sender is always a receiver (i.e.,
-        // senderGroup is a subset of the receiverGroup). Need to set this var.
-        // properly based on receiverGroup in the future (e.g. test if
-        // receiverGroup->rank is negative).
-        : isReceiver(true)
+    template <typename Merger>
+    explicit AllGather(int opId, Context* context, CommunicationGroup* group,
+            size_t length, void* data, Merger* merger)
+        : context(context)
+        , group(group)
+        , length(length)
+        , data(data)
         , merger(*merger)
         , opId(opId)
-        , mutex("receivedFrom")
-        , receivedFrom()
+        , phase(0)
+        , maxPhase(-1)
         , sendDataRpc()
-        , broadcast()
     {
-        // FIXME: right now, BCAST API assumes the initial broadcaster is
-        // inside the communication group, which is too restricted.
-        broadcast.construct(context, receiverGroup);
-        broadcast->send<AllGatherRpc>(opId,
-                (uint32_t) senderGroup->size(), (uint32_t) senderGroup->rank,
-                uint32_t(sizeof(T) * numElements), elements);
+        if (group->size() > 1) {
+            maxPhase = int(std::log2(group->size() - 1));
+        }
+        if (phase <= maxPhase) {
+            sendDataRpc.construct(context, getPeerId(0), opId, phase,
+                    group->rank, length, data);
+        }
     }
 
-    /**
-     * Constructor used by nodes who are purely receivers in the all-gather
-     * operation.
-     *
-     * \tparam Merger
-     *      Concrete type of #merger.
-     * \param opId
-     *      Unique identifier of this collective operation.
-     * \param context
-     *      Service context.
-     * \param merger
-     *      Used to incorporate received data.
-     */
-    template <typename Merger>
-    explicit AllGather(int opId, Context* context, Merger* merger)
-        : isReceiver(true)
-        , merger(*merger)
-        , opId(opId)
-        , mutex("receivedFrom")
-        , receivedFrom()
-        , sendDataRpc()
-        , broadcast()
-    {}
-
     ~AllGather() = default;
+
+    ServerId
+    getPeerId(int phase)
+    {
+        int rank = group->rank >> phase;
+        int d = (rank % 2) ? -1 : 1;
+        return group->getNode(group->rank + d * (1 << phase));
+    }
 
     void handleRpc(const WireFormat::AllGather::Request* reqHdr,
             WireFormat::AllGather::Response* respHdr, Service::Rpc* rpc);
@@ -92,28 +70,25 @@ class AllGather {
     class AllGatherRpc : public ServerIdRpcWrapper {
       public:
         explicit AllGatherRpc(Context* context, ServerId serverId,
-                int opId, int numSenders, int senderId, uint32_t length,
+                int opId, int phase, int senderId, size_t length,
                 const void* data)
             : ServerIdRpcWrapper(context, serverId,
                 sizeof(WireFormat::AllGather::Response))
         {
-            WireFormat::AllGather::Request* reqHdr(
-                    allocHeader<WireFormat::AllGather>(downCast<uint32_t>(opId)));
-            reqHdr->numSenders = downCast<uint32_t>(numSenders);
-            reqHdr->senderId = downCast<uint32_t>(senderId);
-            request.appendExternal(data, length);
+            appendRequest(&request, opId, phase, senderId, length, data);
             send();
         }
 
         static void
-        appendRequest(Buffer* request, int opId, int numSenders, int senderId,
-                uint32_t length, const void* data)
+        appendRequest(Buffer* request, int opId, int phase,
+                int senderId, size_t length, const void* data)
         {
             WireFormat::AllGather::Request* reqHdr(
-                    allocHeader<WireFormat::AllGather>(request, downCast<uint32_t>(opId)));
-            reqHdr->numSenders = downCast<uint32_t>(numSenders);
-            reqHdr->senderId = downCast<uint32_t>(senderId);
-            request->appendExternal(data, length);
+                    allocHeader<WireFormat::AllGather>(request,
+                    downCast<uint32_t>(opId)));
+            reqHdr->phase = phase;
+            reqHdr->senderId = senderId;
+            request->appendExternal(data, (uint32_t)length);
         }
 
         /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
@@ -130,23 +105,23 @@ class AllGather {
         DISALLOW_COPY_AND_ASSIGN(AllGatherRpc);
     };
 
-    bool isReceiver;
+    Context* context;
 
-    std::function<void(Buffer*)> merger;
+    CommunicationGroup* group;
+
+    size_t length;
+
+    void* data;
+
+    std::function<std::pair<void*, size_t>(Buffer*)> merger;
 
     int opId;
 
-    SpinLock mutex;
+    std::atomic<int> phase;
 
-    /// Used to record the nodes from which we have received data. Only present
-    /// on receiver nodes.
-    Tub<boost::dynamic_bitset<>> receivedFrom;
+    int maxPhase;
 
-    /// Only present if #isSender is true.
     Tub<AllGatherRpc> sendDataRpc;
-
-    /// Only present if #isSender is true.
-    Tub<TreeBcast> broadcast;
 
     DISALLOW_COPY_AND_ASSIGN(AllGather)
 };

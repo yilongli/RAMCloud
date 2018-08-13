@@ -109,7 +109,9 @@ class MilliSortService : public Service {
     {
         op.construct(opId, args...);
 
-        // FIXME: sync with the dispatch thread? the following doesn't work; op.construct may be blocking?
+        // Sync with the dispatch thread before accessing collectiveOpTable.
+        // This must be done after constructing the collective op object since
+        // the constructor might be expensive.
         Dispatch::Lock _(context->dispatch);
 
         CollectiveOpRecord* record = getCollectiveOpRecord(opId);
@@ -124,6 +126,13 @@ class MilliSortService : public Service {
         // FIXME: can't do it here because pivotsShuffle needs a ptr to op
 //        op.wait();
 //        collectiveOpTable.erase(opId);
+    }
+
+    void
+    removeCollectiveOp(int opId)
+    {
+        Dispatch::Lock _(context->dispatch);
+        collectiveOpTable.erase(opId);
     }
 
     /**
@@ -154,8 +163,13 @@ class MilliSortService : public Service {
     handleCollectiveOpRpc(const typename Op::RpcType::Request* reqHdr,
             typename Op::RpcType::Response* respHdr, Rpc* rpc)
     {
-        CollectiveOpRecord* record = getCollectiveOpRecord(reqHdr->common.opId);
-        Op* collectiveOp = record->getOp<Op>();
+        Op* collectiveOp = NULL;
+        {
+            Dispatch::Lock _(context->dispatch);
+            CollectiveOpRecord* record =
+                    getCollectiveOpRecord(reqHdr->common.opId);
+            collectiveOp = record->getOp<Op>();
+        }
         if (collectiveOp == NULL) {
             LOG(ERROR, "unable to find the collective op object, opId %u",
                     reqHdr->common.opId);
@@ -202,6 +216,7 @@ class MilliSortService : public Service {
         GATHER_SUPER_PIVOTS,
         BROADCAST_PIVOT_BUCKET_BOUNDARIES,
         ALLSHUFFLE_PIVOTS,
+        BROADCAST_DATA_BUCKET_BOUNDARIES,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_DATA,
     };
@@ -223,17 +238,19 @@ class MilliSortService : public Service {
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
     void pickDataBucketBoundaries();
+    void allGatherDataBucketBoundaries();
     void dataBucketSort();
     void debugLogKeys(const char* prefix, vector<SortKey>* keys);
 
     enum CommunicationGroupId {
         WORLD                   = 0,
         MY_PIVOT_SERVER_GROUP   = 1,
-        ALL_PIVOT_SERVERS       = 2
+        ALL_PIVOT_SERVERS       = 2,
+        ALL_GATHER_PEERS_GROUP  = 3
     };
 
-    /// MilliSort request in progress. NULL means the service is idle.
-    Service::Rpc* ongoingMilliSort;
+//    /// MilliSort request in progress. NULL means the service is idle.
+    std::atomic<Service::Rpc*> ongoingMilliSort;
 
     uint64_t startTime;
 
@@ -278,6 +295,9 @@ class MilliSortService : public Service {
     /// node itself is a pivot server), and all other nodes that are assigned to
     /// this pivot server.
     Tub<CommunicationGroup> myPivotServerGroup;
+
+
+    Tub<CommunicationGroup> allGatherPeersGroup;
 
     // -------- Pivot server state --------
     /// Pivots gathered from this pivot server's slave nodes. Always empty on

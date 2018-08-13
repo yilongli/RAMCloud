@@ -29,42 +29,51 @@ void
 AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
         WireFormat::AllGather::Response* respHdr, Service::Rpc* rpc)
 {
-    SpinLock::Guard _(mutex);
+//    LOG(NOTICE, "AllGather: local phase %d, received from server %u, remote "
+//            "phase %d", phase.load(),
+//            group->getNode(reqHdr->senderId).indexNumber(), reqHdr->phase);
 
-    if (!receivedFrom) {
-        receivedFrom.construct(reqHdr->numSenders);
-    }
-
-    uint32_t senderId = reqHdr->senderId;
-//    LOG(WARNING, "received AllGatherRpc from sender %u", senderId+1);
-    if (receivedFrom->test(senderId)) {
+    int msgPhase = reqHdr->phase;
+    int msgSender = reqHdr->senderId;
+    if (msgPhase < phase) {
         respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
         return;
     }
-    receivedFrom->set(senderId);
+
+    // Copy out the data so that we can send back the reply. Otherwise, peers on
+    // both sides will be waiting for sendDataRpc->isReady() to become true.
+    Buffer buffer;
+    buffer.appendCopy(rpc->requestPayload);
+    rpc->sendReply();
+
+    while (phase < msgPhase) {
+        // Arachne::yield();
+    }
+    while (!sendDataRpc->isReady()) {
+        // Arachne::wait(condition)??
+    }
 
     // Chop off the AllGather header and incorporate the data.
-    rpc->requestPayload->truncateFront(sizeof(*reqHdr));
+    buffer.truncateFront(sizeof(*reqHdr));
     if (merger) {
-        timeTrace("AllGather: about to merge payload from rank %u", senderId);
-        merger(rpc->requestPayload);
+        timeTrace("AllGather: about to merge payload from server %u (rank %u)",
+                group->getNode(msgSender).indexNumber(), (uint32_t) msgSender);
+        std::tie(data, length) = merger(&buffer);
     }
+
+    // Start the next phase.
+    int nextPhase = msgPhase + 1;
+    if (nextPhase <= maxPhase) {
+        sendDataRpc.construct(context, getPeerId(nextPhase), opId, nextPhase,
+                group->rank, length, data);
+    }
+    phase.store(nextPhase);
 }
 
 bool
 AllGather::isReady()
 {
-    if (broadcast && !broadcast->isReady()) {
-        return false;
-    }
-    if (isReceiver) {
-        SpinLock::Guard _(mutex);
-        if (!receivedFrom ||
-                (receivedFrom->count() < receivedFrom->size())) {
-            return false;
-        }
-    }
-    return true;
+    return phase > maxPhase;
 }
 
 void

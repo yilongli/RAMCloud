@@ -77,6 +77,7 @@ MilliSortService::MilliSortService(Context* context,
     , dataBucketBoundaries()
     , world()
     , myPivotServerGroup()
+    , allGatherPeersGroup()
     , gatheredPivots()
     , superPivots()
     , pivotBucketBoundaries()
@@ -167,6 +168,24 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
             return;
         }
 
+        // TODO: the following two limitations are due to our impl. of allgather
+        int nodesPerPivotServer = reqHdr->nodesPerPivotServer;
+        if (world->size() % nodesPerPivotServer != 0) {
+            LOG(ERROR, "illegal nodesPerPivotServer value %d: cannot divide "
+                    "total number of nodes %d", nodesPerPivotServer,
+                    world->size());
+            respHdr->common.status = STATUS_MILLISORT_ERROR;
+            return;
+        }
+        int numPivotServers = world->size() / nodesPerPivotServer;
+        if ((numPivotServers & (numPivotServers - 1)) != 0) {
+            LOG(ERROR, "illegal nodesPerPivotServer value %d; # pivot servers "
+                    "= %d is not a power of 2", nodesPerPivotServer,
+                    numPivotServers);
+            respHdr->common.status = STATUS_MILLISORT_ERROR;
+            return;
+        }
+
         TreeBcast treeBcast(context, world.get());
         treeBcast.send<InitMilliSortRpc>(reqHdr->dataTuplesPerServer,
                 reqHdr->nodesPerPivotServer, false);
@@ -215,6 +234,17 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         allPivotServers.destroy();
     }
 
+    nodes.clear();
+    int peerRank = world->rank % nodesPerPivotServer;
+    for (int i = 0; i < numPivotServers; i++) {
+        nodes.push_back(world->getNode(i * nodesPerPivotServer + peerRank));
+    }
+    allGatherPeersGroup.construct(ALL_GATHER_PEERS_GROUP,
+            world->rank / nodesPerPivotServer, nodes);
+//    for (auto nn : nodes) {
+//        LOG(WARNING, "peer server %u", nn.indexNumber());
+//    }
+
     // Generate data tuples.
     keys.clear();
     for (int i = 0; i < numDataTuples; i++) {
@@ -253,7 +283,7 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     timeTrace("startMilliSort invoked, requestId %u, fromClient %u",
             uint(reqHdr->requestId), reqHdr->fromClient);
 
-    if (ongoingMilliSort != NULL) {
+    if (ongoingMilliSort) {
         respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
         return;
     }
@@ -282,9 +312,9 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     // Kick start the sorting process.
     ongoingMilliSort = rpc;
     localSortAndPickPivots();
-    ongoingMilliSort = NULL;
-
-    // FIXME: what should I do for non-root pivot servers? Should I busy wait here?
+    while (ongoingMilliSort != NULL) {
+        // Arachne wait on condition var.
+    }
 }
 
 void
@@ -365,7 +395,7 @@ MilliSortService::localSortAndPickPivots()
                 localPivots.data(), &merger);
         gatherPivots->wait();
         // TODO: the cleanup is not very nice; how to do RAII?
-        collectiveOpTable.erase(GATHER_PIVOTS);
+        removeCollectiveOp(GATHER_PIVOTS);
 
         // FIXME: seems wrong division of responsibility; should I move this
         // into Gather class? Also this assumes a particular implementation of
@@ -382,7 +412,6 @@ MilliSortService::localSortAndPickPivots()
         pickSuperPivots();
     } else {
         timeTrace("sent %u local pivots", localPivots.size());
-        pickDataBucketBoundaries();
     }
 }
 
@@ -418,7 +447,7 @@ MilliSortService::pickSuperPivots()
                 (uint32_t) superPivots.size(), superPivots.data(), &merger);
         // fixme: this is duplicated everywhere
         gatherSuperPivots->wait();
-        collectiveOpTable.erase(GATHER_SUPER_PIVOTS);
+        removeCollectiveOp(GATHER_SUPER_PIVOTS);
     }
 
     // The root node will advance to pick pivot bucket boundaries when the
@@ -515,7 +544,7 @@ MilliSortService::pivotBucketSort()
             pivotsShuffle->closeSendBuffer(rank);
         }
         pivotsShuffle->wait();
-        collectiveOpTable.erase(ALLSHUFFLE_PIVOTS);
+        removeCollectiveOp(ALLSHUFFLE_PIVOTS);
         debugLogKeys("sorted pivots (local portion): ", &sortedGatheredPivots);
     }
 
@@ -526,28 +555,54 @@ MilliSortService::pivotBucketSort()
 }
 
 void
-MilliSortService::pickDataBucketBoundaries()
-{
+MilliSortService::pickDataBucketBoundaries() {
     timeTrace("=== Stage 5: pickDataBucketBoundaries started");
-    if (isPivotServer) {
-        // TODO: doc. that it's copied from sortAndPartition and modified.
-        int s = numPivotsInTotal / world->size();
-        int k = world->size() * (s + 1) - numPivotsInTotal;
-        int globalIdx = -1;
-        for (int i = 0; i < world->size(); i++) {
-            if (i < k) {
-                globalIdx += s;
-            } else {
-                globalIdx += s + 1;
-            }
 
-            int localIdx = globalIdx - numSmallerPivots;
-            if ((0 <= localIdx) && (localIdx < (int) sortedGatheredPivots.size())) {
-                partialDataBucketBoundaries.push_back(
-                        sortedGatheredPivots[localIdx]);
-            }
+    assert(isPivotServer);
+    // TODO: doc. that it's copied from sortAndPartition and modified.
+    int s = numPivotsInTotal / world->size();
+    int k = world->size() * (s + 1) - numPivotsInTotal;
+    int globalIdx = -1;
+    for (int i = 0; i < world->size(); i++) {
+        if (i < k) {
+            globalIdx += s;
+        } else {
+            globalIdx += s + 1;
+        }
+
+        int localIdx = globalIdx - numSmallerPivots;
+        if ((0 <= localIdx) && (localIdx < (int) sortedGatheredPivots.size())) {
+            partialDataBucketBoundaries.push_back(
+                    sortedGatheredPivots[localIdx]);
         }
     }
+    debugLogKeys("data bucket boundaries (local portion): ",
+            &partialDataBucketBoundaries);
+
+    // Broadcast computed partial data bucket boundaries to the slave nodes.
+    timeTrace("picked %u partial data bucket boundaries, about to broadcast to"
+              "slave nodes", partialDataBucketBoundaries.size());
+    {
+//        CycleCounter<> _(&PerfStats::threadStats.?);
+        TreeBcast bcast(context, myPivotServerGroup.get());
+        bcast.send<SendDataRpc>(BROADCAST_DATA_BUCKET_BOUNDARIES,
+                downCast<uint32_t>(
+                        KeySize * partialDataBucketBoundaries.size()),
+                partialDataBucketBoundaries.data());
+        dataBucketBoundaries = partialDataBucketBoundaries;
+        // FIXME: there is no need to wait here because the following all-gather
+        // modify dataBucketBoundaries rather than partialDataBucketBoundaries.
+        bcast.wait();
+    }
+
+    timeTrace("broadcast to %u slave nodes", uint(myPivotServerGroup->size()));
+    allGatherDataBucketBoundaries();
+}
+
+void
+MilliSortService::allGatherDataBucketBoundaries()
+{
+    timeTrace("=== Stage 6: allGatherDataBucketBoundaries started");
 
     // Merge data bucket boundaries from pivot servers as they arrive.
     auto merger = [this] (Buffer* pivotsBuffer) {
@@ -563,6 +618,8 @@ MilliSortService::pickDataBucketBoundaries()
             // are sorted globally, we know exactly where to insert even they come!
             timeTrace("merged %u data bucket boundaries",
                     pivotsBuffer->size() / KeySize);
+        return std::make_pair(dataBucketBoundaries.data(),
+                dataBucketBoundaries.size() * KeySize);
     };
 
     // Gather data bucket boundaries from pivot servers to all nodes.
@@ -570,18 +627,13 @@ MilliSortService::pickDataBucketBoundaries()
     {
         CycleCounter<> _(&PerfStats::threadStats.allGatherPivotsCycles);
         Tub<AllGather> allGather;
-        if (isPivotServer) {
-            invokeCollectiveOp<AllGather>(allGather,
-                    ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
-                    allPivotServers.get(), world.get(),
-                    (uint32_t) partialDataBucketBoundaries.size(),
-                    partialDataBucketBoundaries.data(), &merger);
-        } else {
-            invokeCollectiveOp<AllGather>(allGather,
-                    ALLGATHER_DATA_BUCKET_BOUNDARIES, context, &merger);
-        }
+        invokeCollectiveOp<AllGather>(allGather,
+                ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
+                allGatherPeersGroup.get(),
+                dataBucketBoundaries.size() * KeySize,
+                dataBucketBoundaries.data(), &merger);
         allGather->wait();
-        collectiveOpTable.erase(ALLGATHER_DATA_BUCKET_BOUNDARIES);
+        removeCollectiveOp(ALLGATHER_DATA_BUCKET_BOUNDARIES);
         debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
     }
 
@@ -595,7 +647,7 @@ MilliSortService::pickDataBucketBoundaries()
 void
 MilliSortService::dataBucketSort()
 {
-    timeTrace("=== Stage 6: dataBucketSort started");
+    timeTrace("=== Stage 7: dataBucketSort started");
 
     // Merge data from other nodes as they arrive.
     auto merger = [this] (Buffer* data) {
@@ -628,17 +680,15 @@ MilliSortService::dataBucketSort()
             dataShuffle->closeSendBuffer(rank);
         }
         dataShuffle->wait();
-        collectiveOpTable.erase(ALLSHUFFLE_DATA);
+        removeCollectiveOp(ALLSHUFFLE_DATA);
     }
 
     endTime = Cycles::rdtsc();
     PerfStats::threadStats.millisortTime += endTime - startTime;
     timeTrace("millisort finished");
 
-    if (ongoingMilliSort) {
-        ongoingMilliSort->sendReply();
-        ongoingMilliSort = NULL;
-    }
+    ongoingMilliSort.load()->sendReply();
+    ongoingMilliSort = NULL;
     debugLogKeys("final result: ", &sortedKeys);
 }
 
@@ -707,6 +757,27 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
 
                 rpc->sendReply();
                 pivotBucketSort();
+            }
+            break;
+        }
+        case BROADCAST_DATA_BUCKET_BOUNDARIES: {
+            // FIXME: info leak in handler; have to handle differently based on
+            // rank
+            if (!isPivotServer) {
+                Buffer *request = rpc->requestPayload;
+                for (uint32_t offset = sizeof(*reqHdr);
+                     offset < request->size();) {
+                    // Put into dataBucketBoundaries directly.
+                    dataBucketBoundaries.push_back(
+                            *request->read<SortKey>(&offset));
+                }
+                timeTrace("received %u partial data bucket boundaries",
+                        dataBucketBoundaries.size());
+                debugLogKeys("data bucket boundaries (local portion): ",
+                        &dataBucketBoundaries);
+
+                rpc->sendReply();
+                allGatherDataBucketBoundaries();
             }
             break;
         }
