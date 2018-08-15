@@ -153,7 +153,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
               reqHdr->fromClient);
 
     // We are busy serving another sorting request.
-    if (ongoingMilliSort != NULL) {
+    if (ongoingMilliSort) {
         respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
         return;
     }
@@ -299,12 +299,6 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
         // Start broadcasting the start request.
         TreeBcast startBcast(context, world.get());
         startBcast.send<StartMilliSortRpc>(reqHdr->requestId, false);
-
-        // FIXME: I am throwing away an entire worker thread here; should I use
-        // sleep? Arachne?
-//        while (!startBcast.isReady()) {
-//            yield();
-//        }
         startBcast.wait();
         return;
     }
@@ -312,8 +306,9 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     // Kick start the sorting process.
     ongoingMilliSort = rpc;
     localSortAndPickPivots();
+    // FIXME: a better solution is to wait on condition var.
     while (ongoingMilliSort != NULL) {
-        // Arachne wait on condition var.
+        Arachne::yield();
     }
 }
 

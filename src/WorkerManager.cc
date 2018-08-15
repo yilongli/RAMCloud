@@ -179,11 +179,10 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
                 const WireFormat::RequestCommonWithOpId*>(header)->opId;
         Service::CollectiveOpRecord* record =
                 millisort->getCollectiveOpRecord(opId);
+//        LOG(NOTICE, "%s RPC from op %u, record->op %p",
+//                WireFormat::opcodeSymbol(header->opcode), opId, record->op);
         if (record->op == NULL) {
             record->serverRpcList.push_back(rpc);
-//            LOG(WARNING, "%s RPC from op %u arrives early, record %p, op %p",
-//                    WireFormat::opcodeSymbol(header->opcode), reqHdr->opId,
-//                    record, record->op);
             return;
         }
     }
@@ -202,7 +201,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     rpc->header = header;
     timeTrace("ID %u: Dispatching opcode %d on core %d", rpc->id,
         header->opcode, sched_getcpu());
-    if (Arachne::createThread(&WorkerManager::workerMain, this, rpc) ==
+    Arachne::ThreadId threadId = Arachne::createThread(&WorkerManager::workerMain, this, rpc);
+    if (threadId ==
             Arachne::NullThread) {
         // Thread creations can fail randomly due to core deallocation,
         // so first retry a few times.
@@ -223,6 +223,10 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
                 STATUS_RETRY);
         rpc->sendReply();
     } else {
+//        RAMCLOUD_LOG(NOTICE, "%s dispatched, init. core %d, core %d, request %p",
+//                WireFormat::opcodeSymbol(header->opcode),
+//                threadId.context->originalCoreId, threadId.context->coreId,
+//                &rpc->requestPayload);
         outstandingRpcs.push_back(rpc);
     }
 }
@@ -267,7 +271,12 @@ WorkerManager::poll()
 
     for (int i = downCast<int>(outstandingRpcs.size()) - 1; i >= 0; i--) {
         Transport::ServerRpc* rpc = outstandingRpcs[i];
-        if (!rpc->finished.load(std::memory_order_acquire)) continue;
+        if (!rpc->finished.load(std::memory_order_acquire)) {
+//            RAMCLOUD_CLOG(NOTICE, "%s not finished, request %p",
+//                    WireFormat::opcodeSymbol(&rpc->requestPayload),
+//                    &rpc->requestPayload);
+            continue;
+        }
 
         foundWork = 1;
 
@@ -280,8 +289,8 @@ WorkerManager::poll()
                     reinterpret_cast<uint64_t>(rpc),
                     rpc->replyPayload.size());
 #endif
-            rpc->sendReply();
-            timeTrace("ID %u: reply sent", rpc->id);
+        rpc->sendReply();
+        timeTrace("ID %u: reply sent", rpc->id);
         numOutstandingRpcs--;
 
         // If we are not the last rpc, store the last Rpc here so that pop-back
@@ -337,6 +346,10 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
     // work.
     uint64_t lastIdle = Cycles::rdtsc();
 
+//    RAMCLOUD_LOG(NOTICE, "%s passed to handler, request %p",
+//            WireFormat::opcodeSymbol(serverRpc->getOpcode()),
+//            &serverRpc->requestPayload);
+
     try {
        timeTrace("ID %u: Starting processing of opcode %d  on KT %d, "
             "idInCore %d", serverRpc->id, serverRpc->header->opcode,
@@ -349,6 +362,8 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
         Service::Rpc rpc(&worker, &serverRpc->requestPayload,
                 &serverRpc->replyPayload);
         Service::handleRpc(context, &rpc);
+//        RAMCLOUD_LOG(NOTICE, "GET_SERVER_ID back from handler, request %p",
+//                &serverRpc->requestPayload);
 
         // Pass the RPC back to the dispatch thread for completion.
         worker.sendReply();

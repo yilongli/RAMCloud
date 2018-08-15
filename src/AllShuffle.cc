@@ -50,7 +50,7 @@ AllShuffle::handleRpc(const WireFormat::AllShuffle::Request* reqHdr,
     SpinLock::Guard _(mutex);
 
     uint32_t senderId = reqHdr->senderId;
-//    LOG(WARNING, "received AllShuffleRpc from server %u", senderId + 1);
+//    LOG(NOTICE, "received AllShuffleRpc from server %u", senderId + 1);
     if (receivedFrom.test(senderId)) {
         respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
         return;
@@ -66,25 +66,26 @@ AllShuffle::handleRpc(const WireFormat::AllShuffle::Request* reqHdr,
     }
 }
 
-bool
-AllShuffle::isReady()
-{
-    for (auto& rpc : outgoingRpcs) {
-        if (rpc && rpc->isReady()) {
-            outstandingRpcs--;
-            rpc.destroy();
-        }
-    }
-
-    SpinLock::Guard _(mutex);
-    return (outstandingRpcs == 0) &&
-           (int(receivedFrom.count()) == group->size());
-}
-
 void
 AllShuffle::wait()
 {
-    while (!isReady());
+    // TODO: what if we want to not send out all the rpcs at the beginning?
+    for (auto& rpc : outgoingRpcs) {
+        if (rpc) {
+            rpc->wait();
+            rpc.destroy();
+            outstandingRpcs--;
+        }
+    }
+
+    // We must not rely on Arachne::SpinLock to yield because it only yield upon
+    // failure to acquire the lock. If the contender thread is dispatched to the
+    // same core as this thread, this thread will keep acquiring the lock and
+    // never yield.
+    for (bool done = false; !done; Arachne::yield()) {
+        SpinLock::Guard _(mutex);
+        done = int(receivedFrom.count()) == group->size();
+    }
 }
 
 }

@@ -1225,6 +1225,9 @@ BasicTransport::handlePacket(Driver::Received* received)
 //                if (header->common.rpcId.clientId == clientId) {
 //                    TimeTrace::record("about to handle pseudo RPC!!!!!!");
 //                }
+//                LOG(NOTICE, "%s from %s, request %p",
+//                        WireFormat::opcodeSymbol(&serverRpc->requestPayload),
+//                        received->sender->toString().c_str(), &serverRpc->requestPayload);
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
@@ -1493,6 +1496,10 @@ BasicTransport::ServerRpc::getClientServiceLocator()
 void
 BasicTransport::ServerRpc::sendReply()
 {
+//    LOG(NOTICE, "send reply of %s to %s",
+//            WireFormat::opcodeSymbol(&requestPayload),
+//            response.recipient->toString().c_str());
+
     uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,

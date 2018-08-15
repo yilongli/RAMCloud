@@ -421,6 +421,7 @@ TransportManager::openSession(const string& serviceLocator)
 {
     // If we're running on a server (i.e., multithreaded) must exclude
     // other threads.
+    // TODO: why not arachne spinlock?
     Tub<std::lock_guard<SpinLock>> lock;
     if (isServer) {
         lock.construct(mutex);

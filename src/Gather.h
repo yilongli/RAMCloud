@@ -30,7 +30,7 @@ class FlatGather {
         , opId(opId)
         , root(root)
         , gatheredFrom()
-        , mutex("gatheredFrom lock")
+        , mutex("FlatGather::mutex")
         , sendData()
     {
         uint32_t numBytes = numElements * sizeof32(T);
@@ -99,7 +99,9 @@ class FlatGather {
 
     /// Used to make sure that only one thread at a time attempts to access
     /// #gatheredFrom.
-    SpinLock mutex;
+    Arachne::SpinLock mutex;
+
+    typedef std::lock_guard<Arachne::SpinLock> Lock;
 
     /// RPC used to transfer data to the root node.
     Tub<FlatGatherRpc> sendData;

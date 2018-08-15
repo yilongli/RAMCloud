@@ -210,7 +210,9 @@ TreeBcast::isReady()
 void
 TreeBcast::wait()
 {
-    while (!isReady()) {};
+    while (!isReady()) {
+        Arachne::yield();
+    };
 }
 
 }

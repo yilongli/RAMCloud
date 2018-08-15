@@ -40,13 +40,13 @@ class AllGather {
         , opId(opId)
         , phase(0)
         , maxPhase(-1)
-        , sendDataRpc()
+        , outgoingRpc()
     {
         if (group->size() > 1) {
             maxPhase = int(std::log2(group->size() - 1));
         }
         if (phase <= maxPhase) {
-            sendDataRpc.construct(context, getPeerId(0), opId, phase,
+            outgoingRpc.construct(context, getPeerId(0), opId, phase,
                     group->rank, length, data);
         }
     }
@@ -121,7 +121,7 @@ class AllGather {
 
     int maxPhase;
 
-    Tub<AllGatherRpc> sendDataRpc;
+    Tub<AllGatherRpc> outgoingRpc;
 
     DISALLOW_COPY_AND_ASSIGN(AllGather)
 };

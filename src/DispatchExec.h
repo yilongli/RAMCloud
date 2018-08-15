@@ -132,10 +132,12 @@ class DispatchExec : public Dispatch::Poller {
         addRequest(Args&&... args) {
             static_assert(std::is_base_of<Lambda, T>::value,
                     "T is not a subclass of Lambda");
+            // TODO: why ramcloud spinlock? because I don't want to yield?
             std::lock_guard<SpinLock> guard(lock);
 
             // This check is done at compile-time because all parts of the
             // expression are constant.
+            // TODO: constexper?
             const uint64_t maxSize = Lambda::getMaxSize();
             if (sizeof(T) > maxSize) {
                 DIE("The data in the Lambda exceeds %lu bytes, aborting...",
@@ -145,6 +147,7 @@ class DispatchExec : public Dispatch::Poller {
             // If there is no space at the current index, it means that the
             // Dispatch thread has fallen behind, so spin until there is space
             // at the current index
+            // TODO: shouldn't use volatile and custom fence!
             while (requests[addIndex].data.full == 1) {
                 RAMCLOUD_CLOG(
                     NOTICE,
@@ -195,6 +198,7 @@ class DispatchExec : public Dispatch::Poller {
 
         // Prevent multiple worker threads from simultaneously adding entries
         // to the same position.
+        // TODO: WHY IS THIS A RAMCLOUD SPINLOCK?
         SpinLock lock;
 
         // The index in requests at which the worker will place the next Lambda

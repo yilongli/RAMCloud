@@ -31,7 +31,7 @@ FlatGather::isReady()
     if (group->rank != root) {
         return sendData->isReady();
     } else {
-        SpinLock::Guard _(mutex);
+        Lock _(mutex);
         return int(gatheredFrom->count()) == group->size();
     }
 }
@@ -40,7 +40,7 @@ void
 FlatGather::handleRpc(const WireFormat::FlatGather::Request* reqHdr,
         WireFormat::FlatGather::Response* respHdr, Service::Rpc* rpc)
 {
-    SpinLock::Guard _(mutex);
+    Lock _(mutex);
 
     assert(group->rank == 0);
     uint32_t senderId = reqHdr->senderId;
@@ -63,7 +63,9 @@ FlatGather::handleRpc(const WireFormat::FlatGather::Request* reqHdr,
 void
 FlatGather::wait()
 {
-    while (!isReady()) {}
+    while (!isReady()) {
+        Arachne::yield();
+    }
 }
 
 }

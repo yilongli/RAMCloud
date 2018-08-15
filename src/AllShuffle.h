@@ -26,7 +26,7 @@ class AllShuffle {
         , localData()
         , outstandingRpcs(0)
         , outgoingRpcs(group->size())
-        , mutex("receivedFrom")
+        , mutex("AllShuffle::mutex")
         , receivedFrom(group->size())
     {
         receivedFrom.set(group->rank);
@@ -43,7 +43,6 @@ class AllShuffle {
     Buffer* getSendBuffer(int rank);
     void handleRpc(const WireFormat::AllShuffle::Request* reqHdr,
             WireFormat::AllShuffle::Response* respHdr, Service::Rpc* rpc);
-    bool isReady();
     void wait();
 
   PRIVATE:

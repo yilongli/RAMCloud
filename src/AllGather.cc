@@ -41,17 +41,21 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     }
 
     // Copy out the data so that we can send back the reply. Otherwise, peers on
-    // both sides will be waiting for sendDataRpc->isReady() to become true.
+    // both sides will deadlock at `outgoingRpc->wait()`.
+    // FIXME: avoid deadlock without extra copy? seems to require the ability to
+    // take ownership of the incoming RPC request payload.
     Buffer buffer;
     buffer.appendCopy(rpc->requestPayload);
     rpc->sendReply();
 
     while (phase < msgPhase) {
-        // Arachne::yield();
+        Arachne::yield();
     }
-    while (!sendDataRpc->isReady()) {
-        // Arachne::wait(condition)??
-    }
+
+    // Must wait till the outgoing RPC to finish before incorporating the
+    // incoming data. Otherwise, we risk corrupting the content of the outgoing
+    // request.
+    outgoingRpc->wait();
 
     // Chop off the AllGather header and incorporate the data.
     buffer.truncateFront(sizeof(*reqHdr));
@@ -64,7 +68,7 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     // Start the next phase.
     int nextPhase = msgPhase + 1;
     if (nextPhase <= maxPhase) {
-        sendDataRpc.construct(context, getPeerId(nextPhase), opId, nextPhase,
+        outgoingRpc.construct(context, getPeerId(nextPhase), opId, nextPhase,
                 group->rank, length, data);
     }
     phase.store(nextPhase);
@@ -79,7 +83,9 @@ AllGather::isReady()
 void
 AllGather::wait()
 {
-    while (!isReady()) {}
+    while (!isReady()) {
+        Arachne::yield();
+    }
 }
 
 }
