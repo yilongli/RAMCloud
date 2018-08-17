@@ -320,7 +320,9 @@ struct PerfStats {
 
     uint64_t bucketSortDataCycles;
 
-    uint64_t bucketSortDataMergeCycles;
+    uint64_t bucketSortMergeKeyCycles;
+
+    uint64_t bucketSortMergeValueCycles;
 
     //--------------------------------------------------------------------
     // Temporary counters. The values below have no pre-defined use;

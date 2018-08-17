@@ -135,7 +135,8 @@ PerfStats::collectStats(PerfStats* total)
         total->allGatherPivotsCycles += stats->allGatherPivotsCycles;
         total->allGatherPivotsMergeCycles += stats->allGatherPivotsMergeCycles;
         total->bucketSortDataCycles += stats->bucketSortDataCycles;
-        total->bucketSortDataMergeCycles += stats->bucketSortDataMergeCycles;
+        total->bucketSortMergeKeyCycles += stats->bucketSortMergeKeyCycles;
+        total->bucketSortMergeValueCycles += stats->bucketSortMergeValueCycles;
         total->temp1 += stats->temp1;
         total->temp2 += stats->temp2;
         total->temp3 += stats->temp3;
@@ -372,8 +373,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Bucket sort data (us)",
             formatMetricRatio(&diff, "bucketSortDataCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "  Merge in bucket sort data (us)",
-            formatMetricRatio(&diff, "bucketSortDataMergeCycles",
+    result.append(format("%-40s %s\n", "  Merge key in bucket sort data (us)",
+            formatMetricRatio(&diff, "bucketSortMergeKeyCycles",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Merge value in bucket sort data (us)",
+            formatMetricRatio(&diff, "bucketSortMergeValueCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
     return result;
 }
@@ -478,7 +482,8 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(allGatherPivotsCycles);
         ADD_METRIC(allGatherPivotsMergeCycles);
         ADD_METRIC(bucketSortDataCycles);
-        ADD_METRIC(bucketSortDataMergeCycles);
+        ADD_METRIC(bucketSortMergeKeyCycles);
+        ADD_METRIC(bucketSortMergeValueCycles);
         ADD_METRIC(temp1);
         ADD_METRIC(temp2);
         ADD_METRIC(temp3);

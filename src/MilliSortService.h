@@ -218,21 +218,161 @@ class MilliSortService : public Service {
         ALLSHUFFLE_PIVOTS,
         BROADCAST_DATA_BUCKET_BOUNDARIES,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
-        ALLSHUFFLE_DATA,
+        ALLSHUFFLE_KEY,
+        ALLSHUFFLE_VALUE,
     };
 
-    ///
-    using SortKey = int;
-    static constexpr uint32_t KeySize = sizeof(SortKey);
+    struct Key {
+        /// # bytes in the key.
+        static constexpr int N = 10;
+
+        /// Holds bytes of the key, starting from the least significant byte.
+        char bytes[N];
+
+        explicit Key(uint64_t key)
+            : bytes()
+        {
+            static_assert(N >= 8, "Key must be at least 8-byte");
+            for (char& byte : bytes) {
+                byte = char(key % 256);
+                key >>= 8;
+            }
+        }
+
+        explicit Key(const std::string& key)
+            : bytes()
+        {
+            assert(key.size() <= N);
+            int msb = N - 1;
+            for (char ch : key) {
+                bytes[msb--] = ch;
+            }
+        }
+
+        /**
+         * If this key is constructed from a uint64_t value, return that value;
+         * otherwise, undefined. Helper method for debugging only.
+         */
+        uint64_t
+        asUint64()
+        {
+            return *((uint64_t*) bytes);
+        }
+
+        /**
+         * If this key is constructed from a string value, return that value;
+         * otherwise, undefined. Helper method for debugging only.
+         */
+        std::string
+        asString()
+        {
+            string str;
+            for (char ch : bytes) {
+                if (ch > 0) {
+                    str += ch;
+                }
+            }
+            std::reverse(str.begin(), str.end());
+            return str;
+        }
+    };
+
+    /**
+     * A pivot consists of the original key of the data tuple plus some
+     * metadata.
+     *
+     * TODO: doc. why metadata; 1. handle duplicate keys gracefully; 2. separate
+     * key and value.
+     */
+    struct PivotKey {
+        // TODO: explain the decl. order of the fields (least significant one
+        // comes first)
+
+        /// 32-bit index that supports more than 4 billion data tuples on each
+        /// server.
+        uint32_t index;
+
+        /// 16-bit serverId that supports up to 65536 nodes.
+        uint16_t serverId;
+
+        /// Original key of the data tuple to be sorted.
+        Key key;
+
+        /**
+         * Convenient method to build a pivot from an 64-bit signed integer.
+         *
+         * \param key
+         * \param serverId
+         * \param index
+         */
+        PivotKey(uint64_t key, uint16_t serverId, uint32_t index)
+            : index(index), serverId(serverId), key(key)
+        {}
+
+        /**
+         * Convenient method to build a pivot from a string.
+         *
+         * \param key
+         * \param serverId
+         * \param index
+         */
+        PivotKey(const string& key, uint16_t serverId, uint32_t index)
+            : index(index), serverId(serverId), key(key)
+        {}
+
+        /**
+         * Interpret and return the 10-byte key and the 6-byte metadata together
+         * as an 128-bit unsigned integer.
+         */
+        inline unsigned __int128
+        asUint128() const
+        {
+            static_assert(sizeof(PivotKey) == 16, "PivotKey must be 128-bit");
+            return *((const unsigned __int128*) this);
+        }
+
+        /// Required by comparison-based sorting algorithms.
+        bool
+        operator<(const PivotKey& other) const
+        {
+            return asUint128() < other.asUint128();
+        }
+
+        bool
+        operator<=(const PivotKey& otherKey) const
+        {
+            return asUint128() <= otherKey.asUint128();
+        }
+    };
+
+    struct Value {
+        char bytes[90];
+
+        explicit Value(uint64_t value)
+            : bytes()
+        {
+            *((uint64_t*) bytes) = value;
+        }
+
+        /**
+         * If this value is constructed from a uint64_t, return that unsigned
+         * integer; otherwise, undefined. Helper method for debugging only.
+         */
+        uint64_t asUint64() { return *((uint64_t*) bytes); }
+    };
+
+    // FIXME: move them into Key/Value struct definition.
+    static constexpr uint32_t KeySize = sizeof(PivotKey);
+    static constexpr uint32_t ValueSize = sizeof(Value);
 
     // ----------------------
     // Computation steps
     // ----------------------
 
-    void inplaceMerge(vector<SortKey>& keys, size_t sizeOfFirstSortedRange);
-    void sort(vector<SortKey>& keys);
-    void partition(std::vector<SortKey>* keys, int numPartitions,
-            std::vector<SortKey>* pivots);
+    void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
+    void sort(vector<PivotKey>& keys);
+    void partition(std::vector<PivotKey>* keys, int numPartitions,
+            std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
@@ -240,7 +380,7 @@ class MilliSortService : public Service {
     void pickDataBucketBoundaries();
     void allGatherDataBucketBoundaries();
     void dataBucketSort();
-    void debugLogKeys(const char* prefix, vector<SortKey>* keys);
+    void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
 
     enum CommunicationGroupId {
         WORLD                   = 0,
@@ -271,22 +411,27 @@ class MilliSortService : public Service {
     int numPivotServers;
 
     /// Keys of the data tuples to be sorted.
-    std::vector<SortKey> keys;
+    std::vector<PivotKey> keys;
 
-    // using Value = uint64_t;
-    // std::vector<Value> values;
+    /// Values of the data tuples to be sorted.
+    std::vector<Value> values;
 
-    std::vector<SortKey> sortedKeys;
+    std::vector<PivotKey> sortedKeys;
+
+    std::vector<Value> sortedValues;
+
+    // FIXME: this is a bad name;
+    std::array<int, 2048> valueStartIdx;
 
     /// Selected keys that evenly divide local #keys on this node into # nodes
     /// partitions.
-    std::vector<SortKey> localPivots;
+    std::vector<PivotKey> localPivots;
 
     /// Data bucket boundaries that determine the final destination of each data
     /// tuple on this node. Same on all nodes.
     /// For example, dataBucketBoundaries = {1, 5, 9} means all data are divided
     /// into 3 buckets: (-Inf, 1], (1, 5], and (5, 9].
-    std::vector<SortKey> dataBucketBoundaries;
+    std::vector<PivotKey> dataBucketBoundaries;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
@@ -302,25 +447,25 @@ class MilliSortService : public Service {
     // -------- Pivot server state --------
     /// Pivots gathered from this pivot server's slave nodes. Always empty on
     /// normal nodes.
-    std::vector<SortKey> gatheredPivots;
+    std::vector<PivotKey> gatheredPivots;
 
     /// Selected pivots that evenly divide #gatherPivots into # pivot servers
     /// partitions. Different on each pivot server. Always empty on normal
     /// nodes.
-    std::vector<SortKey> superPivots;
+    std::vector<PivotKey> superPivots;
 
     /// Pivot bucket boundaries that determine the destination of each pivot on
     /// this pivot server. Same on all pivot servers. Always empty on normal
     /// nodes.
-    std::vector<SortKey> pivotBucketBoundaries;
+    std::vector<PivotKey> pivotBucketBoundaries;
 
     /// After #gatheredPivots on all nodes are sorted globally and spread across
     /// all pivot servers, this variable holds the local portion of this node.
     /// Always empty on normal nodes.
-    std::vector<SortKey> sortedGatheredPivots;
+    std::vector<PivotKey> sortedGatheredPivots;
 
     // TODO: local view of #dataBucketBoundaries
-    std::vector<SortKey> partialDataBucketBoundaries;
+    std::vector<PivotKey> partialDataBucketBoundaries;
 
     /// # pivots on all nodes that are smaller than #sortedGatherPivots. Only
     /// computed on pivot servers.
@@ -336,7 +481,7 @@ class MilliSortService : public Service {
     // -------- Root node state --------
     /// Contains super pivots collected from all pivot servers. Always empty on
     /// non-root nodes.
-    std::vector<SortKey> globalSuperPivots;
+    std::vector<PivotKey> globalSuperPivots;
 
     friend class TreeBcast;
 
