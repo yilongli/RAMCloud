@@ -77,6 +77,8 @@ MilliSortService::MilliSortService(Context* context,
     , values()
     , sortedKeys()
     , sortedValues()
+    , numSortedKeys(0)
+    , numSortedValues(0)
     , valueStartIdx()
     , localPivots()
     , dataBucketBoundaries()
@@ -259,9 +261,17 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                 downCast<uint32_t>(i));
         values.emplace_back(keys.back().key.asUint64());
     }
+    numSortedKeys = 0;
+    numSortedValues = 0;
+    sortedKeys.reserve(numDataTuples * 2);
     sortedKeys.clear();
+    PivotKey nullKey(0, 0, 0);
+    sortedKeys.insert(sortedKeys.begin(), numDataTuples * 2, nullKey);
+    sortedValues.reserve(numDataTuples * 2);
     sortedValues.clear();
-    valueStartIdx.fill(0);
+    sortedValues.insert(sortedValues.begin(), numDataTuples * 2, 0);
+    valueStartIdx.clear();
+    valueStartIdx.insert(valueStartIdx.begin(), world->size() + 1, 0);
 
     //
     localPivots.clear();
@@ -331,14 +341,6 @@ MilliSortService::inplaceMerge(std::vector<PivotKey>& keys,
 }
 
 void
-MilliSortService::sort(std::vector<PivotKey>& keys)
-{
-    if (!std::is_sorted(keys.begin(), keys.end())) {
-        std::sort(keys.begin(), keys.end());
-    }
-}
-
-void
 MilliSortService::partition(std::vector<PivotKey>* keys, int numPartitions,
         std::vector<PivotKey>* pivots)
 {
@@ -370,7 +372,7 @@ MilliSortService::localSortAndPickPivots()
 
     {
         CycleCounter<> _(&PerfStats::threadStats.localSortLatency);
-        sort(keys);
+        sort(keys.begin(), keys.end());
     }
 
     partition(&keys, std::min((int)keys.size(), world->size()), &localPivots);
@@ -502,6 +504,9 @@ MilliSortService::pivotBucketSort()
 
     // Merge pivots from pivot servers as they arrive.
     auto merger = [this] (Buffer* data) {
+        // TODO: merge here is effectively serialized; shall we parallelize it?
+        static SpinLock mutex("pivotShuffle::mutex");
+        SpinLock::Guard lock(mutex);
         CycleCounter<> _(&PerfStats::threadStats.mergePivotsInBucketSortCycles);
         uint32_t offset = 0;
         size_t oldSize = sortedGatheredPivots.size();
@@ -510,8 +515,6 @@ MilliSortService::pivotBucketSort()
         while (offset < data->size()) {
             sortedGatheredPivots.push_back(*data->read<PivotKey>(&offset));
         }
-
-        // FIXME: this should really be an in-place parallel merge operation
         inplaceMerge(sortedGatheredPivots, oldSize);
         timeTrace("merged %u pivots", (data->size() - 8) / KeySize);
     };
@@ -654,27 +657,22 @@ MilliSortService::dataBucketSort()
     timeTrace("=== Stage 7: dataBucketSort started");
 
     // Merge data from other nodes as they arrive.
-    auto keyMerger = [this] (Buffer* data) {
+    auto keyMerger = [this] (Buffer* keyBuffer) {
         CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeKeyCycles);
-        uint32_t offset = 0;
-        size_t oldSize = sortedKeys.size();
-        while (offset < data->size()) {
-            sortedKeys.push_back(*data->read<PivotKey>(&offset));
-        }
-        // TODO: merge is so expensive; should we just do a sort when ALLSHUFFLE_KEY completes?
-        inplaceMerge(sortedKeys, oldSize);
-        timeTrace("merged %u keys", data->size() / KeySize);
+        uint32_t numKeys = keyBuffer->size() / KeySize;
+        int keyIdx = numSortedKeys.fetch_add(numKeys);
+        keyBuffer->copy(0, keyBuffer->size(), &sortedKeys[keyIdx]);
+        timeTrace("merged %u keys, %u bytes", numKeys, keyBuffer->size());
     };
     auto valueMerger = [this] (Buffer* valueBuffer) {
         CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeValueCycles);
         uint32_t offset = 0;
         uint32_t serverId = *valueBuffer->read<uint32_t>(&offset);
-        valueStartIdx[serverId] = downCast<int>(sortedValues.size());
-        while (offset < valueBuffer->size()) {
-            sortedValues.push_back(*valueBuffer->read<Value>(&offset));
-        }
-        timeTrace("merged %u values from serverId %u",
-                valueBuffer->size() / ValueSize, serverId);
+        uint32_t numValues = (valueBuffer->size() - offset) / ValueSize;
+        valueStartIdx[serverId] = numSortedValues.fetch_add(numValues);
+        int valueIdx = valueStartIdx[serverId];
+        valueBuffer->copy(offset, valueBuffer->size(), &sortedValues[valueIdx]);
+        timeTrace("merged %u values, %u bytes", numValues, valueBuffer->size());
     };
 
     // Send data to their designated nodes determined by the data bucket
@@ -695,43 +693,54 @@ MilliSortService::dataBucketSort()
                 keyIdx++;
             }
         }
+        timeTrace("constructed 2 shuffle ops");
         for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
             // TODO: should we hide the following inside the impl. of all-shuffle?
             // Start shuffle by sending to our right neighbor first.
-            int rank = downCast<int>((serverId.indexNumber() + i - 1) %
-                                     dataBucketBoundaries.size());
+            int rank = downCast<int>(
+                    (serverId.indexNumber() + i) % dataBucketBoundaries.size());
             Buffer* keyBuffer = keyShuffle->getSendBuffer(rank);
             Buffer* valueBuffer = valueShuffle->getSendBuffer(rank);
             valueBuffer->emplaceAppend<uint32_t>(serverId.indexNumber());
-            uint32_t order = 0;
             PivotKey rightBound = dataBucketBoundaries[rank];
+            uint32_t numKeys = 0;
+            uint32_t oldKeyIdx = keyIdx;
             while ((keyIdx < keys.size()) && (keys[keyIdx] <= rightBound)) {
                 // TODO: should I try to transmit only the 10 byte key and let
                 // underlying shuffle op keep track of where the data is from?
                 // Do we care about the 6-byte metadata overhead (probably not
                 // if it's very latency-bound)
-                keys[keyIdx].index = order;
-                keyBuffer->appendCopy(&keys[keyIdx]);
-                valueBuffer->appendCopy(&values[keyIdx]);
-                order++;
+                keys[keyIdx].index = numKeys;
+                numKeys++;
                 keyIdx++;
             }
+            keyBuffer->appendExternal(&keys[oldKeyIdx], KeySize * numKeys);
+            valueBuffer->appendExternal(&values[oldKeyIdx],
+                    ValueSize * numKeys);
             if (keyIdx >= keys.size()) {
                 keyIdx = 0;
             }
             keyShuffle->closeSendBuffer(rank);
+            timeTrace("kick start key shuffle rpc to rank %u", rank);
         }
+        timeTrace("initiated %u key shuffle RPCs", dataBucketBoundaries.size());
         keyShuffle->wait();
         removeCollectiveOp(ALLSHUFFLE_KEY);
+        timeTrace("finished key shuffle");
 
         // TODO: should we start sending value as soon as we finish keys?
         for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
-            int rank = downCast<int>((serverId.indexNumber() + i - 1) %
+            int rank = downCast<int>((serverId.indexNumber() + i) %
                     dataBucketBoundaries.size());
             valueShuffle->closeSendBuffer(rank);
         }
+        timeTrace("initiated %u value shuffle RPCs",
+                dataBucketBoundaries.size());
+        // TODO: this is not really parallel merge; is it better this way?
+        sort(sortedKeys.begin(), sortedKeys.begin() + numSortedKeys);
         valueShuffle->wait();
         removeCollectiveOp(ALLSHUFFLE_VALUE);
+        timeTrace("finished value shuffle");
     }
 
     endTime = Cycles::rdtsc();
@@ -743,6 +752,7 @@ MilliSortService::dataBucketSort()
 
 #if LOG_FINAL_RESULT
     string result;
+    sortedKeys.resize(numSortedKeys);
     for (PivotKey& sortKey : sortedKeys) {
         uint64_t key = sortKey.key.asUint64();
         int valueIdx = valueStartIdx[sortKey.serverId] + sortKey.index;

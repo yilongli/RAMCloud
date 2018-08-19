@@ -162,8 +162,8 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
             if (s->length() != 0) {
                 s->append("\n");
             }
-            snprintf(message, sizeof(message), "%8.1f ns (+%6.1f ns): ",
-                    ns, ns - prevTime);
+            snprintf(message, sizeof(message), "T%d %8.1f ns (+%6.1f ns): ",
+                    buffer->threadId, ns, ns - prevTime);
             s->append(message);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
@@ -177,8 +177,8 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
             snprintf(message, sizeof(message), event->format, event->arg0,
                      event->arg1, event->arg2, event->arg3);
 #pragma GCC diagnostic pop
-            RAMCLOUD_LOG(NOTICE, "%8.1f ns (+%6.1f ns): %s", ns, ns - prevTime,
-                    message);
+            RAMCLOUD_LOG(NOTICE, "T%d %8.1f ns (+%6.1f ns): %s",
+                    buffer->threadId, ns, ns - prevTime, message);
 
             // Make sure we're not monopolizing all of the buffer space
             // in the logger.
@@ -289,6 +289,7 @@ TimeTrace::TraceLogger::handleTimerEvent()
 TimeTrace::Buffer::Buffer()
     : nextIndex(0)
     , events()
+    , threadId(ThreadId::get())
 {
     // Mark all of the events invalid.
     for (uint32_t i = 0; i < BUFFER_SIZE; i++) {

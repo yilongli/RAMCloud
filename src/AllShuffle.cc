@@ -29,8 +29,9 @@ void
 AllShuffle::closeSendBuffer(int rank)
 {
     if (rank == group->rank) {
-        SpinLock::Guard _(mutex);
+        timeTrace("AllShuffle: about to merge payload from itself");
         merger(&localData);
+        mergeCount++;
     } else {
         outstandingRpcs++;
         outgoingRpcs[rank]->send();
@@ -47,15 +48,17 @@ void
 AllShuffle::handleRpc(const WireFormat::AllShuffle::Request* reqHdr,
         WireFormat::AllShuffle::Response* respHdr, Service::Rpc* rpc)
 {
-    SpinLock::Guard _(mutex);
-
     uint32_t senderId = reqHdr->senderId;
 //    LOG(NOTICE, "received AllShuffleRpc from server %u", senderId + 1);
-    if (receivedFrom.test(senderId)) {
-        respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
-        return;
+
+    {
+        SpinLock::Guard _(mutex);
+        if (receivedFrom.test(senderId)) {
+            respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
+            return;
+        }
+        receivedFrom.set(senderId);
     }
-    receivedFrom.set(senderId);
 
     // Chop off the AllShuffle header and incorporate the data.
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
@@ -63,6 +66,7 @@ AllShuffle::handleRpc(const WireFormat::AllShuffle::Request* reqHdr,
         timeTrace("AllShuffle: about to merge payload from server %u (rank %u)",
                 group->getNode(senderId).indexNumber(), senderId);
         merger(rpc->requestPayload);
+        mergeCount++;
     }
 }
 
@@ -82,9 +86,8 @@ AllShuffle::wait()
     // failure to acquire the lock. If the contender thread is dispatched to the
     // same core as this thread, this thread will keep acquiring the lock and
     // never yield.
-    for (bool done = false; !done; Arachne::yield()) {
-        SpinLock::Guard _(mutex);
-        done = int(receivedFrom.count()) == group->size();
+    while (mergeCount < group->size()) {
+        Arachne::yield();
     }
 }
 

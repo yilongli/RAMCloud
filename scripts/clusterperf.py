@@ -794,7 +794,7 @@ def workloadDist(name, options, cluster_args, client_args):
 def millisort(name, options, cluster_args, client_args):
     cluster_args['num_clients'] = 1
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--maxCores 2'
+        cluster_args['master_args'] = '--maxCores 4'
 
     default(name, options, cluster_args, client_args)
 

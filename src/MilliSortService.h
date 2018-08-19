@@ -298,6 +298,10 @@ class MilliSortService : public Service {
         /// Original key of the data tuple to be sorted.
         Key key;
 
+        PivotKey()
+            : index(0), serverId(0), key(0)
+        {}
+
         /**
          * Convenient method to build a pivot from an 64-bit signed integer.
          *
@@ -348,7 +352,7 @@ class MilliSortService : public Service {
     struct Value {
         char bytes[90];
 
-        explicit Value(uint64_t value)
+        Value(uint64_t value = 0)
             : bytes()
         {
             *((uint64_t*) bytes) = value;
@@ -370,7 +374,16 @@ class MilliSortService : public Service {
     // ----------------------
 
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
-    void sort(vector<PivotKey>& keys);
+
+    // TODO: remove this method?
+    template <typename KeyIt>
+    void sort(KeyIt first, KeyIt last)
+    {
+        if (!std::is_sorted(first, last)) {
+            std::sort(first, last);
+        }
+    }
+
     void partition(std::vector<PivotKey>* keys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
@@ -420,8 +433,12 @@ class MilliSortService : public Service {
 
     std::vector<Value> sortedValues;
 
+    std::atomic<int> numSortedKeys;
+
+    std::atomic<int> numSortedValues;
+
     // FIXME: this is a bad name;
-    std::array<int, 2048> valueStartIdx;
+    std::vector<int> valueStartIdx;
 
     /// Selected keys that evenly divide local #keys on this node into # nodes
     /// partitions.

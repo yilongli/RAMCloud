@@ -26,8 +26,9 @@ class AllShuffle {
         , localData()
         , outstandingRpcs(0)
         , outgoingRpcs(group->size())
-        , mutex("AllShuffle::mutex")
+        , mutex("receivedFrom::mutex")
         , receivedFrom(group->size())
+        , mergeCount(0)
     {
         receivedFrom.set(group->rank);
         for (int i = 0; i < group->size(); i++) {
@@ -96,6 +97,9 @@ class AllShuffle {
 
     /// Used to record the nodes from which we have collected the data.
     boost::dynamic_bitset<> receivedFrom;
+
+    /// # incoming messages that haved been successfully merged.
+    std::atomic<int> mergeCount;
 
     DISALLOW_COPY_AND_ASSIGN(AllShuffle)
 };

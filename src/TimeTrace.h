@@ -206,6 +206,9 @@ class TimeTrace {
         // Holds information from the most recent calls to the record method.
         TimeTrace::Event events[BUFFER_SIZE];
 
+        // Identifier of the thread that owns this buffer.
+        int threadId;
+
         friend class TimeTrace;
         DISALLOW_COPY_AND_ASSIGN(Buffer);
     };
