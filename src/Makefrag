@@ -179,6 +179,7 @@ SHARED_SRCFILES := \
 		   src/WorkerManager.cc \
 		   src/WorkerSession.cc \
 		   src/WorkerTimer.cc \
+		   src/simulator/Merge.cc \
 		   $(INFINIBAND_SRCFILES) \
 		   $(SOLARFLARE_SRC) \
 		   $(DPDK_SRC) \

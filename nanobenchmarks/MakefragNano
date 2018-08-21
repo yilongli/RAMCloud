@@ -36,6 +36,10 @@ $(NANOOBJDIR)/RecoverSegmentBenchmark: $(NANOOBJDIR)/RecoverSegmentBenchmark.o $
 	@mkdir -p $(@D)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
+$(NANOOBJDIR)/MergeBenchmark: $(NANOOBJDIR)/MergeBenchmark.o $(SHARED_OBJFILES) $(SERVER_OBJFILES)
+	@mkdir -p $(@D)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
 .PHONY: nanobenchmarks
 
 nanobenchmarks: $(NANOOBJDIR)/CleanerCompactionBenchmark \
@@ -46,6 +50,7 @@ nanobenchmarks: $(NANOOBJDIR)/CleanerCompactionBenchmark \
                 $(NANOOBJDIR)/ObjectManagerBenchmark \
                 $(NANOOBJDIR)/Perf \
                 $(NANOOBJDIR)/RecoverSegmentBenchmark \
+                $(NANOOBJDIR)/MergeBenchmark \
                 $(NULL)
 
 all: nanobenchmarks
