@@ -138,7 +138,8 @@ enum Opcode {
     ALL_GATHER                  = 85,
     ALL_SHUFFLE                 = 86,
     SEND_DATA                   = 87,
-    ILLEGAL_RPC_TYPE            = 88, // 1 + the highest legitimate Opcode
+    SHUFFLE_PULL                = 88,
+    ILLEGAL_RPC_TYPE            = 89, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -340,6 +341,19 @@ struct SendData {
     static const ServiceType service = MILLISORT_SERVICE;
     struct Request {
         RequestCommon common;
+        uint32_t dataId;
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+    } __attribute__((packed));
+};
+
+struct ShufflePull {
+    static const Opcode opcode = SHUFFLE_PULL;
+    static const ServiceType service = MILLISORT_SERVICE;
+    struct Request {
+        RequestCommon common;
+        int32_t senderId;
         uint32_t dataId;
     } __attribute__((packed));
     struct Response {

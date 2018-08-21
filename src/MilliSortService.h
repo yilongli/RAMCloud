@@ -200,6 +200,9 @@ class MilliSortService : public Service {
     void sendData(const WireFormat::SendData::Request* reqHdr,
                 WireFormat::SendData::Response* respHdr,
                 Rpc* rpc);
+    void shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
+                WireFormat::ShufflePull::Response* respHdr,
+                Rpc* rpc);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -449,6 +452,14 @@ class MilliSortService : public Service {
     /// For example, dataBucketBoundaries = {1, 5, 9} means all data are divided
     /// into 3 buckets: (-Inf, 1], (1, 5], and (5, 9].
     std::vector<PivotKey> dataBucketBoundaries;
+
+    /// Range of each data bucket in #keys. Each range is represented by a pair
+    /// of integers: the starting index and # items in the bucket. For example,
+    /// dataBucketRanges[i] = (a, b) means the first key in the (i+1)-th data
+    /// bucket is keys[a] and there are b keys in total in the bucket.
+    std::vector<std::pair<int,int>> dataBucketRanges;
+
+    std::atomic_bool dataBucketRangesDone;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;

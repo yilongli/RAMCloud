@@ -110,6 +110,27 @@ PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(SendDataRpc);
 };
 
+class ShufflePullRpc : public ServerIdRpcWrapper {
+  public:
+    ShufflePullRpc(Context* context, ServerId serverId, int32_t senderId,
+            uint32_t dataId, Buffer* response);
+    ~ShufflePullRpc() {}
+
+    static void appendRequest(Buffer* request, int32_t senderId,
+            uint32_t dataId);
+
+    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
+    void wait() {waitAndCheckErrors();}
+
+    static const uint32_t responseHeaderLength =
+            sizeof(WireFormat::ShufflePull::Response);
+
+PRIVATE:
+    DISALLOW_COPY_AND_ASSIGN(ShufflePullRpc);
+};
+
+
+
 } // namespace RAMCloud
 
 #endif // RAMCLOUD_MILLISORTCLIENT_H

@@ -389,6 +389,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "offset %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset);
             driver->sendPacket(address, &header, &iter, 0, &txQueueState);
+//            TimeTrace::record("sent a shuffle reply packet?");
         }
         if (txQueueState.outstandingBytes > 0) {
             timeTrace("sent data, %u bytes queued ahead",
@@ -893,6 +894,13 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
         bytesSent = length;
+
+//        if (WireFormat::Opcode(
+//                request->getStart<WireFormat::RequestCommon>()->opcode) ==
+//            WireFormat::SHUFFLE_PULL) {
+//            TimeTrace::record("sent shuffle pull request");
+//        }
+
     } else {
         t->outgoingRequests.push_back(*clientRpc);
         t->maintainTopOutgoingMessages(&clientRpc->request);
@@ -1000,6 +1008,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     header = received->getOffset<DataHeader>(0);
                 }
                 if (!clientRpc->accumulator) {
+//                    TimeTrace::record("received 1st pkt from shuffle rpc reply");
                     clientRpc->accumulator.construct(this, clientRpc->response);
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
@@ -1499,6 +1508,9 @@ BasicTransport::ServerRpc::sendReply()
 //    LOG(NOTICE, "send reply of %s to %s",
 //            WireFormat::opcodeSymbol(&requestPayload),
 //            response.recipient->toString().c_str());
+//    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
+//        TimeTrace::record("about to send back shuffle pull reply");
+//    }
 
     uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "

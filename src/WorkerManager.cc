@@ -187,6 +187,10 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         }
     }
 
+//    if (header->opcode == WireFormat::SHUFFLE_PULL) {
+//        TimeTrace::record("received shuffle pull request");
+//    }
+
 #ifdef LOG_RPCS
     LOG(NOTICE, "Received %s RPC at %u with %u bytes",
             WireFormat::opcodeSymbol(header->opcode),

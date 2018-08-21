@@ -120,7 +120,8 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
         maxTransmitQueueSize = 2*maxPacketSize;
     }
     LOG(NOTICE, "InfUdDriver bandwidth: %d Gbits/sec, maxTransmitQueueSize: "
-            "%u bytes", bandwidthGbps, maxTransmitQueueSize);
+            "%u bytes, maxPacketSize %u bytes", bandwidthGbps,
+            maxTransmitQueueSize, maxPacketSize);
 
     if (ethernet && !macAddressProvided)
         localMac.construct(MacAddress::RANDOM);

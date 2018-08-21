@@ -82,6 +82,8 @@ MilliSortService::MilliSortService(Context* context,
     , valueStartIdx()
     , localPivots()
     , dataBucketBoundaries()
+    , dataBucketRanges()
+    , dataBucketRangesDone(false)
     , world()
     , myPivotServerGroup()
     , allGatherPeersGroup()
@@ -137,6 +139,10 @@ MilliSortService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
         case WireFormat::SendData::opcode:
             callHandler<WireFormat::SendData, MilliSortService,
                         &MilliSortService::sendData>(rpc);
+            break;
+        case WireFormat::ShufflePull::opcode:
+            callHandler<WireFormat::ShufflePull, MilliSortService,
+                        &MilliSortService::shufflePull>(rpc);
             break;
         default:
             prepareErrorResponse(rpc->replyPayload, 
@@ -276,6 +282,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     //
     localPivots.clear();
     dataBucketBoundaries.clear();
+    dataBucketRanges.clear();
+    dataBucketRangesDone.store(false);
     gatheredPivots.clear();
     superPivots.clear();
     pivotBucketBoundaries.clear();
@@ -643,11 +651,24 @@ MilliSortService::allGatherDataBucketBoundaries()
         removeCollectiveOp(ALLGATHER_DATA_BUCKET_BOUNDARIES);
         debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
     }
+    timeTrace("gathered %u data bucket boundaries",
+            dataBucketBoundaries.size());
+
+    // Compute data bucket ranges required by the shufflePull handler.
+    uint32_t keyIdx = 0;
+    for (const PivotKey& rightBound : dataBucketBoundaries) {
+        int numKeys = 0;
+        int oldKeyIdx = keyIdx;
+        while ((keyIdx < keys.size()) && (keys[keyIdx] <= rightBound)) {
+            numKeys++;
+            keyIdx++;
+        }
+        dataBucketRanges.emplace_back(oldKeyIdx, numKeys);
+    }
+    dataBucketRangesDone.store(true);
 
     // All nodes will advance to the final data shuffle when the all-gather
     // completes.
-    timeTrace("gathered %u data bucket boundaries",
-            dataBucketBoundaries.size());
     dataBucketSort();
 }
 
@@ -664,84 +685,103 @@ MilliSortService::dataBucketSort()
         keyBuffer->copy(0, keyBuffer->size(), &sortedKeys[keyIdx]);
         timeTrace("merged %u keys, %u bytes", numKeys, keyBuffer->size());
     };
-    auto valueMerger = [this] (Buffer* valueBuffer) {
-        CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeValueCycles);
-        uint32_t offset = 0;
-        uint32_t serverId = *valueBuffer->read<uint32_t>(&offset);
-        uint32_t numValues = (valueBuffer->size() - offset) / ValueSize;
-        valueStartIdx[serverId] = numSortedValues.fetch_add(numValues);
-        int valueIdx = valueStartIdx[serverId];
-        valueBuffer->copy(offset, valueBuffer->size(), &sortedValues[valueIdx]);
-        timeTrace("merged %u values, %u bytes", numValues, valueBuffer->size());
-    };
+//    auto valueMerger = [this] (Buffer* valueBuffer) {
+//        CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeValueCycles);
+//        uint32_t offset = 0;
+//        uint32_t serverId = *valueBuffer->read<uint32_t>(&offset);
+//        uint32_t numValues = (valueBuffer->size() - offset) / ValueSize;
+//        valueStartIdx[serverId] = numSortedValues.fetch_add(numValues);
+//        int valueIdx = valueStartIdx[serverId];
+//        valueBuffer->copy(offset, valueBuffer->size(), &sortedValues[valueIdx]);
+//        timeTrace("merged %u values, %u bytes", numValues, valueBuffer->size());
+//    };
 
-    // Send data to their designated nodes determined by the data bucket
-    // boundaries.
+    //////////////// NEW IMPLEMENTATION OF PULL-BASED SHUFFLE
     timeTrace("about to shuffle data tuples");
-    {
-        CycleCounter<> _(&PerfStats::threadStats.bucketSortDataCycles);
-        Tub<AllShuffle> keyShuffle;
-        Tub<AllShuffle> valueShuffle;
-        invokeCollectiveOp<AllShuffle>(keyShuffle, ALLSHUFFLE_KEY, context,
-                world.get(), &keyMerger);
-        invokeCollectiveOp<AllShuffle>(valueShuffle, ALLSHUFFLE_VALUE, context,
-                world.get(), &valueMerger);
-        uint32_t keyIdx = 0;
-        if (serverId.indexNumber() > 1) {
-            auto leftBound = dataBucketBoundaries[serverId.indexNumber() - 2];
-            while (keys[keyIdx] < leftBound) {
-                keyIdx++;
-            }
-        }
-        timeTrace("constructed 2 shuffle ops");
-        for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
-            // TODO: should we hide the following inside the impl. of all-shuffle?
-            // Start shuffle by sending to our right neighbor first.
-            int rank = downCast<int>(
-                    (serverId.indexNumber() + i) % dataBucketBoundaries.size());
-            Buffer* keyBuffer = keyShuffle->getSendBuffer(rank);
-            Buffer* valueBuffer = valueShuffle->getSendBuffer(rank);
-            valueBuffer->emplaceAppend<uint32_t>(serverId.indexNumber());
-            PivotKey rightBound = dataBucketBoundaries[rank];
-            uint32_t numKeys = 0;
-            uint32_t oldKeyIdx = keyIdx;
-            while ((keyIdx < keys.size()) && (keys[keyIdx] <= rightBound)) {
-                // TODO: should I try to transmit only the 10 byte key and let
-                // underlying shuffle op keep track of where the data is from?
-                // Do we care about the 6-byte metadata overhead (probably not
-                // if it's very latency-bound)
-                keys[keyIdx].index = numKeys;
-                numKeys++;
-                keyIdx++;
-            }
-            keyBuffer->appendExternal(&keys[oldKeyIdx], KeySize * numKeys);
-            valueBuffer->appendExternal(&values[oldKeyIdx],
-                    ValueSize * numKeys);
-            if (keyIdx >= keys.size()) {
-                keyIdx = 0;
-            }
-            keyShuffle->closeSendBuffer(rank);
-            timeTrace("kick start key shuffle rpc to rank %u", rank);
-        }
-        timeTrace("initiated %u key shuffle RPCs", dataBucketBoundaries.size());
-        keyShuffle->wait();
-        removeCollectiveOp(ALLSHUFFLE_KEY);
-        timeTrace("finished key shuffle");
-
-        // TODO: should we start sending value as soon as we finish keys?
-        for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
-            int rank = downCast<int>((serverId.indexNumber() + i) %
-                    dataBucketBoundaries.size());
-            valueShuffle->closeSendBuffer(rank);
-        }
-        timeTrace("initiated %u value shuffle RPCs",
-                dataBucketBoundaries.size());
-        // TODO: this is not really parallel merge; is it better this way?
-        sort(sortedKeys.begin(), sortedKeys.begin() + numSortedKeys);
-        valueShuffle->wait();
-        removeCollectiveOp(ALLSHUFFLE_VALUE);
-        timeTrace("finished value shuffle");
+    for (int i = 0; i < world->size(); i++) {
+        timeTrace("about to send shuffle pull request");
+        Buffer keyBuffer;
+        ServerId target = world->getNode(world->rank + 1 + i);
+        ShufflePullRpc pullRpc(context, target, world->rank, ALLSHUFFLE_KEY,
+                &keyBuffer);
+        pullRpc.wait();
+        keyBuffer.truncateFront(sizeof(WireFormat::ResponseCommon));
+        timeTrace("about to merge keys from server %u", target.indexNumber()+1);
+        keyMerger(&keyBuffer);
     }
+    // TODO: this is not really parallel merge; is it better this way?
+    sort(sortedKeys.begin(), sortedKeys.begin() + numSortedKeys);
+    timeTrace("sorted %u final keys", numSortedKeys.load());
+
+    /////////////////////////////////////////////////////////
+
+//    // Send data to their designated nodes determined by the data bucket
+//    // boundaries.
+//    timeTrace("about to shuffle data tuples");
+//    {
+//        CycleCounter<> _(&PerfStats::threadStats.bucketSortDataCycles);
+//        Tub<AllShuffle> keyShuffle;
+//        Tub<AllShuffle> valueShuffle;
+//        invokeCollectiveOp<AllShuffle>(keyShuffle, ALLSHUFFLE_KEY, context,
+//                world.get(), &keyMerger);
+//        invokeCollectiveOp<AllShuffle>(valueShuffle, ALLSHUFFLE_VALUE, context,
+//                world.get(), &valueMerger);
+//        uint32_t keyIdx = 0;
+//        if (serverId.indexNumber() > 1) {
+//            auto leftBound = dataBucketBoundaries[serverId.indexNumber() - 2];
+//            while (keys[keyIdx] < leftBound) {
+//                keyIdx++;
+//            }
+//        }
+//        timeTrace("constructed 2 shuffle ops");
+//        for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
+//            // TODO: should we hide the following inside the impl. of all-shuffle?
+//            // Start shuffle by sending to our right neighbor first.
+//            int rank = downCast<int>(
+//                    (serverId.indexNumber() + i) % dataBucketBoundaries.size());
+//            Buffer* keyBuffer = keyShuffle->getSendBuffer(rank);
+//            Buffer* valueBuffer = valueShuffle->getSendBuffer(rank);
+//            valueBuffer->emplaceAppend<uint32_t>(serverId.indexNumber());
+//            PivotKey rightBound = dataBucketBoundaries[rank];
+//            uint32_t numKeys = 0;
+//            uint32_t oldKeyIdx = keyIdx;
+//            while ((keyIdx < keys.size()) && (keys[keyIdx] <= rightBound)) {
+//                // TODO: should I try to transmit only the 10 byte key and let
+//                // underlying shuffle op keep track of where the data is from?
+//                // Do we care about the 6-byte metadata overhead (probably not
+//                // if it's very latency-bound)
+//                keys[keyIdx].index = numKeys;
+//                numKeys++;
+//                keyIdx++;
+//            }
+//            keyBuffer->appendExternal(&keys[oldKeyIdx], KeySize * numKeys);
+//            valueBuffer->appendExternal(&values[oldKeyIdx],
+//                    ValueSize * numKeys);
+//            if (keyIdx >= keys.size()) {
+//                keyIdx = 0;
+//            }
+//            keyShuffle->closeSendBuffer(rank);
+//            timeTrace("kick start key shuffle rpc to rank %u", rank);
+//        }
+//        timeTrace("initiated %u key shuffle RPCs", dataBucketBoundaries.size());
+//        keyShuffle->wait();
+//        removeCollectiveOp(ALLSHUFFLE_KEY);
+//        timeTrace("finished key shuffle");
+//
+//        // TODO: should we start sending value as soon as we finish keys?
+//        for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
+//            int rank = downCast<int>((serverId.indexNumber() + i) %
+//                    dataBucketBoundaries.size());
+//            valueShuffle->closeSendBuffer(rank);
+//        }
+//        timeTrace("initiated %u value shuffle RPCs",
+//                dataBucketBoundaries.size());
+//        // TODO: this is not really parallel merge; is it better this way?
+//        sort(sortedKeys.begin(), sortedKeys.begin() + numSortedKeys);
+//        valueShuffle->wait();
+//        removeCollectiveOp(ALLSHUFFLE_VALUE);
+//        timeTrace("finished value shuffle");
+//    }
 
     endTime = Cycles::rdtsc();
     PerfStats::threadStats.millisortTime += endTime - startTime;
@@ -755,9 +795,10 @@ MilliSortService::dataBucketSort()
     sortedKeys.resize(numSortedKeys);
     for (PivotKey& sortKey : sortedKeys) {
         uint64_t key = sortKey.key.asUint64();
-        int valueIdx = valueStartIdx[sortKey.serverId] + sortKey.index;
-        uint64_t value = sortedValues[valueIdx].asUint64();
-        result += std::to_string(key) + ":" + std::to_string(value);
+//        int valueIdx = valueStartIdx[sortKey.serverId] + sortKey.index;
+//        uint64_t value = sortedValues[valueIdx].asUint64();
+//        result += std::to_string(key) + ":" + std::to_string(value);
+        result += std::to_string(key);
         result += " ";
     }
     LOG(NOTICE, "final result: %s", result.c_str());
@@ -803,6 +844,38 @@ MilliSortService::allShuffle(const WireFormat::AllShuffle::Request* reqHdr,
             WireFormat::AllShuffle::Response* respHdr, Rpc* rpc)
 {
     handleCollectiveOpRpc<AllShuffle>(reqHdr, respHdr, rpc);
+}
+
+void
+MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
+            WireFormat::ShufflePull::Response* respHdr, Rpc* rpc)
+{
+    int senderId = reqHdr->senderId;
+    switch (reqHdr->dataId) {
+        case ALLSHUFFLE_KEY: {
+//            timeTrace("received ShufflePull for keys");
+            while (!dataBucketRangesDone) {
+                Arachne::yield();
+            }
+            int keyIdx, numKeys;
+            std::tie(keyIdx, numKeys) = dataBucketRanges[senderId];
+            rpc->replyPayload->appendExternal(&keys[keyIdx], numKeys * KeySize);
+//            timeTrace("RPC handler ShufflePull finished");
+            break;
+        }
+        case ALLSHUFFLE_VALUE: {
+            while (!dataBucketRangesDone) {
+                Arachne::yield();
+            }
+            int valueIdx, numValues;
+            std::tie(valueIdx, numValues) = dataBucketRanges[senderId];
+            rpc->replyPayload->appendExternal(&values[valueIdx],
+                    numValues * ValueSize);
+            break;
+        }
+        default:
+            assert(false);
+    }
 }
 
 void

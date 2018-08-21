@@ -107,5 +107,24 @@ SendDataRpc::appendRequest(Buffer* request, uint32_t dataId, uint32_t length,
     request->appendExternal(data, length);
 }
 
+ShufflePullRpc::ShufflePullRpc(Context* context, ServerId serverId,
+        int32_t senderId, uint32_t dataId, Buffer* response)
+    : ServerIdRpcWrapper(context, serverId,
+            sizeof(WireFormat::ShufflePull::Response), response)
+{
+    appendRequest(&request, senderId, dataId);
+    send();
+}
+
+void
+ShufflePullRpc::appendRequest(Buffer* request, int32_t senderId,
+        uint32_t dataId)
+{
+    WireFormat::ShufflePull::Request* reqHdr(
+            allocHeader<WireFormat::ShufflePull>(request));
+    reqHdr->senderId = senderId;
+    reqHdr->dataId = dataId;
+}
+
 
 }  // namespace RAMCloud
