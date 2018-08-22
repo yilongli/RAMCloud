@@ -22,6 +22,8 @@
 #include "Common.h"
 #include "Cycles.h"
 
+#include "MilliSortService.h"
+
 using namespace RAMCloud;
 //#define VERBOSE 1
 
@@ -63,7 +65,7 @@ MergeStats::printStats()
     printf(" - Total # of items: %d\n", totalItemCounts);
     // This bytes for key and value won't work correctly if T is not MillisortItem..
     printf(" - Item size: %d (%d B key + %d B value)\n", itemSize,
-            MillisortItem::MillisortKeyLen, MillisortItem::MillisortValueLen);
+            MillisortItem::KeyLength, MillisortItem::ValueLength);
     printf("\n");
     printf("============================================================="
             "============================================================"
@@ -197,40 +199,24 @@ MergeTestTools<T>::fillRandom(char* dest, uint32_t length)
 {
     memset(dest, 'x', length);
     for (int offset = 0; offset <= static_cast<int>(length) - 8; offset += 8) {
-        *(reinterpret_cast<uint64_t*>(dest + offset)) = generateRandom();
+        *(reinterpret_cast<uint64_t*>(dest + offset)) = mcg64();
     }
     int bytesLeftToFill = length & 7;
     for (uint offset = length - bytesLeftToFill; offset < length; offset++) {
-        *(dest + offset) = downCast<char>(generateRandom() & 127);
+        *(dest + offset) = downCast<char>(mcg64() & 127);
     }
 }
 
-typedef Merge<MillisortItem>::ArrayPtr MillisortArrayPtr;
+//typedef Merge<MillisortItem>::ArrayPtr MillisortArrayPtr;
+#define MillisortArrayPtr typename Merge<T>::ArrayPtr
 
+template <typename T>
 __attribute__((unused))
-static void printData(const MillisortItem* ptr, size_t length, const char* header = "", bool warnIfUnsorted = true) {
+static void printData(const T* ptr, size_t length, const char* header = "", bool warnIfUnsorted = true) {
     printf("%s ", header);
     uint64_t prev = 0;
     for (size_t i = 0; i < length; i++) {
         uint64_t raw = *((const uint64_t*)ptr[i].key);
-        uint64_t swapped = bswap_64(raw);
-        if (warnIfUnsorted && i > 0 && prev > swapped) {
-            printf(" *");
-        }
-        prev = swapped;
-//        printf(" %22" PRIu64 "", swapped);
-        printf(" %3" PRIu64 "", swapped);
-    }
-    printf(" |");
-//    fflush(stdout);
-}
-
-__attribute__((unused))
-static void printData(MillisortArrayPtr ptr, const char* header = "", bool warnIfUnsorted = true) {
-    printf("%s ", header);
-    uint64_t prev = 0;
-    for (size_t i = 0; i < ptr.size; i++) {
-        uint64_t raw = *((uint64_t*)ptr.data[i].key);
         uint64_t swapped = bswap_64(raw);
         if (warnIfUnsorted && i > 0 && prev > swapped) {
             printf(" *");
@@ -260,10 +246,11 @@ void verifyMergeJob(std::vector<typename Merge<T>::ArrayPtr>& arrays, T* dest) {
         }
     }
     std::sort(result.begin(), result.end());
-    
+
     for (int i = 0; i < result.size(); i++) {
-        if (std::memcmp(dest[i].key, result[i].key,
-                MillisortItem::MillisortKeyLen) != 0) {
+//        if (std::memcmp(dest[i].key, result[i].key,
+//                T::KeyLength) != 0) {
+        if (!(dest[i] == result[i])) {
             printf("***** ERROR! mismatch found! at %d ***** Arrays: %d\n",
                     i, arrays.size());
             printData(result.data(), result.size(), "Expected: ");
@@ -274,101 +261,23 @@ void verifyMergeJob(std::vector<typename Merge<T>::ArrayPtr>& arrays, T* dest) {
     }
 }
 
-template<class T>
-void Merge<T>::mergeWorker(MergeWorkerContext* context) {
-    uint64_t lastIdleStart = 0;
-    uint64_t idleTotal = 0;
-    uint64_t workTotal = 0;
-    bool printedIdleWarning = false;
-    while (context->state < 3) {
-        if (context->state != 2) {
-            if (Cycles::toSeconds(Cycles::rdtsc() - lastIdleStart) > 1 &&
-                    !printedIdleWarning && lastIdleStart) {
-                printf("WARNING: WorkerThread has been idle more than 1 sec."
-                       " current state: %d\n", context->state.load());
-                printedIdleWarning = true;
-            }
-            continue;
+template <typename T>
+__attribute__((unused))
+static void printData(MillisortArrayPtr ptr, const char* header = "", bool warnIfUnsorted = true) {
+    printf("%s ", header);
+    uint64_t prev = 0;
+    for (size_t i = 0; i < ptr.size; i++) {
+        uint64_t raw = *((uint64_t*)ptr.data[i].key);
+        uint64_t swapped = bswap_64(raw);
+        if (warnIfUnsorted && i > 0 && prev > swapped) {
+            printf(" *");
         }
-        
-        if (lastIdleStart) { // Exclude initial idle time.
-            idleTotal += Cycles::rdtsc() - lastIdleStart;
-        }
-        uint64_t workStart = Cycles::rdtsc();
-        printedIdleWarning = false;
-        
-        
-        std::vector<ArrayPtr>& arrays = context->arrays;
-//        printf("Input:  ");
-//        for (int i = 0; i < arrays.size(); i++) {
-//            printData(arrays[i]);
-//        }
-//        printf("\n");
-
-        int destIdx = 0;
-        
-        struct PqItem {
-            char* key;
-            int arrayId;
-            PqItem& operator=(PqItem other)
-            {
-                key = other.key;
-                arrayId = other.arrayId;
-                return *this;
-            }
-        };
-        class PqComparator {
-        public:
-            bool operator() (const PqItem& w1, const PqItem& w2)
-            {
-                return std::memcmp(w1.key, w2.key, MillisortItem::MillisortKeyLen) > 0;
-            }
-        };
-        std::priority_queue<PqItem, std::vector<PqItem>, PqComparator> pq;
-        uint nextIds[arrays.size()];
-        bzero(nextIds, sizeof(uint) * arrays.size());
-        for (uint i = 0; i < arrays.size(); i++) {
-            PqItem item;
-            assert(arrays[i].size > 0);
-            item.key = arrays[i].data[0].key; // it might be faster to copy key buffer... TODO: test this.
-            item.arrayId = i;
-#if VERBOSE
-            printf("Pushing to PQ. size: %d, newItemKey: %" PRIu64 "\n",
-                        pq.size(), bswap_64(*((uint64_t*)item.key)));
-#endif
-            pq.push(item);
-
-        }
-
-        while (!pq.empty()) {
-            PqItem minItem = pq.top();
-            MillisortItem& value = arrays[minItem.arrayId].data[nextIds[minItem.arrayId]++];
-            context->dest.data[destIdx++] = value; // memcpy might be faster?? TODO: test this.. or change copy constructor.
-            pq.pop();
-            PqItem nextItem;
-            if (nextIds[minItem.arrayId] < arrays[minItem.arrayId].size) {
-                nextItem.key = arrays[minItem.arrayId].data[nextIds[minItem.arrayId]].key;
-                nextItem.arrayId = minItem.arrayId;
-
-#if VERBOSE
-//                printf("Pushing to PQ. size: %d, newItemKey: %" PRIu64 "\n",
-//                        pq.size(), bswap_64(*((uint64_t*)nextItem.key)));
-#endif
-                pq.push(nextItem);
-
-            }
-        }
-        
-//        printData(context->dest, "Output: ");
-//        printf("\n");
-        
-        context->state = 1; // Done working.
-        workTotal += Cycles::rdtsc() - workStart;
-        lastIdleStart = Cycles::rdtsc();
+        prev = swapped;
+//        printf(" %22" PRIu64 "", swapped);
+        printf(" %3" PRIu64 "", swapped);
     }
-//    printf("**** Worker thread exits.. **** Worker Utilization: %.2f (wait time: %.2f ms)\n",
-//            static_cast<double>(workTotal) / static_cast<double>(workTotal + idleTotal),
-//            Cycles::toSeconds(idleTotal) * 1000);
+    printf(" |");
+//    fflush(stdout);
 }
 
 template<class T>
@@ -376,7 +285,7 @@ inline static void merge_ptr(const T* a_start, const T* a_end, const T* b_start,
         const T* b_end, T* dst)
 {
     while (a_start < a_end && b_start < b_end) {
-        if (*a_start > *b_start) {
+        if (!(*a_start < *b_start)) {
             *dst++ = *b_start++;
         } else {
             *dst++ = *a_start++;
@@ -391,7 +300,7 @@ inline static void merge_ptr(const T* a_start, const T* a_end, const T* b_start,
 }
 
 template<class T>
-void Merge<T>::mergeWorker2(MergeWorkerContext* context) {
+void Merge<T>::mergeWorker(MergeWorkerContext* context) {
     uint64_t lastIdleStart = 0;
     uint64_t idleTotal = 0;
     uint64_t workTotal = 0;
@@ -404,14 +313,14 @@ void Merge<T>::mergeWorker2(MergeWorkerContext* context) {
             }
             continue;
         }
-        
+
         if (lastIdleStart) { // Exclude initial idle time.
             idleTotal += Cycles::rdtsc() - lastIdleStart;
         }
         uint64_t workStart = Cycles::rdtsc();
         printedIdleWarning = false;
-        
-        
+
+
 //        std::vector<ArrayPtr>& arrays = context->arrays;
         int inputArrayCounts = downCast<int>(context->arrays.size());
         ArrayPtr arrays[context->arrays.size()];
@@ -426,9 +335,9 @@ void Merge<T>::mergeWorker2(MergeWorkerContext* context) {
 //        merge_ptr(arrays[0].data, arrays[0].data + arrays[0].size,
 //                arrays[1].data, arrays[1].data + arrays[1].size,
 //                context->dest.data);
-        
+
         // TODO: remove this restriction..
-        
+
         assert(context->arrays.size() > 0);
         assert((context->arrays.size() & (context->arrays.size() - 1)) == 0); // checks it's power of 2.
 
@@ -437,18 +346,20 @@ void Merge<T>::mergeWorker2(MergeWorkerContext* context) {
         for (int i = 0; i < inputArrayCounts; i++) {
             totalSize += arrays[i].size;
         }
-        MillisortItem temp[2][totalSize];
-        bzero(temp, 2 * totalSize * sizeof(MillisortItem));
+        T temp[2][totalSize];
+#ifdef VERBOSE
+        bzero(temp, 2 * totalSize * sizeof(T));
+#endif
         int numLevels = static_cast<int>(ceil(log(inputArrayCounts) / log(2)));
         for (int level = 0; level < numLevels; level++) {
-            MillisortItem* dest;
+            T* dest;
             if (level == numLevels - 1) {
                 dest = context->dest.data;
             } else {
                 dest = temp[level & 1];
             }
 
-//            MillisortItem* bufferStart = arrays[0].data;
+//            T* bufferStart = arrays[0].data;
             size_t destOffset = 0;
             for (int i = 0; i < inputArrayCounts / pow(2, level + 1); i++) {
                 int a = i * 2;
@@ -461,7 +372,7 @@ void Merge<T>::mergeWorker2(MergeWorkerContext* context) {
                 arrays[i].data = dest + destOffset;
                 destOffset += arrays[a].size + arrays[b].size;
                 arrays[i].size = arrays[a].size + arrays[b].size;
-                
+
 //                printData(dest, totalSize, "ML: ");
 //                printf("\n");
             }
@@ -491,9 +402,10 @@ void Merge<T>::mergeWorker2(MergeWorkerContext* context) {
 
 template<class T>
 Merge<T>::Merge(int numArraysTotal, int maxNumAllItems)
+    : initialArraysToMergeCounts(numArraysTotal)
+    , numAllItems(maxNumAllItems)
+    , numArraysCompleted()
 {
-    initialArraysToMergeCounts = numArraysTotal;
-    numAllItems = maxNumAllItems;
     int arrayCount = numArraysTotal;
     while (arrayCount > 1) {
         numArraysTargets.push_back(arrayCount);
@@ -514,7 +426,7 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems)
     int numLevels = int(waysList.size());
     buffer = new T[(numLevels + 1) * numAllItems];
     bzero(buffer, sizeof(T) * (numLevels + 1) * numAllItems);
-    bzero(numArraysCompleted, sizeof(int) * numLevels);
+//    bzero(numArraysCompleted, sizeof(int) * numLevels);
     
     perfStats.initialize(numLevels);
 }
@@ -550,7 +462,7 @@ binarySearch(T* data, size_t size, const T& key)
     while( low < high )
     {
         size_t mid = ( low + high ) / 2;
-        if (key > data[mid])
+        if (data[mid] < key)
             low = mid + 1;
         else
             high = mid;
@@ -858,12 +770,12 @@ template<class T>
 void
 MergeTestTools<T>::initializeInput(int itemsPerNode, int numMasters)
 {
+    mcg64State = 1;
     size_t numAllItems = itemsPerNode * numMasters;
     input.reserve(numAllItems);
     for (size_t i = 0; i < numAllItems; i++) {
-        MillisortItem item;
-        fillRandom(item.key, MillisortItem::MillisortKeyLen);
-        fillRandom(item.data, MillisortItem::MillisortValueLen);
+        T item;
+        fillRandom((char*)&item, sizeof(T));
 #if VERBOSE
         uint64_t randKey = generateRandom() % 1000;
         *((uint64_t*)item.key) = bswap_64(randKey);
@@ -874,6 +786,8 @@ MergeTestTools<T>::initializeInput(int itemsPerNode, int numMasters)
 #if VERBOSE
     printf("\n");
 #endif
+
+//    printf("input[0] = %lu, input[1] = %lu\n", *((uint64_t*)&input[0]), *((uint64_t*)&input[1]));
 
     for (int i = 0; i < numMasters; i++) {
         MillisortArrayPtr ptr;
@@ -900,31 +814,30 @@ MergeTestTools<T>::verifyOutput(T* mergedData, size_t mergedSize)
     }
     assert(numAllItems == mergedSize);
 
-    MillisortItem inputSorted[numAllItems];
+    T inputSorted[numAllItems];
     memcpy(inputSorted, input.data(), sizeof(T) * numAllItems);
     std::sort(inputSorted, inputSorted + numAllItems);
 
     for (size_t i = 0; i < numAllItems; i++) {
-        if (memcmp(inputSorted[i].key, mergedData[i].key,
-                MillisortItem::MillisortKeyLen) != 0) {
-            printf("!! Non-match found at %lu, value: %" PRIu64 " and %" PRIu64"\n",
-                    i, bswap_64(*((uint64_t*)inputSorted[i].key)), bswap_64(*((uint64_t*)mergedData[i].key)));
+        if (!(inputSorted[i] == mergedData[i])) {
+            printf("!! Non-match found at %lu\n", i);
 
-            MillisortArrayPtr ptr;
-            ptr.data = mergedData;
-            ptr.size = numAllItems;
-            printData(ptr);
-            printf("\n");
-            ptr.data = inputSorted;
-            ptr.size = numAllItems;
-            printData(ptr);
-            printf("\n");
+//            MillisortArrayPtr ptr;
+//            ptr.data = mergedData;
+//            ptr.size = numAllItems;
+//            printData(ptr);
+//            printf("\n");
+//            ptr.data = inputSorted;
+//            ptr.size = numAllItems;
+//            printData(ptr);
+//            printf("\n");
             exit(1);
         }
-        assert(memcmp(inputSorted[i].key, mergedData[i].key,
-                MillisortItem::MillisortKeyLen) == 0);
+        assert(inputSorted[i] == mergedData[i]);
     }
 }
 
 template class MergeTestTools<MillisortItem>;
 template class Merge<MillisortItem>;
+template class MergeTestTools<MilliSortService::PivotKey>;
+template class Merge<MilliSortService::PivotKey>;

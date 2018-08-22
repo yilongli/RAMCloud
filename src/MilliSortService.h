@@ -22,6 +22,7 @@
 #include "Service.h"
 #include "ServerConfig.h"
 #include "WorkerManager.h"
+#include "simulator/Merge.h"
 
 namespace RAMCloud {
 
@@ -178,6 +179,153 @@ class MilliSortService : public Service {
         }
     }
 
+    /**
+     * A pivot consists of the original key of the data tuple plus some
+     * metadata.
+     *
+     * TODO: doc. why metadata; 1. handle duplicate keys gracefully; 2. separate
+     * key and value.
+     */
+    struct PivotKey {
+        // TODO: explain the decl. order of the fields (least significant one
+        // comes first)
+
+        /// Size of the original key, in bytes.
+        static const int N = 10;
+
+        /// 32-bit index that supports more than 4 billion data tuples on each
+        /// server.
+        uint32_t index;
+
+        /// 16-bit serverId that supports up to 65536 nodes.
+        uint16_t serverId;
+
+        /// Byte representation of the original key that is specialized for
+        /// little-endian machines. It starts with the least significant byte
+        /// such that
+        // TODO:
+        char bytes[N];
+
+        /**
+         * Default constructor that zero-initializes the object.
+         */
+        PivotKey()
+        {
+            *reinterpret_cast<__int128*>(this) = 0;
+        }
+
+        /**
+         * Convenient method to build a pivot from an 64-bit signed integer.
+         *
+         * \param key
+         * \param serverId
+         * \param index
+         */
+        PivotKey(uint64_t key, uint16_t serverId, uint32_t index)
+            : index(index)
+            , serverId(serverId)
+            , bytes()
+        {
+            static_assert(N >= 8, "Key must be at least 8-byte");
+            for (char& byte : bytes) {
+                byte = char(key % 256);
+                key >>= 8;
+            }
+        }
+
+        /**
+         * Convenient method to build a pivot from a string.
+         *
+         * \param key
+         * \param serverId
+         * \param index
+         */
+        PivotKey(const string& key, uint16_t serverId, uint32_t index)
+            : index(index)
+            , serverId(serverId)
+            , bytes()
+        {
+            assert(key.size() <= N);
+            int msb = N - 1;
+            for (char ch : key) {
+                bytes[msb--] = ch;
+            }
+        }
+
+        /**
+         * Internal helper method that interprets and returns the 10-byte key
+         * and the 6-byte metadata together as an 128-bit unsigned integer.
+         */
+        unsigned __int128
+        asUint128() const
+        {
+            static_assert(sizeof(PivotKey) == 16, "PivotKey must be 128-bit");
+            return *((const unsigned __int128*) this);
+        }
+
+        /**
+         * If this key is constructed from a uint64_t value, return that value;
+         * otherwise, undefined. Helper method for debugging only.
+         */
+        uint64_t
+        keyAsUint64()
+        {
+            return *((uint64_t*) bytes);
+        }
+
+        /**
+         * If this key is constructed from a string value, return that value;
+         * otherwise, undefined. Helper method for debugging only.
+         */
+        std::string
+        keyAsString()
+        {
+            string str;
+            for (char ch : bytes) {
+                if (ch > 0) {
+                    str += ch;
+                }
+            }
+            std::reverse(str.begin(), str.end());
+            return str;
+        }
+
+        /// Required by comparison-based sorting algorithms.
+        bool
+        operator<(const PivotKey& other) const
+        {
+            return asUint128() < other.asUint128();
+        }
+
+        bool
+        operator<=(const PivotKey& otherKey) const
+        {
+            return asUint128() <= otherKey.asUint128();
+        }
+
+        bool
+        operator==(const PivotKey& otherKey) const
+        {
+            return asUint128() == otherKey.asUint128();
+        }
+    };
+
+    struct Value {
+        char bytes[90];
+
+        Value(uint64_t value = 0)
+            : bytes()
+        {
+            *((uint64_t*) bytes) = value;
+        }
+
+        /**
+         * If this value is constructed from a uint64_t, return that unsigned
+         * integer; otherwise, undefined. Helper method for debugging only.
+         */
+        uint64_t asUint64() { return *((uint64_t*) bytes); }
+    };
+
   PRIVATE:
     void initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr,
                 WireFormat::InitMilliSort::Response* respHdr,
@@ -223,149 +371,6 @@ class MilliSortService : public Service {
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_KEY,
         ALLSHUFFLE_VALUE,
-    };
-
-    struct Key {
-        /// # bytes in the key.
-        static constexpr int N = 10;
-
-        /// Holds bytes of the key, starting from the least significant byte.
-        char bytes[N];
-
-        explicit Key(uint64_t key)
-            : bytes()
-        {
-            static_assert(N >= 8, "Key must be at least 8-byte");
-            for (char& byte : bytes) {
-                byte = char(key % 256);
-                key >>= 8;
-            }
-        }
-
-        explicit Key(const std::string& key)
-            : bytes()
-        {
-            assert(key.size() <= N);
-            int msb = N - 1;
-            for (char ch : key) {
-                bytes[msb--] = ch;
-            }
-        }
-
-        /**
-         * If this key is constructed from a uint64_t value, return that value;
-         * otherwise, undefined. Helper method for debugging only.
-         */
-        uint64_t
-        asUint64()
-        {
-            return *((uint64_t*) bytes);
-        }
-
-        /**
-         * If this key is constructed from a string value, return that value;
-         * otherwise, undefined. Helper method for debugging only.
-         */
-        std::string
-        asString()
-        {
-            string str;
-            for (char ch : bytes) {
-                if (ch > 0) {
-                    str += ch;
-                }
-            }
-            std::reverse(str.begin(), str.end());
-            return str;
-        }
-    };
-
-    /**
-     * A pivot consists of the original key of the data tuple plus some
-     * metadata.
-     *
-     * TODO: doc. why metadata; 1. handle duplicate keys gracefully; 2. separate
-     * key and value.
-     */
-    struct PivotKey {
-        // TODO: explain the decl. order of the fields (least significant one
-        // comes first)
-
-        /// 32-bit index that supports more than 4 billion data tuples on each
-        /// server.
-        uint32_t index;
-
-        /// 16-bit serverId that supports up to 65536 nodes.
-        uint16_t serverId;
-
-        /// Original key of the data tuple to be sorted.
-        Key key;
-
-        PivotKey()
-            : index(0), serverId(0), key(0)
-        {}
-
-        /**
-         * Convenient method to build a pivot from an 64-bit signed integer.
-         *
-         * \param key
-         * \param serverId
-         * \param index
-         */
-        PivotKey(uint64_t key, uint16_t serverId, uint32_t index)
-            : index(index), serverId(serverId), key(key)
-        {}
-
-        /**
-         * Convenient method to build a pivot from a string.
-         *
-         * \param key
-         * \param serverId
-         * \param index
-         */
-        PivotKey(const string& key, uint16_t serverId, uint32_t index)
-            : index(index), serverId(serverId), key(key)
-        {}
-
-        /**
-         * Interpret and return the 10-byte key and the 6-byte metadata together
-         * as an 128-bit unsigned integer.
-         */
-        inline unsigned __int128
-        asUint128() const
-        {
-            static_assert(sizeof(PivotKey) == 16, "PivotKey must be 128-bit");
-            return *((const unsigned __int128*) this);
-        }
-
-        /// Required by comparison-based sorting algorithms.
-        bool
-        operator<(const PivotKey& other) const
-        {
-            return asUint128() < other.asUint128();
-        }
-
-        bool
-        operator<=(const PivotKey& otherKey) const
-        {
-            return asUint128() <= otherKey.asUint128();
-        }
-    };
-
-    struct Value {
-        char bytes[90];
-
-        Value(uint64_t value = 0)
-            : bytes()
-        {
-            *((uint64_t*) bytes) = value;
-        }
-
-        /**
-         * If this value is constructed from a uint64_t, return that unsigned
-         * integer; otherwise, undefined. Helper method for debugging only.
-         */
-        uint64_t asUint64() { return *((uint64_t*) bytes); }
     };
 
     // FIXME: move them into Key/Value struct definition.
@@ -461,6 +466,9 @@ class MilliSortService : public Service {
 
     std::atomic_bool dataBucketRangesDone;
 
+//    Tub<Merge<PivotKey>> mergeSorter;
+    Tub<std::pair<int,int>> mergeSorter;
+
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
 
@@ -512,6 +520,7 @@ class MilliSortService : public Service {
     std::vector<PivotKey> globalSuperPivots;
 
     friend class TreeBcast;
+    friend class Merge;
 
     DISALLOW_COPY_AND_ASSIGN(MilliSortService);
 };

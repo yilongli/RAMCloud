@@ -16,6 +16,7 @@
 #ifndef MERGE_H
 #define MERGE_H
 
+#include <algorithm>
 #include <atomic>
 #include <byteswap.h>
 #include <sys/resource.h>
@@ -27,7 +28,7 @@
 
 #include "Cycles.h"
 
-#define MERGE_WORKER mergeWorker2
+#define MERGE_WORKER mergeWorker
 #define MAX_LEVELS 20
 #define NUM_WORKER_THREADS 7
 //#define NUM_WORKER_THREADS 4
@@ -131,9 +132,8 @@ private:
         // State used to calculate performance statistics later.
         uint64_t lastIdleTime = 0;
     };
-    
+
     static void mergeWorker(MergeWorkerContext* context);
-    static void mergeWorker2(MergeWorkerContext* context);
 
 public:
     ///////////////////////////////////////////////////////////////
@@ -153,10 +153,10 @@ private:
     ///////////////////////////////////////////////////////////////
     
     // Number of arrays that are fed (or will be fed) to this merger.
-    int initialArraysToMergeCounts;
+    const int initialArraysToMergeCounts;
     
     // Total number of elements across all arrays that need to be merged.
-    int numAllItems;
+    const int numAllItems;
     
     // Number of arrays to merge at a time in each level.
     std::vector<int> waysList;
@@ -229,32 +229,45 @@ public:
 template<class T>
 class MergeTestTools {
 public:
+    explicit MergeTestTools()
+        : mcg64State(1)
+    {}
+
     void initializeInput(int itemsPerNode, int numMasters);
     void verifyOutput(T* mergedData, size_t mergedSize);
 
     std::vector<T> input;
     std::vector<typename Merge< T >::ArrayPtr > initialArrays;
 private:
+    //
+    uint64_t mcg64()
+    {
+        return (mcg64State = (164603309694725029ull * mcg64State) %
+                             14738995463583502973ull);
+    }
+
+    uint64_t mcg64State;
+
     void fillRandom(char* dest, uint32_t length);
 };
 
 
 
 //struct MillisortItem {
-//   static const int MillisortKeyLen = 10;
-//   static const int MillisortValueLen = 8;
-//   char key[MillisortKeyLen];
+//   static const int KeyLength = 10;
+//   static const int ValueLength = 8;
+//   char key[KeyLength];
 //   char padding1[6];
-//   char data[MillisortValueLen];
+//   char data[ValueLength];
 //   // char padding2[6];
 //   bool operator<(const MillisortItem &other) const
 //   {
-//       return std::memcmp(key, other.key, MillisortKeyLen) < 0;
+//       return std::memcmp(key, other.key, KeyLength) < 0;
 //   }
 //   MillisortItem& operator=(MillisortItem other)
 //   {
-//       std::memcpy(key, other.key, MillisortKeyLen);
-//       std::memcpy(data, other.data, MillisortValueLen);
+//       std::memcpy(key, other.key, KeyLength);
+//       std::memcpy(data, other.data, ValueLength);
 //       return *this;
 //   }
 //}; static_assert(sizeof(MillisortItem) == 24,
@@ -262,18 +275,18 @@ private:
 
 // **** Aligned naturally.
 //struct MillisortItem {
-//    static const int MillisortKeyLen = 8;
-//    static const int MillisortValueLen = 88;
-//    char key[MillisortKeyLen];
-//    char data[MillisortValueLen];
+//    static const int KeyLength = 8;
+//    static const int ValueLength = 88;
+//    char key[KeyLength];
+//    char data[ValueLength];
 //    bool operator<(const MillisortItem &other) const
 //    {
-//        return std::memcmp(key, other.key, MillisortKeyLen) < 0;
+//        return std::memcmp(key, other.key, KeyLength) < 0;
 //    }
 //    MillisortItem& operator=(MillisortItem other)
 //    {
-//        std::memcpy(key, other.key, MillisortKeyLen);
-//        std::memcpy(data, other.data, MillisortValueLen);
+//        std::memcpy(key, other.key, KeyLength);
+//        std::memcpy(data, other.data, ValueLength);
 //        return *this;
 //    }
 //} __attribute__((packed));
@@ -282,55 +295,55 @@ private:
 
 // **** Aligned and faster comparison.
 // struct MillisortItem {
-//     static const int MillisortKeyLen = 8;
-//     static const int MillisortValueLen = 88;
-//     char key[MillisortKeyLen];
-//     char data[MillisortValueLen];
+//     static const int KeyLength = 8;
+//     static const int ValueLength = 88;
+//     char key[KeyLength];
+//     char data[ValueLength];
 //     bool operator<(const MillisortItem &other) const
 //     {
 //         return *((const uint64_t*)key) < *((const uint64_t*)other.key);
 //     }
 //     MillisortItem& operator=(MillisortItem other)
 //     {
-//         std::memcpy(key, other.key, MillisortKeyLen);
-//         std::memcpy(data, other.data, MillisortValueLen);
+//         std::memcpy(key, other.key, KeyLength);
+//         std::memcpy(data, other.data, ValueLength);
 //         return *this;
 //     }
 // };
 
+
 /// FOR DEBUGGING....
 struct MillisortItem {
-    static const int MillisortKeyLen = 10;
-    static const int MillisortValueLen = 6;
-    char key[MillisortKeyLen];
-    char data[MillisortValueLen];
-    bool operator<(const MillisortItem &other) const
+    static const int KeyLength = 10;
+    static const int ValueLength = 6;
+    char key[KeyLength];
+    char data[ValueLength];
+
+    MillisortItem()
+        : key(), data()
+    {}
+
+    inline unsigned __int128
+    asUint128() const
     {
-        unsigned __int128 mine, yours;
-        *(((int64_t*)&mine) + 1) = bswap_64(*((const int64_t*) key));
-        *(((int64_t*)&mine)) = bswap_64(*(((const int64_t*) key) + 1));
-        *(((int64_t*)&yours) + 1) = bswap_64(*((const int64_t*) other.key));
-        *(((int64_t*)&yours)) = bswap_64(*(((const int64_t*) other.key) + 1));
-        return mine < yours;
-//        return std::memcmp(key, other.key, MillisortKeyLen) < 0;
+        return *((const unsigned __int128*) this);
     }
-    bool operator>(const MillisortItem &other) const
+
+    bool operator<(const MillisortItem &other) const {
+        return asUint128() < other.asUint128();
+//        unsigned __int128 mine, yours;
+//        *(((int64_t*) &mine) + 1) = bswap_64(*((const int64_t*) this));
+//        *(((int64_t*) &mine)) = bswap_64(*(((const int64_t*) this) + 1));
+//        *(((int64_t*) &yours) + 1) = bswap_64(*((const int64_t*) &other));
+//        *(((int64_t*) &yours)) = bswap_64(*(((const int64_t*) &other) + 1));
+//        return mine < yours;
+    }
+
+    bool operator==(const MillisortItem& other)
     {
-        unsigned __int128 mine, yours;
-        *(((int64_t*)&mine) + 1) = bswap_64(*((const int64_t*) key));
-        *(((int64_t*)&mine)) = bswap_64(*(((const int64_t*) key) + 1));
-        *(((int64_t*)&yours) + 1) = bswap_64(*((const int64_t*) other.key));
-        *(((int64_t*)&yours)) = bswap_64(*(((const int64_t*) other.key) + 1));
-        return mine > yours;
-//        return std::memcmp(key, other.key, MillisortKeyLen) > 0;
+        return asUint128() == other.asUint128();
     }
-    MillisortItem& operator=(MillisortItem other)
-    {
-        std::memcpy(key, other.key, MillisortKeyLen);
-        std::memcpy(data, other.data, MillisortValueLen);
-        return *this;
-    }
-}; static_assert(sizeof(MillisortItem) == MillisortItem::MillisortKeyLen + 
-        MillisortItem::MillisortValueLen, "Unexpected padding in MillisortItem");
+};
+static_assert(sizeof(MillisortItem) == 16, "Unexpected padding in MillisortItem");
 
 #endif  // MERGE_H
