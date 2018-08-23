@@ -37,6 +37,8 @@
 
 using namespace RAMCloud;
 
+static int numMergeWorkers;
+
 /*
  * This function just discards its argument. It's used to make it
  * appear that data is used,  so that the compiler won't optimize
@@ -169,7 +171,7 @@ void printData(MillisortArrayPtr ptr, const char* header = "", bool warnIfUnsort
 //    fflush(stdout);
 }
 
-#define VERBOSE 0
+#define VERBOSE 1
 
 // Listing 1
 // _end pointer point not to the last element, but one past and never access it.
@@ -201,14 +203,35 @@ inline void merge_ptr(const _Type* a_start, const _Type* a_end, const _Type* b_s
     while (b_start < b_end)	*dst++ = *b_start++;
 }
 
-double mergeModule1()
+double mergeModule()
 {
     int count = 100;
     uint64_t totalTime = 0;
     int numMasters = 1024;
     int numItemsPerNode = 50;
+
+#if USE_ARACHNE
+// TODO: shall I make sure # cores available >= numWorkers + 1 (dispatch)?
+    int numAttempts = 0;
+    Arachne::CorePolicy::CoreList list = Arachne::getCorePolicy()->getCores(0);
+    while (list.size() < numMergeWorkers) {
+        Arachne::sleep(100 * 1000000);
+        numAttempts++;
+        if (numAttempts > 10) {
+            printf("Failed to get enough cores available after %d attemtps, "
+                    "cores avail. %u, numWorkers %d", numAttempts, list.size(),
+                    numMergeWorkers);
+            exit(1);
+        }
+        list = Arachne::getCorePolicy()->getCores(0);
+    }
+    printf("Merge dispatcher running on core %u\n",
+            Arachne::getThreadId().context->coreId);
+#endif
+
     for (int expId = 0; expId < count; expId++) {
-        Merge<MilliSortService::PivotKey> merger(numMasters, numItemsPerNode * numMasters * 2);
+//        printf("starting experiment %d\n", expId);
+        Merge<MilliSortService::PivotKey> merger(numMasters, numItemsPerNode * numMasters * 2, numMergeWorkers);
         MergeTestTools<MilliSortService::PivotKey> testSetup;
         testSetup.initializeInput(numItemsPerNode, numMasters);
         merger.prepareThreads();
@@ -218,41 +241,15 @@ double mergeModule1()
             merger.poll(array.data, array.size);
             // We may add intentional delays here to simulate online merge.
         }
-        while (merger.poll());
-
-        totalTime += merger.stopTick - merger.startTick;
-        
-        // verify output
-        auto mergedArray = merger.getSortedArray();
-        testSetup.verifyOutput(mergedArray.data, mergedArray.size);
-        if (expId == count - 1) {
-            merger.getPerfStats()->printStats();
+        while (merger.poll()) {
+#if USE_ARACHNE
+            Arachne::yield();
+#endif
         }
-    }
-
-    return Cycles::toSeconds(totalTime) / count;
-}
-
-double mergeModule2()
-{
-    int count = 100;
-    uint64_t totalTime = 0;
-    int numMasters = 1024;
-    int numItemsPerNode = 50;
-    for (int expId = 0; expId < count; expId++) {
-        Merge<MillisortItem> merger(numMasters, numItemsPerNode * numMasters * 2);
-        MergeTestTools<MillisortItem> testSetup;
-        testSetup.initializeInput(numItemsPerNode, numMasters);
-        merger.prepareThreads();
-
-        // Run merge. First add all input arrays. Then keep polling to finish.
-        for (auto array : testSetup.initialArrays) {
-            merger.poll(array.data, array.size);
-            // We may add intentional delays here to simulate online merge.
-        }
-        while (merger.poll());
-
-        totalTime += merger.stopTick - merger.startTick;
+        uint64_t ticks = merger.stopTick - merger.startTick;
+        totalTime += ticks;
+        printf("finished experiment %d in %.2f us\n", expId,
+                Cycles::toSeconds(ticks)*1e6);
 
         // verify output
         auto mergedArray = merger.getSortedArray();
@@ -279,10 +276,10 @@ struct TestInfo {
                                   // test output fits on a single line).
 };
 TestInfo tests[] = {
-    {"mergeModule1", mergeModule1,
+    {"memcmp10b", memcmp10b,
+     "memcmp two randomly filled 10b memory buffers."},
+    {"mergeModule", mergeModule,
      "merge 50k items using multiple cores using Merge class"},
-    {"mergeModule2", mergeModule2,
-     "merge 50k items using multiple cores using Merge class"}
 //    {"sortSka", sortSka,
 //     "sort 50k items with ska_sort, which is a single core Radix sort."}, 
 };
@@ -309,23 +306,10 @@ void runTest(TestInfo& info)
     printf("%*s %s\n", 26-width, "", info.description);
 }
 
-int
-main(int argc, char *argv[])
-{
-//    // Increase stack size.
-//    const rlim_t kStackSize = 8 * 1024 * 1024;   // min stack size = 16 MB
-//    struct rlimit rl;
-//    int result = getrlimit(RLIMIT_STACK, &rl);
-//    if (result == 0) {
-//        if (rl.rlim_cur < kStackSize) {
-//            rl.rlim_cur = kStackSize;
-//            result = setrlimit(RLIMIT_STACK, &rl);
-//            if (result != 0) {
-//                fprintf(stderr, "setrlimit returned result = %d\n", result);
-//            }
-//        }
-//    }
-    
+#if USE_ARACHNE
+// This is where user code should start running.
+void
+AppMain(int argc, const char** argv) {
     Cycles::init();
     // Parse command-line options.
     namespace po = boost::program_options;
@@ -337,9 +321,8 @@ main(int argc, char *argv[])
             "Allowed options");
     optionsDesc.add_options()
         ("help", "Print this help message and exit")
-        // ("secondCore", po::value<int>(&core2)->default_value(3),
-        //         "Second core to use for tests involving two cores (first "
-        //         "core is always 2)")
+        ("mergeWorkers", po::value<int>(&numMergeWorkers)->default_value(6),
+                 "Number of merge workers to create")
         ("testName", po::value<vector<string>>(&testNames),
                 "A test is run if its name contains any of the testName"
                 "arguments as a substring");
@@ -351,7 +334,7 @@ main(int argc, char *argv[])
           options(optionsDesc).positional(posDesc).run(), vm);
     po::notify(vm);
     if (vm.count("help")) {
-        // std::cout << optionsDesc << "\n";
+        std::cout << optionsDesc << "\n";
         exit(0);
     }
 
@@ -380,3 +363,73 @@ main(int argc, char *argv[])
         }
     }
 }
+
+// The following bootstrapping code should be copied verbatim into most Arachne
+// applications.
+void AppMainWrapper(int argc, const char** argv) {
+    AppMain(argc, argv);
+    Arachne::shutDown();
+}
+int
+main(int argc, const char** argv) {
+    Arachne::init(&argc, argv);
+    Arachne::createThread(&AppMainWrapper, argc, argv);
+    Arachne::waitForTermination();
+}
+#else
+int
+main(int argc, const char** argv) {
+    Cycles::init();
+    // Parse command-line options.
+    namespace po = boost::program_options;
+    vector<string> testNames;
+    po::options_description optionsDesc(
+            "Usage: Perf [options] testName testName ...\n\n"
+            "Runs one or more micro-benchmarks and outputs performance "
+            "information.\n\n"
+            "Allowed options");
+    optionsDesc.add_options()
+        ("help", "Print this help message and exit")
+        ("mergeWorkers", po::value<int>(&numMergeWorkers)->default_value(6),
+                 "Number of merge workers to create")
+        ("testName", po::value<vector<string>>(&testNames),
+                "A test is run if its name contains any of the testName"
+                "arguments as a substring");
+
+    po::positional_options_description posDesc;
+    posDesc.add("testName", -1);
+    po::variables_map vm;
+    po::store(po::command_line_parser(argc, argv).
+          options(optionsDesc).positional(posDesc).run(), vm);
+    po::notify(vm);
+    if (vm.count("help")) {
+        std::cout << optionsDesc << "\n";
+        exit(0);
+    }
+
+    // CPU_ZERO(&savedAffinities);
+    // sched_getaffinity(0, sizeof(savedAffinities), &savedAffinities);
+    if (argc == 1) {
+        // No test names specified; run all tests.
+        foreach (TestInfo& info, tests) {
+            runTest(info);
+        }
+    } else {
+        // Run only the tests whose names contain at least one of the
+        // command-line arguments as a substring.
+        bool foundTest = false;
+        foreach (TestInfo& info, tests) {
+            for (size_t i = 0; i < testNames.size(); i++) {
+                if (strstr(info.name, testNames[i].c_str()) !=  NULL) {
+                    foundTest = true;
+                    runTest(info);
+                    break;
+                }
+            }
+        }
+        if (!foundTest) {
+            printf("No tests matched given arguments\n");
+        }
+    }
+}
+#endif

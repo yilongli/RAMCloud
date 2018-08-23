@@ -27,11 +27,13 @@
 #include <cstring>
 
 #include "Cycles.h"
+#include "Arachne/Arachne.h"
 
 #define MERGE_WORKER mergeWorker
 #define MAX_LEVELS 20
-#define NUM_WORKER_THREADS 7
-//#define NUM_WORKER_THREADS 4
+#define MAX_WORKERS 7
+
+#define USE_ARACHNE 1
 
 /**
  * Tracks performance statistics of a merge task.
@@ -48,14 +50,15 @@ struct MergeStats {
     int itemSize;
     int keySize;
     int valueSize;
+    int numWorkers;
 
     ///////////////////////////////////////////////////////////////
     // Performance counters
     ///////////////////////////////////////////////////////////////
     std::vector<double> msByLevel;
-    std::vector<uint64_t> busyCyclesByThreadAndLevel[NUM_WORKER_THREADS];
-    std::vector<uint64_t> noJobCyclesByThreadAndLevel[NUM_WORKER_THREADS];
-    std::vector<uint64_t> jobSizeByThreadAndLevel[NUM_WORKER_THREADS];
+    std::vector<uint64_t> busyCyclesByThreadAndLevel[MAX_WORKERS];
+    std::vector<uint64_t> noJobCyclesByThreadAndLevel[MAX_WORKERS];
+    std::vector<uint64_t> jobSizeByThreadAndLevel[MAX_WORKERS];
     int scheduleSplit[MAX_LEVELS] = {};
     int scheduleSplitJob[MAX_LEVELS] = {};
     int scheduleNormal[MAX_LEVELS] = {};
@@ -64,13 +67,14 @@ struct MergeStats {
     // Summarized/derived statistics
     ///////////////////////////////////////////////////////////////
     double msTotal;
-    double busyMsByThread[NUM_WORKER_THREADS];
-    double noJobMsByThread[NUM_WORKER_THREADS];
+    double busyMsByThread[MAX_WORKERS];
+    double noJobMsByThread[MAX_WORKERS];
 
-    void initialize(int numLevels) {
+    void initialize(int numLevels, int numWorkers) {
+        this->numWorkers = numWorkers;
         this->numLevels = numLevels;
         msByLevel.resize(numLevels);
-        for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+        for (int tid = 0; tid < numWorkers; tid++) {
             busyCyclesByThreadAndLevel[tid].resize(numLevels);
             noJobCyclesByThreadAndLevel[tid].resize(numLevels);
             jobSizeByThreadAndLevel[tid].resize(numLevels);
@@ -97,7 +101,7 @@ public:
         size_t size;
     };
     
-    Merge(int numArraysTotal, int maxNumAllItems);
+    Merge(int numArraysTotal, int maxNumAllItems, int numWorkers = 4);
     ~Merge();
     void prepareThreads();
     bool poll();
@@ -165,15 +169,20 @@ private:
     // complete and advance to the next level.
     std::vector<int> numArraysTargets;
     
-    // Number of worker threads.
-    static const int numThreads = NUM_WORKER_THREADS;
+    // Number of merge workers (each running on an Arachne or std thread).
+    const int numWorkers;
     
     ///////////////////////////////////////////////////////////////
     // Variable tracking current progress
     ///////////////////////////////////////////////////////////////
-    MergeWorkerContext contexts[numThreads];
-    std::thread *threads[numThreads];
-    
+    MergeWorkerContext contexts[MAX_WORKERS];
+
+#if USE_ARACHNE
+    Arachne::ThreadId threads[MAX_WORKERS];
+#else
+    std::thread *threads[MAX_WORKERS];
+#endif
+
     // Memory chunk that are used to store intermediately merged arrays.
     T* buffer;
     
@@ -251,67 +260,6 @@ private:
     void fillRandom(char* dest, uint32_t length);
 };
 
-
-
-//struct MillisortItem {
-//   static const int KeyLength = 10;
-//   static const int ValueLength = 8;
-//   char key[KeyLength];
-//   char padding1[6];
-//   char data[ValueLength];
-//   // char padding2[6];
-//   bool operator<(const MillisortItem &other) const
-//   {
-//       return std::memcmp(key, other.key, KeyLength) < 0;
-//   }
-//   MillisortItem& operator=(MillisortItem other)
-//   {
-//       std::memcpy(key, other.key, KeyLength);
-//       std::memcpy(data, other.data, ValueLength);
-//       return *this;
-//   }
-//}; static_assert(sizeof(MillisortItem) == 24,
-//       "Unexpected padding in MillisortItem");
-
-// **** Aligned naturally.
-//struct MillisortItem {
-//    static const int KeyLength = 8;
-//    static const int ValueLength = 88;
-//    char key[KeyLength];
-//    char data[ValueLength];
-//    bool operator<(const MillisortItem &other) const
-//    {
-//        return std::memcmp(key, other.key, KeyLength) < 0;
-//    }
-//    MillisortItem& operator=(MillisortItem other)
-//    {
-//        std::memcpy(key, other.key, KeyLength);
-//        std::memcpy(data, other.data, ValueLength);
-//        return *this;
-//    }
-//} __attribute__((packed));
-//static_assert(sizeof(MillisortItem) == 96,
-//        "Unexpected padding in MillisortItem");
-
-// **** Aligned and faster comparison.
-// struct MillisortItem {
-//     static const int KeyLength = 8;
-//     static const int ValueLength = 88;
-//     char key[KeyLength];
-//     char data[ValueLength];
-//     bool operator<(const MillisortItem &other) const
-//     {
-//         return *((const uint64_t*)key) < *((const uint64_t*)other.key);
-//     }
-//     MillisortItem& operator=(MillisortItem other)
-//     {
-//         std::memcpy(key, other.key, KeyLength);
-//         std::memcpy(data, other.data, ValueLength);
-//         return *this;
-//     }
-// };
-
-
 /// FOR DEBUGGING....
 struct MillisortItem {
     static const int KeyLength = 10;
@@ -331,12 +279,6 @@ struct MillisortItem {
 
     bool operator<(const MillisortItem &other) const {
         return asUint128() < other.asUint128();
-//        unsigned __int128 mine, yours;
-//        *(((int64_t*) &mine) + 1) = bswap_64(*((const int64_t*) this));
-//        *(((int64_t*) &mine)) = bswap_64(*(((const int64_t*) this) + 1));
-//        *(((int64_t*) &yours) + 1) = bswap_64(*((const int64_t*) &other));
-//        *(((int64_t*) &yours)) = bswap_64(*(((const int64_t*) &other) + 1));
-//        return mine < yours;
     }
 
     bool operator==(const MillisortItem& other)

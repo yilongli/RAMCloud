@@ -23,6 +23,7 @@
 #include "Cycles.h"
 
 #include "MilliSortService.h"
+#include "Arachne/DefaultCorePolicy.h"
 
 using namespace RAMCloud;
 //#define VERBOSE 1
@@ -37,14 +38,14 @@ using namespace RAMCloud;
 void
 MergeStats::calcSecondaryStats()
 {
-    for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+    for (int tid = 0; tid < numWorkers; tid++) {
         busyMsByThread[tid] = 0;
         noJobMsByThread[tid] = 0;
     }
     msTotal = 0;
     for (int l = 0; l < numLevels; l++) {
         msTotal += msByLevel[l];
-        for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+        for (int tid = 0; tid < numWorkers; tid++) {
             busyMsByThread[tid] += Cycles::toSeconds(busyCyclesByThreadAndLevel[tid][l]) * 1000;
             noJobMsByThread[tid] += Cycles::toSeconds(noJobCyclesByThreadAndLevel[tid][l]) * 1000;
         }
@@ -88,12 +89,12 @@ MergeStats::printStats()
             "============================================================"
             "===========================\n");
     printf("Level  Total  ");
-    for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+    for (int tid = 0; tid < numWorkers; tid++) {
         printf("      thread%2d     ", tid);
     }
     printf(" | Per-item busy | Scheduled\n");
     printf("        (ms)  ");
-    for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+    for (int tid = 0; tid < numWorkers; tid++) {
         printf(" busy/noJob/trnAro ");
     }
     printf(" | (ns);(min,max)| Normal  Split(#job)\n");
@@ -108,7 +109,7 @@ MergeStats::printStats()
         double perItemTimeMax = 0, perItemTimeMin = 9999;
         int perItemTimeMaxTid = -1, perItemTimeMinTid = -1;
         int internalLevels = static_cast<int>(ceil(log(waysList[l]) / log(2)));
-        for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+        for (int tid = 0; tid < numWorkers; tid++) {
             double busyCycles = Cycles::toSeconds(
                     busyCyclesByThreadAndLevel[tid][l]) * 1000;
             double noJobCycles = Cycles::toSeconds(
@@ -131,7 +132,7 @@ MergeStats::printStats()
 
 //        printf("             ");
         printf("     (%2d-way)", waysList[l]);
-        for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+        for (int tid = 0; tid < numWorkers; tid++) {
             double busyCycles = Cycles::toSeconds(
                     busyCyclesByThreadAndLevel[tid][l]) * 1000;
             double noJobCycles = Cycles::toSeconds(
@@ -148,7 +149,7 @@ MergeStats::printStats()
         "---------------------------|---------------|---------------\n");
     
     printf(" SUM   %2.2f :", msTotal);
-    for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+    for (int tid = 0; tid < numWorkers; tid++) {
         printf("  %5.2f/%5.2f/%5.2f",
                 busyMsByThread[tid], noJobMsByThread[tid],
                 msTotal - busyMsByThread[tid] - noJobMsByThread[tid]);
@@ -156,7 +157,7 @@ MergeStats::printStats()
     printf("\n");
 
     printf("             ");
-    for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+    for (int tid = 0; tid < numWorkers; tid++) {
         printf("   (%3.0f%%/%3.0f%%/%3.0f%%)",
                 busyMsByThread[tid] / msTotal * 100,
                 noJobMsByThread[tid] / msTotal * 100,
@@ -169,17 +170,17 @@ MergeStats::printStats()
     
     double busyMsTotal = 0;
     double noJobMsTotal = 0;
-    for (int tid = 0; tid < NUM_WORKER_THREADS; tid++) {
+    for (int tid = 0; tid < numWorkers; tid++) {
         busyMsTotal += busyMsByThread[tid];
         noJobMsTotal += noJobMsByThread[tid];
     }
     printf(" Overall CPU utilization: %5.2f/%5.2f/%5.2f (%3.0f%%/%3.0f%%/%3.0f%%)\n",
             busyMsTotal, noJobMsTotal,
-            msTotal * NUM_WORKER_THREADS - busyMsTotal - noJobMsTotal,
-            busyMsTotal / (msTotal * NUM_WORKER_THREADS) * 100,
-            noJobMsTotal / (msTotal * NUM_WORKER_THREADS) * 100,
-            (msTotal * NUM_WORKER_THREADS - busyMsTotal - noJobMsTotal)
-                    / (msTotal * NUM_WORKER_THREADS) * 100);
+            msTotal * numWorkers - busyMsTotal - noJobMsTotal,
+            busyMsTotal / (msTotal * numWorkers) * 100,
+            noJobMsTotal / (msTotal * numWorkers) * 100,
+            (msTotal * numWorkers - busyMsTotal - noJobMsTotal)
+                    / (msTotal * numWorkers) * 100);
     printf("-------------------------------------------------------------"
         "------------------------------------------------------------"
         "---------------------------\n");
@@ -311,6 +312,9 @@ void Merge<T>::mergeWorker(MergeWorkerContext* context) {
                 printf("WARNING: WorkerThread has been idle more than 1 sec. current state: %d\n", context->state.load());
                 printedIdleWarning = true;
             }
+#if USE_ARACHNE
+            Arachne::yield();
+#endif
             continue;
         }
 
@@ -401,15 +405,16 @@ void Merge<T>::mergeWorker(MergeWorkerContext* context) {
 }
 
 template<class T>
-Merge<T>::Merge(int numArraysTotal, int maxNumAllItems)
+Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     : initialArraysToMergeCounts(numArraysTotal)
     , numAllItems(maxNumAllItems)
+    , numWorkers(numWorkers)
     , numArraysCompleted()
 {
     int arrayCount = numArraysTotal;
     while (arrayCount > 1) {
         numArraysTargets.push_back(arrayCount);
-        if (arrayCount / numThreads > maxWays) {
+        if (arrayCount / numWorkers > maxWays) {
             waysList.push_back(maxWays);
             arrayCount /= maxWays;
         } else {
@@ -426,19 +431,22 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems)
     int numLevels = int(waysList.size());
     buffer = new T[(numLevels + 1) * numAllItems];
     bzero(buffer, sizeof(T) * (numLevels + 1) * numAllItems);
-//    bzero(numArraysCompleted, sizeof(int) * numLevels);
-    
-    perfStats.initialize(numLevels);
+
+    perfStats.initialize(numLevels, numWorkers);
 }
 
 template<class T>
 Merge<T>::~Merge()
 {
     // Join threads.
-    for (int i = 0; i < numThreads; i++) {
+    for (int i = 0; i < numWorkers; i++) {
         contexts[i].state = 3; // poison the thread to stop.
+#if USE_ARACHNE
+        Arachne::join(threads[i]);
+#else
         threads[i]->join();
         delete threads[i];
+#endif
     }
     delete[] buffer;
 }
@@ -446,9 +454,27 @@ Merge<T>::~Merge()
 template<class T>
 void Merge<T>::prepareThreads()
 {
-    for (int i = 0; i < numThreads; i++) {
+#if USE_ARACHNE
+    Arachne::CorePolicy::CoreList list = Arachne::getCorePolicy()->getCores(0);
+#endif
+    for (int i = 0; i < numWorkers; i++) {
         contexts[i].state = 0;
+#if USE_ARACHNE
+        // FIXME: need to take into account dispatcher?
+        // FIXME: Or, shall we even prepare threads on startup? this seems to be
+        // against Arachne's model; shall we create Arachne thread in poll()
+        // by need?
+        // Manually spread out the workers on all available cores.
+        uint32_t coreId = downCast<uint32_t>(list[i % list.size()]);
+        threads[i] = Arachne::createThreadOnCore(coreId, MERGE_WORKER,
+                &contexts[i]);
+        printf("spawn worker %d on core %u\n", i, threads[i].context->originalCoreId);
+//        threads[i] = Arachne::createThreadWithClass(
+//                Arachne::DefaultCorePolicy::EXCLUSIVE, MERGE_WORKER,
+//                &contexts[i]);
+#else
         threads[i] = new std::thread(MERGE_WORKER, &contexts[i]);
+#endif
     }
     preparedThreads = true;
 }
@@ -515,7 +541,7 @@ Merge<T>::poll()
     if (numArraysCompleted[level] == numArraysTarget && splittedJobs.empty()) {
         // If some worker is still working on some part of splitted array,
         // continue polling instead of completing the sort.
-        for (int tid = 0; tid < numThreads; tid++) {
+        for (int tid = 0; tid < numWorkers; tid++) {
             if (contexts[tid].state > 0) {
                 goto continuePolling;
             }
@@ -527,7 +553,7 @@ Merge<T>::poll()
 //                Cycles::toSeconds(currentTick - lastLevelEndTime) * 1000);
         perfStats.msByLevel[level] = Cycles::toSeconds(currentTick - lastLevelEndTime) * 1000;
         
-        for (int tid = 0; tid < numThreads; tid++) {
+        for (int tid = 0; tid < numWorkers; tid++) {
             if (contexts[tid].currentLevel == level) {
                 // This thread has been used for this level.
                 perfStats.noJobCyclesByThreadAndLevel[tid][level]
@@ -548,7 +574,7 @@ Merge<T>::poll()
             // Merge is completed!
             stopTick = Cycles::rdtscp();
 #ifdef VERBOSE
-            printf("Finished merging with %d workerCores.\n", numThreads);
+            printf("Finished merging with %d workerCores.\n", numWorkers);
 #endif
             return false;
         }
@@ -575,7 +601,7 @@ continuePolling:
     // Sweep through threads.
     std::vector<int> idleWorkers;
     // Scan in reverse order for better cache behavior.
-    for (int tid = numThreads - 1; tid >= 0; tid--) {
+    for (int tid = numWorkers - 1; tid >= 0; tid--) {
         if (contexts[tid].state == 1) { // Done working.
 //                    printf("Level%d thread %d done.\n", mergeLevel, tid);
             int mergeLevel = contexts[tid].currentLevel;
@@ -620,11 +646,12 @@ continuePolling:
             splittedJobs.pop();
             idleWorkers.pop_back();
         } else if (SPLIT_MERGE && ways == 2 &&
-                (STATIC_SPLIT || idleWorkers.size() / jobsAvailable >= 2) &&
-                arraysToMerge[level].front().size > numThreads) {
+                ((STATIC_SPLIT && numWorkers >= 2)
+                    || idleWorkers.size() / jobsAvailable >= 2) &&
+                int(arraysToMerge[level].front().size) > numWorkers) {
             // Split two arrays and schedule merge to multiple workers.
 #if STATIC_SPLIT
-            int splitWays = NUM_WORKER_THREADS;
+            int splitWays = numWorkers;
 #else
             int splitWays = idleWorkers.size() / jobsAvailable;
 #endif
@@ -723,6 +750,10 @@ continuePolling:
             perfStats.jobSizeByThreadAndLevel[tid][level] += afterMergeSize;
             perfStats.scheduleNormal[level]++;
         }
+
+#if USE_ARACHNE
+        Arachne::yield();
+#endif
     }
 
     return true;
