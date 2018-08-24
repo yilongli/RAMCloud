@@ -207,12 +207,9 @@ class MilliSortService : public Service {
         char bytes[N];
 
         /**
-         * Default constructor that zero-initializes the object.
+         * Default constructor that does absolutely nothing.
          */
-        PivotKey()
-        {
-            *reinterpret_cast<__int128*>(this) = 0;
-        }
+        PivotKey() = default;
 
         /**
          * Convenient method to build a pivot from an 64-bit signed integer.
@@ -464,10 +461,13 @@ class MilliSortService : public Service {
     /// bucket is keys[a] and there are b keys in total in the bucket.
     std::vector<std::pair<int,int>> dataBucketRanges;
 
+    /// True means #dataBucketRanges has been filled out and, thus, can be
+    /// safely accessed by #shufflePull handler. Used to prevent data race on
+    /// #dataBucketRanges.
     std::atomic_bool dataBucketRangesDone;
 
-//    Tub<Merge<PivotKey>> mergeSorter;
-    Tub<std::pair<int,int>> mergeSorter;
+    /// Used to sort keys as they arrive during the final key shuffle stage.
+    Tub<Merge<PivotKey>> mergeSorter;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;

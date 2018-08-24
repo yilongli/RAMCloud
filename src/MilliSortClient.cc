@@ -126,5 +126,13 @@ ShufflePullRpc::appendRequest(Buffer* request, int32_t senderId,
     reqHdr->dataId = dataId;
 }
 
+/// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
+Buffer*
+ShufflePullRpc::wait()
+{
+    waitAndCheckErrors();
+    response->truncateFront(responseHeaderLength);
+    return response;
+}
 
 }  // namespace RAMCloud

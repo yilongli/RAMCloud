@@ -84,6 +84,7 @@ MilliSortService::MilliSortService(Context* context,
     , dataBucketBoundaries()
     , dataBucketRanges()
     , dataBucketRangesDone(false)
+    , mergeSorter()
     , world()
     , myPivotServerGroup()
     , allGatherPeersGroup()
@@ -265,7 +266,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         keys.emplace_back(downCast<uint64_t>(key),
                 downCast<uint16_t>(serverId.indexNumber()),
                 downCast<uint32_t>(i));
-        values.emplace_back(keys.back().key.asUint64());
+        values.emplace_back(keys.back().keyAsUint64());
     }
     numSortedKeys = 0;
     numSortedValues = 0;
@@ -284,6 +285,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     dataBucketBoundaries.clear();
     dataBucketRanges.clear();
     dataBucketRangesDone.store(false);
+    mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
     gatheredPivots.clear();
     superPivots.clear();
     pivotBucketBoundaries.clear();
@@ -660,6 +662,7 @@ MilliSortService::allGatherDataBucketBoundaries()
         int numKeys = 0;
         int oldKeyIdx = keyIdx;
         while ((keyIdx < keys.size()) && (keys[keyIdx] <= rightBound)) {
+            keys[keyIdx].index = static_cast<uint32_t>(numKeys);
             numKeys++;
             keyIdx++;
         }
@@ -677,111 +680,85 @@ MilliSortService::dataBucketSort()
 {
     timeTrace("=== Stage 7: dataBucketSort started");
 
-    // Merge data from other nodes as they arrive.
+    // Merge keys from other nodes into a sorted array as they arrive.
     auto keyMerger = [this] (Buffer* keyBuffer) {
         CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeKeyCycles);
         uint32_t numKeys = keyBuffer->size() / KeySize;
         int keyIdx = numSortedKeys.fetch_add(numKeys);
         keyBuffer->copy(0, keyBuffer->size(), &sortedKeys[keyIdx]);
+        mergeSorter->poll(&sortedKeys[keyIdx], numKeys);
         timeTrace("merged %u keys, %u bytes", numKeys, keyBuffer->size());
     };
-//    auto valueMerger = [this] (Buffer* valueBuffer) {
-//        CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeValueCycles);
-//        uint32_t offset = 0;
-//        uint32_t serverId = *valueBuffer->read<uint32_t>(&offset);
-//        uint32_t numValues = (valueBuffer->size() - offset) / ValueSize;
-//        valueStartIdx[serverId] = numSortedValues.fetch_add(numValues);
-//        int valueIdx = valueStartIdx[serverId];
-//        valueBuffer->copy(offset, valueBuffer->size(), &sortedValues[valueIdx]);
-//        timeTrace("merged %u values, %u bytes", numValues, valueBuffer->size());
-//    };
 
     //////////////// NEW IMPLEMENTATION OF PULL-BASED SHUFFLE
-    timeTrace("about to shuffle data tuples");
+    mergeSorter->prepareThreads();
+
+    timeTrace("about to shuffle keys");
     for (int i = 0; i < world->size(); i++) {
         timeTrace("about to send shuffle pull request");
-        Buffer keyBuffer;
         ServerId target = world->getNode(world->rank + 1 + i);
-        ShufflePullRpc pullRpc(context, target, world->rank, ALLSHUFFLE_KEY,
-                &keyBuffer);
-        pullRpc.wait();
-        keyBuffer.truncateFront(sizeof(WireFormat::ResponseCommon));
+        ShufflePullRpc pullRpc(context, target, world->rank, ALLSHUFFLE_KEY);
+        mergeSorter->poll();
+        Buffer* keyBuffer = pullRpc.wait();
         timeTrace("about to merge keys from server %u", target.indexNumber()+1);
-        keyMerger(&keyBuffer);
+        keyMerger(keyBuffer);
     }
-    // TODO: this is not really parallel merge; is it better this way?
-    sort(sortedKeys.begin(), sortedKeys.begin() + numSortedKeys);
+
+    // FIXME: Arachne::yield?
+    while (mergeSorter->poll()) {}
+    auto sortedArray = mergeSorter->getSortedArray();
+    memcpy(sortedKeys.data(), sortedArray.data, sortedArray.size * KeySize);
+    assert(int(sortedArray.size) == numSortedKeys.load());
     timeTrace("sorted %u final keys", numSortedKeys.load());
 
     /////////////////////////////////////////////////////////
+    auto valueMerger = [this] (ServerId fromServer, Buffer* valueBuffer) {
+        CycleCounter<> _(&PerfStats::threadStats.bucketSortMergeValueCycles);
+        uint32_t numValues = valueBuffer->size() / ValueSize;
+        uint32_t serverId = fromServer.indexNumber();
+        valueStartIdx[serverId] = numSortedValues.fetch_add(numValues);
+        int valueIdx = valueStartIdx[serverId];
+        valueBuffer->copy(0, valueBuffer->size(), &sortedValues[valueIdx]);
+        timeTrace("merged %u values from serverId %u, %u bytes", numValues,
+                serverId, valueBuffer->size());
+    };
 
-//    // Send data to their designated nodes determined by the data bucket
-//    // boundaries.
-//    timeTrace("about to shuffle data tuples");
-//    {
-//        CycleCounter<> _(&PerfStats::threadStats.bucketSortDataCycles);
-//        Tub<AllShuffle> keyShuffle;
-//        Tub<AllShuffle> valueShuffle;
-//        invokeCollectiveOp<AllShuffle>(keyShuffle, ALLSHUFFLE_KEY, context,
-//                world.get(), &keyMerger);
-//        invokeCollectiveOp<AllShuffle>(valueShuffle, ALLSHUFFLE_VALUE, context,
-//                world.get(), &valueMerger);
-//        uint32_t keyIdx = 0;
-//        if (serverId.indexNumber() > 1) {
-//            auto leftBound = dataBucketBoundaries[serverId.indexNumber() - 2];
-//            while (keys[keyIdx] < leftBound) {
-//                keyIdx++;
-//            }
-//        }
-//        timeTrace("constructed 2 shuffle ops");
-//        for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
-//            // TODO: should we hide the following inside the impl. of all-shuffle?
-//            // Start shuffle by sending to our right neighbor first.
-//            int rank = downCast<int>(
-//                    (serverId.indexNumber() + i) % dataBucketBoundaries.size());
-//            Buffer* keyBuffer = keyShuffle->getSendBuffer(rank);
-//            Buffer* valueBuffer = valueShuffle->getSendBuffer(rank);
-//            valueBuffer->emplaceAppend<uint32_t>(serverId.indexNumber());
-//            PivotKey rightBound = dataBucketBoundaries[rank];
-//            uint32_t numKeys = 0;
-//            uint32_t oldKeyIdx = keyIdx;
-//            while ((keyIdx < keys.size()) && (keys[keyIdx] <= rightBound)) {
-//                // TODO: should I try to transmit only the 10 byte key and let
-//                // underlying shuffle op keep track of where the data is from?
-//                // Do we care about the 6-byte metadata overhead (probably not
-//                // if it's very latency-bound)
-//                keys[keyIdx].index = numKeys;
-//                numKeys++;
-//                keyIdx++;
-//            }
-//            keyBuffer->appendExternal(&keys[oldKeyIdx], KeySize * numKeys);
-//            valueBuffer->appendExternal(&values[oldKeyIdx],
-//                    ValueSize * numKeys);
-//            if (keyIdx >= keys.size()) {
-//                keyIdx = 0;
-//            }
-//            keyShuffle->closeSendBuffer(rank);
-//            timeTrace("kick start key shuffle rpc to rank %u", rank);
-//        }
-//        timeTrace("initiated %u key shuffle RPCs", dataBucketBoundaries.size());
-//        keyShuffle->wait();
-//        removeCollectiveOp(ALLSHUFFLE_KEY);
-//        timeTrace("finished key shuffle");
-//
-//        // TODO: should we start sending value as soon as we finish keys?
-//        for (size_t i = 0; i < dataBucketBoundaries.size(); i++) {
-//            int rank = downCast<int>((serverId.indexNumber() + i) %
-//                    dataBucketBoundaries.size());
-//            valueShuffle->closeSendBuffer(rank);
-//        }
-//        timeTrace("initiated %u value shuffle RPCs",
-//                dataBucketBoundaries.size());
-//        // TODO: this is not really parallel merge; is it better this way?
-//        sort(sortedKeys.begin(), sortedKeys.begin() + numSortedKeys);
-//        valueShuffle->wait();
-//        removeCollectiveOp(ALLSHUFFLE_VALUE);
-//        timeTrace("finished value shuffle");
-//    }
+    int outstandingRpcs = 0;
+    int completedRpcs = 0;
+    int sentRpcs = 0;
+#define MAX_OUTSTANDING_RPCS 10
+    Tub<ShufflePullRpc> outgoingRpcs[MAX_OUTSTANDING_RPCS];
+    ServerId targetServers[MAX_OUTSTANDING_RPCS];
+    std::vector<int> freeTubs;
+    for (int i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
+        freeTubs.push_back(i);
+    }
+    while (completedRpcs < world->size()) {
+        if ((sentRpcs < world->size()) &&
+                (outstandingRpcs < MAX_OUTSTANDING_RPCS)) {
+            ServerId target = world->getNode(world->rank + sentRpcs + 1);
+            int slot = freeTubs.back();
+            freeTubs.pop_back();
+            targetServers[slot] = target;
+            outgoingRpcs[slot].construct(context, target, world->rank,
+                    ALLSHUFFLE_VALUE);
+            sentRpcs++;
+            outstandingRpcs++;
+        }
+
+        int slot = 0;
+        for (auto& rpc : outgoingRpcs) {
+            if (rpc && rpc->isReady()) {
+                valueMerger(targetServers[slot], rpc->wait());
+                freeTubs.push_back(slot);
+                rpc.destroy();
+                completedRpcs++;
+                outstandingRpcs--;
+            }
+            slot++;
+        }
+        Arachne::yield();
+    }
 
     endTime = Cycles::rdtsc();
     PerfStats::threadStats.millisortTime += endTime - startTime;
@@ -794,11 +771,10 @@ MilliSortService::dataBucketSort()
     string result;
     sortedKeys.resize(numSortedKeys);
     for (PivotKey& sortKey : sortedKeys) {
-        uint64_t key = sortKey.key.asUint64();
-//        int valueIdx = valueStartIdx[sortKey.serverId] + sortKey.index;
-//        uint64_t value = sortedValues[valueIdx].asUint64();
-//        result += std::to_string(key) + ":" + std::to_string(value);
-        result += std::to_string(key);
+        uint64_t key = sortKey.keyAsUint64();
+        int valueIdx = valueStartIdx[sortKey.serverId] + sortKey.index;
+        uint64_t value = sortedValues[valueIdx].asUint64();
+        result += std::to_string(key) + ":" + std::to_string(value);
         result += " ";
     }
     LOG(NOTICE, "final result: %s", result.c_str());

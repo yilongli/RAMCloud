@@ -468,7 +468,7 @@ void Merge<T>::prepareThreads()
         uint32_t coreId = downCast<uint32_t>(list[i % list.size()]);
         threads[i] = Arachne::createThreadOnCore(coreId, MERGE_WORKER,
                 &contexts[i]);
-        printf("spawn worker %d on core %u\n", i, threads[i].context->originalCoreId);
+        LOG(NOTICE, "spawn worker %d on core %u", i, threads[i].context->originalCoreId);
 //        threads[i] = Arachne::createThreadWithClass(
 //                Arachne::DefaultCorePolicy::EXCLUSIVE, MERGE_WORKER,
 //                &contexts[i]);

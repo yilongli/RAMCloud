@@ -113,14 +113,13 @@ PRIVATE:
 class ShufflePullRpc : public ServerIdRpcWrapper {
   public:
     ShufflePullRpc(Context* context, ServerId serverId, int32_t senderId,
-            uint32_t dataId, Buffer* response);
+            uint32_t dataId, Buffer* response = NULL);
     ~ShufflePullRpc() {}
 
     static void appendRequest(Buffer* request, int32_t senderId,
             uint32_t dataId);
 
-    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
-    void wait() {waitAndCheckErrors();}
+    Buffer* wait();
 
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::ShufflePull::Response);
