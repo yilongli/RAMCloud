@@ -274,15 +274,21 @@ struct PerfStats {
     /// requests. This is the end-to-end time that millisort takes.
     uint64_t millisortTime;
 
+    /// # data tuples on this node initially.
+    uint64_t millisortInitItems;
+
+    /// # data tuples end up on this node when the sorting completes.
+    uint64_t millisortFinalItems;
+
     /// Time (in cycles) spent by the worker thread that invokes the local sort
     /// subroutine waiting for the sorting to complete. This is the end-to-end
     /// time that the local sort takes.
-    uint64_t localSortLatency;
+    uint64_t localSortElapsedTime;
 
     /// Total time (in cycles) spent by worker threads sorting the keys (i.e.
     /// if 2 threads are working at once, this counter advances at twice real
     /// time).
-//    uint64_t localSortCycles;
+    uint64_t localSortCycles;
 
     /// Time (in cycles) spent by the worker thread waiting for the
     /// gather-pivots operation to complete.
@@ -318,7 +324,25 @@ struct PerfStats {
 
     uint64_t allGatherPivotsMergeCycles;
 
-    uint64_t bucketSortDataCycles;
+    uint64_t shuffleKeysCycles;
+
+    uint64_t shuffleKeysInputBytes;
+
+    uint64_t shuffleKeysOutputBytes;
+
+    uint64_t shuffleKeysSentRpcs;
+
+    uint64_t shuffleKeysReceivedRpcs;
+
+    uint64_t shuffleValuesCycles;
+
+    uint64_t shuffleValuesInputBytes;
+
+    uint64_t shuffleValuesOutputBytes;
+
+    uint64_t shuffleValuesSentRpcs;
+
+    uint64_t shuffleValuesReceivedRpcs;
 
     uint64_t bucketSortMergeKeyCycles;
 

@@ -349,6 +349,21 @@ class MilliSortService : public Service {
                 WireFormat::ShufflePull::Response* respHdr,
                 Rpc* rpc);
 
+    struct RandomGenerator {
+        explicit RandomGenerator(uint64_t seed = 1)
+            : state(seed)
+        {}
+
+        uint64_t
+        next()
+        {
+            state = (164603309694725029ull * state) % 14738995463583502973ull;
+            return state;
+        }
+
+        uint64_t state;
+    };
+
     /// Shared RAMCloud information.
     Context* context;
 
@@ -379,25 +394,18 @@ class MilliSortService : public Service {
     // ----------------------
 
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
-
-    // TODO: remove this method?
-    template <typename KeyIt>
-    void sort(KeyIt first, KeyIt last)
-    {
-        if (!std::is_sorted(first, last)) {
-            std::sort(first, last);
-        }
-    }
-
     void partition(std::vector<PivotKey>* keys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
+    void rearrangeValues(std::vector<PivotKey>* keys,
+            std::vector<Value>* values, bool useCurrentCore = false);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
     void pickDataBucketBoundaries();
     void allGatherDataBucketBoundaries();
-    void dataBucketSort();
+    void shuffleKeys();
+    void shuffleValues();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
 
     enum CommunicationGroupId {
@@ -407,12 +415,12 @@ class MilliSortService : public Service {
         ALL_GATHER_PEERS_GROUP  = 3
     };
 
-//    /// MilliSort request in progress. NULL means the service is idle.
+    /// MilliSort request in progress. NULL means the service is idle.
     std::atomic<Service::Rpc*> ongoingMilliSort;
 
-    uint64_t startTime;
+    Tub<RandomGenerator> rand;
 
-    uint64_t endTime;
+    uint64_t startTime;
 
     /// Rank of the pivot server this node belongs to. -1 means unknown.
     int pivotServerRank;
@@ -468,6 +476,8 @@ class MilliSortService : public Service {
 
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
+
+    std::vector<Arachne::ThreadId> reorderValueWorkers;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
