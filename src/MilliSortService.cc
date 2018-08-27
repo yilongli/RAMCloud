@@ -46,14 +46,15 @@ namespace {
 }
 
 #define SCOPED_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
-#define START_TIMER(metric) CycleCounter<> _counter_##metric(&PerfStats::threadStats.metric);
-#define STOP_TIMER(metric) _counter_##metric.stop();
+#define START_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
+#define STOP_TIMER(metric) _timer_##metric.stop();
 
 // TODO: the following won't work for network I/O bytes because that counter is accumulated in dispatch thread...
 //#define START_COUNTER(metric) uint64_t _old_##metric = PerfStats::threadStats.metric;
 //#define STOP_COUNTER(metric, counter) PerfStats::threadStats.counter += PerfStats::threadStats.metric - _old_##metric;
 
 #define ADD_COUNTER(metric, delta) PerfStats::threadStats.metric += delta;
+#define SUB_COUNTER(metric, delta) PerfStats::threadStats.metric -= delta;
 #define INC_COUNTER(metric) PerfStats::threadStats.metric++;
 
 // Change 0 -> 1 in the following line to use pseudo-random numbers to
@@ -92,15 +93,14 @@ MilliSortService::MilliSortService(Context* context,
     , values()
     , sortedKeys()
     , sortedValues()
-    , numSortedKeys(0)
-    , numSortedValues(0)
+    , numSortedItems(0)
     , valueStartIdx()
     , localPivots()
     , dataBucketBoundaries()
     , dataBucketRanges()
     , dataBucketRangesDone(false)
     , mergeSorter()
-    , reorderValueWorkers()
+    , valueRearrangers()
     , world()
     , myPivotServerGroup()
     , allGatherPeersGroup()
@@ -287,8 +287,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                 downCast<uint32_t>(i));
         values.emplace_back(key);
     }
-    numSortedKeys = 0;
-    numSortedValues = 0;
+    numSortedItems = 0;
     sortedKeys.reserve(numDataTuples * 2);
     sortedKeys.clear();
     PivotKey nullKey(0, 0, 0);
@@ -305,7 +304,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     dataBucketRanges.clear();
     dataBucketRangesDone.store(false);
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
-    reorderValueWorkers.clear();
+    valueRearrangers.clear();
     gatheredPivots.clear();
     superPivots.clear();
     pivotBucketBoundaries.clear();
@@ -404,58 +403,92 @@ MilliSortService::partition(std::vector<PivotKey>* keys, int numPartitions,
  *      is no latency-sensitive task to perform.
  */
 void
-MilliSortService::rearrangeValues(std::vector<PivotKey>* keys,
-        std::vector<Value>* values, bool useCurrentCore)
+MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
+        bool initialData)
 {
-    /**
-     * Main method of the worker thread. Each worker is responsible to rearrange 
-     * values corresponding to a partition of the keys.
-     *
-     * \param startIdx
-     *      Index of the first key in this worker's key partition.
-     * \param numValues
-     *      # values assigned to this worker. So this worker should rearrange
-     *      values corresponding to keys[startIdx...(startIdx+numValues-1)].
-     * \param readers
-     *      # worker threads that are still reading MilliSortService::values.
-     */
-    auto workerMain = [keys, values] (int startIdx, int numValues,
-            std::atomic<int>* readers) {
-        // Allocate an auxilary array to hold the reordered values temporarily.
-        Value* array = new Value[numValues];
-        Value* dest = array;
-        numValues = std::min(numValues, int(keys->size()) - startIdx);
-        numValues = std::max(numValues, 0);
-        for (int i = startIdx; i < startIdx + numValues; i++) {
-            std::memcpy(dest, &(*values)[(*keys)[i].index], ValueSize);
-            (*keys)[i].index = uint32_t(i - startIdx);
-            dest++;
-        }
-        readers->fetch_sub(1);
-
-        // Wait until all workers have finished reading #values. Then copy the
-        // values from the auxilary array back to #values.
-        while (*readers > 0) {
-            Arachne::yield();
-        }
-        std::memcpy(&(*values)[startIdx], array, numValues * ValueSize);
-        
-        // The first worker is responsible for deleting the atomic variable.
-        if (startIdx == 0) {
-            delete readers;
-        }
-        delete[] array;
-    };
-
+    uint64_t globalStartTime = Cycles::rdtsc();
+    bool useCurrentCore = !initialData;
     int currentCore = useCurrentCore ? -1 :
-            Arachne::getThreadId().context->coreId;
+                      Arachne::getThreadId().context->coreId;
     Arachne::CorePolicy::CoreList list = Arachne::getCorePolicy()->getCores(0);
     int numWorkers = list.size();
     if (list.find(currentCore) >= 0) {
         numWorkers--;
     }
-    std::atomic<int>* readers = new std::atomic<int>(numWorkers);
-    int perWorkerValues = (int(keys->size()) + numWorkers - 1) / numWorkers;
+
+    if (initialData) {
+        ADD_COUNTER(rearrangeInitValuesWorkers, numWorkers);
+    } else {
+        ADD_COUNTER(rearrangeFinalValuesWorkers, numWorkers);
+    }
+// FIXME: somehow capture share_ptr by ref. and use it in workerMain cause stack corruption in Arachne?
+//  ARACHNE: maxNumCores 8 is greater than the number of available hardware cores 7.Stack overflow detected on 0x26d8f40. Canary = 62678462107746304
+#define USE_SHARED_PTR 0
+#if USE_SHARED_PTR
+    auto readers = std::make_shared<std::atomic<int>>(numWorkers);
+#else
+    auto readers = new std::atomic<int>(numWorkers);
+#endif
+    int perWorkerItems = (totalItems + numWorkers - 1) / numWorkers;
+
+    /**
+     * Main method of the worker thread. Each worker is responsible to rearrange 
+     * values corresponding to a partition of the keys.
+     *
+     * For instance, if this worker is assigned keys[a..b], this method will
+     * ensure that, forall i (a <= i <= b), values[i] holds the corresponding
+     * value of keys[i] upon return.
+     *
+     * \param startIdx
+     *      Index of the first key in this worker's key partition.
+     * \param maxItems
+     *      Max # values assigned to this worker. When the number of values
+     *      left is less than this number, this method will recompute the
+     *      correct number of values assigned to this worker.
+     *      parts that go beyond the last element of the entire value array.
+     *      So this worker should rearrange
+     *      values corresponding to keys[startIdx...(startIdx+maxItems-1)].
+     */
+    auto workerMain = [keys, values, totalItems, initialData, globalStartTime,
+#if USE_SHARED_PTR
+            &readers] (int startIdx, int maxItems) {
+#else
+            readers] (int startIdx, int maxItems) {
+#endif
+        uint64_t* cpuTime = initialData ?
+                &PerfStats::threadStats.rearrangeInitValuesCycles :
+                &PerfStats::threadStats.rearrangeFinalValuesCycles;
+        uint64_t* elapsedTime = initialData ?
+                &PerfStats::threadStats.rearrangeInitValuesElapsedTime :
+                &PerfStats::threadStats.rearrangeFinalValuesElapsedTime;
+        uint64_t startTime = Cycles::rdtsc();
+
+        // Allocate an auxilary array to hold the reordered values temporarily.
+        int n = std::max(0, std::min(maxItems, totalItems - startIdx));
+        Value* array = new Value[n];
+        Value* dest = array;
+        for (int i = startIdx; i < startIdx + n; i++) {
+            std::memcpy(dest, &values[keys[i].index], Value::SIZE);
+            keys[i].index = uint32_t(i - startIdx);
+            dest++;
+        }
+        readers->fetch_sub(1);
+        (*cpuTime) += (Cycles::rdtsc() - startTime);
+
+        // Wait until all workers have finished reading #values.
+        while (readers->load() > 0) {
+            Arachne::yield();
+        }
+        startTime = Cycles::rdtsc();
+
+        // Then copy the values from the auxilary array back to #values.
+        std::memcpy(&values[startIdx], array, n * Value::SIZE);
+        // TODO: avoid doing manual delete; use unique_ptr around an array? Memory::unique_ptr_free?
+        delete[] array;
+        (*cpuTime) += (Cycles::rdtsc() - startTime);
+        (*elapsedTime) += (Cycles::rdtsc() - globalStartTime);
+    };
+
 
     // Spin up worker threads on all cores we are allowed to use.
     int start = 0;
@@ -464,15 +497,16 @@ MilliSortService::rearrangeValues(std::vector<PivotKey>* keys,
             continue;
         }
 
-        reorderValueWorkers.push_back(Arachne::createThreadOnCore(list[i],
-                workerMain, start, perWorkerValues, readers));
-        start += perWorkerValues;
+        valueRearrangers.push_back(Arachne::createThreadOnCore(list[i],
+                workerMain, start, perWorkerItems));
+        start += perWorkerItems;
     }
 
     if (useCurrentCore) {
-        for (auto& tid : reorderValueWorkers) {
+        for (auto& tid : valueRearrangers) {
             Arachne::join(tid);
         }
+        valueRearrangers.clear();
     }
 }
 
@@ -480,35 +514,39 @@ void
 MilliSortService::localSortAndPickPivots()
 {
     timeTrace("=== Stage 1: localSortAndPickPivots started");
+    ADD_COUNTER(millisortInitItems, keys.size());
+    ADD_COUNTER(millisortInitKeyBytes, keys.size() * PivotKey::KEY_SIZE);
+    ADD_COUNTER(millisortInitValueBytes, values.size() * Value::SIZE);
 
     {
         SCOPED_TIMER(localSortElapsedTime);
         SCOPED_TIMER(localSortCycles);
-        ADD_COUNTER(millisortInitItems, keys.size());
         std::sort(keys.begin(), keys.end());
     }
-    rearrangeValues(&keys, &values);
+    // FIXME: move this after initiating gatherPivots op!
+    rearrangeValues(keys.data(), values.data(), int(keys.size()), true);
 
     partition(&keys, std::min((int)keys.size(), world->size()), &localPivots);
     debugLogKeys("local pivots: ", &localPivots);
 
     // Merge pivots from slave nodes as they arrive.
     auto merger = [this] (Buffer* pivotsBuffer) {
-            SCOPED_TIMER(mergePivotsCycles);
-            uint32_t offset = 0;
-            size_t oldSize = gatheredPivots.size();
-            while (offset < pivotsBuffer->size()) {
-                gatheredPivots.push_back(*pivotsBuffer->read<PivotKey>(&offset));
-            }
-            inplaceMerge(gatheredPivots, oldSize);
-            timeTrace("merged %u pivots", pivotsBuffer->size() / KeySize);
+        SCOPED_TIMER(gatherPivotsMergeCycles);
+        ADD_COUNTER(gatherPivotsInputBytes, pivotsBuffer->size());
+        uint32_t offset = 0;
+        size_t oldSize = gatheredPivots.size();
+        while (offset < pivotsBuffer->size()) {
+            gatheredPivots.push_back(*pivotsBuffer->read<PivotKey>(&offset));
+        }
+        inplaceMerge(gatheredPivots, oldSize);
+        timeTrace("merged %u pivots", pivotsBuffer->size() / PivotKey::SIZE);
     };
 
     // Initiate the gather op that collects pivots to the pivot server.
     timeTrace("sorted %u data tuples, picked %u local pivots, about to gather "
             "pivots", keys.size(), localPivots.size());
     {
-        SCOPED_TIMER(gatherPivotsCycles);
+        SCOPED_TIMER(gatherPivotsElapsedTime);
         Tub<FlatGather> gatherPivots;
         invokeCollectiveOp<FlatGather>(gatherPivots, GATHER_PIVOTS, context,
                 myPivotServerGroup.get(), 0, (uint32_t) localPivots.size(),
@@ -520,8 +558,8 @@ MilliSortService::localSortAndPickPivots()
         // FIXME: seems wrong division of responsibility; should I move this
         // into Gather class? Also this assumes a particular implementation of
         // Gather.
-        PerfStats::threadStats.gatherPivotsOutputBytes +=
-                localPivots.size() * KeySize;
+        ADD_COUNTER(gatherPivotsOutputBytes,
+                localPivots.size() * PivotKey::SIZE);
     }
 
     // Pivot servers will advance to pick super pivots when the gather op
@@ -546,21 +584,22 @@ MilliSortService::pickSuperPivots()
 
     // Merge super pivots from pivot servers as they arrive.
     auto merger = [this] (Buffer* pivotsBuf) {
-            SCOPED_TIMER(mergeSuperPivotsCycles);
-            uint32_t offset = 0;
-            size_t oldSize = globalSuperPivots.size();
-            while (offset < pivotsBuf->size()) {
-                globalSuperPivots.push_back(*pivotsBuf->read<PivotKey>(&offset));
-            }
-            inplaceMerge(globalSuperPivots, oldSize);
-            timeTrace("merged %u super-pivots", pivotsBuf->size() / KeySize);
+        SCOPED_TIMER(gatherSuperPivotsMergeCycles);
+        ADD_COUNTER(gatherSuperPivotsInputBytes, pivotsBuf->size());
+        uint32_t offset = 0;
+        size_t oldSize = globalSuperPivots.size();
+        while (offset < pivotsBuf->size()) {
+            globalSuperPivots.push_back(*pivotsBuf->read<PivotKey>(&offset));
+        }
+        inplaceMerge(globalSuperPivots, oldSize);
+        timeTrace("merged %u super-pivots", pivotsBuf->size() / PivotKey::SIZE);
     };
 
     // Initiate the gather op that collects super pivots to the root node.
     timeTrace("picked %u super-pivots, about to gather super-pivots",
             superPivots.size());
     {
-        SCOPED_TIMER(gatherSuperPivotsCycles);
+        SCOPED_TIMER(gatherSuperPivotsElapsedTime);
         Tub<FlatGather> gatherSuperPivots;
         invokeCollectiveOp<FlatGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
                 context, allPivotServers.get(), 0,
@@ -568,6 +607,9 @@ MilliSortService::pickSuperPivots()
         // fixme: this is duplicated everywhere
         gatherSuperPivots->wait();
         removeCollectiveOp(GATHER_SUPER_PIVOTS);
+
+        ADD_COUNTER(gatherSuperPivotsOutputBytes,
+                superPivots.size() * PivotKey::SIZE);
     }
 
     // The root node will advance to pick pivot bucket boundaries when the
@@ -601,7 +643,7 @@ MilliSortService::pickPivotBucketBoundaries()
         TreeBcast bcast(context, allPivotServers.get());
         bcast.send<SendDataRpc>(BROADCAST_PIVOT_BUCKET_BOUNDARIES,
                 // TODO: simplify the SendDataRpc api?
-                downCast<uint32_t>(KeySize * pivotBucketBoundaries.size()),
+                downCast<uint32_t>(PivotKey::SIZE * pivotBucketBoundaries.size()),
                 pivotBucketBoundaries.data());
         bcast.wait();
     }
@@ -630,14 +672,14 @@ MilliSortService::pivotBucketSort()
             sortedGatheredPivots.push_back(*data->read<PivotKey>(&offset));
         }
         inplaceMerge(sortedGatheredPivots, oldSize);
-        timeTrace("merged %u pivots", (data->size() - 8) / KeySize);
+        timeTrace("merged %u pivots", (data->size() - 8) / PivotKey::SIZE);
     };
 
     // Send pivots to their designated pivot servers determined by the pivot
     // bucket boundaries.
     timeTrace("about to shuffle pivots");
     {
-        SCOPED_TIMER(bucketSortPivotsCycles);
+        SCOPED_TIMER(bucketSortPivotsElapsedTime);
         Tub<AllShuffle> pivotsShuffle;
         invokeCollectiveOp<AllShuffle>(pivotsShuffle, ALLSHUFFLE_PIVOTS,
                 context,
@@ -707,8 +749,7 @@ MilliSortService::pickDataBucketBoundaries() {
 //        CycleCounter<> _(&PerfStats::threadStats.?);
         TreeBcast bcast(context, myPivotServerGroup.get());
         bcast.send<SendDataRpc>(BROADCAST_DATA_BUCKET_BOUNDARIES,
-                downCast<uint32_t>(
-                        KeySize * partialDataBucketBoundaries.size()),
+                downCast<uint32_t>(PivotKey::SIZE * partialDataBucketBoundaries.size()),
                 partialDataBucketBoundaries.data());
         dataBucketBoundaries = partialDataBucketBoundaries;
         // FIXME: there is no need to wait here because the following all-gather
@@ -738,20 +779,20 @@ MilliSortService::allGatherDataBucketBoundaries()
             // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
             // are sorted globally, we know exactly where to insert even they come!
             timeTrace("merged %u data bucket boundaries",
-                    pivotsBuffer->size() / KeySize);
+                    pivotsBuffer->size() / PivotKey::SIZE);
         return std::make_pair(dataBucketBoundaries.data(),
-                dataBucketBoundaries.size() * KeySize);
+                dataBucketBoundaries.size() * PivotKey::SIZE);
     };
 
     // Gather data bucket boundaries from pivot servers to all nodes.
     timeTrace("about to all-gather data bucket boundaries");
     {
-        SCOPED_TIMER(allGatherPivotsCycles);
+        SCOPED_TIMER(allGatherPivotsElapsedTime);
         Tub<AllGather> allGather;
         invokeCollectiveOp<AllGather>(allGather,
                 ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
                 allGatherPeersGroup.get(),
-                dataBucketBoundaries.size() * KeySize,
+                dataBucketBoundaries.size() * PivotKey::SIZE,
                 dataBucketBoundaries.data(), &merger);
         allGather->wait();
         removeCollectiveOp(ALLGATHER_DATA_BUCKET_BOUNDARIES);
@@ -772,10 +813,10 @@ MilliSortService::allGatherDataBucketBoundaries()
         }
         dataBucketRanges.emplace_back(oldKeyIdx, numKeys);
     }
-    for (auto& tid : reorderValueWorkers) {
+    for (auto& tid : valueRearrangers) {
         Arachne::join(tid);
     }
-    reorderValueWorkers.clear();
+    valueRearrangers.clear();
     dataBucketRangesDone.store(true);
 
     // All nodes will advance to the final data shuffle when the all-gather
@@ -786,15 +827,24 @@ MilliSortService::allGatherDataBucketBoundaries()
 void
 MilliSortService::shuffleKeys() {
     timeTrace("=== Stage 7: shuffleKeys started");
-    START_TIMER(shuffleKeysCycles);
+    START_TIMER(shuffleKeysElapsedTime);
+
+    // TODO: move this into startMillisort? not sure it's a good idea to have
+    // idle A-threads when it's not necessary.
+    mergeSorter->prepareThreads();
 
     // Merge keys from other nodes into a sorted array as they arrive.
-    auto keyMerger = [this] (ServerId fromServer, Buffer* keyBuffer) {
+    // TODO: pull-based shuffle is not parallelized by default; shall we try?
+    std::atomic<int> sortedItemCnt(0);
+    auto keyMerger = [this, &sortedItemCnt] (ServerId fromServer,
+            Buffer* keyBuffer)
+    {
         SCOPED_TIMER(bucketSortMergeKeyCycles);
         ADD_COUNTER(shuffleKeysInputBytes, keyBuffer->size());
-        uint32_t numKeys = keyBuffer->size() / KeySize;
-        int start = numSortedKeys.fetch_add(numKeys);
+        uint32_t numKeys = keyBuffer->size() / PivotKey::SIZE;
+        int start = sortedItemCnt.fetch_add(numKeys);
         valueStartIdx[fromServer.indexNumber()] = start;
+        // TODO: would it be better to merge the following two loops into one?
         keyBuffer->copy(0, keyBuffer->size(), &sortedKeys[start]);
         for (int i = start; i < start + int(numKeys); i++) {
             sortedKeys[i].index = uint32_t(i);
@@ -803,27 +853,48 @@ MilliSortService::shuffleKeys() {
         timeTrace("merged %u keys, %u bytes", numKeys, keyBuffer->size());
     };
 
-    mergeSorter->prepareThreads();
-
     timeTrace("about to shuffle keys");
-    for (int i = 0; i < world->size(); i++) {
-        timeTrace("about to send shuffle pull request");
-        ServerId target = world->getNode(world->rank + 1 + i);
-        ShufflePullRpc pullRpc(context, target, world->rank, ALLSHUFFLE_KEY);
-        mergeSorter->poll();
-        Buffer* keyBuffer = pullRpc.wait();
-        timeTrace("about to merge keys from server %u",
-                target.indexNumber() + 1);
-        keyMerger(target, keyBuffer);
+    // FIXME: duplicate code as shuffleValues
+    int outstandingRpcs = 0;
+    int completedRpcs = 0;
+    int sentRpcs = 0;
+    // TODO: justify this number; need to be large enough to saturate the bw
+    // but not too large that slows down the transport
+#define MAX_OUTSTANDING_RPCS 10
+    Tub<ShufflePullRpc> outgoingRpcs[MAX_OUTSTANDING_RPCS];
+    ServerId targetServers[MAX_OUTSTANDING_RPCS];
+    std::vector<int> freeTubs;
+    for (int i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
+        freeTubs.push_back(i);
     }
+    while (completedRpcs < world->size()) {
+        if ((sentRpcs < world->size()) &&
+                (outstandingRpcs < MAX_OUTSTANDING_RPCS)) {
+            ServerId target = world->getNode(world->rank + sentRpcs + 1);
+            int slot = freeTubs.back();
+            freeTubs.pop_back();
+            targetServers[slot] = target;
+            outgoingRpcs[slot].construct(context, target, world->rank,
+                    ALLSHUFFLE_KEY);
+            sentRpcs++;
+            outstandingRpcs++;
+        }
 
-    // FIXME: Arachne::yield?
-    while (mergeSorter->poll()) {}
-    auto sortedArray = mergeSorter->getSortedArray();
-    memcpy(sortedKeys.data(), sortedArray.data, sortedArray.size * KeySize);
-    assert(int(sortedArray.size) == numSortedKeys.load());
-    timeTrace("sorted %u final keys", numSortedKeys.load());
-    STOP_TIMER(shuffleKeysCycles);
+        int slot = 0;
+        for (auto& rpc : outgoingRpcs) {
+            if (rpc && rpc->isReady()) {
+                keyMerger(targetServers[slot], rpc->wait());
+                freeTubs.push_back(slot);
+                rpc.destroy();
+                completedRpcs++;
+                outstandingRpcs--;
+            }
+            slot++;
+        }
+        Arachne::yield();
+    }
+    numSortedItems = sortedItemCnt.load();
+    STOP_TIMER(shuffleKeysElapsedTime);
     ADD_COUNTER(shuffleKeysSentRpcs, world->size());
 
     shuffleValues();
@@ -833,13 +904,13 @@ void
 MilliSortService::shuffleValues()
 {
     timeTrace("=== Stage 8: shuffleValues started");
-    START_TIMER(shuffleValuesCycles);
+    START_TIMER(shuffleValuesElapsedTime);
 
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
     auto valueMerger = [this] (ServerId fromServer, Buffer* valueBuffer) {
         SCOPED_TIMER(bucketSortMergeValueCycles);
         ADD_COUNTER(shuffleValuesInputBytes, valueBuffer->size());
-        uint32_t numValues = valueBuffer->size() / ValueSize;
+        uint32_t numValues = valueBuffer->size() / Value::SIZE;
         uint32_t serverId = fromServer.indexNumber();
         int start = valueStartIdx[serverId];
         valueBuffer->copy(0, valueBuffer->size(), &sortedValues[start]);
@@ -847,10 +918,29 @@ MilliSortService::shuffleValues()
                 serverId, valueBuffer->size());
     };
 
+    bool mergeSortCompleted = false;
+    auto mergeSortIsReady = [this, &mergeSortCompleted] () {
+        if (mergeSortCompleted) {
+            return true;
+        }
+        if (mergeSorter->poll()) {
+            return false;
+        }
+
+        mergeSortCompleted = true;
+        timeTrace("sorted %d final keys", numSortedItems);
+        // FIXME: is the following copy necessary?
+        auto sortedArray = mergeSorter->getSortedArray();
+        memcpy(sortedKeys.data(), sortedArray.data,
+                sortedArray.size * PivotKey::SIZE);
+        assert(int(sortedArray.size) == numSortedItems);
+        timeTrace("copied %d final keys", numSortedItems);
+        return true;
+    };
+
     int outstandingRpcs = 0;
     int completedRpcs = 0;
     int sentRpcs = 0;
-#define MAX_OUTSTANDING_RPCS 10
     Tub<ShufflePullRpc> outgoingRpcs[MAX_OUTSTANDING_RPCS];
     ServerId targetServers[MAX_OUTSTANDING_RPCS];
     std::vector<int> freeTubs;
@@ -881,16 +971,26 @@ MilliSortService::shuffleValues()
             }
             slot++;
         }
+
+        mergeSortIsReady();
         Arachne::yield();
     }
-    STOP_TIMER(shuffleValuesCycles);
+    STOP_TIMER(shuffleValuesElapsedTime);
     ADD_COUNTER(shuffleValuesSentRpcs, sentRpcs);
+    ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
 
-    // FIXME: need to generalize this method to handle sorted{Keys,Values}
-    sortedKeys.resize(numSortedKeys);
-    rearrangeValues(&sortedKeys, &sortedValues, true);
+    // Make sure the online merge of final keys completes before rearranging
+    // final values. Normally, the online merge to be hidden completely within
+    // value shuffle.
+    while (!mergeSortIsReady()) {
+        RAMCLOUD_CLOG(WARNING, "Failed to hide mergesort within value shuffle");
+    }
+    rearrangeValues(sortedKeys.data(), sortedValues.data(), numSortedItems,
+            false);
+
+    // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
     ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
-    ADD_COUNTER(millisortFinalItems, numSortedKeys);
+    ADD_COUNTER(millisortFinalItems, numSortedItems);
     timeTrace("millisort finished");
 
     ongoingMilliSort.load()->sendReply();
@@ -898,7 +998,7 @@ MilliSortService::shuffleValues()
 
 #if LOG_FINAL_RESULT
     string result;
-    for (size_t i = 0; i < sortedKeys.size(); i++) {
+    for (int i = 0; i < numSortedItems; i++) {
         result += std::to_string(sortedKeys[i].keyAsUint64()) + ":" +
                 std::to_string(sortedValues[i].asUint64());
         result += " ";
@@ -913,7 +1013,7 @@ MilliSortService::debugLogKeys(const char* prefix, vector<PivotKey>* keys)
 #if LOG_INTERMEDIATE_RESULT
     string result;
     for (PivotKey& sortKey : *keys) {
-        result += std::to_string(sortKey.key.asUint64());
+        result += std::to_string(sortKey.keyAsUint64());
         result += " ";
     }
     LOG(NOTICE, "%s%s", prefix, result.c_str());
@@ -961,7 +1061,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             }
             int keyIdx, numKeys;
             std::tie(keyIdx, numKeys) = dataBucketRanges[senderId];
-            rpc->replyPayload->appendExternal(&keys[keyIdx], numKeys * KeySize);
+            rpc->replyPayload->appendExternal(&keys[keyIdx], numKeys * PivotKey::SIZE);
             ADD_COUNTER(shuffleKeysOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleKeysReceivedRpcs);
 //            timeTrace("RPC handler ShufflePull finished");
@@ -974,7 +1074,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             int valueIdx, numValues;
             std::tie(valueIdx, numValues) = dataBucketRanges[senderId];
             rpc->replyPayload->appendExternal(&values[valueIdx],
-                    numValues * ValueSize);
+                    numValues * Value::SIZE);
             ADD_COUNTER(shuffleValuesOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleValuesReceivedRpcs);
             break;

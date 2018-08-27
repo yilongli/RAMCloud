@@ -190,8 +190,11 @@ class MilliSortService : public Service {
         // TODO: explain the decl. order of the fields (least significant one
         // comes first)
 
-        /// Size of the original key, in bytes.
-        static const int N = 10;
+        /// Size of the raw key, in bytes.
+        static const uint32_t KEY_SIZE = 10;
+
+        /// Size of the raw key plus metadata.
+        static const uint32_t SIZE = KEY_SIZE + 6;
 
         /// 32-bit index that supports more than 4 billion data tuples on each
         /// server.
@@ -204,7 +207,7 @@ class MilliSortService : public Service {
         /// little-endian machines. It starts with the least significant byte
         /// such that
         // TODO:
-        char bytes[N];
+        char bytes[KEY_SIZE];
 
         /**
          * Default constructor that does absolutely nothing.
@@ -223,7 +226,7 @@ class MilliSortService : public Service {
             , serverId(serverId)
             , bytes()
         {
-            static_assert(N >= 8, "Key must be at least 8-byte");
+            static_assert(KEY_SIZE >= 8, "Key must be at least 8-byte");
             for (char& byte : bytes) {
                 byte = char(key % 256);
                 key >>= 8;
@@ -242,8 +245,8 @@ class MilliSortService : public Service {
             , serverId(serverId)
             , bytes()
         {
-            assert(key.size() <= N);
-            int msb = N - 1;
+            assert(key.size() <= KEY_SIZE);
+            int msb = KEY_SIZE - 1;
             for (char ch : key) {
                 bytes[msb--] = ch;
             }
@@ -308,7 +311,10 @@ class MilliSortService : public Service {
     };
 
     struct Value {
-        char bytes[90];
+
+        static const uint32_t SIZE = 90;
+
+        char bytes[SIZE];
 
         Value(uint64_t value = 0)
             : bytes()
@@ -385,10 +391,6 @@ class MilliSortService : public Service {
         ALLSHUFFLE_VALUE,
     };
 
-    // FIXME: move them into Key/Value struct definition.
-    static constexpr uint32_t KeySize = sizeof(PivotKey);
-    static constexpr uint32_t ValueSize = sizeof(Value);
-
     // ----------------------
     // Computation steps
     // ----------------------
@@ -397,8 +399,8 @@ class MilliSortService : public Service {
     void partition(std::vector<PivotKey>* keys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
-    void rearrangeValues(std::vector<PivotKey>* keys,
-            std::vector<Value>* values, bool useCurrentCore = false);
+    void rearrangeValues(PivotKey* keys, Value* values, int totalItems,
+            bool initialData);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
@@ -415,7 +417,7 @@ class MilliSortService : public Service {
         ALL_GATHER_PEERS_GROUP  = 3
     };
 
-    /// MilliSort request in progress. NULL means the service is idle.
+    /// MilliSort request in progress. NULL means the service is idle.e
     std::atomic<Service::Rpc*> ongoingMilliSort;
 
     Tub<RandomGenerator> rand;
@@ -442,15 +444,16 @@ class MilliSortService : public Service {
     /// Values of the data tuples to be sorted.
     std::vector<Value> values;
 
+    // FIXME: using vector but relying on numSortedItems for its real size is error-prone!!!
     std::vector<PivotKey> sortedKeys;
 
+    // FIXME: using vector but relying on numSortedItems for its real size is error-prone!!!
     std::vector<Value> sortedValues;
 
-    std::atomic<int> numSortedKeys;
+    /// # data tuples end up on this node when the sorting completes.
+    int numSortedItems;
 
-    std::atomic<int> numSortedValues;
-
-    // FIXME: this is a bad name;
+    // FIXME: this is a bad name; besides, does it have to be class member?
     std::vector<int> valueStartIdx;
 
     /// Selected keys that evenly divide local #keys on this node into # nodes
@@ -474,10 +477,12 @@ class MilliSortService : public Service {
     /// #dataBucketRanges.
     std::atomic_bool dataBucketRangesDone;
 
+    // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
 
-    std::vector<Arachne::ThreadId> reorderValueWorkers;
+    // TODO: do we need to make it class member?
+    std::vector<Arachne::ThreadId> valueRearrangers;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;

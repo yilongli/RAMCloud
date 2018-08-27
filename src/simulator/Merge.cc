@@ -442,6 +442,8 @@ Merge<T>::~Merge()
     for (int i = 0; i < numWorkers; i++) {
         contexts[i].state = 3; // poison the thread to stop.
 #if USE_ARACHNE
+        // FIXME: shouldn't be necessary once Arachne::join is fixed.
+        if (threads[i].context == NULL) continue;
         Arachne::join(threads[i]);
 #else
         threads[i]->join();

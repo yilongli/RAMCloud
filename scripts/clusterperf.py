@@ -794,7 +794,8 @@ def workloadDist(name, options, cluster_args, client_args):
 def millisort(name, options, cluster_args, client_args):
     cluster_args['num_clients'] = 1
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '--minNumCores 5'
+        # Force Arachne CoreArbiter to allocate static number of cores.
+        cluster_args['master_args'] = '--minNumCores 5 --maxNumCores 5'
 
     default(name, options, cluster_args, client_args)
 

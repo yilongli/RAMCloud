@@ -280,6 +280,16 @@ struct PerfStats {
     /// # data tuples end up on this node when the sorting completes.
     uint64_t millisortFinalItems;
 
+    /// Size of the keys on this node initially, in bytes.
+    uint64_t millisortInitKeyBytes;
+
+    /// Size of the values on this node initially, in bytes.
+    uint64_t millisortInitValueBytes;
+
+    /// Size of the values that end up on this node when the sorting completes,
+    /// in bytes.
+    uint64_t millisortFinalValueBytes;
+
     /// Time (in cycles) spent by the worker thread that invokes the local sort
     /// subroutine waiting for the sorting to complete. This is the end-to-end
     /// time that the local sort takes.
@@ -290,41 +300,53 @@ struct PerfStats {
     /// time).
     uint64_t localSortCycles;
 
+    uint64_t rearrangeInitValuesElapsedTime;
+
+    uint64_t rearrangeInitValuesCycles;
+
+    uint64_t rearrangeInitValuesWorkers;
+
     /// Time (in cycles) spent by the worker thread waiting for the
     /// gather-pivots operation to complete.
-    uint64_t gatherPivotsCycles;
-
-    /// Total bytes transmitted on the network by the gather-pivots operation.
-    uint64_t gatherPivotsOutputBytes;
+    uint64_t gatherPivotsElapsedTime;
 
     /// Total bytes received from the network by the gather-pivots operation.
     uint64_t gatherPivotsInputBytes;
 
-    /// Time (in cycles) spent by worker threads merging the pivots received
+    /// Total bytes transmitted on the network by the gather-pivots operation.
+    uint64_t gatherPivotsOutputBytes;
+
+    /// CPU time (in cycles) spent by worker threads merging the pivots received
     /// from the gather-pivots operation.
-    uint64_t mergePivotsCycles;
+    uint64_t gatherPivotsMergeCycles;
 
     /// Time (in cycles) spent by the worker thread waiting for the
     /// gather-super-pivots operation to complete.
-    uint64_t gatherSuperPivotsCycles;
+    uint64_t gatherSuperPivotsElapsedTime;
 
-    /// Time (in cycles) spent by worker threads merging the super-pivots
+    /// Total bytes received from the network by the gather-super-pivots operation.
+    uint64_t gatherSuperPivotsInputBytes;
+
+    /// Total bytes transmitted on the network by the gather-super-pivots operation.
+    uint64_t gatherSuperPivotsOutputBytes;
+
+    /// CPU time (in cycles) spent by worker threads merging the super-pivots
     /// received from the gather-super-pivots operation.
-    uint64_t mergeSuperPivotsCycles;
+    uint64_t gatherSuperPivotsMergeCycles;
 
     /// Time (in cycles) spent by the worker thread waiting for the
     /// broadcast-pivot-bucket-boundaries operation to complete.
     uint64_t bcastPivotBucketBoundariesCycles;
 
-    uint64_t bucketSortPivotsCycles;
+    uint64_t bucketSortPivotsElapsedTime;
 
     uint64_t mergePivotsInBucketSortCycles;
 
-    uint64_t allGatherPivotsCycles;
+    uint64_t allGatherPivotsElapsedTime;
 
     uint64_t allGatherPivotsMergeCycles;
 
-    uint64_t shuffleKeysCycles;
+    uint64_t shuffleKeysElapsedTime;
 
     uint64_t shuffleKeysInputBytes;
 
@@ -334,7 +356,7 @@ struct PerfStats {
 
     uint64_t shuffleKeysReceivedRpcs;
 
-    uint64_t shuffleValuesCycles;
+    uint64_t shuffleValuesElapsedTime;
 
     uint64_t shuffleValuesInputBytes;
 
@@ -347,6 +369,13 @@ struct PerfStats {
     uint64_t bucketSortMergeKeyCycles;
 
     uint64_t bucketSortMergeValueCycles;
+
+    uint64_t rearrangeFinalValuesElapsedTime;
+
+    uint64_t rearrangeFinalValuesCycles;
+
+    uint64_t rearrangeFinalValuesWorkers;
+
 
     //--------------------------------------------------------------------
     // Temporary counters. The values below have no pre-defined use;
