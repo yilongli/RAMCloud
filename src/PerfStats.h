@@ -280,8 +280,12 @@ struct PerfStats {
     /// # data tuples end up on this node when the sorting completes.
     uint64_t millisortFinalItems;
 
-    /// Size of the keys on this node initially, in bytes.
+    /// Size of the raw keys on this node initially, in bytes.
     uint64_t millisortInitKeyBytes;
+
+    /// Size of the keys (including metadata) that end up on this node when the
+    /// sorting completes, in bytes.
+    uint64_t millisortFinalPivotKeyBytes;
 
     /// Size of the values on this node initially, in bytes.
     uint64_t millisortInitValueBytes;
@@ -299,6 +303,8 @@ struct PerfStats {
     /// if 2 threads are working at once, this counter advances at twice real
     /// time).
     uint64_t localSortCycles;
+
+    uint64_t localSortWorkers;
 
     uint64_t rearrangeInitValuesElapsedTime;
 

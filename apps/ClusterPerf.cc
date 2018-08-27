@@ -7336,6 +7336,9 @@ millisort()
 
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsAfter);
+        printf("=====================\n");
+        printf("Experiment ID = %d\n", i);
+        printf("=====================\n");
         printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
                 .c_str());
     }

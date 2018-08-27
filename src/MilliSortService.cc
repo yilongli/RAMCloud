@@ -521,9 +521,11 @@ MilliSortService::localSortAndPickPivots()
     {
         SCOPED_TIMER(localSortElapsedTime);
         SCOPED_TIMER(localSortCycles);
+        ADD_COUNTER(localSortWorkers, 1);
         std::sort(keys.begin(), keys.end());
     }
-    // FIXME: move this after initiating gatherPivots op!
+    // Overlap rearranging initial values with subsequent stages. This only
+    // needs to be done before key shuffle.
     rearrangeValues(keys.data(), values.data(), int(keys.size()), true);
 
     partition(&keys, std::min((int)keys.size(), world->size()), &localPivots);
@@ -896,6 +898,7 @@ MilliSortService::shuffleKeys() {
     numSortedItems = sortedItemCnt.load();
     STOP_TIMER(shuffleKeysElapsedTime);
     ADD_COUNTER(shuffleKeysSentRpcs, world->size());
+    ADD_COUNTER(millisortFinalPivotKeyBytes, numSortedItems * PivotKey::SIZE);
 
     shuffleValues();
 }
