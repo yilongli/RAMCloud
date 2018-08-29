@@ -54,9 +54,13 @@ class InitMilliSortRpc : public ServerIdRpcWrapper {
     static void appendRequest(Buffer* request, uint32_t dataTuplesPerServer,
             uint32_t nodesPerPivotServer, bool fromClient);
 
-    int getNodesInited();
     /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
-    void wait() {waitAndCheckErrors();}
+    WireFormat::InitMilliSort::Response*
+    wait()
+    {
+        waitAndCheckErrors();
+        return response->getStart<WireFormat::InitMilliSort::Response>();
+    }
 
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::InitMilliSort::Response);

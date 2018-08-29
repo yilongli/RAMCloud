@@ -7323,9 +7323,9 @@ millisort()
         InitMilliSortRpc initRpc(context, rootServer,
                 downCast<uint32_t>(dataTuplesPerNode),
                 downCast<uint32_t>(nodesPerPivotServer));
-        initRpc.wait();
+        auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
-                initRpc.getNodesInited());
+                initResp->numNodesInited);
 
         Buffer statsBefore, statsAfter;
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
@@ -7339,6 +7339,19 @@ millisort()
         printf("=====================\n");
         printf("Experiment ID = %d\n", i);
         printf("=====================\n");
+        printf("Configuration Parameters:\n");
+        printf("numNodes = %d\n", initResp->numNodes);
+        int numPivotServers = (initResp->numNodes + nodesPerPivotServer - 1)
+                / nodesPerPivotServer;
+        printf("numPivotServers = %d (reduceFactor = %d)\n", numPivotServers,
+                nodesPerPivotServer);
+        printf("numCoresPerNode = %d\n", initResp->numCoresPerNode);
+        printf("numPivotsPerNode = %d\n", initResp->numPivotsPerNode);
+        printf("maxOutstandingRpcs = %d\n", initResp->maxOutstandingRpcs);
+        printf("numItemsPerNode = %d\n", dataTuplesPerNode);
+        printf("keySize = %d B\n", initResp->keySize);
+        printf("valueSize = %d B\n", initResp->valueSize);
+        printf("\n");
         printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
                 .c_str());
     }

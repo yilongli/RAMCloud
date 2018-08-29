@@ -13,6 +13,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <limits>
 #include "Cycles.h"
 #include "Minimal.h"
 #include "PerfStats.h"
@@ -26,6 +27,8 @@ std::vector<PerfStats*> PerfStats::registeredStats;
 int PerfStats::nextThreadId = 1;
 __thread PerfStats PerfStats::threadStats;
 __thread bool PerfStats::initialized;
+
+const double DOUBLE_MAX = std::numeric_limits<double>::max();
 
 /**
  * This method must be called to make a PerfStats structure "known" so that
@@ -127,41 +130,53 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(millisortFinalPivotKeyBytes);
         COLLECT(millisortInitValueBytes);
         COLLECT(millisortFinalValueBytes);
+        COLLECT(millisortIsPivotServer);
+        COLLECT(localSortStartTime);
         COLLECT(localSortElapsedTime);
         COLLECT(localSortCycles);
         COLLECT(localSortWorkers);
+        COLLECT(rearrangeInitValuesStartTime);
         total->rearrangeInitValuesElapsedTime = std::max(
                 total->rearrangeInitValuesElapsedTime,
                 stats->rearrangeInitValuesElapsedTime);
         COLLECT(rearrangeInitValuesCycles);
         COLLECT(rearrangeInitValuesWorkers);
+        COLLECT(gatherPivotsStartTime);
         COLLECT(gatherPivotsElapsedTime);
         COLLECT(gatherPivotsInputBytes);
         COLLECT(gatherPivotsOutputBytes);
         COLLECT(gatherPivotsMergeCycles);
+        COLLECT(gatherSuperPivotsStartTime);
         COLLECT(gatherSuperPivotsElapsedTime);
         COLLECT(gatherSuperPivotsInputBytes);
         COLLECT(gatherSuperPivotsOutputBytes);
         COLLECT(gatherSuperPivotsMergeCycles);
-        total->bcastPivotBucketBoundariesCycles +=
-                stats->bcastPivotBucketBoundariesCycles;
+        COLLECT(bcastPivotBucketBoundariesStartTime);
+        COLLECT(bcastPivotBucketBoundariesElapsedTime);
+        COLLECT(bucketSortPivotsStartTime);
         COLLECT(bucketSortPivotsElapsedTime);
-        total->mergePivotsInBucketSortCycles +=
-                stats->mergePivotsInBucketSortCycles;
-        total->allGatherPivotsElapsedTime += stats->allGatherPivotsElapsedTime;
-        total->allGatherPivotsMergeCycles += stats->allGatherPivotsMergeCycles;
+        COLLECT(mergePivotsInBucketSortCycles);
+        COLLECT(allGatherPivotsStartTime);
+        COLLECT(allGatherPivotsElapsedTime);
+        COLLECT(allGatherPivotsMergeCycles);
+        COLLECT(shuffleKeysStartTime);
         COLLECT(shuffleKeysElapsedTime);
         COLLECT(shuffleKeysInputBytes);
         COLLECT(shuffleKeysOutputBytes);
         COLLECT(shuffleKeysReceivedRpcs);
         COLLECT(shuffleKeysSentRpcs);
+        COLLECT(onlineMergeSortStartTime);
+        COLLECT(onlineMergeSortElapsedTime);
+        COLLECT(onlineMergeSortWorkers);
+        COLLECT(shuffleValuesStartTime);
         COLLECT(shuffleValuesElapsedTime);
         COLLECT(shuffleValuesInputBytes);
         COLLECT(shuffleValuesOutputBytes);
         COLLECT(shuffleValuesReceivedRpcs);
         COLLECT(shuffleValuesSentRpcs);
-        total->bucketSortMergeKeyCycles += stats->bucketSortMergeKeyCycles;
-        total->bucketSortMergeValueCycles += stats->bucketSortMergeValueCycles;
+        COLLECT(bucketSortMergeKeyCycles);
+        COLLECT(bucketSortMergeValueCycles);
+        COLLECT(rearrangeFinalValuesStartTime);
         total->rearrangeFinalValuesElapsedTime = std::max(
                 total->rearrangeFinalValuesElapsedTime,
                 stats->rearrangeFinalValuesElapsedTime);
@@ -205,15 +220,20 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     }
 
     // Create a few auxiliary rows in the data table.
+    string topColumn = format(" %8s", "Avg") + format(" %8s", "Min") +
+            format(" %8s", "Max");
     for (size_t i = 0; i < diff["serverId"].size(); i++) {
         diff["readBytesObjectsAndKeys"].push_back(
                 diff["readObjectBytes"][i] + diff["readKeyBytes"][i]);
         diff["writeBytesObjectsAndKeys"].push_back(
                 diff["writeObjectBytes"][i] + diff["writeKeyBytes"][i]);
+        topColumn += format(" %8.0f", diff["serverId"][i]);
     }
 
     result.append(format("%-40s %s\n", "Server index",
-            formatMetric(&diff, "serverId", " %8.0f").c_str()));
+            topColumn.c_str()).c_str());
+//    result.append(format("%-40s %s\n", "Server index",
+//            formatMetric(&diff, "serverId", " %8.0f").c_str()));
 /*
     result.append(format("%-40s %s\n", "Elapsed time (sec)",
             formatMetricRatio(&diff, "collectionTime", "cyclesPerSecond",
@@ -366,7 +386,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRate(&diff, "networkOutputBytes",
             " %8.2f", 1e-6).c_str()));
 */
-    double cyclesPerMicros = diff["cyclesPerMicros"].front();
+    // TODO: Arachne core util.
     result.append("\nMilliSort:\n");
     result.append("\n=== Total ===\n");
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
@@ -376,6 +396,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetric(&diff, "millisortInitItems", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Final items",
             formatMetric(&diff, "millisortFinalItems", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Imbalance ratio",
+            formatMetricRatio(&diff, "millisortFinalItems",
+            "millisortInitItems", " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Cost per item (ns)",
             formatMetricRatio(&diff, "millisortTime", "millisortFinalItems",
             " %8.1f", 1e9/Cycles::perSecond()).c_str()));
@@ -385,11 +408,51 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Initial values (MB)",
             formatMetric(&diff, "millisortInitValueBytes",
             " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Is PivotServer?",
+            formatMetric(&diff, "millisortIsPivotServer", " %8.0f").c_str()));
+
+    result.append("\n=== Time Breakdown ===\n");
+    result.append(format("%-40s %s\n", "  Local sorting (%)",
+            formatMetricRatio(&diff, "localSortElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Rearrange ini. values (overlaped) (%)",
+            formatMetricRatio(&diff, "rearrangeInitValuesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Gather pivots (%)",
+            formatMetricRatio(&diff, "gatherPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Gather super-pivots (%)",
+            formatMetricRatio(&diff, "gatherSuperPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Broadcast pivot bucket boundaries (%)",
+            formatMetricRatio(&diff, "bcastPivotBucketBoundariesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Shuffle pivots (%)",
+            formatMetricRatio(&diff, "bucketSortPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  All-gather pivots (%)",
+            formatMetricRatio(&diff, "allGatherPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Shuffle keys (%)",
+            formatMetricRatio(&diff, "shuffleKeysElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Shuffle values (%)",
+            formatMetricRatio(&diff, "shuffleValuesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Rearrange final values (%)",
+            formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
 
     result.append("\n=== Local Sorting ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "localSortStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "localSortElapsedTime", "cyclesPerMicros",
             " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "localSortElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
     result.append(format("%-40s %s\n", "  CPU time (us)",
             formatMetricRatio(&diff, "localSortCycles", "cyclesPerMicros",
             " %8.0f").c_str()));
@@ -399,122 +462,220 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRatio(&diff, "localSortElapsedTime", "millisortInitItems",
             " %8.1f", 1e9/Cycles::perSecond()).c_str()));
 
-    result.append("\n=== Rearrange Initial Values (overlap) ===\n");
+    result.append("\n=== Rearrange Initial Values (overlapped) ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "rearrangeInitValuesStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "rearrangeInitValuesElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "rearrangeInitValuesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
     result.append(format("%-40s %s\n", "  CPU time (us)",
             formatMetricRatio(&diff, "rearrangeInitValuesCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "rearrangeInitValuesWorkers", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Values moved (MB/s)",
-            formatMetricRatio(&diff, "millisortInitValueBytes",
-            "rearrangeInitValuesElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "millisortInitValueBytes",
+            "rearrangeInitValuesElapsedTime", " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Cost per value (ns)",
+            formatMetricRatio(&diff, "rearrangeInitValuesElapsedTime", "millisortInitItems",
+            " %8.1f", 1e9/Cycles::perSecond()).c_str()));
+    result.append(format("%-40s %s\n", "  Slack time (pre. \"Shuffle Keys\") (us)",
+            formatMetricCustom(&diff,
+            [] (vector<double>& v) { return (v[2]-(v[0]+v[1]))/v[3]; },
+            {"rearrangeInitValuesStartTime", "rearrangeInitValuesElapsedTime",
+            "shuffleKeysStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
 
     result.append("\n=== Gather Pivots ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "gatherPivotsStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "gatherPivotsElapsedTime", "cyclesPerMicros",
             " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "gatherPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Input bytes (KB)",
+            formatMetric(&diff, "gatherPivotsInputBytes", " %8.2f", 1e-3).c_str()));
+    result.append(format("%-40s %s\n", "  Output bytes (KB)",
+            formatMetric(&diff, "gatherPivotsOutputBytes", " %8.2f", 1e-3).c_str()));
     result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
-            formatMetricRatio(&diff, "gatherPivotsInputBytes",
-            "gatherPivotsElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "gatherPivotsInputBytes",
+            "gatherPivotsElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
-            formatMetricRatio(&diff, "gatherPivotsOutputBytes",
-            "gatherPivotsElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "gatherPivotsOutputBytes",
+            "gatherPivotsElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "gatherPivotsMergeCycles", "cyclesPerMicros",
             " %8.0f").c_str()));
 
     result.append("\n=== Gather Super-Pivots ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "gatherSuperPivotsStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "gatherSuperPivotsElapsedTime", "cyclesPerMicros",
             " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "gatherSuperPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Input bytes (KB)",
+            formatMetric(&diff, "gatherSuperPivotsInputBytes", " %8.2f", 1e-3).c_str()));
+    result.append(format("%-40s %s\n", "  Output bytes (KB)",
+            formatMetric(&diff, "gatherSuperPivotsOutputBytes", " %8.2f", 1e-3).c_str()));
     result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
-            formatMetricRatio(&diff, "gatherSuperPivotsInputBytes",
-            "gatherSuperPivotsElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "gatherSuperPivotsInputBytes",
+            "gatherSuperPivotsElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
-            formatMetricRatio(&diff, "gatherSuperPivotsOutputBytes",
-            "gatherSuperPivotsElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "gatherSuperPivotsOutputBytes",
+            "gatherSuperPivotsElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "gatherSuperPivotsMergeCycles", "cyclesPerMicros",
             " %8.0f").c_str()));
 
     result.append("\n=== Broadcast Pivot Bucket Boundaries ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "bcastPivotBucketBoundariesStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
-            formatMetricRatio(&diff, "bcastPivotBucketBoundariesCycles",
+            formatMetricRatio(&diff, "bcastPivotBucketBoundariesElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "bcastPivotBucketBoundariesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
 
     result.append("\n=== Shuffle Pivots ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "bucketSortPivotsStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "bucketSortPivotsElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "bucketSortPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "mergePivotsInBucketSortCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
 
     result.append("\n=== All-Gather Data Bucket Boundaries ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "allGatherPivotsStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "allGatherPivotsElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "allGatherPivotsElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "allGatherPivotsMergeCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
 
     result.append("\n=== Shuffle Keys ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "shuffleKeysStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
             formatMetricRatio(&diff, "shuffleKeysElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "  Key + metadata (MB)",
-            formatMetric(&diff, "millisortFinalPivotKeyBytes",
-            " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "shuffleKeysElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Input bytes (MB)",
+            formatMetric(&diff, "shuffleKeysInputBytes", " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Output bytes (MB)",
+            formatMetric(&diff, "shuffleKeysOutputBytes", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
-            formatMetricRatio(&diff, "shuffleKeysInputBytes",
-            "shuffleKeysElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "shuffleKeysInputBytes",
+            "shuffleKeysElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
-            formatMetricRatio(&diff, "shuffleKeysOutputBytes",
-            "shuffleKeysElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "shuffleKeysOutputBytes",
+            "shuffleKeysElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Received RPCs",
             formatMetric(&diff, "shuffleKeysReceivedRpcs", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Sent RPCs",
             formatMetric(&diff, "shuffleKeysSentRpcs", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Avg. RPC size (KB)",
+            formatMetricRatio(&diff, "shuffleKeysOutputBytes",
+            "shuffleKeysReceivedRpcs", " %8.2f", 1e-3).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "bucketSortMergeKeyCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
 
-    result.append("\n=== Online MergeSort (overlap) ===\n");
-    result.append("\nTODO\n");
+    result.append("\n=== Online MergeSort (overlapped) ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "onlineMergeSortStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Elasped time (us)",
+            formatMetricRatio(&diff, "onlineMergeSortElapsedTime",
+            "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "onlineMergeSortElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    // TODO: active time
+    // TODO: CPU time
+    result.append(format("%-40s %s\n", "  Parallel workers",
+            formatMetric(&diff, "onlineMergeSortWorkers", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Slack time (pre. \"Rearr. Values\") (us)",
+            formatMetricCustom(&diff,
+            [] (vector<double>& v) { return (v[2]-(v[0]+v[1]))/v[3]; },
+            {"onlineMergeSortStartTime", "onlineMergeSortElapsedTime",
+            "rearrangeFinalValuesStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
 
     result.append("\n=== Shuffle Values ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "shuffleValuesStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elasped time (us)",
             formatMetricRatio(&diff, "shuffleValuesElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "shuffleValuesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  Input bytes (MB)",
+            formatMetric(&diff, "shuffleValuesInputBytes", " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Output bytes (MB)",
+            formatMetric(&diff, "shuffleValuesOutputBytes", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
-            formatMetricRatio(&diff, "shuffleValuesInputBytes",
-            "shuffleValuesElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "shuffleValuesInputBytes",
+            "shuffleValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
-            formatMetricRatio(&diff, "shuffleValuesOutputBytes",
-            "shuffleValuesElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "shuffleValuesOutputBytes",
+            "shuffleValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Received RPCs",
             formatMetric(&diff, "shuffleValuesReceivedRpcs", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Sent RPCs",
             formatMetric(&diff, "shuffleValuesSentRpcs", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Avg. RPC size (KB)",
+            formatMetricRatio(&diff, "shuffleValuesOutputBytes",
+            "shuffleValuesReceivedRpcs", " %8.2f", 1e-3).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "bucketSortMergeValueCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
 
     result.append("\n=== Rearrange Values ===\n");
+    result.append(format("%-40s %s\n", "  Start time (us)",
+            formatMetricRatio(&diff, "rearrangeFinalValuesStartTime", "cyclesPerMicros",
+            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elasped time (us)",
             formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Percentage (%)",
+            formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime", "millisortTime",
+            " %8.2f", 100).c_str()));
     result.append(format("%-40s %s\n", "  CPU time (us)",
             formatMetricRatio(&diff, "rearrangeFinalValuesCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "rearrangeFinalValuesWorkers", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Values moved (MB/s)",
-            formatMetricRatio(&diff, "millisortFinalValueBytes",
-            "rearrangeFinalValuesElapsedTime", " %8.2f", cyclesPerMicros).c_str()));
+            formatMetricRate(&diff, "millisortFinalValueBytes",
+            "rearrangeFinalValuesElapsedTime", " %8.2f", 1e-6).c_str()));
 
     return result;
 }
@@ -612,30 +773,43 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(millisortFinalPivotKeyBytes);
         ADD_METRIC(millisortInitValueBytes);
         ADD_METRIC(millisortFinalValueBytes);
+        ADD_METRIC(millisortIsPivotServer);
+        ADD_METRIC(localSortStartTime);
         ADD_METRIC(localSortElapsedTime);
         ADD_METRIC(localSortCycles);
         ADD_METRIC(localSortWorkers);
+        ADD_METRIC(rearrangeInitValuesStartTime);
         ADD_METRIC(rearrangeInitValuesElapsedTime);
         ADD_METRIC(rearrangeInitValuesCycles);
         ADD_METRIC(rearrangeInitValuesWorkers);
+        ADD_METRIC(gatherPivotsStartTime);
         ADD_METRIC(gatherPivotsElapsedTime);
         ADD_METRIC(gatherPivotsOutputBytes);
         ADD_METRIC(gatherPivotsInputBytes);
         ADD_METRIC(gatherPivotsMergeCycles);
+        ADD_METRIC(gatherSuperPivotsStartTime);
         ADD_METRIC(gatherSuperPivotsElapsedTime);
         ADD_METRIC(gatherSuperPivotsOutputBytes);
         ADD_METRIC(gatherSuperPivotsInputBytes);
         ADD_METRIC(gatherSuperPivotsMergeCycles);
-        ADD_METRIC(bcastPivotBucketBoundariesCycles);
+        ADD_METRIC(bcastPivotBucketBoundariesStartTime);
+        ADD_METRIC(bcastPivotBucketBoundariesElapsedTime);
+        ADD_METRIC(bucketSortPivotsStartTime);
         ADD_METRIC(bucketSortPivotsElapsedTime);
         ADD_METRIC(mergePivotsInBucketSortCycles);
+        ADD_METRIC(allGatherPivotsStartTime);
         ADD_METRIC(allGatherPivotsElapsedTime);
         ADD_METRIC(allGatherPivotsMergeCycles);
+        ADD_METRIC(shuffleKeysStartTime);
         ADD_METRIC(shuffleKeysElapsedTime);
         ADD_METRIC(shuffleKeysInputBytes);
         ADD_METRIC(shuffleKeysOutputBytes);
         ADD_METRIC(shuffleKeysReceivedRpcs);
         ADD_METRIC(shuffleKeysSentRpcs);
+        ADD_METRIC(onlineMergeSortStartTime);
+        ADD_METRIC(onlineMergeSortElapsedTime);
+        ADD_METRIC(onlineMergeSortWorkers);
+        ADD_METRIC(shuffleValuesStartTime);
         ADD_METRIC(shuffleValuesElapsedTime);
         ADD_METRIC(shuffleValuesInputBytes);
         ADD_METRIC(shuffleValuesOutputBytes);
@@ -643,6 +817,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(shuffleValuesSentRpcs);
         ADD_METRIC(bucketSortMergeKeyCycles);
         ADD_METRIC(bucketSortMergeValueCycles);
+        ADD_METRIC(rearrangeFinalValuesStartTime);
         ADD_METRIC(rearrangeFinalValuesElapsedTime);
         ADD_METRIC(rearrangeFinalValuesCycles);
         ADD_METRIC(rearrangeFinalValuesWorkers);
@@ -715,9 +890,46 @@ PerfStats::formatMetric(PerfStats::Diff* diff, const char* metric,
     if (diff->find(metric) == diff->end()) {
         return format("no metric %s", metric);
     }
-    foreach (double value, (*diff)[metric]) {
-        result.append(format(formatString, value*scale));
+    vector<double>& v = (*diff)[metric];
+    double min = DOUBLE_MAX, max = -DOUBLE_MAX, avg = 0, numSamples = 0;
+    foreach (double value, v) {
+        value *= scale;
+        updateAggMetric(avg, min, max, numSamples, value);
+        result.append(format(formatString, value));
     }
+    string prefix = format(formatString, avg) + format(formatString, min) +
+            format(formatString, max) + " |";
+    result = prefix + result;
+    return result;
+}
+#pragma GCC diagnostic warning "-Wformat-nonliteral"
+
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+string
+PerfStats::formatMetricCustom(PerfStats::Diff* diff,
+        std::function<double(vector<double>&)> compute,
+        vector<const char*> metrics, const char* formatString)
+{
+    string result;
+    for (auto& metric : metrics) {
+        if (diff->find(metric) == diff->end()) {
+            return format("no metric %s", metric);
+        }
+    }
+    size_t numServers = (*diff)[metrics.front()].size();
+    double min = DOUBLE_MAX, max = -DOUBLE_MAX, avg = 0, numSamples = 0;
+    for (size_t i = 0; i < numServers; i++) {
+        vector<double> vs;
+        for (auto& metric : metrics) {
+            vs.push_back((*diff)[metric][i]);
+        }
+        double value = compute(vs);
+        updateAggMetric(avg, min, max, numSamples, value);
+        result.append(format(formatString, value));
+    }
+    string prefix = format(formatString, avg) + format(formatString, min) +
+            format(formatString, max) + " |";
+    result = prefix + result;
     return result;
 }
 #pragma GCC diagnostic warning "-Wformat-nonliteral"
@@ -759,13 +971,54 @@ PerfStats::formatMetricRate(PerfStats::Diff* diff, const char* metric,
     vector<double>& v = (*diff)[metric];
     vector<double>& cycles = (*diff)["collectionTime"];
     vector<double>& cyclesPerSecond = (*diff)["cyclesPerSecond"];
+    double min = DOUBLE_MAX, max = -DOUBLE_MAX, avg = 0, numSamples = 0;
     for (size_t i = 0; i < v.size(); i++) {
         double value = 0;
         if (cycles[i] != 0) {
             value = v[i]/(cycles[i]/cyclesPerSecond[i]);
         }
-        result.append(format(formatString, value*scale));
+        value *= scale;
+        updateAggMetric(avg, min, max, numSamples, value);
+        result.append(format(formatString, value));
     }
+    string prefix = format(formatString, avg) + format(formatString, min) +
+            format(formatString, max) + " |";
+    result = prefix + result;
+    return result;
+}
+#pragma GCC diagnostic warning "-Wformat-nonliteral"
+
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+string
+PerfStats::formatMetricRate(PerfStats::Diff* diff, const char* metric,
+        const char* elapsedTime, const char* formatString, double scale)
+{
+    string result;
+    if (diff->find(metric) == diff->end()) {
+        return format("no metric %s", metric);
+    }
+    if (diff->find(elapsedTime) == diff->end()) {
+        return format("no metric %s", elapsedTime);
+    }
+    if (diff->find("cyclesPerSecond") == diff->end()) {
+        return "no metric cyclesPerSecond";
+    }
+    vector<double>& v = (*diff)[metric];
+    vector<double>& cycles = (*diff)[elapsedTime];
+    vector<double>& cyclesPerSecond = (*diff)["cyclesPerSecond"];
+    double min = DOUBLE_MAX, max = -DOUBLE_MAX, avg = 0, numSamples = 0;
+    for (size_t i = 0; i < v.size(); i++) {
+        double value = 0;
+        if (cycles[i] != 0) {
+            value = v[i]/(cycles[i]/cyclesPerSecond[i]);
+        }
+        value *= scale;
+        updateAggMetric(avg, min, max, numSamples, value);
+        result.append(format(formatString, value));
+    }
+    string prefix = format(formatString, avg) + format(formatString, min) +
+            format(formatString, max) + " |";
+    result = prefix + result;
     return result;
 }
 #pragma GCC diagnostic warning "-Wformat-nonliteral"
@@ -805,12 +1058,30 @@ PerfStats::formatMetricRatio(PerfStats::Diff* diff, const char* metric1,
     }
     vector<double>& v1 = (*diff)[metric1];
     vector<double>& v2 = (*diff)[metric2];
+    double min = DOUBLE_MAX, max = -DOUBLE_MAX, avg = 0, numSamples = 0;
     for (size_t i = 0; i < v1.size(); i++) {
         double value = (v2[i] == 0) ? 0 : v1[i]/v2[i];
-        result.append(format(formatString, value*scale));
+        value *= scale;
+        updateAggMetric(avg, min, max, numSamples, value);
+        result.append(format(formatString, value));
     }
+    string prefix = format(formatString, avg) + format(formatString, min) +
+            format(formatString, max) + " |";
+    result = prefix + result;
     return result;
 }
 #pragma GCC diagnostic warning "-Wformat-nonliteral"
+
+void
+PerfStats::updateAggMetric(double &avg, double &min, double &max,
+        double& numSamples, double value)
+{
+    min = std::min(min, value);
+    max = std::max(max, value);
+    if (value > 1e-3) {
+        avg = ((avg * numSamples) + value) / (numSamples + 1);
+        numSamples++;
+    }
+}
 
 }  // namespace RAMCloud

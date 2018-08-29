@@ -52,12 +52,6 @@ InitMilliSortRpc::appendRequest(Buffer* request, uint32_t dataTuplesPerServer,
     reqHdr->fromClient = fromClient;
 }
 
-int
-InitMilliSortRpc::getNodesInited()
-{
-    return getResponseHeader<WireFormat::InitMilliSort>()->numNodesInited;
-}
-
 void
 MilliSortClient::startMilliSort(Context* context, ServerId serverId,
         bool fromClient)

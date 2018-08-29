@@ -45,6 +45,10 @@ namespace {
     }
 }
 
+// TODO: justify this number; need to be large enough to saturate the bw
+// but not too large that slows down the transport
+#define MAX_OUTSTANDING_RPCS 10
+
 #define SCOPED_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
 #define START_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
 #define STOP_TIMER(metric) _timer_##metric.stop();
@@ -228,9 +232,17 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                     result->read<WireFormat::InitMilliSort::Response>(
                     &offset)->numNodesInited;
         }
+        respHdr->numNodes = respHdr->numNodesInited;
+        respHdr->numCoresPerNode = static_cast<int>(
+                Arachne::numActiveCores.load());
+        respHdr->numPivotsPerNode = respHdr->numNodes;
+        respHdr->maxOutstandingRpcs = MAX_OUTSTANDING_RPCS;
+        respHdr->keySize = 10;
+        respHdr->valueSize = 90;
         return;
     }
 
+    startTime = 0;
     numDataTuples = reqHdr->dataTuplesPerServer;
     int nodesPerPivotServer = (int) reqHdr->nodesPerPivotServer;
     pivotServerRank = world->rank / nodesPerPivotServer *
@@ -327,7 +339,7 @@ void
 MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqHdr,
         WireFormat::StartMilliSort::Response* respHdr, Rpc* rpc)
 {
-    startTime = Cycles::rdtsc();
+    startTime = startTime > 0 ? startTime : Cycles::rdtsc();
     timeTrace("startMilliSort invoked, requestId %u, fromClient %u",
             uint(reqHdr->requestId), reqHdr->fromClient);
 
@@ -348,10 +360,12 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
         TreeBcast startBcast(context, world.get());
         startBcast.send<StartMilliSortRpc>(reqHdr->requestId, false);
         startBcast.wait();
+        ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
         return;
     }
 
     // Kick start the sorting process.
+    ADD_COUNTER(millisortIsPivotServer, isPivotServer ? 1 : 0);
     ongoingMilliSort = rpc;
     localSortAndPickPivots();
     // FIXME: a better solution is to wait on condition var.
@@ -407,6 +421,12 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
         bool initialData)
 {
     uint64_t globalStartTime = Cycles::rdtsc();
+    if (initialData) {
+        ADD_COUNTER(rearrangeInitValuesStartTime, globalStartTime - startTime);
+    } else {
+        ADD_COUNTER(rearrangeFinalValuesStartTime, globalStartTime - startTime);
+    }
+
     bool useCurrentCore = !initialData;
     int currentCore = useCurrentCore ? -1 :
                       Arachne::getThreadId().context->coreId;
@@ -519,6 +539,7 @@ MilliSortService::localSortAndPickPivots()
     ADD_COUNTER(millisortInitValueBytes, values.size() * Value::SIZE);
 
     {
+        ADD_COUNTER(localSortStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(localSortElapsedTime);
         SCOPED_TIMER(localSortCycles);
         ADD_COUNTER(localSortWorkers, 1);
@@ -548,6 +569,7 @@ MilliSortService::localSortAndPickPivots()
     timeTrace("sorted %u data tuples, picked %u local pivots, about to gather "
             "pivots", keys.size(), localPivots.size());
     {
+        ADD_COUNTER(gatherPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(gatherPivotsElapsedTime);
         Tub<FlatGather> gatherPivots;
         invokeCollectiveOp<FlatGather>(gatherPivots, GATHER_PIVOTS, context,
@@ -601,6 +623,7 @@ MilliSortService::pickSuperPivots()
     timeTrace("picked %u super-pivots, about to gather super-pivots",
             superPivots.size());
     {
+        ADD_COUNTER(gatherSuperPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(gatherSuperPivotsElapsedTime);
         Tub<FlatGather> gatherSuperPivots;
         invokeCollectiveOp<FlatGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
@@ -641,7 +664,9 @@ MilliSortService::pickPivotBucketBoundaries()
     timeTrace("picked %u pivot bucket boundaries, about to broadcast",
             pivotBucketBoundaries.size());
     {
-        SCOPED_TIMER(bcastPivotBucketBoundariesCycles);
+        ADD_COUNTER(bcastPivotBucketBoundariesStartTime,
+                Cycles::rdtsc() - startTime);
+        SCOPED_TIMER(bcastPivotBucketBoundariesElapsedTime);
         TreeBcast bcast(context, allPivotServers.get());
         bcast.send<SendDataRpc>(BROADCAST_PIVOT_BUCKET_BOUNDARIES,
                 // TODO: simplify the SendDataRpc api?
@@ -681,6 +706,7 @@ MilliSortService::pivotBucketSort()
     // bucket boundaries.
     timeTrace("about to shuffle pivots");
     {
+        ADD_COUNTER(bucketSortPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(bucketSortPivotsElapsedTime);
         Tub<AllShuffle> pivotsShuffle;
         invokeCollectiveOp<AllShuffle>(pivotsShuffle, ALLSHUFFLE_PIVOTS,
@@ -789,6 +815,7 @@ MilliSortService::allGatherDataBucketBoundaries()
     // Gather data bucket boundaries from pivot servers to all nodes.
     timeTrace("about to all-gather data bucket boundaries");
     {
+        ADD_COUNTER(allGatherPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(allGatherPivotsElapsedTime);
         Tub<AllGather> allGather;
         invokeCollectiveOp<AllGather>(allGather,
@@ -829,6 +856,7 @@ MilliSortService::allGatherDataBucketBoundaries()
 void
 MilliSortService::shuffleKeys() {
     timeTrace("=== Stage 7: shuffleKeys started");
+    ADD_COUNTER(shuffleKeysStartTime, Cycles::rdtsc() - startTime);
     START_TIMER(shuffleKeysElapsedTime);
 
     // TODO: move this into startMillisort? not sure it's a good idea to have
@@ -860,9 +888,6 @@ MilliSortService::shuffleKeys() {
     int outstandingRpcs = 0;
     int completedRpcs = 0;
     int sentRpcs = 0;
-    // TODO: justify this number; need to be large enough to saturate the bw
-    // but not too large that slows down the transport
-#define MAX_OUTSTANDING_RPCS 10
     Tub<ShufflePullRpc> outgoingRpcs[MAX_OUTSTANDING_RPCS];
     ServerId targetServers[MAX_OUTSTANDING_RPCS];
     std::vector<int> freeTubs;
@@ -907,6 +932,7 @@ void
 MilliSortService::shuffleValues()
 {
     timeTrace("=== Stage 8: shuffleValues started");
+    ADD_COUNTER(shuffleValuesStartTime, Cycles::rdtsc() - startTime);
     START_TIMER(shuffleValuesElapsedTime);
 
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
@@ -931,6 +957,11 @@ MilliSortService::shuffleValues()
         }
 
         mergeSortCompleted = true;
+        ADD_COUNTER(onlineMergeSortStartTime,
+                mergeSorter->startTime - startTime);
+        ADD_COUNTER(onlineMergeSortElapsedTime,
+                mergeSorter->stopTick - mergeSorter->startTime);
+        ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
         timeTrace("sorted %d final keys", numSortedItems);
         // FIXME: is the following copy necessary?
         auto sortedArray = mergeSorter->getSortedArray();
@@ -992,7 +1023,9 @@ MilliSortService::shuffleValues()
             false);
 
     // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
-    ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
+    if (world->rank > 0) {
+        ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
+    }
     ADD_COUNTER(millisortFinalItems, numSortedItems);
     timeTrace("millisort finished");
 
@@ -1005,7 +1038,11 @@ MilliSortService::shuffleValues()
         result += std::to_string(sortedKeys[i].keyAsUint64()) + ":" +
                 std::to_string(sortedValues[i].asUint64());
         result += " ";
+        if (i % 100 == 0) {
+            Arachne::yield();
+        }
     }
+    Arachne::yield();
     LOG(NOTICE, "final result: %s", result.c_str());
 #endif
 }

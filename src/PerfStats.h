@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_PERFSTATS_H
 #define RAMCLOUD_PERFSTATS_H
 
+#include <functional>
 #include <unordered_map>
 #include <vector>
 #include "Buffer.h"
@@ -294,6 +295,12 @@ struct PerfStats {
     /// in bytes.
     uint64_t millisortFinalValueBytes;
 
+    /// 1 means true; 0 means false.
+    uint64_t millisortIsPivotServer;
+
+    /// Starting time of the local sorting stage.
+    uint64_t localSortStartTime;
+
     /// Time (in cycles) spent by the worker thread that invokes the local sort
     /// subroutine waiting for the sorting to complete. This is the end-to-end
     /// time that the local sort takes.
@@ -306,11 +313,16 @@ struct PerfStats {
 
     uint64_t localSortWorkers;
 
+    uint64_t rearrangeInitValuesStartTime;
+
     uint64_t rearrangeInitValuesElapsedTime;
 
     uint64_t rearrangeInitValuesCycles;
 
     uint64_t rearrangeInitValuesWorkers;
+
+    /// Starting time of the gather pivots stage.
+    uint64_t gatherPivotsStartTime;
 
     /// Time (in cycles) spent by the worker thread waiting for the
     /// gather-pivots operation to complete.
@@ -326,6 +338,8 @@ struct PerfStats {
     /// from the gather-pivots operation.
     uint64_t gatherPivotsMergeCycles;
 
+    uint64_t gatherSuperPivotsStartTime;
+
     /// Time (in cycles) spent by the worker thread waiting for the
     /// gather-super-pivots operation to complete.
     uint64_t gatherSuperPivotsElapsedTime;
@@ -340,17 +354,25 @@ struct PerfStats {
     /// received from the gather-super-pivots operation.
     uint64_t gatherSuperPivotsMergeCycles;
 
+    uint64_t bcastPivotBucketBoundariesStartTime;
+
     /// Time (in cycles) spent by the worker thread waiting for the
     /// broadcast-pivot-bucket-boundaries operation to complete.
-    uint64_t bcastPivotBucketBoundariesCycles;
+    uint64_t bcastPivotBucketBoundariesElapsedTime;
+
+    uint64_t bucketSortPivotsStartTime;
 
     uint64_t bucketSortPivotsElapsedTime;
 
     uint64_t mergePivotsInBucketSortCycles;
 
+    uint64_t allGatherPivotsStartTime;
+
     uint64_t allGatherPivotsElapsedTime;
 
     uint64_t allGatherPivotsMergeCycles;
+
+    uint64_t shuffleKeysStartTime;
 
     uint64_t shuffleKeysElapsedTime;
 
@@ -361,6 +383,14 @@ struct PerfStats {
     uint64_t shuffleKeysSentRpcs;
 
     uint64_t shuffleKeysReceivedRpcs;
+
+    uint64_t onlineMergeSortStartTime;
+
+    uint64_t onlineMergeSortElapsedTime;
+
+    uint64_t onlineMergeSortWorkers;
+
+    uint64_t shuffleValuesStartTime;
 
     uint64_t shuffleValuesElapsedTime;
 
@@ -375,6 +405,8 @@ struct PerfStats {
     uint64_t bucketSortMergeKeyCycles;
 
     uint64_t bucketSortMergeValueCycles;
+
+    uint64_t rearrangeFinalValuesStartTime;
 
     uint64_t rearrangeFinalValuesElapsedTime;
 
@@ -416,8 +448,14 @@ struct PerfStats {
 
     static string formatMetric(Diff* diff, const char* metric,
             const char* formatString, double scale = 1.0);
+    static string formatMetricCustom(PerfStats::Diff* diff,
+            std::function<double(vector<double>&)> compute,
+            vector<const char*> metrics, const char* formatString);
     static string formatMetricRate(Diff* diff, const char* metric,
             const char* formatString, double scale = 1.0);
+    static string formatMetricRate(Diff* diff, const char* metric,
+            const char* elapsedTime, const char* formatString,
+            double scale = 1.0);
     static string formatMetricRatio(Diff* diff, const char* metric1,
             const char* metric2, const char* formatString, double scale = 1.0);
     static void clusterDiff(Buffer* before, Buffer* after,
@@ -435,6 +473,8 @@ struct PerfStats {
 
   PRIVATE:
     static void parseStats(Buffer* rawData, std::vector<PerfStats>* results);
+    static void updateAggMetric(double& avg, double& min, double& max,
+            double& numSamples, double value);
 
     /// Used in a monitor-style fashion for mutual exclusion.
     static SpinLock mutex;

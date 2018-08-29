@@ -410,6 +410,7 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     , numAllItems(maxNumAllItems)
     , numWorkers(numWorkers)
     , numArraysCompleted()
+    , startTime(0)
 {
     int arrayCount = numArraysTotal;
     while (arrayCount > 1) {
@@ -769,6 +770,9 @@ bool
 Merge<T>::poll(T* newData, size_t size)
 {
     assert(preparedThreads);
+    if (startTime == 0) {
+        startTime = Cycles::rdtsc();
+    }
     
     ArrayPtr ptr;
     ptr.data = newData;

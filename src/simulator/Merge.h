@@ -168,10 +168,10 @@ private:
     // Total number of merged arrays that need to be generated for next level to
     // complete and advance to the next level.
     std::vector<int> numArraysTargets;
-    
+public:
     // Number of merge workers (each running on an Arachne or std thread).
     const int numWorkers;
-    
+private:
     ///////////////////////////////////////////////////////////////
     // Variable tracking current progress
     ///////////////////////////////////////////////////////////////
@@ -229,6 +229,9 @@ public:
     uint64_t startTick;
     uint64_t stopTick;
     MergeStats perfStats;
+
+    // FIXME: startTick is set in poll(), which doesn't seem right to me
+    uint64_t startTime;
 };
 
 /**

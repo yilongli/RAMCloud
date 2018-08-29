@@ -271,9 +271,30 @@ struct InitMilliSort {
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
+
         /// # nodes initialized in response to this RPC. Should always be 1
         /// if #fromClient is false.
         int32_t numNodesInited;
+
+        /// Configuration parameters (only defined when #fromClient is true).
+
+        /// Total # nodes participating in the millisort service.
+        int32_t numNodes;
+
+        /// # cores allocated to MilliSort service (including dispatch thread).
+        int32_t numCoresPerNode;
+
+        /// # pivots each node selects initially.
+        int32_t numPivotsPerNode;
+
+        /// Max # outstanding RPCs
+        int32_t maxOutstandingRpcs;
+
+        /// Size of the key, in bytes.
+        int32_t keySize;
+
+        /// Size of the value, in bytes.
+        int32_t valueSize;
     } __attribute__((packed));
 };
 
