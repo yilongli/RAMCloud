@@ -316,7 +316,12 @@ class MilliSortService : public Service {
 
         char bytes[SIZE];
 
-        Value(uint64_t value = 0)
+        /**
+         * Default constructor that does absolutely nothing.
+         */
+        Value() = default;
+
+        Value(uint64_t value)
             : bytes()
         {
             *((uint64_t*) bytes) = value;
@@ -370,6 +375,30 @@ class MilliSortService : public Service {
         uint64_t state;
     };
 
+    using PivotKeyArray = std::unique_ptr<PivotKey[]>;
+
+    using ValueArray = std::unique_ptr<Value[]>;
+
+    /// Encapsulates the state of method #rearrangeValues, allowing it to finish
+    /// asynchronously.
+    struct RearrangeValueTask {
+        /// C-style array holding the values after rearrangement.
+        Value* dest;
+
+        /// Worker threads that rearrange the values.
+        std::list<Arachne::ThreadId> workers;
+
+        void
+        wait(ValueArray* oldValues)
+        {
+            for (auto& tid : workers) {
+                Arachne::join(tid);
+            }
+            oldValues->reset(dest);
+            dest = NULL;
+        }
+    };
+
     /// Shared RAMCloud information.
     Context* context;
 
@@ -396,11 +425,11 @@ class MilliSortService : public Service {
     // ----------------------
 
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
-    void partition(std::vector<PivotKey>* keys, int numPartitions,
+    void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
-    void rearrangeValues(PivotKey* keys, Value* values, int totalItems,
-            bool initialData);
+    RearrangeValueTask rearrangeValues(PivotKey* keys, Value* values,
+            int totalItems, bool initialData);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
@@ -439,16 +468,16 @@ class MilliSortService : public Service {
     int numPivotServers;
 
     /// Keys of the data tuples to be sorted.
-    std::vector<PivotKey> keys;
+    PivotKeyArray keys;
 
     /// Values of the data tuples to be sorted.
-    std::vector<Value> values;
+    ValueArray values;
 
-    // FIXME: using vector but relying on numSortedItems for its real size is error-prone!!!
-    std::vector<PivotKey> sortedKeys;
+    /// Sorted keys on this node when the sorting completes.
+    PivotKeyArray sortedKeys;
 
-    // FIXME: using vector but relying on numSortedItems for its real size is error-prone!!!
-    std::vector<Value> sortedValues;
+    /// Sorted values on this node when the sorting completes.
+    ValueArray sortedValues;
 
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;
@@ -459,6 +488,9 @@ class MilliSortService : public Service {
     /// Selected keys that evenly divide local #keys on this node into # nodes
     /// partitions.
     std::vector<PivotKey> localPivots;
+
+    /// Represents the task of rearranging local values.
+    RearrangeValueTask rearrangeLocalVals;
 
     /// Data bucket boundaries that determine the final destination of each data
     /// tuple on this node. Same on all nodes.
@@ -480,9 +512,6 @@ class MilliSortService : public Service {
     // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
-
-    // TODO: do we need to make it class member?
-    std::vector<Arachne::ThreadId> valueRearrangers;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;

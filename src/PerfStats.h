@@ -448,7 +448,7 @@ struct PerfStats {
 
     static string formatMetric(Diff* diff, const char* metric,
             const char* formatString, double scale = 1.0);
-    static string formatMetricCustom(PerfStats::Diff* diff,
+    static string formatMetricLambda(PerfStats::Diff* diff,
             std::function<double(vector<double>&)> compute,
             vector<const char*> metrics, const char* formatString);
     static string formatMetricRate(Diff* diff, const char* metric,

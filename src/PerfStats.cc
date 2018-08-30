@@ -400,8 +400,10 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRatio(&diff, "millisortFinalItems",
             "millisortInitItems", " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Cost per item (ns)",
-            formatMetricRatio(&diff, "millisortTime", "millisortFinalItems",
-            " %8.1f", 1e9/Cycles::perSecond()).c_str()));
+            formatMetricLambda(&diff,
+            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            {"millisortTime", "millisortFinalItems", "cyclesPerNanos"},
+            " %8.1f").c_str()));
     result.append(format("%-40s %s\n", "  Initial keys (MB)",
             formatMetric(&diff, "millisortInitKeyBytes",
             " %8.2f", 1e-6).c_str()));
@@ -459,8 +461,10 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "localSortWorkers", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Cost per key (ns)",
-            formatMetricRatio(&diff, "localSortElapsedTime", "millisortInitItems",
-            " %8.1f", 1e9/Cycles::perSecond()).c_str()));
+            formatMetricLambda(&diff,
+            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            {"localSortElapsedTime", "millisortInitItems", "cyclesPerNanos"},
+            " %8.1f").c_str()));
 
     result.append("\n=== Rearrange Initial Values (overlapped) ===\n");
     result.append(format("%-40s %s\n", "  Start time (us)",
@@ -481,10 +485,12 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRate(&diff, "millisortInitValueBytes",
             "rearrangeInitValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Cost per value (ns)",
-            formatMetricRatio(&diff, "rearrangeInitValuesElapsedTime", "millisortInitItems",
-            " %8.1f", 1e9/Cycles::perSecond()).c_str()));
+            formatMetricLambda(&diff,
+            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            {"rearrangeInitValuesElapsedTime", "millisortInitItems", "cyclesPerNanos"},
+            " %8.1f").c_str()));
     result.append(format("%-40s %s\n", "  Slack time (pre. \"Shuffle Keys\") (us)",
-            formatMetricCustom(&diff,
+            formatMetricLambda(&diff,
             [] (vector<double>& v) { return (v[2]-(v[0]+v[1]))/v[3]; },
             {"rearrangeInitValuesStartTime", "rearrangeInitValuesElapsedTime",
             "shuffleKeysStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
@@ -622,7 +628,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "onlineMergeSortWorkers", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Slack time (pre. \"Rearr. Values\") (us)",
-            formatMetricCustom(&diff,
+            formatMetricLambda(&diff,
             [] (vector<double>& v) { return (v[2]-(v[0]+v[1]))/v[3]; },
             {"onlineMergeSortStartTime", "onlineMergeSortElapsedTime",
             "rearrangeFinalValuesStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
@@ -676,6 +682,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Values moved (MB/s)",
             formatMetricRate(&diff, "millisortFinalValueBytes",
             "rearrangeFinalValuesElapsedTime", " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Cost per value (ns)",
+            formatMetricLambda(&diff,
+            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            {"rearrangeFinalValuesElapsedTime", "millisortFinalItems", "cyclesPerNanos"},
+            " %8.1f").c_str()));
 
     return result;
 }
@@ -906,7 +917,7 @@ PerfStats::formatMetric(PerfStats::Diff* diff, const char* metric,
 
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
 string
-PerfStats::formatMetricCustom(PerfStats::Diff* diff,
+PerfStats::formatMetricLambda(PerfStats::Diff* diff,
         std::function<double(vector<double>&)> compute,
         vector<const char*> metrics, const char* formatString)
 {
