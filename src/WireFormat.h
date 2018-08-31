@@ -139,7 +139,8 @@ enum Opcode {
     ALL_SHUFFLE                 = 86,
     SEND_DATA                   = 87,
     SHUFFLE_PULL                = 88,
-    ILLEGAL_RPC_TYPE            = 89, // 1 + the highest legitimate Opcode
+    BENCHMARK_COLLECTIVE_OP     = 89,
+    ILLEGAL_RPC_TYPE            = 90, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -261,6 +262,8 @@ struct InitMilliSort {
     static const ServiceType service = MILLISORT_SERVICE;
     struct Request {
         RequestCommon common;
+        /// # nodes participating in the millisort.
+        uint32_t numNodes;
         /// # tuples on each server.
         uint32_t dataTuplesPerServer;
         /// # nodes assigned to each pivot server (including itself).
@@ -313,6 +316,30 @@ struct StartMilliSort {
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
+    } __attribute__((packed));
+};
+
+struct BenchmarkCollectiveOp {
+    static const Opcode opcode = BENCHMARK_COLLECTIVE_OP;
+    static const ServiceType service = MILLISORT_SERVICE;
+    struct Request {
+        RequestCommon common;
+
+        /// # times to perform the same operation.
+        int32_t count;
+
+        /// Identifier of the operation to perform.
+        uint32_t opcode;
+
+        // TODO: each op can have its own interpretation on this field.
+        // For bcast, it's the request size in bytes.
+        uint32_t dataSize;
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+
+        /// Time, in microseconds, to finish the experiment.
+        uint64_t elapsedTime;
     } __attribute__((packed));
 };
 

@@ -138,10 +138,6 @@ void
 TreeBcast::handleRpc(Context* context,
         const WireFormat::TreeBcast::Request* reqHdr, Service::Rpc* rpc)
 {
-    // FIXME: temporary hack to set up at least the world comm. group for
-    // non-root nodes.
-    context->getMilliSortService()->initWorld();
-
     TreeBcast treeBcast(context, reqHdr, rpc);
     treeBcast.wait();
 }
@@ -174,11 +170,13 @@ TreeBcast::start()
     // FIXME: can we avoid using RPC to deliver payload request locally? Could
     // save some time on the leaf nodes.
     // Deliver the payload request locally.
-    payloadRpc.construct(payloadResponseHeaderLength);
-    payloadRpc->request.appendExternal(&payloadRequest);
-    ServerId id = group->getNode(group->rank);
-    payloadRpc->session = context->serverList->getSession(id);
-    payloadRpc->send();
+    if (payloadResponseHeaderLength > 0) {
+        payloadRpc.construct(payloadResponseHeaderLength);
+        payloadRpc->request.appendExternal(&payloadRequest);
+        ServerId id = group->getNode(group->rank);
+        payloadRpc->session = context->serverList->getSession(id);
+        payloadRpc->send();
+    }
 }
 
 bool

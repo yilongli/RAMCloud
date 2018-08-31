@@ -57,28 +57,26 @@ class MilliSortService : public Service {
     }
 
     void
-    initWorld()
+    initWorld(uint32_t numNodes)
     {
-        if (!world) {
-            // FIXME: Geee, I can't believe this is actually what you need to do
-            // to iterate over the server list.
-            std::vector<ServerId> allNodes;
-            // FIXME: not sure why serverList can have duplicate records.
-            std::array<bool, 1000> set = {0};
-            bool end = false;
-            for (ServerId id = ServerId(0); !end;) {
-                id = context->serverList->nextServer(id,
-                        ServiceMask({WireFormat::MILLISORT_SERVICE}), &end);
-                if (!set[id.indexNumber()]) {
-                    allNodes.push_back(id);
-//                    LOG(WARNING, "server id %u, gen. %u", id.indexNumber(),
-//                            id.generationNumber());
-                    set[id.indexNumber()] = true;
-                }
+        std::vector<ServerId> nodes;
+        // FIXME: Geee, I can't believe this is actually what you need to do
+        // to iterate over the server list.
+        // FIXME: not sure why serverList can have duplicate records.
+        std::array<bool, 1000> set = {0};
+        bool end = false;
+        for (ServerId id = ServerId(0); !end;) {
+            id = context->serverList->nextServer(id,
+                    ServiceMask({WireFormat::MILLISORT_SERVICE}), &end);
+            if ((id.indexNumber() <= numNodes) && !set[id.indexNumber()]) {
+                nodes.push_back(id);
+//                LOG(NOTICE, "server id %u, gen. %u", id.indexNumber(),
+//                        id.generationNumber());
+                set[id.indexNumber()] = true;
             }
-            std::sort(allNodes.begin(), allNodes.end(), std::less<ServerId>());
-            world.construct(WORLD, serverId.indexNumber() - 1, allNodes);
         }
+        std::sort(nodes.begin(), nodes.end(), std::less<ServerId>());
+        world.construct(WORLD, serverId.indexNumber() - 1, nodes);
         registerCommunicationGroup(world.get());
     }
 
@@ -358,6 +356,10 @@ class MilliSortService : public Service {
                 Rpc* rpc);
     void shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
                 WireFormat::ShufflePull::Response* respHdr,
+                Rpc* rpc);
+    void benchmarkCollectiveOp(
+                const WireFormat::BenchmarkCollectiveOp::Request* reqHdr,
+                WireFormat::BenchmarkCollectiveOp::Response* respHdr,
                 Rpc* rpc);
 
     struct RandomGenerator {

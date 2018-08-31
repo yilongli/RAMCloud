@@ -67,6 +67,15 @@ class TreeBcast {
         start();
     }
 
+    /// For testing only. No embedded RPC; just a block of data.
+    void send(const void* data, uint32_t length)
+    {
+        assert(payloadRequest.size() == 0);
+        payloadResponseHeaderLength = 0;
+        payloadRequest.appendExternal(data, length);
+        start();
+    }
+
     bool isReady();
     void wait();
 

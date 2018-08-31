@@ -19,34 +19,33 @@ namespace RAMCloud {
 
 void
 MilliSortClient::initMilliSort(Context* context, ServerId serverId,
-        uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-        bool fromClient)
+        uint32_t numNodes, uint32_t dataTuplesPerServer,
+        uint32_t nodesPerPivotServer, bool fromClient)
 {
-    InitMilliSortRpc rpc(context, serverId, dataTuplesPerServer,
+    InitMilliSortRpc rpc(context, serverId, numNodes, dataTuplesPerServer,
             nodesPerPivotServer, fromClient);
     rpc.wait();
 }
 
 InitMilliSortRpc::InitMilliSortRpc(Context* context, ServerId serverId,
-        uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-        bool fromClient)
+        uint32_t numNodes, uint32_t dataTuplesPerServer,
+        uint32_t nodesPerPivotServer, bool fromClient)
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::InitMilliSort::Response))
 {
-    WireFormat::InitMilliSort::Request* reqHdr(
-            allocHeader<WireFormat::InitMilliSort>());
-    reqHdr->dataTuplesPerServer = dataTuplesPerServer;
-    reqHdr->nodesPerPivotServer = nodesPerPivotServer;
-    reqHdr->fromClient = fromClient;
+    appendRequest(&request, numNodes, dataTuplesPerServer, nodesPerPivotServer,
+            fromClient);
     send();
 }
 
 void
-InitMilliSortRpc::appendRequest(Buffer* request, uint32_t dataTuplesPerServer,
-        uint32_t nodesPerPivotServer, bool fromClient)
+InitMilliSortRpc::appendRequest(Buffer* request, uint32_t numNodes,
+        uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
+        bool fromClient)
 {
     WireFormat::InitMilliSort::Request* reqHdr(
             RpcWrapper::allocHeader<WireFormat::InitMilliSort>(request));
+    reqHdr->numNodes = numNodes;
     reqHdr->dataTuplesPerServer = dataTuplesPerServer;
     reqHdr->nodesPerPivotServer = nodesPerPivotServer;
     reqHdr->fromClient = fromClient;
@@ -80,6 +79,19 @@ StartMilliSortRpc::appendRequest(Buffer* request, int requestId,
             RpcWrapper::allocHeader<WireFormat::StartMilliSort>(request));
     reqHdr->requestId = requestId;
     reqHdr->fromClient = fromClient;
+}
+
+BenchmarkCollectiveOpRpc::BenchmarkCollectiveOpRpc(Context* context, int count,
+        uint32_t opcode, uint32_t dataSize)
+    : ServerIdRpcWrapper(context, ServerId(1, 0),
+            sizeof(WireFormat::StartMilliSort::Response))
+{
+    WireFormat::BenchmarkCollectiveOp::Request* reqHdr(
+            allocHeader<WireFormat::BenchmarkCollectiveOp>());
+    reqHdr->count = count;
+    reqHdr->opcode = opcode;
+    reqHdr->dataSize = dataSize;
+    send();
 }
 
 SendDataRpc::SendDataRpc(Context* context, ServerId serverId, uint32_t dataId,

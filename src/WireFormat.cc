@@ -131,6 +131,7 @@ opcodeSymbol(uint32_t opcode)
         case ALL_SHUFFLE:                  return "ALL_SHUFFLE";
         case SEND_DATA:                    return "SEND_DATA";
         case SHUFFLE_PULL:                 return "SHUFFLE_PULL";
+        case BENCHMARK_COLLECTIVE_OP:      return "BENCHMARK_COLLECTIVE_OP";
         case ILLEGAL_RPC_TYPE:             return "ILLEGAL_RPC_TYPE";
     }
 

@@ -31,8 +31,8 @@ namespace RAMCloud {
 class MilliSortClient {
   public:
     static void initMilliSort(Context* context, ServerId serverId,
-            uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-            bool fromClient = true);
+            uint32_t numNodes, uint32_t dataTuplesPerServer,
+            uint32_t nodesPerPivotServer, bool fromClient = true);
     static void startMilliSort(Context* context, ServerId serverId,
             bool fromClient = true);
 
@@ -46,13 +46,14 @@ class MilliSortClient {
  */
 class InitMilliSortRpc : public ServerIdRpcWrapper {
   public:
-    InitMilliSortRpc(Context* context, ServerId serverId,
+    InitMilliSortRpc(Context* context, ServerId serverId, uint32_t numNodes,
             uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
             bool fromClient = true);
     ~InitMilliSortRpc() {}
 
-    static void appendRequest(Buffer* request, uint32_t dataTuplesPerServer,
-            uint32_t nodesPerPivotServer, bool fromClient);
+    static void appendRequest(Buffer* request, uint32_t numNodes,
+            uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
+            bool fromClient);
 
     /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
     WireFormat::InitMilliSort::Response*
@@ -89,6 +90,28 @@ class StartMilliSortRpc : public ServerIdRpcWrapper {
 
 PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(StartMilliSortRpc);
+};
+
+/**
+ * Encapsulates the state of a MilliSortClient::startMilliSort request,
+ * allowing it to execute asynchronously.
+ */
+class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
+  public:
+    BenchmarkCollectiveOpRpc(Context* context, int count, uint32_t opcode,
+            uint32_t dataSize);
+    ~BenchmarkCollectiveOpRpc() {}
+
+    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
+    uint64_t wait()
+    {
+        waitAndCheckErrors();
+        return response->getStart<
+                WireFormat::BenchmarkCollectiveOp::Response>()->elapsedTime;
+    }
+
+PRIVATE:
+    DISALLOW_COPY_AND_ASSIGN(BenchmarkCollectiveOpRpc);
 };
 
 /**

@@ -165,6 +165,10 @@ MilliSortService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             callHandler<WireFormat::ShufflePull, MilliSortService,
                         &MilliSortService::shufflePull>(rpc);
             break;
+        case WireFormat::BenchmarkCollectiveOp::opcode:
+            callHandler<WireFormat::BenchmarkCollectiveOp, MilliSortService,
+                        &MilliSortService::benchmarkCollectiveOp>(rpc);
+            break;
         default:
             prepareErrorResponse(rpc->replyPayload, 
                     STATUS_UNIMPLEMENTED_REQUEST);
@@ -192,7 +196,9 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         return;
     }
 
-    initWorld();
+    if (reqHdr->fromClient || (serverId.indexNumber() > 1)) {
+        initWorld(reqHdr->numNodes);
+    }
 
     // Initialization request from an external client should only be processed
     // by the root node, which would then broadcast the request to all nodes.
@@ -202,36 +208,20 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
             return;
         }
 
-        // TODO: the following two limitations are due to our impl. of allgather
-        int nodesPerPivotServer = reqHdr->nodesPerPivotServer;
-        if (world->size() % nodesPerPivotServer != 0) {
-            LOG(ERROR, "illegal nodesPerPivotServer value %d: cannot divide "
-                    "total number of nodes %d", nodesPerPivotServer,
-                    world->size());
-            respHdr->common.status = STATUS_MILLISORT_ERROR;
-            return;
+        // TODO: can't do broadcast before communication group has been setup
+        std::list<InitMilliSortRpc> outgoingRpcs;
+        for (int i = 0; i < world->size(); i++) {
+            outgoingRpcs.emplace_back(context, world->getNode(i),
+                    reqHdr->numNodes, reqHdr->dataTuplesPerServer,
+                    reqHdr->nodesPerPivotServer, false);
         }
-        int numPivotServers = world->size() / nodesPerPivotServer;
-        if ((numPivotServers & (numPivotServers - 1)) != 0) {
-            LOG(ERROR, "illegal nodesPerPivotServer value %d; # pivot servers "
-                    "= %d is not a power of 2", nodesPerPivotServer,
-                    numPivotServers);
-            respHdr->common.status = STATUS_MILLISORT_ERROR;
-            return;
+        while (!outgoingRpcs.empty()) {
+            InitMilliSortRpc* initRpc = &outgoingRpcs.front();
+            auto initResult = initRpc->wait();
+            respHdr->numNodesInited += initResult->numNodesInited;
+            outgoingRpcs.pop_front();
         }
 
-        TreeBcast treeBcast(context, world.get());
-        treeBcast.send<InitMilliSortRpc>(reqHdr->dataTuplesPerServer,
-                reqHdr->nodesPerPivotServer, false);
-        treeBcast.wait();
-
-        Buffer* result = treeBcast.getResult();
-        uint32_t offset = 0;
-        while (offset < result->size()) {
-            respHdr->numNodesInited +=
-                    result->read<WireFormat::InitMilliSort::Response>(
-                    &offset)->numNodesInited;
-        }
         respHdr->numNodes = respHdr->numNodesInited;
         respHdr->numCoresPerNode = static_cast<int>(
                 Arachne::numActiveCores.load());
@@ -278,8 +268,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 
     nodes.clear();
     int peerRank = world->rank % nodesPerPivotServer;
-    for (int i = 0; i < numPivotServers; i++) {
-        nodes.push_back(world->getNode(i * nodesPerPivotServer + peerRank));
+    for (int i = peerRank; i < world->size(); i += nodesPerPivotServer) {
+        nodes.push_back(world->getNode(i));
     }
     allGatherPeersGroup.construct(ALL_GATHER_PEERS_GROUP,
             world->rank / nodesPerPivotServer, nodes);
@@ -1082,6 +1072,24 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
         default:
             assert(false);
     }
+}
+
+void
+MilliSortService::benchmarkCollectiveOp(
+        const WireFormat::BenchmarkCollectiveOp::Request* reqHdr,
+        WireFormat::BenchmarkCollectiveOp::Response* respHdr,
+        Rpc* rpc)
+{
+    std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
+    uint64_t start = Cycles::rdtsc();
+    if (reqHdr->opcode == WireFormat::BCAST_TREE) {
+        for (int i = 0; i < reqHdr->count; i++) {
+            TreeBcast bcast(context, world.get());
+            bcast.send(data.get(), reqHdr->dataSize);
+            bcast.wait();
+        }
+    }
+    respHdr->elapsedTime = Cycles::toMicroseconds(Cycles::rdtsc() - start);
 }
 
 void

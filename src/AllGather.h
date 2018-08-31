@@ -42,9 +42,16 @@ class AllGather {
         , maxPhase(-1)
         , outgoingRpc()
     {
-        if (group->size() > 1) {
-            maxPhase = int(std::log2(group->size() - 1));
+        int n = group->size();
+        if (n > 1) {
+            maxPhase = int(std::log2(n - 1));
         }
+
+        // FIXME: remove this limitation
+        if (!n || (n & (n - 1))) {
+            DIE("group size = %d is not a power of 2", n);
+        }
+
         if (phase <= maxPhase) {
             outgoingRpc.construct(context, getPeerId(0), opId, phase,
                     group->rank, length, data);

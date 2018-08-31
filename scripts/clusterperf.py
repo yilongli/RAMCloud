@@ -900,6 +900,7 @@ simple_tests = [
     Test("readAllToAll", readAllToAll),
     Test("readNotFound", default),
     Test("millisort", millisort),
+    Test("treeBcast", millisort),
 ]
 
 graph_tests = [

@@ -7321,6 +7321,7 @@ millisort()
     for (int i = 0; i < count; i++) {
         // Initialize the experiment.
         InitMilliSortRpc initRpc(context, rootServer,
+                downCast<uint32_t>(serverList.size() - 1),
                 downCast<uint32_t>(dataTuplesPerNode),
                 downCast<uint32_t>(nodesPerPivotServer));
         auto initResp = initRpc.wait();
@@ -7354,6 +7355,50 @@ millisort()
         printf("\n");
         printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
                 .c_str());
+    }
+}
+
+void
+treeBcast()
+{
+    // Normally, cluster->serverList is NULL on clients. Get it from the
+    // coordinator.
+    ServerList serverList(context);
+    ProtoBuf::ServerList list;
+    CoordinatorClient::getServerList(context, &list);
+    serverList.applyServerList(list);
+
+    // Get the number of nodes to broadcast.
+    int numMasters = 0;
+    // FIXME: I doubt this is the best/correct way to get # masters...
+    for (uint32_t i = 0; i < serverList.size(); i++) {
+        if (serverList[i].isValid()) {
+            numMasters++;
+        }
+    }
+
+    ServerId rootServer(1, 0);
+    printf("#%12s%12s%12s%12s\n", "nodes", "size (B)", "runs", "avg (us)");
+    printf("#------------------------------------------------\n");
+
+    // Sweep machineCount from 1 to numMasters.
+    for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
+        // Initialize the millisort service.
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+        auto initResp = initRpc.wait();
+        LOG(NOTICE, "Initialized %d millisort service nodes",
+                initResp->numNodesInited);
+
+        // Warmup
+        BenchmarkCollectiveOpRpc warmup(context, 10, WireFormat::BCAST_TREE, 0);
+        warmup.wait();
+
+        // Start the experiment.
+        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::BCAST_TREE,
+                objectSize);
+        uint64_t elapsedTime = rpc.wait();
+        printf(" %12d%12d%12d%12.2f\n", machineCount, objectSize, count,
+                double(elapsedTime) / double(count));
     }
 }
 
@@ -7408,6 +7453,7 @@ TestInfo tests[] = {
     {"writeThroughput", writeThroughput},
     {"workloadThroughput", workloadThroughput},
     {"millisort", millisort},
+    {"treeBcast", treeBcast},
 };
 
 int
