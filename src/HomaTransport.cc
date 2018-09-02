@@ -1738,7 +1738,6 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     , totalLength(totalLength)
 {
     assert(buffer->size() == 0);
-    buffer->reserve(totalLength);
 }
 
 /**

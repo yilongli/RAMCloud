@@ -1833,6 +1833,24 @@ double queueEstimator()
     // printf("Result: %u\n", total/count);
     return Cycles::toSeconds(stop - start)/count;
 }
+
+// Measure the cost of the QueueEstimator::packetQueued method.
+double queueEstimatorPacketQueued()
+{
+    int count = 1000000;
+    QueueEstimator estimator(8000);
+    uint64_t start = Cycles::rdtscp();
+    static uint32_t total = 0;
+    QueueEstimator::TransmitQueueState txQueueState;
+    for (int i = 0; i < count; i++) {
+        estimator.packetQueued(1000, Cycles::rdtsc(), &txQueueState);
+        total += txQueueState.outstandingBytes;
+    }
+    uint64_t stop = Cycles::rdtscp();
+    // printf("Result: %u\n", total/count);
+    return Cycles::toSeconds(stop - start)/count;
+}
+
 /**
   * A random number generator from the Internet that returns 64-bit integers.
   * It is advertised to be fast.
@@ -2478,6 +2496,8 @@ TestInfo tests[] = {
      "Prefetch instruction"},
     {"queueEstimator", queueEstimator,
      "Recompute # bytes outstanding in queue"},
+    {"queueEstimatorPacketQueued", queueEstimatorPacketQueued,
+     "Update the estimator's state after transmitting a new packet"},
     {"random", randomTest,
      "Generate 64-bit random number (Arachne version)"},
     {"rdtsc", rdtscTest,

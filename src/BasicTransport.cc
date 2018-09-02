@@ -15,6 +15,7 @@
 #include <algorithm>
 
 #include "BasicTransport.h"
+#include "CycleCounter.h"
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
@@ -42,6 +43,18 @@ namespace {
 #endif
     }
 }
+
+#define SCOPED_TIMER(metric) CycleCounter<> \
+        _timer_##metric(&PerfStats::threadStats.metric);
+#define CANCEL_SCOPED_TIMER(metric) _timer_##metric.cancel();
+
+#define START_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
+#define STOP_TIMER(metric) _timer_##metric.stop();
+
+#define INC_COUNTER(metric) PerfStats::threadStats.metric++;
+#define ADD_COUNTER(metric, delta) PerfStats::threadStats.metric += delta;
+
+#define DEBUG_SHUFFLE_PULL 0
 
 /**
  * Construct a new BasicTransport.
@@ -352,6 +365,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         Buffer* message, uint32_t offset, uint32_t maxBytes,
         uint32_t unscheduledBytes, uint8_t flags, bool partialOK)
 {
+    SCOPED_TIMER(basicTransportSendDataCycles);
     uint32_t messageSize = message->size();
 
     uint32_t curOffset = offset;
@@ -378,6 +392,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "server sending ALL_DATA, clientId %u, sequence %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence);
             driver->sendPacket(address, &header, &iter, 0, &txQueueState);
+            ADD_COUNTER(basicTransportOutputDataBytes, sizeof(AllDataHeader));
         } else {
             DataHeader header(rpcId, message->size(), curOffset,
                     unscheduledBytes, flags);
@@ -389,7 +404,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                     "offset %u";
             timeTrace(fmt, rpcId.clientId, rpcId.sequence, curOffset);
             driver->sendPacket(address, &header, &iter, 0, &txQueueState);
-//            TimeTrace::record("sent a shuffle reply packet?");
+            ADD_COUNTER(basicTransportOutputDataBytes, sizeof(DataHeader));
         }
         if (txQueueState.outstandingBytes > 0) {
             timeTrace("sent data, %u bytes queued ahead",
@@ -400,8 +415,10 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         }
         bytesSent += bytesThisPacket;
         curOffset += bytesThisPacket;
+        INC_COUNTER(basicTransportOutputDataPackets);
     }
 
+    ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
     return bytesSent;
 }
 
@@ -418,6 +435,9 @@ void
 BasicTransport::sendControlPacket(const Driver::Address* recipient,
         const T* packet)
 {
+    INC_COUNTER(basicTransportOutputControlPackets);
+    ADD_COUNTER(basicTransportOutputControlBytes, sizeof(T));
+    SCOPED_TIMER(basicTransportSendControlCycles);
     QueueEstimator::TransmitQueueState txQueueState;
     driver->sendPacket(recipient, packet, NULL, 0, &txQueueState);
     timeTrace("sent control packet, opcode %u, %u bytes queued ahead, "
@@ -860,6 +880,7 @@ void
 BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier)
 {
+    SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = request->size();
     timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing requests", t->clientId, t->nextClientSequenceNumber,
@@ -894,13 +915,14 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
         bytesSent = length;
-
-//        if (WireFormat::Opcode(
-//                request->getStart<WireFormat::RequestCommon>()->opcode) ==
-//            WireFormat::SHUFFLE_PULL) {
-//            TimeTrace::record("sent shuffle pull request");
-//        }
-
+#if DEBUG_SHUFFLE_PULL
+        if (WireFormat::Opcode(
+                request->getStart<WireFormat::RequestCommon>()->opcode) ==
+            WireFormat::SHUFFLE_PULL) {
+            TimeTrace::record("ShufflePull request completes, clientId %u, "
+                    "sequence %u", uint32_t(rpcId.clientId), uint32_t(rpcId.sequence));
+        }
+#endif
     } else {
         t->outgoingRequests.push_back(*clientRpc);
         t->maintainTopOutgoingMessages(&clientRpc->request);
@@ -928,6 +950,10 @@ BasicTransport::handlePacket(Driver::Received* received)
         RAMCLOUD_CLOG(WARNING, "packet from %s too short (%u bytes)",
                 received->sender->toString().c_str(), received->len);
         return;
+    }
+
+    if (common->opcode <= DATA) {
+        ADD_COUNTER(basicTransportInputDataBytes, received->len);
     }
 
     if (!(common->flags & FROM_CLIENT)) {
@@ -1008,9 +1034,16 @@ BasicTransport::handlePacket(Driver::Received* received)
                     header = received->getOffset<DataHeader>(0);
                 }
                 if (!clientRpc->accumulator) {
-//                    TimeTrace::record("received 1st pkt from shuffle rpc reply");
-                    clientRpc->accumulator.construct(this, clientRpc->response,
-                            uint32_t(header->totalLength));
+#if DEBUG_SHUFFLE_PULL
+                    if ((header->totalLength > 28000) && (header->totalLength < 32000)) {
+                        TimeTrace::record("ShufflePull response arrives, "
+                                "size %u, clientId %u, sequence %u",
+                                header->totalLength,
+                                uint32_t(header->common.rpcId.clientId),
+                                uint32_t(header->common.rpcId.sequence));
+                    }
+#endif
+                    clientRpc->accumulator.construct(this, clientRpc->response);
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
                                 clientRpc->rpcId, clientRpc->accumulator.get(),
@@ -1031,6 +1064,15 @@ BasicTransport::handlePacket(Driver::Received* received)
                         // truncate the response.
                         clientRpc->response->truncate(header->totalLength);
                     }
+#if DEBUG_SHUFFLE_PULL
+                    if ((header->totalLength > 28000) && (header->totalLength < 32000)) {
+                        TimeTrace::record("ShufflePull response completes, "
+                                "size %u, clientId %u, sequence %u",
+                                header->totalLength,
+                                uint32_t(header->common.rpcId.clientId),
+                                uint32_t(header->common.rpcId.sequence));
+                    }
+#endif
                     clientRpc->notifier->completed();
                     deleteClientRpc(clientRpc);
                 } else {
@@ -1238,6 +1280,15 @@ BasicTransport::handlePacket(Driver::Received* received)
 //                LOG(NOTICE, "%s from %s, request %p",
 //                        WireFormat::opcodeSymbol(&serverRpc->requestPayload),
 //                        received->sender->toString().c_str(), &serverRpc->requestPayload);
+#if DEBUG_SHUFFLE_PULL
+                if (serverRpc->requestPayload.getStart<WireFormat::RequestCommon>()->opcode
+                        == WireFormat::SHUFFLE_PULL) {
+                    TimeTrace::record("ShufflePull request received, "
+                            "clientId %u, sequence %u",
+                            uint32_t(header->common.rpcId.clientId),
+                            uint32_t(header->common.rpcId.sequence));
+                }
+#endif
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
@@ -1268,8 +1319,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload,
-                            uint32_t(header->totalLength));
+                            &serverRpc->requestPayload);
                     if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
                                 serverRpc->rpcId, serverRpc->accumulator.get(),
@@ -1510,10 +1560,14 @@ BasicTransport::ServerRpc::sendReply()
 //    LOG(NOTICE, "send reply of %s to %s",
 //            WireFormat::opcodeSymbol(&requestPayload),
 //            response.recipient->toString().c_str());
-//    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
-//        TimeTrace::record("about to send back shuffle pull reply");
-//    }
-
+#if DEBUG_SHUFFLE_PULL
+    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
+        TimeTrace::record("ShufflePull response ready to send, size %u, "
+                "clientId %u, sequence %u", replyPayload.size(),
+                uint32_t(rpcId.clientId), uint32_t(rpcId.sequence));
+    }
+#endif
+    SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
@@ -1560,17 +1614,14 @@ BasicTransport::ServerRpc::sendReply()
  *      The complete message will be assembled here; caller should ensure
  *      that this is initially empty. The caller owns the storage for this
  *      and must ensure that it persists as long as this object persists.
- * \param totalLength
- *      Length of the message, in bytes.
  */
 BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
-        Buffer* buffer, uint32_t totalLength)
+        Buffer* buffer)
     : t(t)
     , buffer(buffer)
     , fragments()
 {
     assert(buffer->size() == 0);
-    buffer->reserve(totalLength);
 }
 
 /**
@@ -1768,6 +1819,7 @@ BasicTransport::ScheduledMessage::~ScheduledMessage()
 int
 BasicTransport::Poller::poll()
 {
+    SCOPED_TIMER(basicTransportActiveCycles);
     int result = 0;
 
 #if TIME_TRACE
@@ -1781,8 +1833,15 @@ BasicTransport::Poller::poll()
     // best value).
 #define MAX_PACKETS 8
     uint32_t numPackets;
-    t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
-    numPackets = downCast<uint>(t->receivedPackets.size());
+    {
+        SCOPED_TIMER(basicTransportReceiveCycles);
+        t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
+        numPackets = downCast<uint>(t->receivedPackets.size());
+        if (numPackets == 0) {
+            CANCEL_SCOPED_TIMER(basicTransportReceiveCycles);
+        }
+        ADD_COUNTER(basicTransportInputPackets, numPackets);
+    }
 #if TIME_TRACE
     // Log the beginning of poll() here so that timetrace entries do not
     // go back in time.
@@ -1794,9 +1853,12 @@ BasicTransport::Poller::poll()
     }
     lastPollTime = Cycles::rdtsc();
 #endif
+
+    START_TIMER(basicTransportHandlePacketCycles);
     for (uint i = 0; i < numPackets; i++) {
         t->handlePacket(&t->receivedPackets[i]);
     }
+    STOP_TIMER(basicTransportHandlePacketCycles);
     t->receivedPackets.clear();
     result = numPackets > 0 ? 1 : result;
 
@@ -1878,6 +1940,8 @@ BasicTransport::Poller::poll()
         timeTrace("end of polling iteration %u, received %u packets, "
                 "transmitted %u bytes", owner->iteration, numPackets,
                 totalBytesSent);
+    } else {
+        CANCEL_SCOPED_TIMER(basicTransportActiveCycles);
     }
     return result;
 }

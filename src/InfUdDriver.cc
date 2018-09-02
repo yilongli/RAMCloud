@@ -25,6 +25,7 @@
 
 #include "Common.h"
 #include "Cycles.h"
+#include "CycleCounter.h"
 #include "BitOps.h"
 #include "InfUdDriver.h"
 #include "PcapFile.h"
@@ -35,9 +36,31 @@
 
 namespace RAMCloud {
 
-// Change 0 -> 1 in the following line to enable time tracing in
+// Change 0 -> 1 in the following line to compile detailed time tracing in
 // this driver.
 #define TIME_TRACE 0
+
+// Provides a cleaner way of invoking TimeTrace::record, with the code
+// conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
+// are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
+// frequently cast their 64-bit arguments into uint32_t explicitly: we will
+// help perform the casting internally.
+namespace {
+    inline void
+    timeTrace(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+}
+
+// Change 0 -> 1 in the following line to compile the code for collecting
+// detailed PerfStats metrics in this driver.
+#define COLLECT_LOW_LEVEL_PERFSTATS 1
 
 /**
  * Construct an InfUdDriver.
@@ -114,10 +137,10 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
             * MAX_DRAIN_TIME / 8.0);
     uint32_t maxPacketSize = getMaxPacketSize();
-    if (maxTransmitQueueSize < 2*maxPacketSize) {
+    if (maxTransmitQueueSize < 4*maxPacketSize) {
         // Make sure that we advertise enough space in the transmit queue to
         // prepare the next packet while the current one is transmitting.
-        maxTransmitQueueSize = 2*maxPacketSize;
+        maxTransmitQueueSize = 4*maxPacketSize;
     }
     LOG(NOTICE, "InfUdDriver bandwidth: %d Gbits/sec, maxTransmitQueueSize: "
             "%u bytes, maxPacketSize %u bytes", bandwidthGbps,
@@ -269,8 +292,7 @@ InfUdDriver::reapTransmitBuffers()
 {
 #define MAX_TO_RETRIEVE 100
     ibv_wc retArray[MAX_TO_RETRIEVE];
-    int numBuffers = infiniband->pollCompletionQueue(txcq,
-            MAX_TO_RETRIEVE, retArray);
+    int numBuffers = ibv_poll_cq(txcq, MAX_TO_RETRIEVE, retArray);
     for (int i = 0; i < numBuffers; i++) {
         BufferDescriptor* bd =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
@@ -339,6 +361,9 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
                         int priority,
                         TransmitQueueState* txQueueState)
 {
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t startTime = Cycles::rdtscp();
+#endif
     uint32_t totalLength = headerLen +
                            (payload ? payload->size() : 0);
     assert(totalLength <= getMaxPacketSize());
@@ -411,22 +436,24 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     if (bd->packetLength <= Infiniband::MAX_INLINE_DATA)
         workRequest.send_flags |= IBV_SEND_INLINE;
 
-#if TIME_TRACE
-    TimeTrace::record("before postSend in InfUdDriver");
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t prepareWorkRequest = Cycles::rdtscp();
 #endif
     ibv_send_wr *bad_txWorkRequest;
     if (ibv_post_send(qp->qp, &workRequest, &bad_txWorkRequest)) {
         LOG(WARNING, "Error posting transmit packet: %s", strerror(errno));
         txPool->freeBuffers.push_back(bd);
     }
-#if TIME_TRACE
-    TimeTrace::record("sent packet with %u bytes, %d free buffers",
-            totalLength, downCast<int>(txPool->freeBuffers.size()));
-#endif
     lastTransmitTime = Cycles::rdtsc();
+    timeTrace("sent packet with %u bytes, %u free buffers", totalLength,
+            txPool->freeBuffers.size());
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t ibvPostSend = Cycles::rdtscp();
+#endif
     queueEstimator.packetQueued(bd->packetLength, lastTransmitTime,
             txQueueState);
     PerfStats::threadStats.networkOutputBytes += bd->packetLength;
+    PerfStats::threadStats.networkOutputPackets++;
 
     // Every once in a while, see if we can reclaim used transmit buffers.
     // This code isn't strictly necessary, since we'll eventually reclaim
@@ -442,6 +469,16 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
         reapTransmitBuffers();
         sendsSinceLastReap = 0;
     }
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t stopTime = Cycles::rdtscp();
+    PerfStats::threadStats.infudDriverTxCycles += stopTime - startTime;
+    PerfStats::threadStats.infudDriverTxPrepareCycles +=
+            prepareWorkRequest - startTime;
+    PerfStats::threadStats.infudDriverTxPostSendCycles +=
+            ibvPostSend - prepareWorkRequest;
+    PerfStats::threadStats.infudDriverTxPostProcessCycles +=
+            stopTime - ibvPostSend;
+#endif
 }
 
 /*
@@ -451,22 +488,27 @@ void
 InfUdDriver::receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets)
 {
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t startTime = Cycles::rdtscp();
+#endif
     static const int MAX_COMPLETIONS = 50;
     ibv_wc wc[MAX_COMPLETIONS];
     uint32_t maxToReceive = (maxPackets < MAX_COMPLETIONS) ? maxPackets
             : MAX_COMPLETIONS;
-    int numPackets = infiniband->pollCompletionQueue(qp->rxcq,
-            maxToReceive, wc);
+    int numPackets = ibv_poll_cq(qp->rxcq, maxToReceive, wc);
     if (numPackets <= 0) {
         if (numPackets < 0) {
-            LOG(ERROR, "pollCompletionQueue failed with result %d", numPackets);
+            LOG(ERROR, "ibv_poll_cq failed with result %d", numPackets);
         }
         return;
     }
 #if TIME_TRACE
     TimeTrace::record(context->dispatch->currentTime,
             "start of poller loop");
-    TimeTrace::record("InfUdDriver received %d packets", numPackets);
+#endif
+    timeTrace("InfUdDriver received %d packets", numPackets);
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t ibvPollCq = Cycles::rdtscp();
 #endif
 
     // First, prefetch the initial bytes of all the incoming packets. This
@@ -480,9 +522,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
                 incoming->byte_len > 256 ? 256 : incoming->byte_len);
     }
     refillReceiver();
-#if TIME_TRACE
-    TimeTrace::record("receive queue refilled");
-#endif
+    timeTrace("receive queue refilled");
 
     rxBuffersInHca -= numPackets;
     if (rxBuffersInHca == 0) {
@@ -490,6 +530,9 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
                 "out of packet buffers; could result in dropped packets");
     }
 
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t startProcessPacket = Cycles::rdtscp();
+#endif
     // Each iteration of the following loop processes one incoming packet.
     for (int i = 0; i < numPackets; i++) {
         ibv_wc* incoming = &wc[i];
@@ -510,6 +553,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         }
 
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
+        PerfStats::threadStats.networkInputPackets++;
         if (localMac) {
             EthernetHeader* ethHdr = reinterpret_cast<EthernetHeader*>(
                     bd->buffer);
@@ -534,8 +578,15 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         SpinLock::Guard guard(mutex);
         rxPool->freeBuffers.push_back(bd);
     }
-#if TIME_TRACE
-    TimeTrace::record("InfUdDriver::receivePackets done");
+    timeTrace("InfUdDriver::receivePackets done");
+#if COLLECT_LOW_LEVEL_PERFSTATS
+    uint64_t stopTime = Cycles::rdtscp();
+    PerfStats::threadStats.infudDriverRxCycles += stopTime - startTime;
+    PerfStats::threadStats.infudDriverRxPollCqCycles += ibvPollCq - startTime;
+    PerfStats::threadStats.infudDriverRxRefillCycles +=
+            startProcessPacket - ibvPollCq;
+    PerfStats::threadStats.infudDriverRxProcessPacketCycles +=
+            stopTime - startProcessPacket;
 #endif
 }
 

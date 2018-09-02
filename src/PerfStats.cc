@@ -121,8 +121,28 @@ PerfStats::collectStats(PerfStats* total)
         total->migrationPhase1Cycles += stats->migrationPhase1Cycles;
         total->networkInputBytes += stats->networkInputBytes;
         total->networkOutputBytes += stats->networkOutputBytes;
-
+        total->networkInputPackets += stats->networkInputPackets;
+        total->networkOutputPackets += stats->networkOutputPackets;
 #define COLLECT(x) total->x += stats->x
+        COLLECT(basicTransportActiveCycles);
+        COLLECT(basicTransportHandlePacketCycles);
+        COLLECT(basicTransportReceiveCycles);
+        COLLECT(basicTransportInputPackets);
+        COLLECT(basicTransportInputDataBytes);
+        COLLECT(basicTransportSendDataCycles);
+        COLLECT(basicTransportSendControlCycles);
+        COLLECT(basicTransportOutputControlPackets);
+        COLLECT(basicTransportOutputControlBytes);
+        COLLECT(basicTransportOutputDataPackets);
+        COLLECT(basicTransportOutputDataBytes);
+        COLLECT(infudDriverTxCycles);
+        COLLECT(infudDriverTxPrepareCycles);
+        COLLECT(infudDriverTxPostSendCycles);
+        COLLECT(infudDriverTxPostProcessCycles);
+        COLLECT(infudDriverRxCycles);
+        COLLECT(infudDriverRxPollCqCycles);
+        COLLECT(infudDriverRxRefillCycles);
+        COLLECT(infudDriverRxProcessPacketCycles);
         COLLECT(millisortTime);
         COLLECT(millisortInitItems);
         COLLECT(millisortFinalItems);
@@ -210,11 +230,11 @@ PerfStats::collectStats(PerfStats* total)
  *      The string ends in a newline character.
  */
 string
-PerfStats::printClusterStats(Buffer* first, Buffer* second)
+PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
 {
     string result;
     Diff diff;
-    clusterDiff(first, second, &diff);
+    clusterDiff(first, second, numServers, &diff);
     if (diff["serverId"].size() == 0) {
         return "Insufficient PerfStats data\n";
     }
@@ -234,7 +254,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             topColumn.c_str()).c_str());
 //    result.append(format("%-40s %s\n", "Server index",
 //            formatMetric(&diff, "serverId", " %8.0f").c_str()));
-/*
+
     result.append(format("%-40s %s\n", "Elapsed time (sec)",
             formatMetricRatio(&diff, "collectionTime", "cyclesPerSecond",
             " %8.3f").c_str()));
@@ -244,7 +264,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "Worker load factor",
             formatMetricRatio(&diff, "workerActiveCycles", "collectionTime",
             " %8.3f").c_str()));
-
+/*
     result.append("\nReads:\n");
     result.append(format("%-40s %s\n", "  Objects read (K)",
             formatMetric(&diff, "readCount", " %8.1f", 1e-3).c_str()));
@@ -377,7 +397,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  P1 load factor",
             formatMetricRatio(&diff, "migrationPhase1Cycles",
             "collectionTime", " %8.3f").c_str()));
-
+*/
     result.append("\nNetwork:\n");
     result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
             formatMetricRate(&diff, "networkInputBytes",
@@ -385,7 +405,111 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
             formatMetricRate(&diff, "networkOutputBytes",
             " %8.2f", 1e-6).c_str()));
-*/
+    result.append(format("%-40s %s\n", "  Input packets (Mpps)",
+            formatMetricRate(&diff, "networkInputPackets",
+            " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Output packets (Mpps)",
+            formatMetricRate(&diff, "networkOutputPackets",
+            " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Average input packet size (B)",
+            formatMetricRatio(&diff, "networkInputBytes",
+            "networkInputPackets", " %8.1f").c_str()));
+    result.append(format("%-40s %s\n", "  Average output packet size (B)",
+            formatMetricRatio(&diff, "networkOutputBytes",
+            "networkOutputPackets", " %8.1f").c_str()));
+
+    auto perItemCostComputer = [] (vector<double>& v) {
+        return v[1] < 1 ? 0 : v[0]/(v[1]*v[2]);
+    };
+    result.append("\nTransport:\n");
+    result.append(format("%-40s %s\n", "  Basic load factor",
+            formatMetricRatio(&diff, "basicTransportActiveCycles",
+            "collectionTime", " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "  Basic input data bytes (MB/s)",
+            formatMetricRate(&diff, "basicTransportInputDataBytes",
+            "basicTransportActiveCycles", " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Basic output data bytes (MB/s)",
+            formatMetricRate(&diff, "basicTransportOutputDataBytes",
+            "basicTransportActiveCycles", " %8.2f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "  Basic active time (sec)",
+            formatMetricRatio(&diff, "basicTransportActiveCycles",
+            "cyclesPerSecond", " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    Basic send data packets (%)",
+            formatMetricRatio(&diff, "basicTransportSendDataCycles",
+            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "      Cost per packet  (ns)",
+            formatMetricLambda(&diff, perItemCostComputer,
+            {"basicTransportSendDataCycles", "basicTransportOutputDataPackets",
+            "cyclesPerNanos"}, " %8.1f").c_str()));
+    result.append(format("%-40s %s\n", "      Packets (M)",
+            formatMetric(&diff, "basicTransportOutputDataPackets",
+            " %8.3f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "      Avg. packet size (B)",
+            formatMetricRatio(&diff, "basicTransportOutputDataBytes",
+            "basicTransportOutputDataPackets", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "    Basic send control packets (%)",
+            formatMetricRatio(&diff, "basicTransportSendControlCycles",
+            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "      Cost per packet (ns)",
+            formatMetricLambda(&diff, perItemCostComputer,
+            {"basicTransportSendControlCycles", "basicTransportOutputControlPackets",
+            "cyclesPerNanos"}, " %8.1f").c_str()));
+    result.append(format("%-40s %s\n", "      Packets (M)",
+            formatMetric(&diff, "basicTransportOutputControlPackets",
+            " %8.3f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "      Avg. packet size (B)",
+            formatMetricRatio(&diff, "basicTransportOutputControlBytes",
+            "basicTransportOutputControlPackets", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "    Basic receive packets (%)",
+            formatMetricRatio(&diff, "basicTransportReceiveCycles",
+            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "      Cost per packet (ns)",
+            formatMetricLambda(&diff, perItemCostComputer,
+            {"basicTransportReceiveCycles", "basicTransportInputPackets",
+            "cyclesPerNanos"}, " %8.1f").c_str()));
+    result.append(format("%-40s %s\n", "      Packets (M)",
+            formatMetric(&diff, "basicTransportInputPackets",
+            " %8.3f", 1e-6).c_str()));
+    result.append(format("%-40s %s\n", "    Basic handle packets (%)",
+            formatMetricRatio(&diff, "basicTransportHandlePacketCycles",
+            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "      Cost per packet (ns)",
+            formatMetricLambda(&diff, perItemCostComputer,
+            {"basicTransportHandlePacketCycles", "basicTransportInputPackets",
+             "cyclesPerNanos"}, " %8.1f").c_str()));
+
+    // TODO: Perf. numbers in the driver section are not very trustworthy and
+    // require further investigation. The numbers tend to fluctuate a lot (!)
+    // between different nodes and different runs for unknown reasons.
+    result.append("\nDriver:\n");
+    result.append("===WARNING===: Performance numbers in this section need "
+            "further verification; they are not even stable across nodes "
+            "and/or runs.\n");
+    result.append(format("%-40s %s\n", "  infud send time (sec)",
+            formatMetricRatio(&diff, "infudDriverTxCycles", "cyclesPerSecond",
+            " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    prepare work request (%)",
+            formatMetricRatio(&diff, "infudDriverTxPrepareCycles",
+            "infudDriverTxCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "    ibv_post_send (%)",
+            formatMetricRatio(&diff, "infudDriverTxPostSendCycles",
+            "infudDriverTxCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "    post-processing (%)",
+            formatMetricRatio(&diff, "infudDriverTxPostProcessCycles",
+            "infudDriverTxCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "  infud recv time (sec)",
+            formatMetricRatio(&diff, "infudDriverRxCycles", "cyclesPerSecond",
+            " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    ibv_poll_cq (%)",
+            formatMetricRatio(&diff, "infudDriverRxPollCqCycles",
+            "infudDriverRxCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "    prefetch + refill (%)",
+            formatMetricRatio(&diff, "infudDriverRxRefillCycles",
+            "infudDriverRxCycles", " %8.1f", 100).c_str()));
+    result.append(format("%-40s %s\n", "    process packets (%)",
+            formatMetricRatio(&diff, "infudDriverRxProcessPacketCycles",
+            "infudDriverRxCycles", " %8.1f", 100).c_str()));
+
     // TODO: Arachne core util.
     result.append("\nMilliSort:\n");
     result.append("\n=== Total ===\n");
@@ -400,8 +524,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRatio(&diff, "millisortFinalItems",
             "millisortInitItems", " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Cost per item (ns)",
-            formatMetricLambda(&diff,
-            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            formatMetricLambda(&diff, perItemCostComputer,
             {"millisortTime", "millisortFinalItems", "cyclesPerNanos"},
             " %8.1f").c_str()));
     result.append(format("%-40s %s\n", "  Initial keys (MB)",
@@ -461,8 +584,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "localSortWorkers", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Cost per key (ns)",
-            formatMetricLambda(&diff,
-            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            formatMetricLambda(&diff, perItemCostComputer,
             {"localSortElapsedTime", "millisortInitItems", "cyclesPerNanos"},
             " %8.1f").c_str()));
 
@@ -485,8 +607,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRate(&diff, "millisortInitValueBytes",
             "rearrangeInitValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Cost per value (ns)",
-            formatMetricLambda(&diff,
-            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            formatMetricLambda(&diff, perItemCostComputer,
             {"rearrangeInitValuesElapsedTime", "millisortInitItems", "cyclesPerNanos"},
             " %8.1f").c_str()));
     result.append(format("%-40s %s\n", "  Slack time (pre. \"Shuffle Keys\") (us)",
@@ -685,8 +806,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
             formatMetricRate(&diff, "millisortFinalValueBytes",
             "rearrangeFinalValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Cost per value (ns)",
-            formatMetricLambda(&diff,
-            [] (vector<double>& v) { return v[0]/(v[1]*v[2]); },
+            formatMetricLambda(&diff, perItemCostComputer,
             {"rearrangeFinalValuesElapsedTime", "millisortFinalItems", "cyclesPerNanos"},
             " %8.1f").c_str()));
 
@@ -704,6 +824,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
  * \param after
  *      Response buffer from a later call to
  *      CoordinatorClient::serverControlAll.
+ * \param numServers
+ *      # servers that participate in the experiment. They must appear first
+ *      in the two perfstats buffers.
  * \param[out] diff
  *      Contents are replaced with information about how much each
  *      performance metric changed between the before and after
@@ -711,7 +834,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
  *      on the format of this information.
  */
 void
-PerfStats::clusterDiff(Buffer* before, Buffer* after,
+PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         PerfStats::Diff* diff)
 {
     // First, parse each of the two readings.
@@ -730,6 +853,11 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         PerfStats& p2 = secondStats[i];
         if ((p1.collectionTime == 0) || (p2.collectionTime == 0)){
             continue;
+        }
+
+        // Ignore servers that don't participate in the experiment.
+        if (static_cast<int>((*diff)["serverId"].size()) == numServers) {
+            break;
         }
 
 #define ADD_METRIC(metric) \
@@ -779,6 +907,27 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(migrationPhase1Cycles);
         ADD_METRIC(networkInputBytes);
         ADD_METRIC(networkOutputBytes);
+        ADD_METRIC(networkInputPackets);
+        ADD_METRIC(networkOutputPackets);
+        ADD_METRIC(basicTransportActiveCycles);
+        ADD_METRIC(basicTransportHandlePacketCycles);
+        ADD_METRIC(basicTransportReceiveCycles);
+        ADD_METRIC(basicTransportInputPackets);
+        ADD_METRIC(basicTransportInputDataBytes);
+        ADD_METRIC(basicTransportSendDataCycles);
+        ADD_METRIC(basicTransportSendControlCycles);
+        ADD_METRIC(basicTransportOutputControlPackets);
+        ADD_METRIC(basicTransportOutputControlBytes);
+        ADD_METRIC(basicTransportOutputDataPackets);
+        ADD_METRIC(basicTransportOutputDataBytes);
+        ADD_METRIC(infudDriverTxCycles);
+        ADD_METRIC(infudDriverTxPrepareCycles);
+        ADD_METRIC(infudDriverTxPostSendCycles);
+        ADD_METRIC(infudDriverTxPostProcessCycles);
+        ADD_METRIC(infudDriverRxCycles);
+        ADD_METRIC(infudDriverRxPollCqCycles);
+        ADD_METRIC(infudDriverRxRefillCycles);
+        ADD_METRIC(infudDriverRxProcessPacketCycles);
         ADD_METRIC(millisortTime);
         ADD_METRIC(millisortInitItems);
         ADD_METRIC(millisortFinalItems);

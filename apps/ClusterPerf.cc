@@ -7421,15 +7421,19 @@ allShuffle()
         }
     }
 
-    ServerId rootServer(1, 0);
+    // Start performance counters.
+    cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
+
     printf("#%12s%12s%12s%16s%20s\n", "nodes", "bytes/node", "ops",
             "latency (us)", "throughput (MB/s)");
     printf("#------------------------------------------------------------------"
             "------\n");
 
     // Sweep machineCount from 1 to numMasters.
+    string perfstats;
     for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
         // Initialize the millisort service.
+        ServerId rootServer(1, 0);
         InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
@@ -7439,6 +7443,11 @@ allShuffle()
         BenchmarkCollectiveOpRpc warmup(context, 10, WireFormat::ALL_SHUFFLE, 0);
         warmup.wait();
 
+        // Take a PerfStats snapshot before the experiment.
+        Buffer statsBefore, statsAfter;
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsBefore);
+
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
                 objectSize);
@@ -7447,7 +7456,15 @@ allShuffle()
         double throughput = double(objectSize) / latency;
         printf(" %12d%12d%12d%16.2f%20.2f\n", machineCount, objectSize, count,
                 latency, throughput);
+
+        // Take another PerfStats snapshot after the experiment.
+        cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
+                &statsAfter);
+        perfstats += PerfStats::printClusterStats(&statsBefore, &statsAfter,
+                machineCount);
+        perfstats += "\n\n";
     }
+    printf("%s", perfstats.c_str());
 }
 
 // The following struct and table define each performance test in terms of

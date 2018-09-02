@@ -1004,9 +1004,9 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             break;
         }
         case ALLSHUFFLE_BENCHMARK: {
-            static char data[Transport::MAX_RPC_LEN];
-            if (reqHdr->dataSize <= arrayLength(data)) {
-                rpc->replyPayload->appendExternal(data, reqHdr->dataSize);
+            if (reqHdr->dataSize <= Transport::MAX_RPC_LEN) {
+                rpc->replyPayload->appendExternal(
+                        context->masterZeroCopyRegion, reqHdr->dataSize);
             } else {
                 respHdr->common.status = STATUS_INVALID_PARAMETER;
             }
@@ -1057,7 +1057,7 @@ MilliSortService::benchmarkCollectiveOp(
             auto merger = [&bytesReceived] (int _, Buffer* dataBuffer) {
                 bytesReceived.fetch_add(dataBuffer->size());
                 // Copy the pulled data into contiguous space.
-                dataBuffer->getRange(0, dataBuffer->size());
+//                dataBuffer->getRange(0, dataBuffer->size());
             };
 
             std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(

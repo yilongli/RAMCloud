@@ -112,6 +112,7 @@ SegmentManager::SegmentManager(Context* context,
     // buffer when running Homa benchmarks.
     context->masterZeroCopyRegion = allocator.getBaseAddress();
 #endif
+    context->masterZeroCopyRegion = allocator.getBaseAddress();
 }
 
 /**

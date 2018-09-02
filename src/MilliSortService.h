@@ -148,8 +148,7 @@ class MilliSortService : public Service {
         int firstNotReady = 0;
         std::vector<bool> completed(numNodes);
         while (completedRpcs < numNodes) {
-            if ((sentRpcs < numNodes) &&
-                    (outstandingRpcs < maxRpcs)) {
+            if ((sentRpcs < numNodes) && (outstandingRpcs < maxRpcs)) {
                 ServerId target = group->getNode(group->rank + 1 + sentRpcs);
                 pullRpcs[sentRpcs].construct(context, target, group->rank,
                         dataId, numBytes);

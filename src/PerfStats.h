@@ -229,6 +229,68 @@ struct PerfStats {
     /// Total bytes transmitted on the network by all transports.
     uint64_t networkOutputBytes;
 
+    /// Total packets received from the network via all transports.
+    uint64_t networkInputPackets;
+
+    /// Total packets transmitted on the network by all transports.
+    uint64_t networkOutputPackets;
+
+    // TODO: use only transportActiveCycles, driverTxCycles, and driverRxCycles
+    // across all transports and drivers?
+
+    /// Total rdtsc ticks spent in calls to BasicTransport::poll that did
+    /// useful work (if a call to Dispatch::poll found no useful work, then
+    /// it's execution time is excluded), BasicTransport::Session:sendRequest,
+    /// and BasicTransport::ServerRpc::sendReply.
+    uint64_t basicTransportActiveCycles;
+
+    /// Total rdtsc ticks spent in calls to BasicTransport::handlePacket, which
+    /// implements the protocol logic including the receiver-side scheduling
+    /// algorithm.
+    uint64_t basicTransportHandlePacketCycles;
+
+    /// Total time (in Cycles::rdtsc ticks) spent in receiving all packets.
+    uint64_t basicTransportReceiveCycles;
+
+    /// Total packets received from the network.
+    uint64_t basicTransportInputPackets;
+
+    /// Total bytes of data packets (including transport header) received from
+    /// the network.
+    uint64_t basicTransportInputDataBytes;
+
+    /// Total time (in Cycles::rdtsc ticks) spent in sending data packets.
+    uint64_t basicTransportSendDataCycles;
+
+    /// Total time (in Cycles::rdtsc ticks) spent in sending control packets.
+    uint64_t basicTransportSendControlCycles;
+
+    /// Total control packets transmitted on the network.
+    uint64_t basicTransportOutputControlPackets;
+
+    /// Total bytes of control packets transmitted on the network.
+    uint64_t basicTransportOutputControlBytes;
+
+    /// Total data packets transmitted on the network.
+    uint64_t basicTransportOutputDataPackets;
+
+    /// Total bytes of data packets (including transport header) transmitted
+    /// on the network.
+    uint64_t basicTransportOutputDataBytes;
+
+    uint64_t infudDriverTxCycles;
+    uint64_t infudDriverTxPrepareCycles;
+    uint64_t infudDriverTxPostSendCycles;
+    uint64_t infudDriverTxPostProcessCycles;
+
+    uint64_t infudDriverRxCycles;
+    uint64_t infudDriverRxPollCqCycles;
+    uint64_t infudDriverRxRefillCycles;
+    uint64_t infudDriverRxProcessPacketCycles;
+
+    // TODO?
+//    uint64_t infudDriverReleaseCycles;
+
     //--------------------------------------------------------------------
     // Statistics for space used by log in memory and backups.
     // Note: these are NOT counter based statistics.
@@ -458,10 +520,11 @@ struct PerfStats {
             double scale = 1.0);
     static string formatMetricRatio(Diff* diff, const char* metric1,
             const char* metric2, const char* formatString, double scale = 1.0);
-    static void clusterDiff(Buffer* before, Buffer* after,
+    static void clusterDiff(Buffer* before, Buffer* after, int numServers,
             PerfStats::Diff* diff);
     static void collectStats(PerfStats* total);
-    static string printClusterStats(Buffer* first, Buffer* second);
+    static string printClusterStats(Buffer* first, Buffer* second,
+            int numServers = -1);
     static void registerStats(PerfStats* stats);
 
     /// The following thread-local variable is used to access the statistics
