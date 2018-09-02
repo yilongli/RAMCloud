@@ -384,6 +384,8 @@ struct PerfStats {
 
     uint64_t shuffleKeysReceivedRpcs;
 
+    uint64_t shuffleKeysCopyResponseCycles;
+
     uint64_t onlineMergeSortStartTime;
 
     uint64_t onlineMergeSortElapsedTime;
@@ -402,9 +404,7 @@ struct PerfStats {
 
     uint64_t shuffleValuesReceivedRpcs;
 
-    uint64_t bucketSortMergeKeyCycles;
-
-    uint64_t bucketSortMergeValueCycles;
+    uint64_t shuffleValuesCopyResponseCycles;
 
     uint64_t rearrangeFinalValuesStartTime;
 

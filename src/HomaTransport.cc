@@ -1738,6 +1738,7 @@ HomaTransport::MessageAccumulator::MessageAccumulator(HomaTransport* t,
     , totalLength(totalLength)
 {
     assert(buffer->size() == 0);
+    buffer->reserve(totalLength);
 }
 
 /**
@@ -1805,23 +1806,22 @@ HomaTransport::MessageAccumulator::addPacket(DataHeader *header,
         // Each iteration of the following loop appends one fragment to
         // the buffer.
         MessageFragment fragment(header, length);
-        do {
+        while (true) {
             char* payload = reinterpret_cast<char*>(fragment.header);
-            Driver::PayloadChunk::appendToBuffer(buffer,
-                    payload + sizeof32(DataHeader), fragment.length,
-                    t->driver, payload);
+            buffer->appendCopy(payload + sizeof32(DataHeader), fragment.length);
+            if (header != fragment.header) {
+                t->driver->release(fragment.header);
+            }
             FragmentMap::iterator it = fragments.find(buffer->size());
             if (it == fragments.end()) {
-                return true;
+                break;
             } else {
                 fragment = it->second;
                 fragments.erase(it);
             }
-        } while (true);
-    } else {
-        // This packet is redundant.
-        return false;
+        }
     }
+    return false;
 }
 
 /**

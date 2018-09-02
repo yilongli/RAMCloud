@@ -13,7 +13,6 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include "MilliSortClient.h"
 #include "MilliSortService.h"
 #include "AllGather.h"
 #include "AllShuffle.h"
@@ -98,12 +97,15 @@ MilliSortService::MilliSortService(Context* context,
     , sortedKeys()
     , sortedValues()
     , numSortedItems(0)
+    , printingResult()
     , valueStartIdx()
     , localPivots()
     , rearrangeLocalVals()
     , dataBucketBoundaries()
     , dataBucketRanges()
     , dataBucketRangesDone(false)
+    , pullKeyRpcs()
+    , pullValueRpcs()
     , mergeSorter()
     , world()
     , myPivotServerGroup()
@@ -289,17 +291,24 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                 downCast<uint32_t>(i));
         new(&values[i]) Value(key);
     }
+
+    while (printingResult) {
+        Arachne::yield();
+    }
     numSortedItems = 0;
-    sortedKeys.reset(new PivotKey[numDataTuples * 2]);
-    sortedValues.reset(new Value[numDataTuples * 2]);
+#define MAX_IMBALANCE_RATIO 2
+    sortedKeys = NULL;
+    sortedValues.reset(new Value[numDataTuples * MAX_IMBALANCE_RATIO]);
     valueStartIdx.clear();
-    valueStartIdx.insert(valueStartIdx.begin(), world->size() + 1, 0);
+    valueStartIdx.insert(valueStartIdx.begin(), world->size(), 0);
 
     //
     localPivots.clear();
     dataBucketBoundaries.clear();
     dataBucketRanges.clear();
     dataBucketRangesDone.store(false);
+    pullKeyRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
+    pullValueRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
     gatheredPivots.clear();
     superPivots.clear();
@@ -453,8 +462,10 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
         // Allocate an auxilary array to hold the reordered values temporarily.
         Value* nextValue = dest + startIdx;
         for (int i = startIdx; i < startIdx + n; i++) {
+            // Note: it's OK to leave the stale value in keys[i].index because
+            // after rearrangement, the correspondence between keys and values
+            // is trivial (ie. keys[i] -> values[i]).
             std::memcpy(nextValue, &values[keys[i].index], Value::SIZE);
-            keys[i].index = uint32_t(i - startIdx);
             nextValue++;
         }
         uint64_t endTime = Cycles::rdtsc();
@@ -789,7 +800,6 @@ MilliSortService::allGatherDataBucketBoundaries()
         int numKeys = 0;
         int oldKeyIdx = keyIdx;
         while ((keyIdx < numDataTuples) && (keys[keyIdx] <= rightBound)) {
-            keys[keyIdx].index = static_cast<uint32_t>(numKeys);
             numKeys++;
             keyIdx++;
         }
@@ -816,20 +826,19 @@ MilliSortService::shuffleKeys() {
     // Merge keys from other nodes into a sorted array as they arrive.
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
     std::atomic<int> sortedItemCnt(0);
-    auto keyMerger = [this, &sortedItemCnt] (ServerId fromServer,
-            Buffer* keyBuffer)
+    auto keyMerger = [this, &sortedItemCnt] (int serverRank, Buffer* keyBuffer)
     {
-        SCOPED_TIMER(bucketSortMergeKeyCycles);
+        SCOPED_TIMER(shuffleKeysCopyResponseCycles);
         ADD_COUNTER(shuffleKeysInputBytes, keyBuffer->size());
         uint32_t numKeys = keyBuffer->size() / PivotKey::SIZE;
         int start = sortedItemCnt.fetch_add(numKeys);
-        valueStartIdx[fromServer.indexNumber()] = start;
-        // TODO: would it be better to merge the following two loops into one?
-        keyBuffer->copy(0, keyBuffer->size(), &sortedKeys[start]);
-        for (int i = start; i < start + int(numKeys); i++) {
-            sortedKeys[i].index = uint32_t(i);
+        valueStartIdx[serverRank] = start;
+        PivotKey* newKeys = static_cast<PivotKey*>(
+                keyBuffer->getRange(0, keyBuffer->size()));
+        for (uint32_t i = 0; i < numKeys; i++) {
+            newKeys[i].index = uint32_t(start) + i;
         }
-        mergeSorter->poll(&sortedKeys[start], numKeys);
+        mergeSorter->poll(newKeys, numKeys);
         timeTrace("merged %u keys, %u bytes", numKeys, keyBuffer->size());
     };
 
@@ -838,35 +847,30 @@ MilliSortService::shuffleKeys() {
     int outstandingRpcs = 0;
     int completedRpcs = 0;
     int sentRpcs = 0;
-    Tub<ShufflePullRpc> outgoingRpcs[MAX_OUTSTANDING_RPCS];
-    ServerId targetServers[MAX_OUTSTANDING_RPCS];
-    std::vector<int> freeTubs;
-    for (int i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
-        freeTubs.push_back(i);
-    }
+    int firstNotReady = 0;
+    std::vector<bool> completed(world->size());
     while (completedRpcs < world->size()) {
         if ((sentRpcs < world->size()) &&
                 (outstandingRpcs < MAX_OUTSTANDING_RPCS)) {
-            ServerId target = world->getNode(world->rank + sentRpcs + 1);
-            int slot = freeTubs.back();
-            freeTubs.pop_back();
-            targetServers[slot] = target;
-            outgoingRpcs[slot].construct(context, target, world->rank,
+            ServerId target = world->getNode(world->rank + 1 + sentRpcs);
+            pullKeyRpcs[sentRpcs].construct(context, target, world->rank,
                     ALLSHUFFLE_KEY);
             sentRpcs++;
             outstandingRpcs++;
         }
 
-        int slot = 0;
-        for (auto& rpc : outgoingRpcs) {
-            if (rpc && rpc->isReady()) {
-                keyMerger(targetServers[slot], rpc->wait());
-                freeTubs.push_back(slot);
-                rpc.destroy();
+        for (int i = firstNotReady; i < sentRpcs; i++) {
+            ShufflePullRpc* rpc = pullKeyRpcs[i].get();
+            if (!completed[i] && rpc->isReady()) {
+                keyMerger((world->rank + i + 1) % world->size(), rpc->wait());
+                if (i == firstNotReady) {
+                    firstNotReady++;
+                }
                 completedRpcs++;
+                completed[i] = true;
                 outstandingRpcs--;
             }
-            slot++;
+
         }
         Arachne::yield();
     }
@@ -886,15 +890,15 @@ MilliSortService::shuffleValues()
     START_TIMER(shuffleValuesElapsedTime);
 
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
-    auto valueMerger = [this] (ServerId fromServer, Buffer* valueBuffer) {
-        SCOPED_TIMER(bucketSortMergeValueCycles);
+    auto valueMerger = [this] (int serverId, Buffer* valueBuffer) {
+        SCOPED_TIMER(shuffleValuesCopyResponseCycles);
         ADD_COUNTER(shuffleValuesInputBytes, valueBuffer->size());
         uint32_t numValues = valueBuffer->size() / Value::SIZE;
-        uint32_t serverId = fromServer.indexNumber();
         int start = valueStartIdx[serverId];
+        // TODO: eliminate this copy
         valueBuffer->copy(0, valueBuffer->size(), &sortedValues[start]);
-        timeTrace("merged %u values from serverId %u, %u bytes", numValues,
-                serverId, valueBuffer->size());
+        timeTrace("merged %u values from serverId %d, %u bytes", numValues,
+                serverId+1, valueBuffer->size());
     };
 
     bool mergeSortCompleted = false;
@@ -907,55 +911,45 @@ MilliSortService::shuffleValues()
         }
 
         mergeSortCompleted = true;
+        sortedKeys = mergeSorter->getSortedArray().data;
+        assert(int(mergeSorter->getSortedArray().size) == numSortedItems);
         ADD_COUNTER(onlineMergeSortStartTime,
                 mergeSorter->startTime - startTime);
         ADD_COUNTER(onlineMergeSortElapsedTime,
                 mergeSorter->stopTick - mergeSorter->startTime);
         ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
         timeTrace("sorted %d final keys", numSortedItems);
-        // FIXME: is the following copy necessary?
-        auto sortedArray = mergeSorter->getSortedArray();
-        memcpy(sortedKeys.get(), sortedArray.data,
-                sortedArray.size * PivotKey::SIZE);
-        assert(int(sortedArray.size) == numSortedItems);
-        timeTrace("copied %d final keys", numSortedItems);
         return true;
     };
 
     int outstandingRpcs = 0;
     int completedRpcs = 0;
     int sentRpcs = 0;
-    Tub<ShufflePullRpc> outgoingRpcs[MAX_OUTSTANDING_RPCS];
-    ServerId targetServers[MAX_OUTSTANDING_RPCS];
-    std::vector<int> freeTubs;
-    for (int i = 0; i < MAX_OUTSTANDING_RPCS; i++) {
-        freeTubs.push_back(i);
-    }
+    int firstNotReady = 0;
+    std::vector<bool> completed(world->size());
     while (completedRpcs < world->size()) {
         if ((sentRpcs < world->size()) &&
                 (outstandingRpcs < MAX_OUTSTANDING_RPCS)) {
-            ServerId target = world->getNode(world->rank + sentRpcs + 1);
-            int slot = freeTubs.back();
-            freeTubs.pop_back();
-            targetServers[slot] = target;
-            outgoingRpcs[slot].construct(context, target, world->rank,
+            ServerId target = world->getNode(world->rank + 1 + sentRpcs);
+            pullValueRpcs[sentRpcs].construct(context, target, world->rank,
                     ALLSHUFFLE_VALUE);
             sentRpcs++;
             outstandingRpcs++;
         }
 
-        int slot = 0;
-        for (auto& rpc : outgoingRpcs) {
-            if (rpc && rpc->isReady()) {
-                valueMerger(targetServers[slot], rpc->wait());
-                freeTubs.push_back(slot);
-                rpc.destroy();
+        for (int i = firstNotReady; i < sentRpcs; i++) {
+            ShufflePullRpc* rpc = pullValueRpcs[i].get();
+            if (!completed[i] && rpc->isReady()) {
+                valueMerger((world->rank + i + 1) % world->size(), rpc->wait());
+                if (i == firstNotReady) {
+                    firstNotReady++;
+                }
                 completedRpcs++;
+                completed[i] = true;
                 outstandingRpcs--;
             }
-            slot++;
-        }
 
+        }
         mergeSortIsReady();
         Arachne::yield();
     }
@@ -969,8 +963,8 @@ MilliSortService::shuffleValues()
     while (!mergeSortIsReady()) {
         RAMCLOUD_CLOG(WARNING, "Failed to hide mergesort within value shuffle");
     }
-    rearrangeValues(sortedKeys.get(), sortedValues.get(), numSortedItems,
-            false).wait(&sortedValues);
+    rearrangeValues(sortedKeys, sortedValues.get(), numSortedItems, false)
+            .wait(&sortedValues);
 
     // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
     if (world->rank > 0) {
@@ -979,22 +973,25 @@ MilliSortService::shuffleValues()
     ADD_COUNTER(millisortFinalItems, numSortedItems);
     timeTrace("millisort finished");
 
+    printingResult = true;
     ongoingMilliSort.load()->sendReply();
     ongoingMilliSort = NULL;
 
 #if LOG_FINAL_RESULT
+    LOG(NOTICE, "numSortedItems = %d", numSortedItems);
     string result;
     for (int i = 0; i < numSortedItems; i++) {
-        result += std::to_string(sortedKeys[i].keyAsUint64()) + ":" +
-                std::to_string(sortedValues[i].asUint64());
+        result += std::to_string(sortedKeys[i].keyAsUint64());
+        result += ":";
+        result += std::to_string(sortedValues[i].asUint64());
         result += " ";
-        if (i % 100 == 0) {
+        if (i % 1000 == 0) {
             Arachne::yield();
         }
     }
-    Arachne::yield();
     LOG(NOTICE, "final result: %s", result.c_str());
 #endif
+    printingResult = false;
 }
 
 void
