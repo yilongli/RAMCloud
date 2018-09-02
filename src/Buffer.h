@@ -282,6 +282,8 @@ class Buffer {
         return result;
     }
 
+    void reserve(uint32_t numBytes);
+
     virtual void reset();
 
     /**

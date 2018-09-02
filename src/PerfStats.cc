@@ -165,6 +165,7 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(shuffleKeysOutputBytes);
         COLLECT(shuffleKeysReceivedRpcs);
         COLLECT(shuffleKeysSentRpcs);
+        COLLECT(shuffleKeysCopyResponseCycles);
         COLLECT(onlineMergeSortStartTime);
         COLLECT(onlineMergeSortElapsedTime);
         COLLECT(onlineMergeSortWorkers);
@@ -174,8 +175,7 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(shuffleValuesOutputBytes);
         COLLECT(shuffleValuesReceivedRpcs);
         COLLECT(shuffleValuesSentRpcs);
-        COLLECT(bucketSortMergeKeyCycles);
-        COLLECT(bucketSortMergeValueCycles);
+        COLLECT(shuffleValuesCopyResponseCycles);
         COLLECT(rearrangeFinalValuesStartTime);
         total->rearrangeFinalValuesElapsedTime = std::max(
                 total->rearrangeFinalValuesElapsedTime,
@@ -609,8 +609,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Avg. RPC size (KB)",
             formatMetricRatio(&diff, "shuffleKeysOutputBytes",
             "shuffleKeysReceivedRpcs", " %8.2f", 1e-3).c_str()));
-    result.append(format("%-40s %s\n", "  Merge CPU time (us)",
-            formatMetricRatio(&diff, "bucketSortMergeKeyCycles",
+    // TODO: # parallel shuffle key pullers
+    result.append(format("%-40s %s\n", "  Copy RPC response (us)",
+            formatMetricRatio(&diff, "shuffleKeysCopyResponseCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
 
     result.append("\n=== Online MergeSort (overlapped) ===\n");
@@ -660,8 +661,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second)
     result.append(format("%-40s %s\n", "  Avg. RPC size (KB)",
             formatMetricRatio(&diff, "shuffleValuesOutputBytes",
             "shuffleValuesReceivedRpcs", " %8.2f", 1e-3).c_str()));
-    result.append(format("%-40s %s\n", "  Merge CPU time (us)",
-            formatMetricRatio(&diff, "bucketSortMergeValueCycles",
+    // TODO: # parallel pullers
+    result.append(format("%-40s %s\n", "  Copy RPC response (us)",
+            formatMetricRatio(&diff, "shuffleValuesCopyResponseCycles",
             "cyclesPerMicros", " %8.0f").c_str()));
 
     result.append("\n=== Rearrange Values ===\n");
@@ -817,6 +819,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(shuffleKeysOutputBytes);
         ADD_METRIC(shuffleKeysReceivedRpcs);
         ADD_METRIC(shuffleKeysSentRpcs);
+        ADD_METRIC(shuffleKeysCopyResponseCycles);
         ADD_METRIC(onlineMergeSortStartTime);
         ADD_METRIC(onlineMergeSortElapsedTime);
         ADD_METRIC(onlineMergeSortWorkers);
@@ -826,8 +829,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after,
         ADD_METRIC(shuffleValuesOutputBytes);
         ADD_METRIC(shuffleValuesReceivedRpcs);
         ADD_METRIC(shuffleValuesSentRpcs);
-        ADD_METRIC(bucketSortMergeKeyCycles);
-        ADD_METRIC(bucketSortMergeValueCycles);
+        ADD_METRIC(shuffleValuesCopyResponseCycles);
         ADD_METRIC(rearrangeFinalValuesStartTime);
         ADD_METRIC(rearrangeFinalValuesElapsedTime);
         ADD_METRIC(rearrangeFinalValuesCycles);

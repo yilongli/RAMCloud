@@ -1009,7 +1009,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                 }
                 if (!clientRpc->accumulator) {
 //                    TimeTrace::record("received 1st pkt from shuffle rpc reply");
-                    clientRpc->accumulator.construct(this, clientRpc->response);
+                    clientRpc->accumulator.construct(this, clientRpc->response,
+                            uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         clientRpc->scheduledMessage.construct(
                                 clientRpc->rpcId, clientRpc->accumulator.get(),
@@ -1267,7 +1268,8 @@ BasicTransport::handlePacket(Driver::Received* received)
                     nextServerSequenceNumber++;
                     incomingRpcs[header->common.rpcId] = serverRpc;
                     serverRpc->accumulator.construct(this,
-                            &serverRpc->requestPayload);
+                            &serverRpc->requestPayload,
+                            uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
                         serverRpc->scheduledMessage.construct(
                                 serverRpc->rpcId, serverRpc->accumulator.get(),
@@ -1558,14 +1560,17 @@ BasicTransport::ServerRpc::sendReply()
  *      The complete message will be assembled here; caller should ensure
  *      that this is initially empty. The caller owns the storage for this
  *      and must ensure that it persists as long as this object persists.
+ * \param totalLength
+ *      Length of the message, in bytes.
  */
 BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
-        Buffer* buffer)
+        Buffer* buffer, uint32_t totalLength)
     : t(t)
     , buffer(buffer)
     , fragments()
 {
     assert(buffer->size() == 0);
+    buffer->reserve(totalLength);
 }
 
 /**
@@ -1633,7 +1638,7 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         // Each iteration of the following loop appends one fragment to
         // the buffer.
         MessageFragment fragment(header, length);
-        do {
+        while (true) {
             char* payload = reinterpret_cast<char*>(fragment.header);
             Driver::PayloadChunk::appendToBuffer(buffer,
                     payload + sizeof32(DataHeader), fragment.length,
@@ -1645,7 +1650,7 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                 fragment = it->second;
                 fragments.erase(it);
             }
-        } while (true);
+        }
     } else {
         // This packet is redundant.
         return false;

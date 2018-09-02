@@ -168,9 +168,10 @@ Service::handleRpc(Context* context, Rpc* rpc) {
         }
     } catch (ClientException& e) {
         if (rpc->worker->replySent) {
-            DIE("%s exception thrown after reply sent for %s RPC",
+            DIE("%s exception thrown after reply sent for %s RPC from %s",
                     statusToSymbol(e.status),
-                    WireFormat::opcodeSymbol(opcode));
+                    WireFormat::opcodeSymbol(opcode),
+                    e.where.str().c_str());
         } else {
             prepareErrorResponse(rpc->replyPayload, e.status);
         }
