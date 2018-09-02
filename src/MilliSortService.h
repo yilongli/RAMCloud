@@ -19,6 +19,7 @@
 #include "CommunicationGroup.h"
 #include "Context.h"
 #include "Dispatch.h"
+#include "MilliSortClient.h"
 #include "Service.h"
 #include "ServerConfig.h"
 #include "WorkerManager.h"
@@ -195,7 +196,8 @@ class MilliSortService : public Service {
         static const uint32_t SIZE = KEY_SIZE + 6;
 
         /// 32-bit index that supports more than 4 billion data tuples on each
-        /// server.
+        /// server. Note that we allow this pointer index to become stale after
+        /// #rearrangeValues to avoid the cost of rewriting it.
         uint32_t index;
 
         /// 16-bit serverId that supports up to 65536 nodes.
@@ -484,6 +486,10 @@ class MilliSortService : public Service {
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;
 
+    /// True if we haven't finished printing the result of the previous request.
+    /// Used to prevent concurrent write from a new InitMilliSort request.
+    std::atomic_bool printingResult;
+
     // FIXME: this is a bad name; besides, does it have to be class member?
     std::vector<int> valueStartIdx;
 
@@ -510,6 +516,12 @@ class MilliSortService : public Service {
     /// safely accessed by #shufflePull handler. Used to prevent data race on
     /// #dataBucketRanges.
     std::atomic_bool dataBucketRangesDone;
+
+    /// Outgoing RPCs used to implement the key shuffle stage.
+    std::unique_ptr<Tub<ShufflePullRpc>[]> pullKeyRpcs;
+
+    /// Outgoing RPCs used to implement the value shuffle stage.
+    std::unique_ptr<Tub<ShufflePullRpc>[]> pullValueRpcs;
 
     // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.
