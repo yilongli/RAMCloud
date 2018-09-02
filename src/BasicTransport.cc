@@ -43,6 +43,8 @@ namespace {
     }
 }
 
+#define DEBUG_SHUFFLE_PULL 1
+
 /**
  * Construct a new BasicTransport.
  * 
@@ -894,13 +896,14 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
         bytesSent = length;
-
-//        if (WireFormat::Opcode(
-//                request->getStart<WireFormat::RequestCommon>()->opcode) ==
-//            WireFormat::SHUFFLE_PULL) {
-//            TimeTrace::record("sent shuffle pull request");
-//        }
-
+#if DEBUG_SHUFFLE_PULL
+        if (WireFormat::Opcode(
+                request->getStart<WireFormat::RequestCommon>()->opcode) ==
+            WireFormat::SHUFFLE_PULL) {
+            TimeTrace::record("ShufflePull request completes, clientId %u, "
+                    "sequence %u", uint32_t(rpcId.clientId), uint32_t(rpcId.sequence));
+        }
+#endif
     } else {
         t->outgoingRequests.push_back(*clientRpc);
         t->maintainTopOutgoingMessages(&clientRpc->request);
@@ -1008,7 +1011,15 @@ BasicTransport::handlePacket(Driver::Received* received)
                     header = received->getOffset<DataHeader>(0);
                 }
                 if (!clientRpc->accumulator) {
-//                    TimeTrace::record("received 1st pkt from shuffle rpc reply");
+#if DEBUG_SHUFFLE_PULL
+                    if ((header->totalLength > 28000) && (header->totalLength < 32000)) {
+                        TimeTrace::record("ShufflePull response arrives, "
+                                "size %u, clientId %u, sequence %u",
+                                header->totalLength,
+                                uint32_t(header->common.rpcId.clientId),
+                                uint32_t(header->common.rpcId.sequence));
+                    }
+#endif
                     clientRpc->accumulator.construct(this, clientRpc->response,
                             uint32_t(header->totalLength));
                     if (header->totalLength > header->unscheduledBytes) {
@@ -1031,6 +1042,15 @@ BasicTransport::handlePacket(Driver::Received* received)
                         // truncate the response.
                         clientRpc->response->truncate(header->totalLength);
                     }
+#if DEBUG_SHUFFLE_PULL
+                    if ((header->totalLength > 28000) && (header->totalLength < 32000)) {
+                        TimeTrace::record("ShufflePull response completes, "
+                                "size %u, clientId %u, sequence %u",
+                                header->totalLength,
+                                uint32_t(header->common.rpcId.clientId),
+                                uint32_t(header->common.rpcId.sequence));
+                    }
+#endif
                     clientRpc->notifier->completed();
                     deleteClientRpc(clientRpc);
                 } else {
@@ -1238,6 +1258,15 @@ BasicTransport::handlePacket(Driver::Received* received)
 //                LOG(NOTICE, "%s from %s, request %p",
 //                        WireFormat::opcodeSymbol(&serverRpc->requestPayload),
 //                        received->sender->toString().c_str(), &serverRpc->requestPayload);
+#if DEBUG_SHUFFLE_PULL
+                if (serverRpc->requestPayload.getStart<WireFormat::RequestCommon>()->opcode
+                        == WireFormat::SHUFFLE_PULL) {
+                    TimeTrace::record("ShufflePull request received, "
+                            "clientId %u, sequence %u",
+                            uint32_t(header->common.rpcId.clientId),
+                            uint32_t(header->common.rpcId.sequence));
+                }
+#endif
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
@@ -1510,10 +1539,13 @@ BasicTransport::ServerRpc::sendReply()
 //    LOG(NOTICE, "send reply of %s to %s",
 //            WireFormat::opcodeSymbol(&requestPayload),
 //            response.recipient->toString().c_str());
-//    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
-//        TimeTrace::record("about to send back shuffle pull reply");
-//    }
-
+#if DEBUG_SHUFFLE_PULL
+    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
+        TimeTrace::record("ShufflePull response ready to send, size %u, "
+                "clientId %u, sequence %u", replyPayload.size(),
+                uint32_t(rpcId.clientId), uint32_t(rpcId.sequence));
+    }
+#endif
     uint32_t length = replyPayload.size();
     timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,

@@ -830,11 +830,14 @@ MilliSortService::shuffleKeys() {
     {
         SCOPED_TIMER(shuffleKeysCopyResponseCycles);
         ADD_COUNTER(shuffleKeysInputBytes, keyBuffer->size());
+        timeTrace("keyMerger invoked");
         uint32_t numKeys = keyBuffer->size() / PivotKey::SIZE;
         int start = sortedItemCnt.fetch_add(numKeys);
         valueStartIdx[serverRank] = start;
+        timeTrace("keyMerger: before getRange");
         PivotKey* newKeys = static_cast<PivotKey*>(
                 keyBuffer->getRange(0, keyBuffer->size()));
+        timeTrace("keyMerger: before rewrite index");
         for (uint32_t i = 0; i < numKeys; i++) {
             newKeys[i].index = uint32_t(start) + i;
         }
@@ -855,6 +858,7 @@ MilliSortService::shuffleKeys() {
             ServerId target = world->getNode(world->rank + 1 + sentRpcs);
             pullKeyRpcs[sentRpcs].construct(context, target, world->rank,
                     ALLSHUFFLE_KEY);
+            timeTrace("ShufflePull request initiated");
             sentRpcs++;
             outstandingRpcs++;
         }
@@ -895,7 +899,7 @@ MilliSortService::shuffleValues()
         ADD_COUNTER(shuffleValuesInputBytes, valueBuffer->size());
         uint32_t numValues = valueBuffer->size() / Value::SIZE;
         int start = valueStartIdx[serverId];
-        // TODO: eliminate this copy
+        // TODO: eliminate this copy?
         valueBuffer->copy(0, valueBuffer->size(), &sortedValues[start]);
         timeTrace("merged %u values from serverId %d, %u bytes", numValues,
                 serverId+1, valueBuffer->size());
@@ -940,7 +944,9 @@ MilliSortService::shuffleValues()
         for (int i = firstNotReady; i < sentRpcs; i++) {
             ShufflePullRpc* rpc = pullValueRpcs[i].get();
             if (!completed[i] && rpc->isReady()) {
-                valueMerger((world->rank + i + 1) % world->size(), rpc->wait());
+//                valueMerger((world->rank + i + 1) % world->size(), rpc->wait());
+                Arachne::createThread(valueMerger,
+                        (world->rank + i + 1) % world->size(), rpc->wait());
                 if (i == firstNotReady) {
                     firstNotReady++;
                 }
