@@ -77,7 +77,7 @@ class TreeBcast {
     }
 
     bool isReady();
-    void wait();
+    Buffer* wait();
 
   PRIVATE:
     void start();

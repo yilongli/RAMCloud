@@ -901,6 +901,7 @@ simple_tests = [
     Test("readNotFound", default),
     Test("millisort", millisort),
     Test("treeBcast", millisort),
+    Test("allShuffle", millisort),
 ]
 
 graph_tests = [

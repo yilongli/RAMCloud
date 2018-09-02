@@ -99,8 +99,11 @@ PRIVATE:
 class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
   public:
     BenchmarkCollectiveOpRpc(Context* context, int count, uint32_t opcode,
-            uint32_t dataSize);
+            uint32_t dataSize, bool fromClient = true);
     ~BenchmarkCollectiveOpRpc() {}
+
+    static void appendRequest(Buffer* request, int count, uint32_t opcode,
+            uint32_t dataSize, bool fromClient);
 
     /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
     uint64_t wait()
@@ -109,6 +112,9 @@ class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
         return response->getStart<
                 WireFormat::BenchmarkCollectiveOp::Response>()->elapsedTime;
     }
+
+    static const uint32_t responseHeaderLength =
+            sizeof(WireFormat::BenchmarkCollectiveOp::Response);
 
 PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(BenchmarkCollectiveOpRpc);
@@ -140,11 +146,11 @@ PRIVATE:
 class ShufflePullRpc : public ServerIdRpcWrapper {
   public:
     ShufflePullRpc(Context* context, ServerId serverId, int32_t senderId,
-            uint32_t dataId, Buffer* response = NULL);
+            uint32_t dataId, uint32_t dataSize = 0, Buffer* response = NULL);
     ~ShufflePullRpc() {}
 
     static void appendRequest(Buffer* request, int32_t senderId,
-            uint32_t dataId);
+            uint32_t dataId, uint32_t dataSize);
 
     Buffer* wait();
 

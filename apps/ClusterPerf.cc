@@ -7378,7 +7378,7 @@ treeBcast()
     }
 
     ServerId rootServer(1, 0);
-    printf("#%12s%12s%12s%12s\n", "nodes", "size (B)", "runs", "avg (us)");
+    printf("#%12s%12s%12s%12s\n", "nodes", "size (B)", "ops", "avg (us)");
     printf("#------------------------------------------------\n");
 
     // Sweep machineCount from 1 to numMasters.
@@ -7399,6 +7399,54 @@ treeBcast()
         uint64_t elapsedTime = rpc.wait();
         printf(" %12d%12d%12d%12.2f\n", machineCount, objectSize, count,
                 double(elapsedTime) / double(count));
+    }
+}
+
+void
+allShuffle()
+{
+    // Normally, cluster->serverList is NULL on clients. Get it from the
+    // coordinator.
+    ServerList serverList(context);
+    ProtoBuf::ServerList list;
+    CoordinatorClient::getServerList(context, &list);
+    serverList.applyServerList(list);
+
+    // Get the number of nodes to broadcast.
+    int numMasters = 0;
+    // FIXME: I doubt this is the best/correct way to get # masters...
+    for (uint32_t i = 0; i < serverList.size(); i++) {
+        if (serverList[i].isValid()) {
+            numMasters++;
+        }
+    }
+
+    ServerId rootServer(1, 0);
+    printf("#%12s%12s%12s%16s%20s\n", "nodes", "bytes/node", "ops",
+            "latency (us)", "throughput (MB/s)");
+    printf("#------------------------------------------------------------------"
+            "------\n");
+
+    // Sweep machineCount from 1 to numMasters.
+    for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
+        // Initialize the millisort service.
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+        auto initResp = initRpc.wait();
+        LOG(NOTICE, "Initialized %d millisort service nodes",
+                initResp->numNodesInited);
+
+        // Warmup
+        BenchmarkCollectiveOpRpc warmup(context, 10, WireFormat::ALL_SHUFFLE, 0);
+        warmup.wait();
+
+        // Start the experiment.
+        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
+                objectSize);
+        uint64_t elapsedTime = rpc.wait();
+        double latency = double(elapsedTime) / double(count);
+        double throughput = double(objectSize) / latency;
+        printf(" %12d%12d%12d%16.2f%20.2f\n", machineCount, objectSize, count,
+                latency, throughput);
     }
 }
 
@@ -7454,6 +7502,7 @@ TestInfo tests[] = {
     {"workloadThroughput", workloadThroughput},
     {"millisort", millisort},
     {"treeBcast", treeBcast},
+    {"allShuffle", allShuffle},
 };
 
 int

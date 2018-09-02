@@ -82,16 +82,24 @@ StartMilliSortRpc::appendRequest(Buffer* request, int requestId,
 }
 
 BenchmarkCollectiveOpRpc::BenchmarkCollectiveOpRpc(Context* context, int count,
-        uint32_t opcode, uint32_t dataSize)
+        uint32_t opcode, uint32_t dataSize, bool fromClient)
     : ServerIdRpcWrapper(context, ServerId(1, 0),
             sizeof(WireFormat::StartMilliSort::Response))
 {
+    appendRequest(&request, count, opcode, dataSize, fromClient);
+    send();
+}
+
+void
+BenchmarkCollectiveOpRpc::appendRequest(Buffer* request, int count,
+        uint32_t opcode, uint32_t dataSize, bool fromClient)
+{
     WireFormat::BenchmarkCollectiveOp::Request* reqHdr(
-            allocHeader<WireFormat::BenchmarkCollectiveOp>());
+            allocHeader<WireFormat::BenchmarkCollectiveOp>(request));
     reqHdr->count = count;
     reqHdr->opcode = opcode;
     reqHdr->dataSize = dataSize;
-    send();
+    reqHdr->fromClient = fromClient;
 }
 
 SendDataRpc::SendDataRpc(Context* context, ServerId serverId, uint32_t dataId,
@@ -114,22 +122,23 @@ SendDataRpc::appendRequest(Buffer* request, uint32_t dataId, uint32_t length,
 }
 
 ShufflePullRpc::ShufflePullRpc(Context* context, ServerId serverId,
-        int32_t senderId, uint32_t dataId, Buffer* response)
+        int32_t senderId, uint32_t dataId, uint32_t dataSize, Buffer* response)
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::ShufflePull::Response), response)
 {
-    appendRequest(&request, senderId, dataId);
+    appendRequest(&request, senderId, dataId, dataSize);
     send();
 }
 
 void
 ShufflePullRpc::appendRequest(Buffer* request, int32_t senderId,
-        uint32_t dataId)
+        uint32_t dataId, uint32_t dataSize)
 {
     WireFormat::ShufflePull::Request* reqHdr(
             allocHeader<WireFormat::ShufflePull>(request));
     reqHdr->senderId = senderId;
     reqHdr->dataId = dataId;
+    reqHdr->dataSize = dataSize;
 }
 
 /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors

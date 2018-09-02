@@ -6,7 +6,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -205,12 +205,13 @@ TreeBcast::isReady()
     return outstandingRpcs.empty() && !payloadRpc;
 }
 
-void
+Buffer*
 TreeBcast::wait()
 {
     while (!isReady()) {
         Arachne::yield();
     };
+    return outgoingResponse;
 }
 
 }

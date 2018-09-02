@@ -128,6 +128,52 @@ class MilliSortService : public Service {
 //        collectiveOpTable.erase(opId);
     }
 
+    /**
+     * Pull-based implementation of the all-to-all shuffle operation.
+     *
+     * \param pullRpcs
+     * \param dataId
+     * \param numBytes
+     * \param merger
+     */
+    template <typename Merger>
+    void
+    invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs, CommunicationGroup* group,
+            int maxRpcs, uint32_t dataId, Merger& merger, uint32_t numBytes = 0)
+    {
+        int numNodes = group->size();
+        int outstandingRpcs = 0;
+        int completedRpcs = 0;
+        int sentRpcs = 0;
+        int firstNotReady = 0;
+        std::vector<bool> completed(numNodes);
+        while (completedRpcs < numNodes) {
+            if ((sentRpcs < numNodes) &&
+                    (outstandingRpcs < maxRpcs)) {
+                ServerId target = group->getNode(group->rank + 1 + sentRpcs);
+                pullRpcs[sentRpcs].construct(context, target, group->rank,
+                        dataId, numBytes);
+                sentRpcs++;
+                outstandingRpcs++;
+            }
+
+            for (int i = firstNotReady; i < sentRpcs; i++) {
+                ShufflePullRpc* rpc = pullRpcs[i].get();
+                if (!completed[i] && rpc->isReady()) {
+                    merger((group->rank + i + 1) % numNodes, rpc->wait());
+                    if (i == firstNotReady) {
+                        firstNotReady++;
+                    }
+                    completedRpcs++;
+                    completed[i] = true;
+                    outstandingRpcs--;
+                }
+            }
+            Arachne::yield();
+        }
+    }
+
+
     void
     removeCollectiveOp(int opId)
     {
@@ -422,6 +468,7 @@ class MilliSortService : public Service {
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_KEY,
         ALLSHUFFLE_VALUE,
+        ALLSHUFFLE_BENCHMARK,
     };
 
     // ----------------------

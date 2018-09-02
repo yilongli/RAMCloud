@@ -842,37 +842,8 @@ MilliSortService::shuffleKeys() {
     };
 
     timeTrace("about to shuffle keys");
-    // FIXME: duplicate code as shuffleValues
-    int outstandingRpcs = 0;
-    int completedRpcs = 0;
-    int sentRpcs = 0;
-    int firstNotReady = 0;
-    std::vector<bool> completed(world->size());
-    while (completedRpcs < world->size()) {
-        if ((sentRpcs < world->size()) &&
-                (outstandingRpcs < MAX_OUTSTANDING_RPCS)) {
-            ServerId target = world->getNode(world->rank + 1 + sentRpcs);
-            pullKeyRpcs[sentRpcs].construct(context, target, world->rank,
-                    ALLSHUFFLE_KEY);
-            sentRpcs++;
-            outstandingRpcs++;
-        }
-
-        for (int i = firstNotReady; i < sentRpcs; i++) {
-            ShufflePullRpc* rpc = pullKeyRpcs[i].get();
-            if (!completed[i] && rpc->isReady()) {
-                keyMerger((world->rank + i + 1) % world->size(), rpc->wait());
-                if (i == firstNotReady) {
-                    firstNotReady++;
-                }
-                completedRpcs++;
-                completed[i] = true;
-                outstandingRpcs--;
-            }
-
-        }
-        Arachne::yield();
-    }
+    invokeShufflePull(pullKeyRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
+            ALLSHUFFLE_KEY, keyMerger);
     numSortedItems = sortedItemCnt.load();
     STOP_TIMER(shuffleKeysElapsedTime);
     ADD_COUNTER(shuffleKeysSentRpcs, world->size());
@@ -900,16 +871,10 @@ MilliSortService::shuffleValues()
                 serverId+1, valueBuffer->size());
     };
 
-    bool mergeSortCompleted = false;
-    auto mergeSortIsReady = [this, &mergeSortCompleted] () {
-        if (mergeSortCompleted) {
-            return true;
+    Arachne::ThreadId mergeSortPoller = Arachne::createThread([this] () {
+        while (mergeSorter->poll()) {
+            Arachne::yield();
         }
-        if (mergeSorter->poll()) {
-            return false;
-        }
-
-        mergeSortCompleted = true;
         assert(int(mergeSorter->getSortedArray().size) == numSortedItems);
         ADD_COUNTER(onlineMergeSortStartTime,
                 mergeSorter->startTime - startTime);
@@ -923,50 +888,18 @@ MilliSortService::shuffleValues()
                 sortedArray.size * PivotKey::SIZE);
         assert(int(sortedArray.size) == numSortedItems);
         timeTrace("copied %d final keys", numSortedItems);
-        return true;
-    };
+    });
 
-    int outstandingRpcs = 0;
-    int completedRpcs = 0;
-    int sentRpcs = 0;
-    int firstNotReady = 0;
-    std::vector<bool> completed(world->size());
-    while (completedRpcs < world->size()) {
-        if ((sentRpcs < world->size()) &&
-                (outstandingRpcs < MAX_OUTSTANDING_RPCS)) {
-            ServerId target = world->getNode(world->rank + 1 + sentRpcs);
-            pullValueRpcs[sentRpcs].construct(context, target, world->rank,
-                    ALLSHUFFLE_VALUE);
-            sentRpcs++;
-            outstandingRpcs++;
-        }
-
-        for (int i = firstNotReady; i < sentRpcs; i++) {
-            ShufflePullRpc* rpc = pullValueRpcs[i].get();
-            if (!completed[i] && rpc->isReady()) {
-                valueMerger((world->rank + i + 1) % world->size(), rpc->wait());
-                if (i == firstNotReady) {
-                    firstNotReady++;
-                }
-                completedRpcs++;
-                completed[i] = true;
-                outstandingRpcs--;
-            }
-
-        }
-        mergeSortIsReady();
-        Arachne::yield();
-    }
+    invokeShufflePull(pullValueRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
+            ALLSHUFFLE_VALUE, valueMerger);
     STOP_TIMER(shuffleValuesElapsedTime);
-    ADD_COUNTER(shuffleValuesSentRpcs, sentRpcs);
+    ADD_COUNTER(shuffleValuesSentRpcs, world->size());
     ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
 
     // Make sure the online merge of final keys completes before rearranging
     // final values. Normally, the online merge to be hidden completely within
     // value shuffle.
-    while (!mergeSortIsReady()) {
-        RAMCLOUD_CLOG(WARNING, "Failed to hide mergesort within value shuffle");
-    }
+    Arachne::join(mergeSortPoller);
     rearrangeValues(sortedKeys.get(), sortedValues.get(), numSortedItems, false)
             .wait(&sortedValues);
 
@@ -1070,6 +1003,15 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             INC_COUNTER(shuffleValuesReceivedRpcs);
             break;
         }
+        case ALLSHUFFLE_BENCHMARK: {
+            static char data[Transport::MAX_RPC_LEN];
+            if (reqHdr->dataSize <= arrayLength(data)) {
+                rpc->replyPayload->appendExternal(data, reqHdr->dataSize);
+            } else {
+                respHdr->common.status = STATUS_INVALID_PARAMETER;
+            }
+            break;
+        }
         default:
             assert(false);
     }
@@ -1081,16 +1023,57 @@ MilliSortService::benchmarkCollectiveOp(
         WireFormat::BenchmarkCollectiveOp::Response* respHdr,
         Rpc* rpc)
 {
+    CycleCounter<> timer;
     std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
-    uint64_t start = Cycles::rdtsc();
     if (reqHdr->opcode == WireFormat::BCAST_TREE) {
         for (int i = 0; i < reqHdr->count; i++) {
             TreeBcast bcast(context, world.get());
             bcast.send(data.get(), reqHdr->dataSize);
             bcast.wait();
         }
+    } else if (reqHdr->opcode == WireFormat::ALL_SHUFFLE) {
+        if (reqHdr->fromClient) {
+            timer.cancel();
+            for (int i = 0; i < reqHdr->count; i++) {
+                TreeBcast bcast(context, world.get());
+                bcast.send<BenchmarkCollectiveOpRpc>(-1, reqHdr->opcode,
+                        reqHdr->dataSize, false);
+                Buffer* result = bcast.wait();
+
+                // Instead of including the round-trip broadcast delay, it would
+                // be more interesting to see the max elapsed time of all nodes.
+                uint64_t elapsedTime = 0;
+                uint32_t offset = 0;
+                while (offset < result->size()) {
+                    elapsedTime = std::max(elapsedTime, result->read<
+                            WireFormat::BenchmarkCollectiveOp::Response>(
+                            &offset)->elapsedTime);
+                }
+                respHdr->elapsedTime += elapsedTime;
+            }
+        } else {
+//            timeTrace("ALL_SHUFFLE benchmark started");
+            std::atomic<int> bytesReceived(0);
+            auto merger = [&bytesReceived] (int _, Buffer* dataBuffer) {
+                bytesReceived.fetch_add(dataBuffer->size());
+                // Copy the pulled data into contiguous space.
+                dataBuffer->getRange(0, dataBuffer->size());
+            };
+
+            std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(
+                    new Tub<ShufflePullRpc>[world->size()]);
+            uint32_t numBytes = reqHdr->dataSize / uint32_t(world->size());
+            invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
+                    ALLSHUFFLE_BENCHMARK, merger, numBytes);
+//            timeTrace("ALL_SHUFFLE benchmark completes, received %u bytes",
+//                    bytesReceived.load());
+        }
     }
-    respHdr->elapsedTime = Cycles::toMicroseconds(Cycles::rdtsc() - start);
+
+    uint64_t elapsedCycles = timer.stop();
+    if (elapsedCycles > 0) {
+        respHdr->elapsedTime = Cycles::toMicroseconds(elapsedCycles);
+    }
 }
 
 void

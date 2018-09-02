@@ -334,6 +334,10 @@ struct BenchmarkCollectiveOp {
         // TODO: each op can have its own interpretation on this field.
         // For bcast, it's the request size in bytes.
         uint32_t dataSize;
+
+        /// True if this RPC is initiated from an external client outside the
+        /// MilliSort service nodes.
+        bool fromClient;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
@@ -403,6 +407,8 @@ struct ShufflePull {
         RequestCommon common;
         int32_t senderId;
         uint32_t dataId;
+        /// # bytes to pull. Only used in benchmarking.
+        uint32_t dataSize;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
