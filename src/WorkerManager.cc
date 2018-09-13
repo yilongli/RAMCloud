@@ -152,7 +152,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     // it's not worth passing them to worker threads. Also, handle
     // ping requests inline so that high server load can never cause
     // a server to appear offline.
-    if ((header->opcode == WireFormat::ECHO) ||
+    if ((header->opcode == WireFormat::CLOCK_SYNC) ||
+            (header->opcode == WireFormat::ECHO) ||
             (header->opcode == WireFormat::PING)) {
         Service::Rpc serviceRpc(NULL, &rpc->requestPayload,
                 &rpc->replyPayload);

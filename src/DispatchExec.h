@@ -149,6 +149,10 @@ class DispatchExec : public Dispatch::Poller {
             // at the current index
             // TODO: shouldn't use volatile and custom fence!
             while (requests[addIndex].data.full == 1) {
+                if (owner->isDispatchThread()) {
+                    DIE("Invoked DispatchExec::addRequest from dispatch thread,"
+                            " deadlocked due to full request queue");
+                }
                 RAMCLOUD_CLOG(
                     NOTICE,
                     "Request queue for dispatch thread full, worker blocked..");

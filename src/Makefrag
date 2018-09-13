@@ -66,6 +66,7 @@ SHARED_SRCFILES := \
 		   src/CleanableSegmentManager.cc \
 		   src/ClientException.cc \
 		   src/ClusterMetrics.cc \
+		   src/ClockSynchronizer.cc \
 		   src/CodeLocation.cc \
 		   src/Common.cc \
 		   src/Cycles.cc \

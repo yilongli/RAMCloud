@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_ADMINSERVICE_H
 #define RAMCLOUD_ADMINSERVICE_H
 
+#include "ClockSynchronizer.h"
 #include "Service.h"
 #include "ServerConfig.h"
 #include "ServerList.h"
@@ -34,6 +35,9 @@ class AdminService : public Service {
     void dispatch(WireFormat::Opcode opcode, Rpc* rpc);
 
   PRIVATE:
+    void clockSync(const WireFormat::ClockSync::Request* reqHdr,
+            WireFormat::ClockSync::Response* respHdr,
+            Rpc* rpc);
     void getMetrics(const WireFormat::GetMetrics::Request* reqHdr,
             WireFormat::GetMetrics::Response* respHdr,
             Rpc* rpc);
@@ -61,6 +65,9 @@ class AdminService : public Service {
 
     /// Shared RAMCloud information.
     Context* context;
+
+    /// Handle clock synchronization-related requests.
+    ClockSynchronizer clockSynchronizer;
 
     /// ServerList to update in response to Coordinator's RPCs. NULL means
     /// that we will reject requests to update our server list.

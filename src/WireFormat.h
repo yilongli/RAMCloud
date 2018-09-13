@@ -131,16 +131,17 @@ enum Opcode {
     TX_REQUEST_ABORT            = 78,
     TX_HINT_FAILED              = 79,
     ECHO                        = 80,
-    INIT_MILLISORT              = 81,
-    START_MILLISORT             = 82,
-    BCAST_TREE                  = 83,
-    GATHER_FLAT                 = 84,
-    ALL_GATHER                  = 85,
-    ALL_SHUFFLE                 = 86,
-    SEND_DATA                   = 87,
-    SHUFFLE_PULL                = 88,
-    BENCHMARK_COLLECTIVE_OP     = 89,
-    ILLEGAL_RPC_TYPE            = 90, // 1 + the highest legitimate Opcode
+    CLOCK_SYNC                  = 81,
+    INIT_MILLISORT              = 82,
+    START_MILLISORT             = 83,
+    BCAST_TREE                  = 84,
+    GATHER_FLAT                 = 85,
+    ALL_GATHER                  = 86,
+    ALL_SHUFFLE                 = 87,
+    SEND_DATA                   = 88,
+    SHUFFLE_PULL                = 89,
+    BENCHMARK_COLLECTIVE_OP     = 90,
+    ILLEGAL_RPC_TYPE            = 91, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -162,6 +163,7 @@ enum ControlOp {
     LOG_MESSAGE                 = 1010,
     RESET_METRICS               = 1011,
     QUIESCE                     = 1012,
+    START_CLOCK_SYNC            = 1013,
 };
 
 /**
@@ -646,6 +648,23 @@ struct BackupWrite {
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
+    } __attribute__((packed));
+};
+
+struct ClockSync {
+    static const Opcode opcode = Opcode::CLOCK_SYNC;
+    static const ServiceType service = ADMIN_SERVICE;
+    struct Request {
+        RequestCommon common;
+        uint64_t callerId;          // ServerId of the caller, or invalid
+                                    // server id.
+        uint64_t clientTsc;          // Rdtsc reading right before sending out
+                                    // this RPC.
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+        uint64_t serverTsc;         // Rdtsc reading when the RPC server is
+                                    // about to service the request.
     } __attribute__((packed));
 };
 

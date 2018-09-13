@@ -24,6 +24,7 @@ namespace RAMCloud {
 
 // forward declarations
 class AbstractServerList;
+class AdminService;
 class BackupService;
 class CacheTrace;
 class CommandLineOptions;
@@ -149,6 +150,16 @@ class Context {
      * Returns whether the context belongs to a client.
      */
     bool isClient();
+
+    /**
+     * Returns the AdminService associated with this context, if there is one,
+     * or NULL if there is none.
+     */
+    AdminService*
+    getAdminService() {
+        return reinterpret_cast<AdminService*>(
+                services[WireFormat::ADMIN_SERVICE]);
+    }
 
     /**
      * Returns the BackupService associated with this context, if

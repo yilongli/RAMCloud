@@ -32,6 +32,8 @@ class AdminClient {
   public:
     static void ping(Context* context, ServerId targetId,
             ServerId callerId = ServerId());
+//    static void clockSync(Context* context, ServerId targetId,
+//            ServerId callerId = ServerId());
     static uint64_t proxyPing(Context* context, ServerId proxyId,
             ServerId targetId, uint64_t timeoutNanoseconds);
     static void serverControl(Context* context, ServerId serverId,
@@ -45,6 +47,33 @@ class AdminClient {
 
   private:
     AdminClient();
+};
+
+/**
+ * Encapsulates the state of a AdminClient::clockSync request, allowing it to
+ * execute asynchronously.
+ */
+class ClockSyncRpc : public RpcWrapper {
+    // FIXME: subclass RpcWrapper instead (like GetServerIdRpc) to avoid complex
+    // (and potentially blocking) getSession opertion inside ServerIdRpcWrapper::send()?
+
+  public:
+    ClockSyncRpc(Context* context, Transport::SessionRef session,
+            uint64_t initTime, ServerId targetId, ServerId callerId);
+    ~ClockSyncRpc() {}
+    void completed();
+    /// serverTsc - clientTsc
+    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
+    int64_t wait();
+    uint64_t getCompletionTime();
+
+    ServerId targetId;
+  PRIVATE:
+    Context* context;
+    uint64_t baseTime;
+    uint64_t startTime;
+    uint64_t endTime;
+    DISALLOW_COPY_AND_ASSIGN(ClockSyncRpc);
 };
 
 /**

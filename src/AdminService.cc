@@ -51,6 +51,7 @@ AdminService::AdminService(Context* context,
         ServerList* serverList,
         const ServerConfig* serverConfig)
     : context(context)
+    , clockSynchronizer(context)
     , serverList(serverList)
     , serverConfig(serverConfig)
     , ignoreKill(false)
@@ -62,6 +63,17 @@ AdminService::AdminService(Context* context,
 AdminService::~AdminService()
 {
     context->services[WireFormat::ADMIN_SERVICE] = NULL;
+}
+
+void
+AdminService::clockSync(const WireFormat::ClockSync::Request* reqHdr,
+             WireFormat::ClockSync::Response* respHdr,
+             Rpc* rpc)
+{
+    uint64_t serverTsc = Cycles::rdtsc();
+    ServerId caller = ServerId(reqHdr->callerId);
+    respHdr->serverTsc = clockSynchronizer.handleRequest(caller,
+            reqHdr->clientTsc, serverTsc);
 }
 
 /**
@@ -388,6 +400,11 @@ AdminService::serverControl(const WireFormat::ServerControl::Request* reqHdr,
             Perf::EnabledCounter::enabled = false;
             break;
         }
+        case WireFormat::START_CLOCK_SYNC:
+        {
+            clockSynchronizer.start();
+            break;
+        }
         default:
             respHdr->common.status = STATUS_UNIMPLEMENTED_REQUEST;
             return;
@@ -444,6 +461,10 @@ void
 AdminService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
 {
     switch (opcode) {
+        case WireFormat::ClockSync::opcode:
+            callHandler<WireFormat::ClockSync, AdminService,
+                        &AdminService::clockSync>(rpc);
+            break;
         case WireFormat::GetMetrics::opcode:
             callHandler<WireFormat::GetMetrics, AdminService,
                         &AdminService::getMetrics>(rpc);

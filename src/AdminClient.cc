@@ -25,6 +25,56 @@
 
 namespace RAMCloud {
 
+//void
+//AdminClient::clockSync(Context* context, ServerId targetId, ServerId callerId)
+//{
+//    ClockSyncRpc rpc(context, targetId, callerId);
+//    rpc.wait();
+//}
+
+ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
+        uint64_t initTime, ServerId targetId, ServerId callerId)
+    : RpcWrapper(sizeof(WireFormat::GetServerId::Response))
+    , targetId(targetId)
+    , context(context)
+    , baseTime(initTime)
+    , startTime(0)
+    , endTime()
+{
+    this->session = session;
+    WireFormat::ClockSync::Request* reqHdr(
+            allocHeader<WireFormat::ClockSync>());
+    reqHdr->callerId = callerId.getId();
+    startTime = Cycles::rdtsc() - baseTime;
+    reqHdr->clientTsc = startTime;
+    send();
+}
+
+// See Transport::Notifier for documentation.
+void
+ClockSyncRpc::completed() {
+    RpcWrapper::completed();
+    endTime = Cycles::rdtsc() - baseTime;
+}
+
+uint64_t
+ClockSyncRpc::getCompletionTime()
+{
+    return endTime - startTime;
+}
+
+int64_t
+ClockSyncRpc::wait()
+{
+    waitInternal(context->dispatch);
+    if (getState() != FINISHED) {
+        throw TransportException(HERE, "ClockSync RPC failed");
+    }
+    uint64_t serverTsc =
+            response->getStart<WireFormat::ClockSync::Response>()->serverTsc;
+    return int64_t(serverTsc) - int64_t(startTime);
+}
+
 /**
  * Issue a trivial RPC to test that a server exists and is responsive.
  *

@@ -123,6 +123,7 @@ opcodeSymbol(uint32_t opcode)
         case TX_REQUEST_ABORT:             return "TX_REQUEST_ABORT";
         case TX_HINT_FAILED:               return "TX_HINT_FAILED";
         case ECHO:                         return "ECHO";
+        case CLOCK_SYNC:                   return "CLOCK_SYNC";
         case INIT_MILLISORT:               return "INIT_MILLISORT";
         case START_MILLISORT:              return "START_MILLISORT";
         case BCAST_TREE:                   return "BCAST_TREE";
