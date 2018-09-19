@@ -70,10 +70,8 @@ AdminService::clockSync(const WireFormat::ClockSync::Request* reqHdr,
              WireFormat::ClockSync::Response* respHdr,
              Rpc* rpc)
 {
-    uint64_t serverTsc = Cycles::rdtsc();
-    ServerId caller = ServerId(reqHdr->callerId);
-    respHdr->serverTsc = clockSynchronizer.handleRequest(caller,
-            reqHdr->clientTsc, serverTsc);
+    respHdr->serverTsc = clockSynchronizer.handleRequest(Cycles::rdtsc(),
+            reqHdr);
 }
 
 /**
@@ -402,7 +400,9 @@ AdminService::serverControl(const WireFormat::ServerControl::Request* reqHdr,
         }
         case WireFormat::START_CLOCK_SYNC:
         {
-            clockSynchronizer.start();
+            uint32_t* seconds = rpc->requestPayload->getOffset<uint32_t>(
+                    sizeof(*reqHdr));
+            clockSynchronizer.run(seconds ? *seconds : 1);
             break;
         }
         default:

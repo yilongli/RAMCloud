@@ -23,14 +23,17 @@
 
 namespace RAMCloud {
 
+/**
+ * TODO: document the algorithm
+ */
 class ClockSynchronizer : Dispatch::Poller {
   public:
     explicit ClockSynchronizer(Context* context);
     ~ClockSynchronizer() {}
-    uint64_t handleRequest(ServerId callerId, uint64_t clientTsc,
-            uint64_t serverTsc);
+    uint64_t handleRequest(uint64_t timestamp,
+            const WireFormat::ClockSync::Request* reqHdr);
     int poll();
-    void start();
+    void run(uint32_t seconds);
 
   PRIVATE:
     void computeOffset();
@@ -38,24 +41,62 @@ class ClockSynchronizer : Dispatch::Poller {
     /// Shared RAMCloud information.
     Context* context;
 
+    /// Time (in rdtsc ticks) when we hypothetically reset timestamp on this
+    /// node. This results in much smaller timestamps during the computation of
+    /// clock offsets and, thus, reduce error in the results significantly.
+    /// For example, consider the relation between two clocks:
+    ///         tsc_1 = skew_factor * tsc_2 + offset
+    /// Within a few seconds, we can only obtain 6~7 accurate digits after the
+    /// decimal of the skew factor. Therefore, the larger tsc_1 and tsc_2 are,
+    /// the more error we have in the computed offset.
+    const uint64_t baseTsc;
+
+    /// Store the clock base times of all nodes in the cluster when the
+    /// synchronization completes.
+    std::unordered_map<ServerId, uint64_t> clockBaseTsc;
+
     /// Store the clock offsets between this node and other nodes in the cluster
     /// when the synchronization completes.
     std::unordered_map<ServerId, int64_t> clockOffset;
 
-    /// Time (in rdtsc ticks) the clock synchronizer is instantiated.
-    const uint64_t initTime;
+    /// Store the clock skew factor between this node and other nodes in the
+    /// cluster when the synchronization completes.
+    std::unordered_map<ServerId, double> clockSkew;
 
     /// When (in rdtsc ticks) should we update the serverTracker.
     uint64_t nextUpdateTime;
 
-    // fixme: rename "probe"; it's now {client, server}Diff
-    /// Records incoming ClockSync RPC requests.
-    /// {local_server_tsc, local_server_tsc - remote_client_tsc}
-//    using IncomingProbe = std::pair<uint64_t, int64_t>;
-    std::unordered_map<ServerId, int64_t> incomingProbes;
+    /// Each probe basically represents a ClockSync RPC (incoming or outgoing),
+    /// but it only contains information needed to compute the clock skew factor
+    /// and offset.
+    struct Probe {
+        /// See WireFormat::ClockSync::Request::clientTsc
+        uint64_t clientTsc;
+        /// See WireFormat::ClockSync::Response::serverTsc
+        uint64_t serverTsc;
 
-    /// Records responses of outgoing ClockSync RPCs.
-    std::unordered_map<ServerId, int64_t> outgoingProbes;
+        /// Completion time (in rdtsc ticks) of the ClockSync RPC. This is used
+        /// by the the RPC sender to select the fastest probe with (hopefully)
+        /// the most precise timestamps.
+        uint64_t completionTime;
+
+        /// Default constructor. Constructs a null probe with "infinitely" large
+        /// completion time.
+        Probe()
+            : clientTsc(), serverTsc(), completionTime(~0lu)
+        {}
+    };
+
+    /// Records the fastest incoming ClockSync RPCs received from each server.
+    std::unordered_map<ServerId, Probe> incomingProbes;
+
+    /// Records the fastest outgoing ClockSync RPCs sent to each server, in each
+    /// phase.
+    std::unordered_map<ServerId, Probe> outgoingProbes[3];
+
+    /// Current phase of the protocol. -1 means the clock sync. protocol is not
+    /// running; otherwise, it must be either 0, 1, or 2.
+    std::atomic<int> phase;
 
     /// Placeholder for the outgoing ClockSync RPC.
     Tub<ClockSyncRpc> outstandingRpc;

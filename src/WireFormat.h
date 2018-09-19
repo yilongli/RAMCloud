@@ -658,8 +658,14 @@ struct ClockSync {
         RequestCommon common;
         uint64_t callerId;          // ServerId of the caller, or invalid
                                     // server id.
-        uint64_t clientTsc;          // Rdtsc reading right before sending out
+        uint64_t baseTsc;           // Rdtsc reading when we reset the timestamp
+                                    // counter logically.
+        uint64_t clientTsc;         // Rdtsc reading right before sending out
                                     // this RPC.
+        uint64_t fastestClientTsc;  // clientTsc from the fastest ClockSync RPC
+                                    // we sent previously.
+        uint64_t fastestServerTsc;  // serverTsc from the fastest ClockSync RPC
+                                    // we sent previously.
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;

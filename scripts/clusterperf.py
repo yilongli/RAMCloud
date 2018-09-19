@@ -894,6 +894,7 @@ def migrateLoaded(name, options, cluster_args, client_args):
 simple_tests = [
     Test("basic", basic),
     Test("broadcast", broadcast),
+    Test("clockSync", basic),
     Test("echo_basic", echo),
     Test("multiRead_colocation", default),
     Test("netBandwidth", netBandwidth),

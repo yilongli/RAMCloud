@@ -43,14 +43,19 @@ namespace {
     }
 }
 
+#define PRINT_CLOCK_SYNC_MATRIX 1
+
 ClockSynchronizer::ClockSynchronizer(Context* context)
     : Dispatch::Poller(context->dispatch, "ClockSynchronizer")
     , context(context)
+    , baseTsc(Cycles::rdtsc())
+    , clockBaseTsc()
     , clockOffset()
-    , initTime(Cycles::rdtsc())
+    , clockSkew()
     , nextUpdateTime(0)
     , incomingProbes()
     , outgoingProbes()
+    , phase(-1)
     , outstandingRpc()
     , sendingRpc(false)
     , serverTracker(context)
@@ -60,53 +65,126 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     assert(context->serverList);
 }
 
+/**
+ * Compute the clock skew factors and offsets between this node and other nodes
+ * in the cluster. This method is called from a worker thread and must be
+ * carefully synchronized with #handleRequest and #poll that both run in the
+ * dispatch thread.
+ */
 void
 ClockSynchronizer::computeOffset()
 {
+    {
+        // Wait till the current poll(), if any, to finish. The next poll()
+        // will realize that it has passed the stop time and return immediately.
+        Dispatch::Lock _(context->dispatch);
+        phase = -1;
+    }
+    timeTrace("computeOffset released dispatch lock");
+    outstandingRpc.destroy();
+    clockSkew.clear();
     clockOffset.clear();
 
-    // TODO: how to iterate over all serverId using serverTrack?
-    for (auto& p : outgoingProbes) {
-        ServerId targetId = p.first;
-        int64_t clientDiff = p.second;
-        if (incomingProbes.find(targetId) == incomingProbes.end()) {
-            // TODO: LOG ERROR
-            continue;
-        }
-        int64_t serverDiff = incomingProbes[targetId];
-        int64_t rtt = clientDiff + serverDiff;
-        int64_t offset = (serverDiff - clientDiff) / 2;
-        LOG(NOTICE, "serverDiff = %ld, clientDiff = %ld", serverDiff, clientDiff);
-        LOG(NOTICE, "Clock sync'ed with server %u, RTT = %lu ns, "
-                "offset = %ld cyc", targetId.indexNumber(),
-                Cycles::toNanoseconds(static_cast<uint64_t>(rtt)), offset);
-        clockOffset[targetId] = offset;
+    ServerId ourServerId = context->getAdminService()->serverId;
+    clockBaseTsc[ourServerId] = baseTsc;
+    clockOffset[ourServerId] = 0;
+    clockSkew[ourServerId] = 1.0;
+
+    for (auto& p : outgoingProbes[1]) {
+        ServerId syncee = p.first;
+        
+        // Use the fastest probes from phase 0 and phase 2 to compute the clock
+        // skew factor.
+        Probe probe1 = outgoingProbes[0][syncee];
+        Probe probe2 = outgoingProbes[2][syncee];
+        double skew = double(probe2.clientTsc - probe1.clientTsc) /
+                double(probe2.serverTsc - probe1.serverTsc);
+        clockSkew[syncee] = skew;
+
+        // Then use the fastest outgoing probe and incoming probe to compute
+        // the clock offset.
+        Probe incoming = incomingProbes[syncee];
+        Probe outgoing = p.second;
+        double localElapsed = double(incoming.serverTsc) -
+                double(outgoing.clientTsc);
+        double remoteElapsed = double(incoming.clientTsc) -
+                double(outgoing.serverTsc);
+        uint64_t halfRTT = static_cast<uint64_t>(
+                (localElapsed - skew * remoteElapsed) / (1 + skew));
+        int64_t offset = int64_t(outgoing.clientTsc + halfRTT) -
+                static_cast<int64_t>(skew * double(outgoing.serverTsc));
+        clockOffset[syncee] = offset;
+        LOG(NOTICE, "Synchronized clock with server %u; est. RTT = %.2f us; "
+                "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
+                syncee.indexNumber(), Cycles::toSeconds(2*halfRTT)*1e6,
+                ourServerId.indexNumber(), clockBaseTsc[ourServerId], skew,
+                syncee.indexNumber(), clockBaseTsc[syncee], offset);
     }
 
-    // FIXME: check data race; this method is run in a worker thread now
+#if PRINT_CLOCK_SYNC_MATRIX
+    std::vector<ServerId> serverIds;
+    for (auto& p : clockSkew) {
+        serverIds.push_back(p.first);
+    }
+    std::sort(serverIds.begin(), serverIds.end());
+    for (size_t i = 0; i < serverIds.size(); i++) {
+        ServerId server1 = serverIds[i];
+        for (size_t j = i + 1; j < serverIds.size(); j++) {
+            ServerId server2 = serverIds[j];
+            double skew = clockSkew[server2] / clockSkew[server1];
+            int64_t offset = static_cast<int64_t>(
+                    double(clockOffset[server2] - clockOffset[server1]) /
+                    clockSkew[server1]);
+            LOG(WARNING, "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
+                    server1.indexNumber(), clockBaseTsc[server1], skew,
+                    server2.indexNumber(), clockBaseTsc[server2], offset);
+        }
+    }
+#endif
+
     incomingProbes.clear();
-    outgoingProbes.clear();
+    outgoingProbes[0].clear();
+    outgoingProbes[1].clear();
+    outgoingProbes[2].clear();
 }
 
+/**
+ * The actual RPC handler for CLOCK_SYNC request. AdminServer::clockSync simply
+ * forwards the request here for processing so that we can easily access the
+ * internal state of ClockSynchronizer.
+ *
+ * This handler is run directly in the dispatch thread for performance. This
+ * also simplifies our synchronization policy in this class.
+ *
+ * \param timestamp
+ *      Time, in Cycles::rdtsc ticks, when the handler is invoked.
+ * \param reqHdr
+ *      CLOCK_SYNC request header.
+ * \return
+ *      The logical timestamp when the handler is invoked.
+ */
 uint64_t
-ClockSynchronizer::handleRequest(ServerId callerId, uint64_t clientTsc,
-        uint64_t serverTsc)
+ClockSynchronizer::handleRequest(uint64_t timestamp,
+        const WireFormat::ClockSync::Request* reqHdr)
 {
     assert(context->dispatch->isDispatchThread());
-    serverTsc -= initTime;
-    int64_t diff = int64_t(serverTsc) - int64_t(clientTsc);
-    if (context->dispatch->currentTime <
-            syncStopTime.load(std::memory_order_relaxed)) {
-        auto it = incomingProbes.find(callerId);
-        if (it == incomingProbes.end()) {
-            incomingProbes[callerId] = diff;
-        } else if (it->second > diff) {
-            it->second = diff;
-        }
+    uint64_t serverTsc = timestamp - baseTsc;
+    // We shall not modify incomingProbes once computeOffset() has started.
+    if (phase.load(std::memory_order_acquire) >= 0) {
+        ServerId caller(reqHdr->callerId);
+        clockBaseTsc[caller] = reqHdr->baseTsc;
+        incomingProbes[caller].clientTsc = reqHdr->fastestClientTsc;
+        incomingProbes[caller].serverTsc = reqHdr->fastestServerTsc;
     }
     return serverTsc;
 }
 
+/**
+ * Send ClockSync RPCs to random nodes in the cluster back-to-back.
+ *
+ * \return
+ *      0, if no useful work has been performed; 1, otherwise.
+ */
 int
 ClockSynchronizer::poll()
 {
@@ -140,24 +218,15 @@ ClockSynchronizer::poll()
     if (outstandingRpc && outstandingRpc->isReady()) {
         ClockSyncRpc* rpc = outstandingRpc.get();
         ServerId targetId = rpc->targetId;
-        int64_t result = rpc->wait();
-        auto it = outgoingProbes.find(targetId);
-        if (it == outgoingProbes.end()) {
-            outgoingProbes[targetId] = result;
-        } else if (it->second > result) {
-            int64_t rtt = (result + incomingProbes[targetId]);
-            LOG(NOTICE, "min. tsc diff. %ld, est. RTT %.2f us, "
-                    "completion time %.2f us", result,
-                    Cycles::toSeconds(rtt)*1e6,
-                    Cycles::toSeconds(rpc->getCompletionTime())*1e6);
-            timeTrace("min. tsc diff. %d, RTT %ld, completion time %u ns",
-                    int(result), rtt, Cycles::toNanoseconds(rpc->getCompletionTime()));
-            it->second = result;
+        int index = phase.load(std::memory_order_relaxed);
+        Probe* fastestProbe = &outgoingProbes[index][targetId];
+        if (rpc->getCompletionTime() < fastestProbe->completionTime) {
+            fastestProbe->clientTsc = rpc->getClientTsc();
+            fastestProbe->serverTsc = rpc->wait();
+            fastestProbe->completionTime = rpc->getCompletionTime();
+            timeTrace("update fastest probe, completion time %u ns",
+                    Cycles::toNanoseconds(rpc->getCompletionTime()));
         }
-        static int64_t baseline = result;
-        timeTrace("clock sync. rpc finished, RTT %u ns, TSC diff %d + %d",
-                Cycles::toNanoseconds(rpc->getCompletionTime()),
-                int(baseline), int(result-baseline));
         outstandingRpc.destroy();
     }
 
@@ -171,23 +240,49 @@ ClockSynchronizer::poll()
     }
     ServerId ourServerId = context->getAdminService()->serverId;
     if (target.isValid() && target != ourServerId) {
-        timeTrace("about to send clock sync. RPC");
-        outstandingRpc.construct(context, sessions[target], initTime, target,
-                ourServerId);
+        Probe* fastestProbe = &outgoingProbes[1][target];
+        outstandingRpc.construct(context, sessions[target], baseTsc, target,
+                ourServerId, fastestProbe->clientTsc, fastestProbe->serverTsc);
     }
 
     return 1;
 }
 
+/**
+ * Run the clock synchronization protocol for a given period of time.
+ * Return after the clock synchronization process completes.
+ *
+ * \param seconds
+ *      Time to run, in seconds.
+ */
 void
-ClockSynchronizer::start()
+ClockSynchronizer::run(uint32_t seconds)
 {
-    LOG(NOTICE, "ClockSynchronizer started");
+    LOG(NOTICE, "Start running clock sync. for %u seconds", seconds);
     timeTrace("ClockSynchronizer started");
-    uint64_t runTime = Cycles::fromSeconds(1);
-//    uint64_t runTime = Cycles::fromSeconds(.1);
-    syncStopTime = Cycles::rdtsc() + runTime;
-    Arachne::sleep(Cycles::toNanoseconds(runTime));
+    uint64_t totalTimeNs = seconds * 1000000000UL;
+    uint64_t timeNs[3];
+    timeNs[0] = totalTimeNs / 10;
+    timeNs[2] = totalTimeNs / 10;
+    timeNs[1] = totalTimeNs - timeNs[0] - timeNs[2];
+    uint64_t wakeupTime = Cycles::rdtsc() + Cycles::fromSeconds(seconds);
+    phase = 0;
+    syncStopTime = wakeupTime;
+    Arachne::sleep(timeNs[0]);
+    phase++;
+    Arachne::sleep(timeNs[1]);
+    phase++;
+    Arachne::sleep(timeNs[2]);
+    while (true) {
+        uint64_t now = Cycles::rdtsc();
+        // The following can happen because our Cycles::perSecond() is different
+        // from Arachne's Cycles::perSecond().
+        if (now < wakeupTime) {
+            Arachne::sleep(Cycles::toNanoseconds(wakeupTime - now));
+        } else {
+            break;
+        }
+    }
     computeOffset();
     LOG(NOTICE, "ClockSynchronizer stopped");
 }

@@ -54,24 +54,28 @@ class AdminClient {
  * execute asynchronously.
  */
 class ClockSyncRpc : public RpcWrapper {
-    // FIXME: subclass RpcWrapper instead (like GetServerIdRpc) to avoid complex
-    // (and potentially blocking) getSession opertion inside ServerIdRpcWrapper::send()?
-
   public:
     ClockSyncRpc(Context* context, Transport::SessionRef session,
-            uint64_t initTime, ServerId targetId, ServerId callerId);
+            uint64_t baseTsc, ServerId targetId, ServerId callerId,
+            uint64_t fastestClientTsc, uint64_t fastestServerTsc);
     ~ClockSyncRpc() {}
     void completed();
-    /// serverTsc - clientTsc
-    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
-    int64_t wait();
+    uint64_t wait();
+    uint64_t getClientTsc();
     uint64_t getCompletionTime();
 
     ServerId targetId;
   PRIVATE:
     Context* context;
-    uint64_t baseTime;
+
+    /// Cycles::rdtsc ticks when we logically reset the timestamp counter on
+    /// this machine.
+    uint64_t baseTsc;
+
+    /// Cycles::rdtsc ticks since #baseTsc when we invoke RpcWrapper::send().
     uint64_t startTime;
+
+    /// Cycles::rdtsc ticks since #baseTsc when the RPC completes.
     uint64_t endTime;
     DISALLOW_COPY_AND_ASSIGN(ClockSyncRpc);
 };

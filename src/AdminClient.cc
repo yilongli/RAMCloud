@@ -33,20 +33,24 @@ namespace RAMCloud {
 //}
 
 ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
-        uint64_t initTime, ServerId targetId, ServerId callerId)
+        uint64_t baseTsc, ServerId targetId, ServerId callerId,
+        uint64_t fastestClientTsc, uint64_t fastestServerTsc)
     : RpcWrapper(sizeof(WireFormat::GetServerId::Response))
     , targetId(targetId)
     , context(context)
-    , baseTime(initTime)
+    , baseTsc(baseTsc)
     , startTime(0)
     , endTime()
 {
     this->session = session;
     WireFormat::ClockSync::Request* reqHdr(
             allocHeader<WireFormat::ClockSync>());
+    reqHdr->baseTsc = baseTsc;
     reqHdr->callerId = callerId.getId();
-    startTime = Cycles::rdtsc() - baseTime;
     reqHdr->clientTsc = startTime;
+    reqHdr->fastestClientTsc = fastestClientTsc;
+    reqHdr->fastestServerTsc = fastestServerTsc;
+    startTime = Cycles::rdtsc() - baseTsc;
     send();
 }
 
@@ -54,7 +58,17 @@ ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
 void
 ClockSyncRpc::completed() {
     RpcWrapper::completed();
-    endTime = Cycles::rdtsc() - baseTime;
+    endTime = Cycles::rdtsc() - baseTsc;
+}
+
+/**
+ * Return the logical Cycles::rdtsc reading at the RPC client when it is about
+ * to send this RPC.
+ */
+uint64_t
+ClockSyncRpc::getClientTsc()
+{
+    return startTime;
 }
 
 uint64_t
@@ -63,16 +77,18 @@ ClockSyncRpc::getCompletionTime()
     return endTime - startTime;
 }
 
-int64_t
+/**
+ * Return the logical Cycles::rdtsc reading at the RPC server when it is about
+ * to process this RPC.
+ */
+uint64_t
 ClockSyncRpc::wait()
 {
     waitInternal(context->dispatch);
     if (getState() != FINISHED) {
         throw TransportException(HERE, "ClockSync RPC failed");
     }
-    uint64_t serverTsc =
-            response->getStart<WireFormat::ClockSync::Response>()->serverTsc;
-    return int64_t(serverTsc) - int64_t(startTime);
+    return response->getStart<WireFormat::ClockSync::Response>()->serverTsc;
 }
 
 /**

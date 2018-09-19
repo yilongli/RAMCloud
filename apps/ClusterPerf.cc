@@ -2605,6 +2605,21 @@ broadcast()
 }
 
 /**
+ * Run the clock synchronization protocol on all servers for a given period of
+ * time. Repeat the experiment multiple times to check if the results are
+ * stable.
+ */
+void
+clockSync()
+{
+    for (int i = 0; i < count; i++) {
+        uint32_t clockSyncSeconds = downCast<uint32_t>(seconds);
+        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+                &clockSyncSeconds, sizeof(clockSyncSeconds));
+    }
+}
+
+/**
  * This method contains the core of all the "multiRead" tests.
  * It writes objsPerMaster objects on numMasters servers
  * and reads them back in one multiRead operation.
@@ -7479,6 +7494,7 @@ struct TestInfo {
 TestInfo tests[] = {
     {"basic", basic},
     {"broadcast", broadcast},
+    {"clockSync", clockSync},
     {"echo_basic", echo_basic},
     {"echo_workload", echo_workload},
     {"indexBasic", indexBasic},
