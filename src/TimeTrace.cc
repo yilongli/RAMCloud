@@ -71,7 +71,8 @@ TimeTrace::getTrace()
  *      time trace. If NULL, the trace will be printed on the system log.
  */
 void
-TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
+TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s,
+        TimeConverter* timeConverter)
 {
     bool printedAnything = false;
 
@@ -157,7 +158,11 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
                 % Buffer::BUFFER_SIZE;
 
         char message[1000];
-        double ns = Cycles::toSeconds(event->timestamp - startTime) * 1e09;
+        // FIXME: I am not sure rebase against startTime is a good idea anymore;
+        // for instance, it makes integration with OS tracing tool harder.
+        double ns = (timeConverter && timeConverter->isValid()) ?
+                timeConverter->toRemoteTime(event->timestamp) :
+                Cycles::toSeconds(event->timestamp - startTime) * 1e09;
         if (s != NULL) {
             if (s->length() != 0) {
                 s->append("\n");
@@ -204,7 +209,7 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s)
  * Combine all of the thread-local buffers and print them to the system log.
  */
 void
-TimeTrace::printToLog()
+TimeTrace::printToLog(TimeConverter* timeConverter)
 {
     std::vector<Buffer*> buffers;
     activeReaders.add(1);
@@ -215,7 +220,7 @@ TimeTrace::printToLog()
         SpinLock::Guard guard(mutex);
         buffers = threadBuffers;
     }
-    TimeTrace::printInternal(&buffers, NULL);
+    TimeTrace::printInternal(&buffers, NULL, timeConverter);
     activeReaders.add(-1);
 }
 

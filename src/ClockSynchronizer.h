@@ -23,6 +23,8 @@
 
 namespace RAMCloud {
 
+class TimeConverter;
+
 /**
  * TODO: document the algorithm
  */
@@ -34,8 +36,7 @@ class ClockSynchronizer : Dispatch::Poller {
             const WireFormat::ClockSync::Request* reqHdr);
     int poll();
     void run(uint32_t seconds);
-    uint64_t toLocalTsc(ServerId remote, uint64_t remoteTsc);
-    uint64_t toRemoteTsc(ServerId remote, uint64_t localTsc);
+    TimeConverter getConverter(ServerId serverId);
 
   PRIVATE:
     void computeOffset();
@@ -53,18 +54,22 @@ class ClockSynchronizer : Dispatch::Poller {
     /// the more error we have in the computed offset.
     const uint64_t baseTsc;
 
-    // FIXME: introduce struct ClockState = {baseTsc, offset, skew}; combine 3 map accesses into one!
-    /// Stores the clock base times of all nodes in the cluster when the
+    /// Information about clock on a remote node that is sufficient to convert
+    /// timestamps on that node to local timestamps.
+    struct ClockState {
+        /// See docs of ClockSynchronizer::baseTsc.
+        uint64_t baseTsc;
+
+        /// See docs of ClockSynchronizer::baseTsc.
+        int64_t offset;
+
+        /// See docs of ClockSynchronizer::baseTsc.
+        double skew;
+    };
+
+    /// Stores the states of clocks on all nodes in the cluster when the
     /// synchronization completes.
-    std::unordered_map<ServerId, uint64_t> clockBaseTsc;
-
-    /// Stores the clock offsets between this node and other nodes in the cluster
-    /// when the synchronization completes.
-    std::unordered_map<ServerId, int64_t> clockOffset;
-
-    /// Stores the clock skew factor between this node and other nodes in the
-    /// cluster when the synchronization completes.
-    std::unordered_map<ServerId, double> clockSkew;
+    std::unordered_map<ServerId, ClockState> clockState;
 
     /// Provides exclusive access to clock{BaseTsc, Offset, Skew}.
     SpinLock mutex;
@@ -121,6 +126,47 @@ class ClockSynchronizer : Dispatch::Poller {
     std::atomic<uint64_t> syncStopTime;
 
     DISALLOW_COPY_AND_ASSIGN(ClockSynchronizer);
+};
+
+class TimeConverter {
+  public:
+    explicit TimeConverter() { valid = false; }
+
+    explicit TimeConverter(uint64_t localBaseTsc, uint64_t remoteBaseTsc,
+            int64_t offset, double skew)
+        : localBaseTsc(localBaseTsc)
+        , remoteBaseTsc(remoteBaseTsc)
+        , offset(static_cast<double>(offset))
+        , skew(skew)
+        , valid(true)
+    {}
+
+    ~TimeConverter() {};
+
+    bool isValid() { return valid; }
+
+    uint64_t toLocalTsc(uint64_t remoteTsc);
+    uint64_t toRemoteTsc(uint64_t localTsc);
+    double toRemoteTime(uint64_t localTsc);
+
+  PRIVATE:
+    // TODO: properly document baseTsc, offset, and skew in TimeConverter's
+    // class doc.; have ClockSync::baseTsc refer to it.
+
+    /// See docs of ClockSynchronizer::baseTsc.
+    uint64_t localBaseTsc;
+
+    /// See docs of ClockSynchronizer::baseTsc.
+    uint64_t remoteBaseTsc;
+
+    /// See docs of ClockSynchronizer::baseTsc.
+    double offset;
+
+    /// See docs of ClockSynchronizer::baseTsc.
+    double skew;
+
+    /// True if this converter corresponds to a clock we have synchronized with.
+    bool valid;
 };
 
 }  // namespace RAMCloud

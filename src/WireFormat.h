@@ -327,7 +327,8 @@ struct BenchmarkCollectiveOp {
     struct Request {
         RequestCommon common;
 
-        /// # times to perform the same operation.
+        /// # times to perform the operation, if masterId is 0; otherwise,
+        /// # times the operation has been completed.
         int32_t count;
 
         /// Identifier of the operation to perform.
@@ -339,7 +340,7 @@ struct BenchmarkCollectiveOp {
 
         /// ServerId of the master node that orchestrates the benchmark. This is
         /// the node that receives benchmark requests from external clients.
-        /// 0 means this RPC is init
+        /// 0 means this RPC is from an external client.
         uint64_t masterId;
 
         /// When (in Cycles::rdtsc ticks at the master node) shall each node

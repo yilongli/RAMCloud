@@ -103,10 +103,11 @@ TreeBcast::TreeBcast(Context* context,
 {
     timeTrace("TreeBcast: received request, rank %u", uint32_t(group->rank));
 
+    // TODO: make the following optional; not sure how expensive it is though.
     // Convert the local time when we receive the broadcast to remote time
     // at the root node.
-    respHdr->receiveTime = context->clockSynchronizer->toRemoteTsc(
-            group->getNode(root), Cycles::rdtsc());
+    respHdr->receiveTime = context->clockSynchronizer->
+            getConverter(group->getNode(root)).toRemoteTsc(Cycles::rdtsc());
 
     // Copy out the payload request (from network packet buffers) to make it
     // contiguous. TreeBcast is not meant for large messages anyway.

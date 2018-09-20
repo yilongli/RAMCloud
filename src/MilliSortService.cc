@@ -1049,7 +1049,7 @@ MilliSortService::benchmarkCollectiveOp(
                 uint64_t startTime = Cycles::rdtsc() +
                         Cycles::fromMicroseconds(100);
                 TreeBcast bcast(context, world.get());
-                bcast.send<BenchmarkCollectiveOpRpc>(-1, reqHdr->opcode,
+                bcast.send<BenchmarkCollectiveOpRpc>(i, reqHdr->opcode,
                         reqHdr->dataSize, serverId.getId(), startTime);
                 Buffer* result = bcast.wait();
 
@@ -1067,7 +1067,7 @@ MilliSortService::benchmarkCollectiveOp(
                 }
             }
         } else {
-//            timeTrace("ALL_SHUFFLE benchmark started");
+//            timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->count);
             std::atomic<int> bytesReceived(0);
             auto merger = [&bytesReceived] (int _, Buffer* dataBuffer) {
                 bytesReceived.fetch_add(dataBuffer->size());
@@ -1078,14 +1078,15 @@ MilliSortService::benchmarkCollectiveOp(
             std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(
                     new Tub<ShufflePullRpc>[world->size()]);
             uint32_t numBytes = reqHdr->dataSize / uint32_t(world->size());
-            uint64_t startTime = context->clockSynchronizer->toLocalTsc(
-                    ServerId(reqHdr->masterId), reqHdr->startTime);
+            uint64_t startTime = context->clockSynchronizer->getConverter(
+                    ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
             if (Cycles::rdtsc() > startTime) {
                 LOG(ERROR, "AllShuffle operation started %.2f us late!",
                         Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
-                timeTrace("late late late");
-            } else {
-                timeTrace("%u us before start", Cycles::toMicroseconds(startTime - Cycles::rdtsc()));
+//            } else {
+//                timeTrace("%u us before start, %d",
+//                        Cycles::toMicroseconds(startTime - Cycles::rdtsc()),
+//                        reqHdr->count);
             }
             while (Cycles::rdtsc() < startTime) {}
             invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,

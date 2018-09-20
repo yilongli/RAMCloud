@@ -25,13 +25,6 @@
 
 namespace RAMCloud {
 
-//void
-//AdminClient::clockSync(Context* context, ServerId targetId, ServerId callerId)
-//{
-//    ClockSyncRpc rpc(context, targetId, callerId);
-//    rpc.wait();
-//}
-
 ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
         uint64_t baseTsc, ServerId targetId, ServerId callerId,
         uint64_t fastestClientTsc, uint64_t fastestServerTsc)

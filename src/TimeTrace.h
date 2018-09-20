@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_TIMETRACE_H
 #define RAMCLOUD_TIMETRACE_H
 
+#include "ClockSynchronizer.h"
 #include "Common.h"
 #include "Atomic.h"
 #include "Cycles.h"
@@ -54,7 +55,7 @@ class TimeTrace {
   public:
     class Buffer;
     static string getTrace();
-    static void printToLog();
+    static void printToLog(TimeConverter* timeConverter = NULL);
     static void printToLogBackground(Dispatch* dispatch);
 
     /**
@@ -105,7 +106,7 @@ class TimeTrace {
     TimeTrace();
     static void createThreadBuffer();
     static void printInternal(std::vector<TimeTrace::Buffer*>* traces,
-            string* s);
+            string* s, TimeConverter* timeConverter = NULL);
 
     /**
      * This class is used to print the time trace to the log in the

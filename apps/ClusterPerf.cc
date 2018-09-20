@@ -7667,7 +7667,11 @@ try
     fflush(stdout);
 
     if (clientIndex == 0) {
-        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
+        // FIXME: is it OK to assume ServerId(1,0) always exists and alive over
+        // the entire lifetime of all experiments?
+        uint64_t masterId = ServerId(1, 0).getId();
+        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
+                sizeof(masterId));
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();

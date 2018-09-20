@@ -360,7 +360,15 @@ AdminService::serverControl(const WireFormat::ServerControl::Request* reqHdr,
         }
         case WireFormat::LOG_TIME_TRACE:
         {
-            TimeTrace::printToLog();
+            uint64_t* masterId = rpc->requestPayload->getOffset<uint64_t>(
+                    sizeof(*reqHdr));
+            if (masterId) {
+                TimeConverter converter = clockSynchronizer.getConverter(
+                        ServerId(*masterId));
+                TimeTrace::printToLog(&converter);
+            } else {
+                TimeTrace::printToLog();
+            }
             break;
         }
         case WireFormat::GET_CACHE_TRACE:

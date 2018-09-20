@@ -32,8 +32,6 @@ class AdminClient {
   public:
     static void ping(Context* context, ServerId targetId,
             ServerId callerId = ServerId());
-//    static void clockSync(Context* context, ServerId targetId,
-//            ServerId callerId = ServerId());
     static uint64_t proxyPing(Context* context, ServerId proxyId,
             ServerId targetId, uint64_t timeoutNanoseconds);
     static void serverControl(Context* context, ServerId serverId,

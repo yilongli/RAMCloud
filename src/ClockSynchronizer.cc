@@ -49,10 +49,8 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     : Dispatch::Poller(context->dispatch, "ClockSynchronizer")
     , context(context)
     , baseTsc(Cycles::rdtsc())
-    , clockBaseTsc()
-    , clockOffset()
-    , clockSkew()
-    , mutex("ClockSync::clockState")
+    , clockState()
+    , mutex("ClockSynchronizer::clockState")
     , nextUpdateTime(0)
     , incomingProbes()
     , outgoingProbes()
@@ -85,16 +83,13 @@ ClockSynchronizer::computeOffset()
     timeTrace("computeOffset released dispatch lock");
     SpinLock::Guard _(mutex);
     outstandingRpc.destroy();
-    clockSkew.clear();
-    clockOffset.clear();
 
     ServerId ourServerId = context->getAdminService()->serverId;
-    clockBaseTsc[ourServerId] = baseTsc;
-    clockOffset[ourServerId] = 0;
-    clockSkew[ourServerId] = 1.0;
+    clockState[ourServerId] = {baseTsc, 0, 1.0};
 
     for (auto& p : outgoingProbes[1]) {
         ServerId syncee = p.first;
+        ClockState* clock = &clockState[syncee];
         
         // Use the fastest probes from phase 0 and phase 2 to compute the clock
         // skew factor.
@@ -102,7 +97,7 @@ ClockSynchronizer::computeOffset()
         Probe probe2 = outgoingProbes[2][syncee];
         double skew = double(probe2.clientTsc - probe1.clientTsc) /
                 double(probe2.serverTsc - probe1.serverTsc);
-        clockSkew[syncee] = skew;
+        clock->skew = skew;
 
         // Then use the fastest outgoing probe and incoming probe to compute
         // the clock offset.
@@ -116,31 +111,35 @@ ClockSynchronizer::computeOffset()
                 (localElapsed - skew * remoteElapsed) / (1 + skew));
         int64_t offset = int64_t(outgoing.clientTsc + halfRTT) -
                 static_cast<int64_t>(skew * double(outgoing.serverTsc));
-        clockOffset[syncee] = offset;
-        LOG(NOTICE, "Synchronized clock with server %u; est. RTT = %.2f us; "
+        clock->offset = offset;
+        // FIXME: est. cyclesPerSec is quite different from measured one???
+        LOG(NOTICE, "Synchronized clock with server %u; est. RTT %.2f us; "
+                "est. cyclesPerSec %.0f; "
                 "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
                 syncee.indexNumber(), Cycles::toSeconds(2*halfRTT)*1e6,
-                ourServerId.indexNumber(), clockBaseTsc[ourServerId], skew,
-                syncee.indexNumber(), clockBaseTsc[syncee], offset);
+                Cycles::perSecond() / clock->skew, ourServerId.indexNumber(),
+                clockState[ourServerId].baseTsc, skew, syncee.indexNumber(),
+                clock->baseTsc, offset);
     }
 
 #if PRINT_CLOCK_SYNC_MATRIX
     std::vector<ServerId> serverIds;
-    for (auto& p : clockSkew) {
+    for (auto& p : clockState) {
         serverIds.push_back(p.first);
     }
     std::sort(serverIds.begin(), serverIds.end());
     for (size_t i = 0; i < serverIds.size(); i++) {
         ServerId server1 = serverIds[i];
+        ClockState* clock1 = &clockState[server1];
         for (size_t j = i + 1; j < serverIds.size(); j++) {
             ServerId server2 = serverIds[j];
-            double skew = clockSkew[server2] / clockSkew[server1];
+            ClockState* clock2 = &clockState[server2];
+            double skew = clock2->skew / clock1->skew;
             int64_t offset = static_cast<int64_t>(
-                    double(clockOffset[server2] - clockOffset[server1]) /
-                    clockSkew[server1]);
+                    double(clock2->offset - clock1->offset) / clock1->skew);
             LOG(NOTICE, "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
-                    server1.indexNumber(), clockBaseTsc[server1], skew,
-                    server2.indexNumber(), clockBaseTsc[server2], offset);
+                    server1.indexNumber(), clock1->baseTsc, skew,
+                    server2.indexNumber(), clock2->baseTsc, offset);
         }
     }
 #endif
@@ -175,9 +174,9 @@ ClockSynchronizer::handleRequest(uint64_t timestamp,
     // We shall not modify incomingProbes once computeOffset() has started.
     if (phase.load(std::memory_order_acquire) >= 0) {
         ServerId caller(reqHdr->callerId);
-        if (clockBaseTsc.find(caller) == clockBaseTsc.end()) {
+        if (clockState.find(caller) == clockState.end()) {
             SpinLock::Guard _(mutex);
-            clockBaseTsc[caller] = reqHdr->baseTsc;
+            clockState[caller].baseTsc = reqHdr->baseTsc;
         }
         incomingProbes[caller].clientTsc = reqHdr->fastestClientTsc;
         incomingProbes[caller].serverTsc = reqHdr->fastestServerTsc;
@@ -293,58 +292,82 @@ ClockSynchronizer::run(uint32_t seconds)
     LOG(NOTICE, "ClockSynchronizer stopped");
 }
 
+TimeConverter
+ClockSynchronizer::getConverter(ServerId serverId)
+{
+    SpinLock::Guard _(mutex);
+    auto it = clockState.find(serverId);
+    if (it == clockState.end()) {
+        RAMCLOUD_CLOG(ERROR, "Clock not synchronized with server %s",
+                serverId.toString().c_str());
+        return TimeConverter();
+    }
+
+    ClockState* clock = &it->second;
+    return TimeConverter(baseTsc, clock->baseTsc, clock->offset, clock->skew);
+}
+
 /**
- * Convert the Cycles::rdtsc timestamp on a remote server to that on this
+ * Convert the Cycles::rdtsc timestamp on the remote server to that on this
  * server.
  *
- * \param remote
- *      Remote server.
  * \param remoteTsc
  *      Remote rdtsc timestamp.
  * \return
  *      Local rdtsc timestamp.
  */
 uint64_t
-ClockSynchronizer::toLocalTsc(ServerId remote, uint64_t remoteTsc)
+TimeConverter::toLocalTsc(uint64_t remoteTsc)
 {
-    SpinLock::Guard _(mutex);
-    if (clockOffset.find(remote) == clockOffset.end()) {
-        LOG(ERROR, "Clock not synchronized with server %s",
-                remote.toString().c_str());
-        return 0;
-    }
-
     // TSC_local - base_local = skew * (TSC_remote - base_remote) + offset
     return static_cast<uint64_t>(
-            double(remoteTsc - clockBaseTsc[remote]) * clockSkew[remote] +
-            double(clockOffset[remote])) + baseTsc;
+            double(remoteTsc - remoteBaseTsc) * skew + offset) + localBaseTsc;
 }
 
 /**
- * Convert the Cycles::rdtsc timestamp on this server to that on a remote
+ * Convert the Cycles::rdtsc timestamp on this server to that on the remote
  * server.
  *
- * \param remote
- *      Remote server.
  * \param localTsc
  *      Local rdtsc timestamp.
  * \return
  *      Remote rdtsc timestamp.
  */
 uint64_t
-ClockSynchronizer::toRemoteTsc(ServerId remote, uint64_t localTsc)
+TimeConverter::toRemoteTsc(uint64_t localTsc)
 {
-    SpinLock::Guard _(mutex);
-    if (clockOffset.find(remote) == clockOffset.end()) {
-        LOG(ERROR, "Clock not synchronized with server %s",
-                remote.toString().c_str());
-        return 0;
-    }
-
     // TSC_local - base_local = skew * (TSC_remote - base_remote) + offset
     return static_cast<uint64_t>(
-            (double(localTsc - baseTsc) - double(clockOffset[remote])) /
-            clockSkew[remote]) + clockBaseTsc[remote];
+            (double(localTsc - localBaseTsc) - offset) / skew) + remoteBaseTsc;
+}
+
+/**
+ * Convert the Cycles::rdtsc timestamp on this server to POSIX time on the
+ * remote server.
+ *
+ * \param localTsc
+ *      Local rdtsc timestamp.
+ * \return
+ *      Remote time, in nanoseconds.
+ */
+double
+TimeConverter::toRemoteTime(uint64_t localTsc)
+{
+    uint64_t remoteTsc = toRemoteTsc(localTsc);
+
+    // Here is the tricky part. As of 09/2018, Cycles::perSecond() estimated
+    // on rc machines somehow have only 4 significant digits (i.e., only the
+    // integral part of cyclesPerMicros is accurate). However, remoteTsc
+    // computed above is a very large number. Therefore, if we simply use
+    // "Cycles::perSecond() / skew" to compute remoteCyclesPerSec, we will get
+    // very different results in nanoseconds on different machines. Fortunately,
+    // since we just want to align time traces and don't care much about the
+    // absolute time in ns, we can live with inaccurate cyclesPerSec, we just
+    // need to make sure all machines use the same value.
+    uint64_t remoteCyclesPerMicros =
+            static_cast<uint64_t>(Cycles::perSecond() / skew * 1e-6);
+    double remoteCyclesPerSec = double(remoteCyclesPerMicros) * 1e6;
+    return Cycles::toSeconds(remoteTsc, remoteCyclesPerSec) * 1e9;
 }
 
 } // namespace RAMCloud
