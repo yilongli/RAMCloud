@@ -99,13 +99,15 @@ PRIVATE:
 class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
   public:
     BenchmarkCollectiveOpRpc(Context* context, int count, uint32_t opcode,
-            uint32_t dataSize, bool fromClient = true);
+            uint32_t dataSize);
+    BenchmarkCollectiveOpRpc(Context* context, int count, uint32_t opcode,
+            uint32_t dataSize, uint64_t masterId, uint64_t startTime);
     ~BenchmarkCollectiveOpRpc() {}
 
     static void appendRequest(Buffer* request, int count, uint32_t opcode,
-            uint32_t dataSize, bool fromClient);
+            uint32_t dataSize, uint64_t masterId, uint64_t startTime);
 
-    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
+    /// Return the time, in microseconds, to complete the collective operation.
     uint64_t wait()
     {
         waitAndCheckErrors();

@@ -23,7 +23,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -52,6 +52,7 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     , clockBaseTsc()
     , clockOffset()
     , clockSkew()
+    , mutex("ClockSync::clockState")
     , nextUpdateTime(0)
     , incomingProbes()
     , outgoingProbes()
@@ -63,6 +64,7 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     , syncStopTime()
 {
     assert(context->serverList);
+    context->clockSynchronizer = this;
 }
 
 /**
@@ -81,6 +83,7 @@ ClockSynchronizer::computeOffset()
         phase = -1;
     }
     timeTrace("computeOffset released dispatch lock");
+    SpinLock::Guard _(mutex);
     outstandingRpc.destroy();
     clockSkew.clear();
     clockOffset.clear();
@@ -135,7 +138,7 @@ ClockSynchronizer::computeOffset()
             int64_t offset = static_cast<int64_t>(
                     double(clockOffset[server2] - clockOffset[server1]) /
                     clockSkew[server1]);
-            LOG(WARNING, "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
+            LOG(NOTICE, "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
                     server1.indexNumber(), clockBaseTsc[server1], skew,
                     server2.indexNumber(), clockBaseTsc[server2], offset);
         }
@@ -172,7 +175,10 @@ ClockSynchronizer::handleRequest(uint64_t timestamp,
     // We shall not modify incomingProbes once computeOffset() has started.
     if (phase.load(std::memory_order_acquire) >= 0) {
         ServerId caller(reqHdr->callerId);
-        clockBaseTsc[caller] = reqHdr->baseTsc;
+        if (clockBaseTsc.find(caller) == clockBaseTsc.end()) {
+            SpinLock::Guard _(mutex);
+            clockBaseTsc[caller] = reqHdr->baseTsc;
+        }
         incomingProbes[caller].clientTsc = reqHdr->fastestClientTsc;
         incomingProbes[caller].serverTsc = reqHdr->fastestServerTsc;
     }
@@ -285,6 +291,60 @@ ClockSynchronizer::run(uint32_t seconds)
     }
     computeOffset();
     LOG(NOTICE, "ClockSynchronizer stopped");
+}
+
+/**
+ * Convert the Cycles::rdtsc timestamp on a remote server to that on this
+ * server.
+ *
+ * \param remote
+ *      Remote server.
+ * \param remoteTsc
+ *      Remote rdtsc timestamp.
+ * \return
+ *      Local rdtsc timestamp.
+ */
+uint64_t
+ClockSynchronizer::toLocalTsc(ServerId remote, uint64_t remoteTsc)
+{
+    SpinLock::Guard _(mutex);
+    if (clockOffset.find(remote) == clockOffset.end()) {
+        LOG(ERROR, "Clock not synchronized with server %s",
+                remote.toString().c_str());
+        return 0;
+    }
+
+    // TSC_local - base_local = skew * (TSC_remote - base_remote) + offset
+    return static_cast<uint64_t>(
+            double(remoteTsc - clockBaseTsc[remote]) * clockSkew[remote] +
+            double(clockOffset[remote])) + baseTsc;
+}
+
+/**
+ * Convert the Cycles::rdtsc timestamp on this server to that on a remote
+ * server.
+ *
+ * \param remote
+ *      Remote server.
+ * \param localTsc
+ *      Local rdtsc timestamp.
+ * \return
+ *      Remote rdtsc timestamp.
+ */
+uint64_t
+ClockSynchronizer::toRemoteTsc(ServerId remote, uint64_t localTsc)
+{
+    SpinLock::Guard _(mutex);
+    if (clockOffset.find(remote) == clockOffset.end()) {
+        LOG(ERROR, "Clock not synchronized with server %s",
+                remote.toString().c_str());
+        return 0;
+    }
+
+    // TSC_local - base_local = skew * (TSC_remote - base_remote) + offset
+    return static_cast<uint64_t>(
+            (double(localTsc - baseTsc) - double(clockOffset[remote])) /
+            clockSkew[remote]) + clockBaseTsc[remote];
 }
 
 } // namespace RAMCloud

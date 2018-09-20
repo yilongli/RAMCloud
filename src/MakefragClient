@@ -39,6 +39,7 @@ CLIENT_SRCFILES := \
 		   src/ClientLeaseAgent.cc \
 		   src/ClientTransactionManager.cc \
 		   src/ClientTransactionTask.cc \
+		   src/ClockSynchronizer.cc \
 		   src/ClusterMetrics.cc \
 		   src/CodeLocation.cc \
 		   src/Context.cc \

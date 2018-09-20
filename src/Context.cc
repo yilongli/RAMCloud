@@ -94,6 +94,7 @@ Context::Context(bool hasDedicatedDispatchThread,
 #else
     , masterZeroCopyRegion(Memory::xmalloc(HERE, Transport::MAX_RPC_LEN))
 #endif
+    , clockSynchronizer(NULL)
 {
     try {
         Cycles::init();
@@ -195,6 +196,8 @@ Context::destroy()
     free(const_cast<void*>(masterZeroCopyRegion));
     masterZeroCopyRegion = NULL;
 #endif
+
+    clockSynchronizer = NULL;
 }
 
 } // namespace RAMCloud

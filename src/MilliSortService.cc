@@ -13,6 +13,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "ClockSynchronizer.h"
 #include "MilliSortService.h"
 #include "AllGather.h"
 #include "AllShuffle.h"
@@ -1023,21 +1024,33 @@ MilliSortService::benchmarkCollectiveOp(
         WireFormat::BenchmarkCollectiveOp::Response* respHdr,
         Rpc* rpc)
 {
-    CycleCounter<> timer;
-    std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
+#define WARMUP_COUNT 10
     if (reqHdr->opcode == WireFormat::BCAST_TREE) {
-        for (int i = 0; i < reqHdr->count; i++) {
+        /* Broadcast benchmark */
+        std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
+        uint64_t totalTime = 0;
+        for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
+            uint64_t startTime = Cycles::rdtsc();
+            uint64_t endTime;
             TreeBcast bcast(context, world.get());
             bcast.send(data.get(), reqHdr->dataSize);
-            bcast.wait();
+            bcast.wait(&endTime);
+            if (i >= WARMUP_COUNT) {
+                totalTime += endTime - startTime;
+            }
         }
+        respHdr->elapsedTime = Cycles::toMicroseconds(totalTime);
     } else if (reqHdr->opcode == WireFormat::ALL_SHUFFLE) {
-        if (reqHdr->fromClient) {
-            timer.cancel();
-            for (int i = 0; i < reqHdr->count; i++) {
+        /* AllShuffle benchmark */
+        if (reqHdr->masterId == 0) {
+            for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
+                // Start the operation 100 us from now, which should be enough
+                // for the broadcast message to reach all the participants.
+                uint64_t startTime = Cycles::rdtsc() +
+                        Cycles::fromMicroseconds(100);
                 TreeBcast bcast(context, world.get());
                 bcast.send<BenchmarkCollectiveOpRpc>(-1, reqHdr->opcode,
-                        reqHdr->dataSize, false);
+                        reqHdr->dataSize, serverId.getId(), startTime);
                 Buffer* result = bcast.wait();
 
                 // Instead of including the round-trip broadcast delay, it would
@@ -1049,7 +1062,9 @@ MilliSortService::benchmarkCollectiveOp(
                             WireFormat::BenchmarkCollectiveOp::Response>(
                             &offset)->elapsedTime);
                 }
-                respHdr->elapsedTime += elapsedTime;
+                if (i >= WARMUP_COUNT) {
+                    respHdr->elapsedTime += elapsedTime;
+                }
             }
         } else {
 //            timeTrace("ALL_SHUFFLE benchmark started");
@@ -1063,16 +1078,25 @@ MilliSortService::benchmarkCollectiveOp(
             std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(
                     new Tub<ShufflePullRpc>[world->size()]);
             uint32_t numBytes = reqHdr->dataSize / uint32_t(world->size());
+            uint64_t startTime = context->clockSynchronizer->toLocalTsc(
+                    ServerId(reqHdr->masterId), reqHdr->startTime);
+            if (Cycles::rdtsc() > startTime) {
+                LOG(ERROR, "AllShuffle operation started %.2f us late!",
+                        Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
+                timeTrace("late late late");
+            } else {
+                timeTrace("%u us before start", Cycles::toMicroseconds(startTime - Cycles::rdtsc()));
+            }
+            while (Cycles::rdtsc() < startTime) {}
             invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
                     ALLSHUFFLE_BENCHMARK, merger, numBytes);
 //            timeTrace("ALL_SHUFFLE benchmark completes, received %u bytes",
 //                    bytesReceived.load());
+            respHdr->elapsedTime = Cycles::toMicroseconds(
+                    Cycles::rdtsc() - startTime);
         }
-    }
-
-    uint64_t elapsedCycles = timer.stop();
-    if (elapsedCycles > 0) {
-        respHdr->elapsedTime = Cycles::toMicroseconds(elapsedCycles);
+    } else {
+        respHdr->common.status = STATUS_INVALID_PARAMETER;
     }
 }
 

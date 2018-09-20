@@ -337,9 +337,15 @@ struct BenchmarkCollectiveOp {
         // For bcast, it's the request size in bytes.
         uint32_t dataSize;
 
-        /// True if this RPC is initiated from an external client outside the
-        /// MilliSort service nodes.
-        bool fromClient;
+        /// ServerId of the master node that orchestrates the benchmark. This is
+        /// the node that receives benchmark requests from external clients.
+        /// 0 means this RPC is init
+        uint64_t masterId;
+
+        /// When (in Cycles::rdtsc ticks at the master node) shall each node
+        /// start the collective operation. 0 means starting as soon as they
+        /// receive this request. Only used when #fromClient is false.
+        uint64_t startTime;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
@@ -369,6 +375,11 @@ struct TreeBcast {
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
+
+        /// Time (in Cycles::rdtsc ticks at the root node) when the last node
+        /// in the broadcast tree received the broadcast. Intended only for
+        /// performance benchmark.
+        uint64_t receiveTime;
     } __attribute__((packed));
 };
 

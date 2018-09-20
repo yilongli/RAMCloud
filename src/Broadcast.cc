@@ -1,4 +1,5 @@
 #include "Broadcast.h"
+#include "ClockSynchronizer.h"
 #include "MilliSortService.h"
 #include "TimeTrace.h"
 
@@ -54,6 +55,7 @@ TreeBcast::TreeBcast(Context* context, CommunicationGroup* group)
     , localResult()
     , root(group->rank)
     , outgoingResponse()
+    , respHdr()
     , responseStorage()
     , outstandingRpcs()
     , payloadResponseHeaderLength(0)
@@ -62,6 +64,10 @@ TreeBcast::TreeBcast(Context* context, CommunicationGroup* group)
     , serviceRpc()
 {
     outgoingResponse = responseStorage.construct();
+    WireFormat::TreeBcast::Response response;
+    bzero(&response, sizeof(response));
+    outgoingResponse->appendCopy(&response);
+    respHdr = outgoingResponse->getStart<WireFormat::TreeBcast::Response>();
 }
 
 /**
@@ -87,6 +93,7 @@ TreeBcast::TreeBcast(Context* context,
     , localResult()
     , root(reqHdr->root)
     , outgoingResponse(rpc->replyPayload)
+    , respHdr(rpc->replyPayload->getStart<WireFormat::TreeBcast::Response>())
     , responseStorage()
     , outstandingRpcs()
     , payloadResponseHeaderLength(reqHdr->payloadResponseHeaderLength)
@@ -95,6 +102,11 @@ TreeBcast::TreeBcast(Context* context,
     , serviceRpc(rpc)
 {
     timeTrace("TreeBcast: received request, rank %u", uint32_t(group->rank));
+
+    // Convert the local time when we receive the broadcast to remote time
+    // at the root node.
+    respHdr->receiveTime = context->clockSynchronizer->toRemoteTsc(
+            group->getNode(root), Cycles::rdtsc());
 
     // Copy out the payload request (from network packet buffers) to make it
     // contiguous. TreeBcast is not meant for large messages anyway.
@@ -139,7 +151,9 @@ TreeBcast::handleRpc(Context* context,
         const WireFormat::TreeBcast::Request* reqHdr, Service::Rpc* rpc)
 {
     TreeBcast treeBcast(context, reqHdr, rpc);
-    treeBcast.wait();
+    while (!treeBcast.isReady()) {
+        Arachne::yield();
+    }
 }
 
 /**
@@ -186,7 +200,7 @@ TreeBcast::isReady()
             it != outstandingRpcs.end();) {
         TreeBcastRpc* rpc = &(*it);
         if (rpc->isReady()) {
-            rpc->wait();
+            respHdr->receiveTime = std::max(rpc->wait(), respHdr->receiveTime);
             outgoingResponse->append(rpc->response);
             it = outstandingRpcs.erase(it);
         } else {
@@ -205,12 +219,29 @@ TreeBcast::isReady()
     return outstandingRpcs.empty() && !payloadRpc;
 }
 
+/**
+ * Return the buffer that stores the final result produced by merging the
+ * individual embedded RPC responses collected from each node in the
+ * communication group.
+ *
+ * The interpretation of the content inside the buffer is up to the caller
+ * depending on the response format of the RPC being broadcasted and the merge
+ * operation being used.
+ *
+ * \param broadcastTime[out]
+ *      Time (in Cycles::rdtsc ticks at the root node) when the broadcast
+ *      message reached the last node in the communication group.
+ */
 Buffer*
-TreeBcast::wait()
+TreeBcast::wait(uint64_t* broadcastTime)
 {
     while (!isReady()) {
         Arachne::yield();
     };
+    if (broadcastTime) {
+        *broadcastTime = respHdr->receiveTime;
+    }
+    outgoingResponse->truncateFront(sizeof(*respHdr));
     return outgoingResponse;
 }
 

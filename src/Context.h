@@ -27,6 +27,7 @@ class AbstractServerList;
 class AdminService;
 class BackupService;
 class CacheTrace;
+class ClockSynchronizer;
 class CommandLineOptions;
 class CoordinatorServerList;
 class CoordinatorService;
@@ -146,6 +147,13 @@ class Context {
     // request/reply message of an RPC.
     const void* masterZeroCopyRegion;
 
+    // On masters and backups, it is used to convert the rdtsc timestamp on this
+    // server to that on a remote server. This is especially useful in debugging
+    // (since we can have globally synchronized timestamp in logs and time
+    // traces) and benchmarking (e.g. measure one-way latency). Owned elsewhere;
+    // not freed by this class.
+    ClockSynchronizer* clockSynchronizer;
+
     /**
      * Returns whether the context belongs to a client.
      */
@@ -208,4 +216,4 @@ class Context {
 
 } // end RAMCloud
 
-#endif  // RAMCLOUD_DISPATCH_H
+#endif  // RAMCLOUD_CONTEXT_H

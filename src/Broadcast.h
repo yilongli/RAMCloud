@@ -39,6 +39,7 @@ class TreeBcast {
   public:
     ~TreeBcast() = default;
 
+    // TODO: remove this; use wait() instead?
     Buffer* getResult();
     static void handleRpc(Context* context,
             const WireFormat::TreeBcast::Request* reqHdr, Service::Rpc* rpc);
@@ -73,11 +74,12 @@ class TreeBcast {
         assert(payloadRequest.size() == 0);
         payloadResponseHeaderLength = 0;
         payloadRequest.appendExternal(data, length);
+        respHdr->receiveTime = Cycles::rdtsc();
         start();
     }
 
     bool isReady();
-    Buffer* wait();
+    Buffer* wait(uint64_t* broadcastTime = NULL);
 
   PRIVATE:
     void start();
@@ -99,12 +101,17 @@ class TreeBcast {
             send();
         }
 
-        /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
-        void wait()
+        /// Return the time (in Cycles::rdtsc ticks at the root node) when the
+        /// broadcast message reached the last node in the tree.
+        uint64_t
+        wait()
         {
             waitAndCheckErrors();
+            uint64_t receiveTime =
+                    getResponseHeader<WireFormat::TreeBcast>()->receiveTime;
             // Chop off the TreeBcast response header.
             response->truncateFront(responseHeaderLength);
+            return receiveTime;
         }
 
         DISALLOW_COPY_AND_ASSIGN(TreeBcastRpc);
@@ -128,6 +135,9 @@ class TreeBcast {
     /// RPC/transport layer. Otherwise, it points to #responseStorage and the
     /// buffer is owned by this class.
     Buffer* outgoingResponse;
+
+    /// Corresponding RPC response header of #outgoingResponse.
+    WireFormat::TreeBcast::Response* respHdr;
 
     /// Storage to use for #outgoingResponse on root node. Empty otherwise.
     Tub<Buffer> responseStorage;

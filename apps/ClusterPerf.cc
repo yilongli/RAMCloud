@@ -7392,6 +7392,11 @@ treeBcast()
         }
     }
 
+    // TODO: should I (re)synchronize every iteration? Or every X secs?
+    uint32_t clockSyncSeconds = 5;
+    cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+            &clockSyncSeconds, sizeof(clockSyncSeconds));
+
     ServerId rootServer(1, 0);
     printf("#%12s%12s%12s%12s\n", "nodes", "size (B)", "ops", "avg (us)");
     printf("#------------------------------------------------\n");
@@ -7403,10 +7408,6 @@ treeBcast()
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);
-
-        // Warmup
-        BenchmarkCollectiveOpRpc warmup(context, 10, WireFormat::BCAST_TREE, 0);
-        warmup.wait();
 
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::BCAST_TREE,
@@ -7436,6 +7437,11 @@ allShuffle()
         }
     }
 
+    // TODO: should I (re)synchronize every iteration? Or every X secs?
+    uint32_t clockSyncSeconds = 5;
+    cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+            &clockSyncSeconds, sizeof(clockSyncSeconds));
+
     // Start performance counters.
     cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
 
@@ -7453,10 +7459,6 @@ allShuffle()
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);
-
-        // Warmup
-        BenchmarkCollectiveOpRpc warmup(context, 10, WireFormat::ALL_SHUFFLE, 0);
-        warmup.wait();
 
         // Take a PerfStats snapshot before the experiment.
         Buffer statsBefore, statsAfter;

@@ -82,24 +82,36 @@ StartMilliSortRpc::appendRequest(Buffer* request, int requestId,
 }
 
 BenchmarkCollectiveOpRpc::BenchmarkCollectiveOpRpc(Context* context, int count,
-        uint32_t opcode, uint32_t dataSize, bool fromClient)
+        uint32_t opcode, uint32_t dataSize)
     : ServerIdRpcWrapper(context, ServerId(1, 0),
             sizeof(WireFormat::StartMilliSort::Response))
 {
-    appendRequest(&request, count, opcode, dataSize, fromClient);
+    appendRequest(&request, count, opcode, dataSize, 0, 0);
+    send();
+}
+
+BenchmarkCollectiveOpRpc::BenchmarkCollectiveOpRpc(Context* context, int count,
+        uint32_t opcode, uint32_t dataSize, uint64_t masterId,
+        uint64_t startTime)
+    : ServerIdRpcWrapper(context, ServerId(1, 0),
+            sizeof(WireFormat::StartMilliSort::Response))
+{
+    appendRequest(&request, count, opcode, dataSize, masterId, startTime);
     send();
 }
 
 void
 BenchmarkCollectiveOpRpc::appendRequest(Buffer* request, int count,
-        uint32_t opcode, uint32_t dataSize, bool fromClient)
+        uint32_t opcode, uint32_t dataSize, uint64_t masterId,
+        uint64_t startTime)
 {
     WireFormat::BenchmarkCollectiveOp::Request* reqHdr(
             allocHeader<WireFormat::BenchmarkCollectiveOp>(request));
     reqHdr->count = count;
     reqHdr->opcode = opcode;
     reqHdr->dataSize = dataSize;
-    reqHdr->fromClient = fromClient;
+    reqHdr->masterId = masterId;
+    reqHdr->startTime = startTime;
 }
 
 SendDataRpc::SendDataRpc(Context* context, ServerId serverId, uint32_t dataId,

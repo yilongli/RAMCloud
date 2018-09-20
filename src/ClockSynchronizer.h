@@ -34,6 +34,8 @@ class ClockSynchronizer : Dispatch::Poller {
             const WireFormat::ClockSync::Request* reqHdr);
     int poll();
     void run(uint32_t seconds);
+    uint64_t toLocalTsc(ServerId remote, uint64_t remoteTsc);
+    uint64_t toRemoteTsc(ServerId remote, uint64_t localTsc);
 
   PRIVATE:
     void computeOffset();
@@ -51,17 +53,21 @@ class ClockSynchronizer : Dispatch::Poller {
     /// the more error we have in the computed offset.
     const uint64_t baseTsc;
 
-    /// Store the clock base times of all nodes in the cluster when the
+    // FIXME: introduce struct ClockState = {baseTsc, offset, skew}; combine 3 map accesses into one!
+    /// Stores the clock base times of all nodes in the cluster when the
     /// synchronization completes.
     std::unordered_map<ServerId, uint64_t> clockBaseTsc;
 
-    /// Store the clock offsets between this node and other nodes in the cluster
+    /// Stores the clock offsets between this node and other nodes in the cluster
     /// when the synchronization completes.
     std::unordered_map<ServerId, int64_t> clockOffset;
 
-    /// Store the clock skew factor between this node and other nodes in the
+    /// Stores the clock skew factor between this node and other nodes in the
     /// cluster when the synchronization completes.
     std::unordered_map<ServerId, double> clockSkew;
+
+    /// Provides exclusive access to clock{BaseTsc, Offset, Skew}.
+    SpinLock mutex;
 
     /// When (in rdtsc ticks) should we update the serverTracker.
     uint64_t nextUpdateTime;
