@@ -1028,7 +1028,6 @@ MilliSortService::benchmarkCollectiveOp(
     if (reqHdr->opcode == WireFormat::BCAST_TREE) {
         /* Broadcast benchmark */
         std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
-        uint64_t totalTime = 0;
         for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
             uint64_t startTime = Cycles::rdtsc();
             uint64_t endTime;
@@ -1036,10 +1035,11 @@ MilliSortService::benchmarkCollectiveOp(
             bcast.send(data.get(), reqHdr->dataSize);
             bcast.wait(&endTime);
             if (i >= WARMUP_COUNT) {
-                totalTime += endTime - startTime;
+                uint64_t elapsedNanos =
+                        Cycles::toNanoseconds(endTime - startTime);
+                rpc->replyPayload->emplaceAppend<uint64_t>(elapsedNanos);
             }
         }
-        respHdr->elapsedTime = Cycles::toMicroseconds(totalTime);
     } else if (reqHdr->opcode == WireFormat::ALL_SHUFFLE) {
         /* AllShuffle benchmark */
         if (reqHdr->masterId == 0) {
@@ -1053,17 +1053,19 @@ MilliSortService::benchmarkCollectiveOp(
                         reqHdr->dataSize, serverId.getId(), startTime);
                 Buffer* result = bcast.wait();
 
-                // Instead of including the round-trip broadcast delay, it would
-                // be more interesting to see the max elapsed time of all nodes.
-                uint64_t elapsedTime = 0;
+                // Get the timestamp (on the root node) when the last node
+                // completes the shuffle and convert to nanasecond.
+                uint64_t elapsedNanos = 0;
                 uint32_t offset = 0;
                 while (offset < result->size()) {
-                    elapsedTime = std::max(elapsedTime, result->read<
-                            WireFormat::BenchmarkCollectiveOp::Response>(
-                            &offset)->elapsedTime);
+                    result->read<WireFormat::BenchmarkCollectiveOp::Response>(
+                            &offset);
+                    uint64_t endTime = *result->read<uint64_t>(&offset);
+                    elapsedNanos = std::max(elapsedNanos,
+                            Cycles::toNanoseconds(endTime - startTime));
                 }
                 if (i >= WARMUP_COUNT) {
-                    respHdr->elapsedTime += elapsedTime;
+                    rpc->replyPayload->emplaceAppend<uint64_t>(elapsedNanos);
                 }
             }
         } else {
@@ -1093,8 +1095,9 @@ MilliSortService::benchmarkCollectiveOp(
                     ALLSHUFFLE_BENCHMARK, merger, numBytes);
 //            timeTrace("ALL_SHUFFLE benchmark completes, received %u bytes",
 //                    bytesReceived.load());
-            respHdr->elapsedTime = Cycles::toMicroseconds(
-                    Cycles::rdtsc() - startTime);
+            uint64_t endTime = context->clockSynchronizer->getConverter(
+                    ServerId(reqHdr->masterId)).toRemoteTsc(Cycles::rdtsc());
+            rpc->replyPayload->emplaceAppend<uint64_t>(endTime);
         }
     } else {
         respHdr->common.status = STATUS_INVALID_PARAMETER;

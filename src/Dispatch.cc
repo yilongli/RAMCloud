@@ -294,16 +294,26 @@ void
 Dispatch::run()
 {
     PerfStats::registerStats(&PerfStats::threadStats);
-    uint64_t prev = Cycles::rdtsc();
+    uint64_t prevPollTime = Cycles::rdtsc();
     int prevResult = 0;
+    uint64_t idleTime = 0;
     while (true) {
         int r = poll();
+        if (r > 0) {
+            if (idleTime > 0) {
+                LOG(DEBUG, "Dispatch was idle for %lu cycles before this "
+                        "iteration", idleTime);
+            }
+            idleTime = 0;
+        }
+        uint64_t elapsed = currentTime - prevPollTime;
         if (prevResult > 0) {
-            PerfStats::threadStats.dispatchActiveCycles +=
-                    currentTime - prev;
+            PerfStats::threadStats.dispatchActiveCycles += elapsed;
+        } else {
+            idleTime += elapsed;
         }
         prevResult = r;
-        prev = currentTime;
+        prevPollTime = currentTime;
     }
 }
 

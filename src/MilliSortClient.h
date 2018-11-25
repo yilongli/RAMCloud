@@ -108,11 +108,14 @@ class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
             uint32_t dataSize, uint64_t masterId, uint64_t startTime);
 
     /// Return the time, in microseconds, to complete the collective operation.
-    uint64_t wait()
+    void wait(std::vector<uint64_t>* completionTimes)
     {
         waitAndCheckErrors();
-        return response->getStart<
-                WireFormat::BenchmarkCollectiveOp::Response>()->elapsedTime;
+        completionTimes->clear();
+        uint32_t offset= sizeof32(WireFormat::BenchmarkCollectiveOp::Response);
+        while (offset < response->size()) {
+            completionTimes->push_back(*response->read<uint64_t>(&offset));
+        }
     }
 
     static const uint32_t responseHeaderLength =

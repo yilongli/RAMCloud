@@ -93,20 +93,37 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     , rxBuffersInHca(0)
     , rxBufferLogThreshold(0)
     , txPool()
+    , txBuffersInHca()
     , QKEY(ethernet ? 0 : 0xdeadbeef)
     , rxcq(0)
     , txcq(0)
     , qp()
     , ibPhysicalPort(ethernet ? 2 : 1)
     , lid(0)
+    , mtu(0)
     , qpn(0)
     , localMac()
     , locatorString("infud:")
-    , bandwidthGbps(32)                   // Default bandwidth in gbs
+    // As of 11/2018, the network bandwidth of our RC machines at Stanford is
+    // actually limited by the effective bandwidth of PCIe 2.0x4, which should
+    // be ~29Gbps when taking into account the overhead of PCIe headers.
+    // For example, suppose the HCA's MTU is 256B and the PCIe headers are 24B
+    // in total, the effective bandwidth of PCIe 2.0x4 is
+    //      32Gbps * 256 / (256 + 24) = 29.25Gbps
+    // Unfortunately, it appears that our ConnextX-2 HCA somehow cannot fully
+    // utilize the 29Gbps PCIe bandwidth when sending UD packets. This can be
+    // verified by running one or more ib_send_bw programs on two machines.
+    // The maximum outgoing bandwidth we can achieve in practice is ~3020MB/s,
+    // or 23.6Gbps. Note that we need to set the outgoing bandwidth slightly
+    // higher than 24Gbps in order to saturate the 23.6Gbps outgoing bandwidth.
+    // This is because the throughput of the HCA has non-negligible variation:
+    // when it's running faster than 24Gbps, we don't want the transport to
+    // throttle the throughput and leave the HCA idle.
+    , bandwidthGbps(26)                   // Default outgoing bandwidth in gbs
     , zeroCopyStart(NULL)
     , zeroCopyEnd(NULL)
     , zeroCopyRegion(NULL)
-    , sendsSinceLastReap(0)
+    , sendsSinceLastSignal(0)
 {
     const char *ibDeviceName = NULL;
     bool macAddressProvided = false;
@@ -118,6 +135,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
             try {
                 localMac.construct(sl->getOption<const char*>("mac"));
                 macAddressProvided = true;
+                mtu = 1514;
             } catch (ServiceLocator::NoSuchKeyException& e) {}
         }
 
@@ -133,14 +151,16 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
             bandwidthGbps = sl->getOption<int>("gbs");
         } catch (ServiceLocator::NoSuchKeyException& e) {}
     }
+    infiniband = realInfiniband.construct(ibDeviceName);
+    mtu = infiniband->getMtu(ibPhysicalPort);
     queueEstimator.setBandwidth(1000*bandwidthGbps);
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
             * MAX_DRAIN_TIME / 8.0);
     uint32_t maxPacketSize = getMaxPacketSize();
-    if (maxTransmitQueueSize < 4*maxPacketSize) {
+    if (maxTransmitQueueSize < 2*maxPacketSize) {
         // Make sure that we advertise enough space in the transmit queue to
         // prepare the next packet while the current one is transmitting.
-        maxTransmitQueueSize = 4*maxPacketSize;
+        maxTransmitQueueSize = 2*maxPacketSize;
     }
     LOG(NOTICE, "InfUdDriver bandwidth: %d Gbits/sec, maxTransmitQueueSize: "
             "%u bytes, maxPacketSize %u bytes", bandwidthGbps,
@@ -148,8 +168,6 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
 
     if (ethernet && !macAddressProvided)
         localMac.construct(MacAddress::RANDOM);
-
-    infiniband = realInfiniband.construct(ibDeviceName);
 
     // Allocate buffer pools.
     uint32_t bufSize = (maxPacketSize +
@@ -236,9 +254,7 @@ InfUdDriver::~InfUdDriver()
 uint32_t
 InfUdDriver::getMaxPacketSize()
 {
-    const uint32_t eth = 1500 + 14 - sizeof32(EthernetHeader);
-    const uint32_t inf = 2048 - GRH_SIZE;
-    return localMac ? eth : inf;
+    return localMac ? mtu - sizeof32(EthernetHeader) : mtu - GRH_SIZE;
 }
 
 /**
@@ -290,13 +306,29 @@ InfUdDriver::getTransmitBuffer()
 void
 InfUdDriver::reapTransmitBuffers()
 {
-#define MAX_TO_RETRIEVE 100
+#define MAX_TO_RETRIEVE 4
     ibv_wc retArray[MAX_TO_RETRIEVE];
-    int numBuffers = ibv_poll_cq(txcq, MAX_TO_RETRIEVE, retArray);
-    for (int i = 0; i < numBuffers; i++) {
-        BufferDescriptor* bd =
+    int cqes = infiniband->pollCompletionQueue(txcq, MAX_TO_RETRIEVE, retArray);
+    if (cqes) {
+        timeTrace("polling TX completion queue returned %d CQEs", cqes);
+    }
+    for (int i = 0; i < cqes; i++) {
+        BufferDescriptor* signaledCompletion =
             reinterpret_cast<BufferDescriptor*>(retArray[i].wr_id);
-        txPool->freeBuffers.push_back(bd);
+        bool found = false;
+        while (!txBuffersInHca.empty()) {
+            BufferDescriptor* bd = txBuffersInHca.front();
+            txBuffersInHca.pop_front();
+            txPool->freeBuffers.push_back(bd);
+            if (bd == signaledCompletion) {
+                found = true;
+                timeTrace("reaped %d TX buffers", SIGNALED_SEND_PERIOD);
+                break;
+            }
+        }
+        if (!found) {
+            DIE("Couldn't find the send request (SR) just completed");
+        }
 
         if (retArray[i].status != IBV_WC_SUCCESS) {
             LOG(WARNING, "Infud transmit failed: %s",
@@ -410,6 +442,8 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
         } else {
             memcpy(p, currentChunk, payload->getLength());
             p += payload->getLength();
+            timeTrace("0-copy not applicable; copied %u bytes",
+                    payload->getLength());
         }
         payload->next();
     }
@@ -428,7 +462,11 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     workRequest.sg_list = sges;
     workRequest.num_sge = numSges;
     workRequest.opcode = IBV_WR_SEND;
-    workRequest.send_flags = IBV_SEND_SIGNALED;
+    sendsSinceLastSignal++;
+    if (sendsSinceLastSignal >= SIGNALED_SEND_PERIOD) {
+        workRequest.send_flags = IBV_SEND_SIGNALED;
+        sendsSinceLastSignal = 0;
+    }
 
     // We can get a substantial latency improvement (nearly 2usec less per RTT)
     // by inlining data with the WQE for small messages. The Verbs library
@@ -443,6 +481,9 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     if (ibv_post_send(qp->qp, &workRequest, &bad_txWorkRequest)) {
         LOG(WARNING, "Error posting transmit packet: %s", strerror(errno));
         txPool->freeBuffers.push_back(bd);
+        return;
+    } else {
+        txBuffersInHca.push_back(bd);
     }
     lastTransmitTime = Cycles::rdtsc();
     timeTrace("sent packet with %u bytes, %u free buffers", totalLength,
@@ -454,21 +495,6 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
             txQueueState);
     PerfStats::threadStats.networkOutputBytes += bd->packetLength;
     PerfStats::threadStats.networkOutputPackets++;
-
-    // Every once in a while, see if we can reclaim used transmit buffers.
-    // This code isn't strictly necessary, since we'll eventually reclaim
-    // them in getTransmitBuffer. However, if we do it here, there's some
-    // chance that we didn't have anything else to do, so reclamation
-    // will effectively be free. The number "10" was chosen through
-    // experimentation in 8/2016. It's large enough to amortize the fixed
-    // costs of NIC communication; above this, the cost grows with the
-    // number of buffers retrieved, so the cost per buffer ends up about the
-    // same, but we take a bigger hit on tail latency.
-    sendsSinceLastReap++;
-    if (sendsSinceLastReap >= 10) {
-        reapTransmitBuffers();
-        sendsSinceLastReap = 0;
-    }
 #if COLLECT_LOW_LEVEL_PERFSTATS
     uint64_t stopTime = Cycles::rdtscp();
     PerfStats::threadStats.infudDriverTxCycles += stopTime - startTime;
@@ -502,10 +528,6 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         }
         return;
     }
-#if TIME_TRACE
-    TimeTrace::record(context->dispatch->currentTime,
-            "start of poller loop");
-#endif
     timeTrace("InfUdDriver received %d packets", numPackets);
 #if COLLECT_LOW_LEVEL_PERFSTATS
     uint64_t ibvPollCq = Cycles::rdtscp();

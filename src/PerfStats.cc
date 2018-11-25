@@ -13,6 +13,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <numeric>
 #include <limits>
 #include "Cycles.h"
 #include "Minimal.h"
@@ -434,9 +435,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Basic active time (sec)",
             formatMetricRatio(&diff, "basicTransportActiveCycles",
             "cyclesPerSecond", " %8.3f").c_str()));
-    result.append(format("%-40s %s\n", "    Basic send data packets (%)",
+    result.append(format("%-40s %s\n", "    Basic send data packets (sec)",
             formatMetricRatio(&diff, "basicTransportSendDataCycles",
-            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+            "cyclesPerSecond", " %8.3f").c_str()));
     result.append(format("%-40s %s\n", "      Cost per packet  (ns)",
             formatMetricLambda(&diff, perItemCostComputer,
             {"basicTransportSendDataCycles", "basicTransportOutputDataPackets",
@@ -447,9 +448,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "      Avg. packet size (B)",
             formatMetricRatio(&diff, "basicTransportOutputDataBytes",
             "basicTransportOutputDataPackets", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "    Basic send control packets (%)",
+    result.append(format("%-40s %s\n", "    Basic send control packets (sec)",
             formatMetricRatio(&diff, "basicTransportSendControlCycles",
-            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+            "cyclesPerSecond", " %8.3f").c_str()));
     result.append(format("%-40s %s\n", "      Cost per packet (ns)",
             formatMetricLambda(&diff, perItemCostComputer,
             {"basicTransportSendControlCycles", "basicTransportOutputControlPackets",
@@ -460,9 +461,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "      Avg. packet size (B)",
             formatMetricRatio(&diff, "basicTransportOutputControlBytes",
             "basicTransportOutputControlPackets", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "    Basic receive packets (%)",
+    result.append(format("%-40s %s\n", "    Basic receive packets (sec)",
             formatMetricRatio(&diff, "basicTransportReceiveCycles",
-            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+            "cyclesPerSecond", " %8.3f").c_str()));
     result.append(format("%-40s %s\n", "      Cost per packet (ns)",
             formatMetricLambda(&diff, perItemCostComputer,
             {"basicTransportReceiveCycles", "basicTransportInputPackets",
@@ -470,9 +471,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "      Packets (M)",
             formatMetric(&diff, "basicTransportInputPackets",
             " %8.3f", 1e-6).c_str()));
-    result.append(format("%-40s %s\n", "    Basic handle packets (%)",
+    result.append(format("%-40s %s\n", "    Basic handle packets (sec)",
             formatMetricRatio(&diff, "basicTransportHandlePacketCycles",
-            "basicTransportActiveCycles", " %8.1f", 100).c_str()));
+            "cyclesPerSecond", " %8.3f").c_str()));
     result.append(format("%-40s %s\n", "      Cost per packet (ns)",
             formatMetricLambda(&diff, perItemCostComputer,
             {"basicTransportHandlePacketCycles", "basicTransportInputPackets",
@@ -488,29 +489,33 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  infud send time (sec)",
             formatMetricRatio(&diff, "infudDriverTxCycles", "cyclesPerSecond",
             " %8.3f").c_str()));
-    result.append(format("%-40s %s\n", "    prepare work request (%)",
+    result.append(format("%-40s %s\n", "    prepare work request (sec)",
             formatMetricRatio(&diff, "infudDriverTxPrepareCycles",
-            "infudDriverTxCycles", " %8.1f", 100).c_str()));
-    result.append(format("%-40s %s\n", "    ibv_post_send (%)",
+            "cyclesPerSecond", " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    ibv_post_send (sec)",
             formatMetricRatio(&diff, "infudDriverTxPostSendCycles",
-            "infudDriverTxCycles", " %8.1f", 100).c_str()));
-    result.append(format("%-40s %s\n", "    post-processing (%)",
+            "cyclesPerSecond", " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    post-processing (sec)",
             formatMetricRatio(&diff, "infudDriverTxPostProcessCycles",
-            "infudDriverTxCycles", " %8.1f", 100).c_str()));
+            "cyclesPerSecond", " %8.3f").c_str()));
     result.append(format("%-40s %s\n", "  infud recv time (sec)",
             formatMetricRatio(&diff, "infudDriverRxCycles", "cyclesPerSecond",
             " %8.3f").c_str()));
-    result.append(format("%-40s %s\n", "    ibv_poll_cq (%)",
+    result.append(format("%-40s %s\n", "    ibv_poll_cq (sec)",
             formatMetricRatio(&diff, "infudDriverRxPollCqCycles",
-            "infudDriverRxCycles", " %8.1f", 100).c_str()));
-    result.append(format("%-40s %s\n", "    prefetch + refill (%)",
+            "cyclesPerSecond", " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    prefetch + refill (sec)",
             formatMetricRatio(&diff, "infudDriverRxRefillCycles",
-            "infudDriverRxCycles", " %8.1f", 100).c_str()));
-    result.append(format("%-40s %s\n", "    process packets (%)",
+            "cyclesPerSecond", " %8.3f").c_str()));
+    result.append(format("%-40s %s\n", "    process packets (sec)",
             formatMetricRatio(&diff, "infudDriverRxProcessPacketCycles",
-            "infudDriverRxCycles", " %8.1f", 100).c_str()));
+            "cyclesPerSecond", " %8.3f").c_str()));
 
     // TODO: Arachne core util.
+    auto vs = diff.find("millisortTime")->second;
+    if (std::accumulate(vs.begin(), vs.end(), 0.0) < 1e-6) {
+        return result;
+    }
     result.append("\nMilliSort:\n");
     result.append("\n=== Total ===\n");
     result.append(format("%-40s %s\n", "  Elapsed time (us)",

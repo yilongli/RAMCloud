@@ -7412,9 +7412,12 @@ treeBcast()
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::BCAST_TREE,
                 objectSize);
-        uint64_t elapsedTime = rpc.wait();
+        std::vector<uint64_t> completionTimes;
+        rpc.wait(&completionTimes);
+        double elapsedMicros = double(std::accumulate(completionTimes.begin(),
+                completionTimes.end(), 0ul)) * 1e-3;
         printf(" %12d%12d%12d%12.2f\n", machineCount, objectSize, count,
-                double(elapsedTime) / double(count));
+                elapsedMicros / double(count));
     }
 }
 
@@ -7445,10 +7448,11 @@ allShuffle()
     // Start performance counters.
     cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
 
-    printf("#%12s%12s%12s%16s%20s\n", "nodes", "bytes/node", "ops",
-            "latency (us)", "throughput (MB/s)");
+    printf("# Note: the latency numbers are displayed in microseconds.\n"
+            "#%12s%12s%12s%12s%12s%12s%12s%12s%20s\n", "nodes", "bytes/node",
+            "ops", "min", "avg", "p50", "p90", "p99", "throughput (MB/s)");
     printf("#------------------------------------------------------------------"
-            "------\n");
+            "--------------------------------------------------\n");
 
     // Sweep machineCount from 1 to numMasters.
     string perfstats;
@@ -7468,11 +7472,20 @@ allShuffle()
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
                 objectSize);
-        uint64_t elapsedTime = rpc.wait();
-        double latency = double(elapsedTime) / double(count);
-        double throughput = double(objectSize) / latency;
-        printf(" %12d%12d%12d%16.2f%20.2f\n", machineCount, objectSize, count,
-                latency, throughput);
+        std::vector<uint64_t> completionTimes;
+        rpc.wait(&completionTimes);
+
+        std::sort(completionTimes.begin(), completionTimes.end());
+        double min = double(completionTimes[0]) * 1e-3;
+        double avg = double(std::accumulate(completionTimes.begin(),
+                completionTimes.end(), 0ul)) / double(count) * 1e-3;
+        double p50 = double(completionTimes[int(count * 0.5)]) * 1e-3;
+        double p90 = double(completionTimes[int(count * 0.9)]) * 1e-3;
+        double p99 = double(completionTimes[int(count * 0.99)]) * 1e-3;
+        double throughput = double(objectSize) / avg;
+        printf(" %12d%12d%12d%12.2f%12.2f%12.2f%12.2f%12.2f%20.2f\n",
+                machineCount, objectSize, count, min, avg, p50, p90, p99,
+                throughput);
 
         // Take another PerfStats snapshot after the experiment.
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,

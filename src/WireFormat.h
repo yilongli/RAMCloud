@@ -351,8 +351,11 @@ struct BenchmarkCollectiveOp {
     struct Response {
         ResponseCommon common;
 
-        /// Time, in microseconds, to finish the experiment.
-        uint64_t elapsedTime;
+        /// In the response buffer that follows are the completion times of all
+        /// the operations performed, in nanoseconds; each completion time is
+        /// represented as an uint64_t. If the request is from an external
+        /// client (i.e., Request::masterId is 0), there will be exactly
+        /// Request::count numbers in the buffer; otherwise, only one number.
     } __attribute__((packed));
 };
 
