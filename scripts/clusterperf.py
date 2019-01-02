@@ -427,6 +427,29 @@ def broadcast(name, options, cluster_args, client_args):
         cluster_args['num_clients'] = 10
     default(name, options, cluster_args, client_args)
 
+def clockSync(name, options, cluster_args, client_args):
+    # TODO: example command
+    # scripts/clusterperf.py --replicas 0 --servers 8 --transport basic+infud --count 5 --seconds 1 clockSync
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '-t 4000'
+    if cluster_args['timeout'] < 250:
+        cluster_args['timeout'] = 250
+    default(name, options, cluster_args, client_args)
+    globResult = glob.glob('%s/latest/server*.log' % options.log_dir)
+    # TODO: more sophisticated output of processing the server log files
+    p = re.compile('Synchronized clock')
+    for logfile in globResult:
+        print(logfile)
+        l = []
+        for line in open(logfile, 'r'):
+            m = p.search(line)
+            if m:
+                start, end = m.span()
+                l.append(line[start:].strip())
+        l.sort()
+        for line in l:
+            print(line)
+
 def echo(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '-t 4000'
@@ -894,7 +917,7 @@ def migrateLoaded(name, options, cluster_args, client_args):
 simple_tests = [
     Test("basic", basic),
     Test("broadcast", broadcast),
-    Test("clockSync", basic),
+    Test("clockSync", clockSync),
     Test("echo_basic", echo),
     Test("multiRead_colocation", default),
     Test("netBandwidth", netBandwidth),

@@ -271,12 +271,12 @@ struct PerfStats {
     /// Total bytes of control packets transmitted on the network.
     uint64_t basicTransportOutputControlBytes;
 
-    /// Total data packets transmitted on the network.
-    uint64_t basicTransportOutputDataPackets;
-
     /// Total bytes of data packets (including transport header) transmitted
     /// on the network.
     uint64_t basicTransportOutputDataBytes;
+
+    /// Total data packets transmitted on the network.
+    uint64_t basicTransportOutputDataPackets;
 
     uint64_t infudDriverTxCycles;
     uint64_t infudDriverTxPrepareCycles;

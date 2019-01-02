@@ -13,35 +13,10 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include "malloc.h"
-
 #include "Cycles.h"
 #include "DispatchExec.h"
 
 namespace RAMCloud {
-
-/**
- * This method is invoked by the dispatch poller; it checks for DispatchExec
- * requests and executes them.
- * \return
- *      1 is returned if there was at least one request to execute; 0
- *      is returned if this method found nothing to do.
- */
-int DispatchExec::poll()
-{
-    int foundWork = 0;
-    while (requests[removeIndex].data.full == 1) {
-        Fence::enter();
-        requests[removeIndex].getLambda()->invoke();
-        Fence::leave();
-        requests[removeIndex].data.full = 0;
-        removeIndex++;
-        if (removeIndex == NUM_WORKER_REQUESTS) removeIndex = 0;
-        totalRemoves++;
-        foundWork = 1;
-    }
-    return foundWork;
-}
 
 /**
  * Construct a DispatchExec.
@@ -67,7 +42,6 @@ DispatchExec::DispatchExec(Dispatch* dispatch)
         // Zero-initialize the LambdaBox array so that all the 'full' bits are
         // clear at the outset.
         memset(requests, 0, NUM_WORKER_REQUESTS * sizeof(pad));
-        Fence::sfence();
 }
 
 /**

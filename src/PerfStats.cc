@@ -134,8 +134,8 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(basicTransportSendControlCycles);
         COLLECT(basicTransportOutputControlPackets);
         COLLECT(basicTransportOutputControlBytes);
-        COLLECT(basicTransportOutputDataPackets);
         COLLECT(basicTransportOutputDataBytes);
+        COLLECT(basicTransportOutputDataPackets);
         COLLECT(infudDriverTxCycles);
         COLLECT(infudDriverTxPrepareCycles);
         COLLECT(infudDriverTxPostSendCycles);
@@ -468,6 +468,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricLambda(&diff, perItemCostComputer,
             {"basicTransportReceiveCycles", "basicTransportInputPackets",
             "cyclesPerNanos"}, " %8.1f").c_str()));
+    result.append(format("%-40s %s\n", "      Avg. packet size (B)",
+            formatMetricRatio(&diff, "basicTransportInputDataBytes",
+            "basicTransportInputPackets", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "      Packets (M)",
             formatMetric(&diff, "basicTransportInputPackets",
             " %8.3f", 1e-6).c_str()));
@@ -923,8 +926,8 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(basicTransportSendControlCycles);
         ADD_METRIC(basicTransportOutputControlPackets);
         ADD_METRIC(basicTransportOutputControlBytes);
-        ADD_METRIC(basicTransportOutputDataPackets);
         ADD_METRIC(basicTransportOutputDataBytes);
+        ADD_METRIC(basicTransportOutputDataPackets);
         ADD_METRIC(infudDriverTxCycles);
         ADD_METRIC(infudDriverTxPrepareCycles);
         ADD_METRIC(infudDriverTxPostSendCycles);

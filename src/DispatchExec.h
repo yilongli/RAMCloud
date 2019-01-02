@@ -15,10 +15,9 @@
 #ifndef RAMCLOUD_DISPATCHEXEC_H
 #define RAMCLOUD_DISPATCHEXEC_H
 
+#include <atomic>
 #include "Common.h"
 #include "Dispatch.h"
-#include "Fence.h"
-#include "Atomic.h"
 #include "ShortMacros.h"
 
 namespace RAMCloud {
@@ -81,13 +80,7 @@ class DispatchExec : public Dispatch::Poller {
                 //
                 // We make this 64 bits to align the Lambda on an 8-byte
                 // boundary.
-                //
-                // We would have preferred to use Atomic, but C++ does not allow
-                // the use of Atomic<uint64_t> in unions because Atomic has a
-                // constructor. However, based on the load and store operations
-                // inside Atomic.h, it appears that we will be safe as long as
-                // we do not try to do arithmetic on this value.
-                volatile uint64_t full;
+                std::atomic<uint64_t> full;
 
                 // This is storage space for constructing a Lambda that
                 // describes the request.
@@ -108,7 +101,33 @@ class DispatchExec : public Dispatch::Poller {
 
         explicit DispatchExec(Dispatch* dispatch);
         ~DispatchExec();
-        virtual int poll();
+
+        /**
+         * This method is invoked by the dispatch poller; it checks for DispatchExec
+         * requests and executes them.
+         * \return
+         *      1 is returned if there was at least one request to execute; 0
+         *      is returned if this method found nothing to do.
+         */
+        __always_inline
+        int poll()
+        {
+            int foundWork = 0;
+            while (true) {
+                DispatchExec::LambdaBox* request = &requests[removeIndex];
+                if (!request->data.full.load(std::memory_order_acquire)) {
+                    break;
+                }
+                request->getLambda()->invoke();
+                request->data.full.store(0, std::memory_order_release);
+                removeIndex++;
+                if (removeIndex == NUM_WORKER_REQUESTS) removeIndex = 0;
+                totalRemoves++;
+                foundWork = 1;
+            }
+            return foundWork;
+        }
+
         void sync(uint64_t id);
 
         /**
@@ -147,8 +166,8 @@ class DispatchExec : public Dispatch::Poller {
             // If there is no space at the current index, it means that the
             // Dispatch thread has fallen behind, so spin until there is space
             // at the current index
-            // TODO: shouldn't use volatile and custom fence!
-            while (requests[addIndex].data.full == 1) {
+            DispatchExec::LambdaBox* request = &requests[addIndex];
+            while (request->data.full.load(std::memory_order_acquire)) {
                 if (owner->isDispatchThread()) {
                     DIE("Invoked DispatchExec::addRequest from dispatch thread,"
                             " deadlocked due to full request queue");
@@ -158,13 +177,12 @@ class DispatchExec : public Dispatch::Poller {
                     "Request queue for dispatch thread full, worker blocked..");
             }
 
-            new(&requests[addIndex].data.lambda)
+            new(&request->data.lambda)
                 T(static_cast<Args&&>(args)...);
 
             // Make sure the object above has fully initialized before marking
             // the LambdaBox as full
-            Fence::sfence();
-            requests[addIndex].data.full = 1;
+            request->data.full.store(1, std::memory_order_release);
             addIndex++;
             if (addIndex == NUM_WORKER_REQUESTS)
                 addIndex = 0;

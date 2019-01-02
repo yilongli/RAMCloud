@@ -40,7 +40,39 @@ class WorkerManager : Dispatch::Poller {
 
     void handleRpc(Transport::ServerRpc* rpc);
     bool idle();
-    int poll();
+
+    /**
+     * This method is invoked by Dispatch during its polling loop. It checks
+     * for completion of outstanding RPCs.
+     */
+    __always_inline
+    int poll()
+    {
+        for (auto collectiveOpRpc : collectiveOpRpcs) {
+            handleRpc(collectiveOpRpc);
+        }
+        collectiveOpRpcs.clear();
+
+        int foundWork = 0;
+        for (int i = downCast<int>(outstandingRpcs.size()) - 1; i >= 0; i--) {
+            Transport::ServerRpc* rpc = outstandingRpcs[i];
+            if (!rpc->finished.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            foundWork = 1;
+            rpc->sendReply();
+            numOutstandingRpcs--;
+
+            // If we are not the last rpc, store the last Rpc here so that pop-back
+            // doesn't lose data and we do not iterate here again.
+            if (rpc != outstandingRpcs.back())
+                outstandingRpcs[i] = outstandingRpcs.back();
+            outstandingRpcs.pop_back();
+        }
+        return foundWork;
+    }
+
     Transport::ServerRpc* waitForRpc(double timeoutSeconds);
     void workerMain(Transport::ServerRpc* serverRpc);
 

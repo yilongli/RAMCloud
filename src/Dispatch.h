@@ -16,15 +16,10 @@
 #ifndef RAMCLOUD_DISPATCH_H
 #define RAMCLOUD_DISPATCH_H
 
-#if (__GNUC__ == 4 && __GNUC_MINOR__ >= 5) || (__GNUC__ > 4)
 #include <atomic>
-#else
-#include <cstdatomic>
-#endif
 #include <thread>
 
 #include "Common.h"
-#include "Atomic.h"
 #include "ThreadId.h"
 #include "Tub.h"
 #include "SpinLock.h"
@@ -129,6 +124,7 @@ class Dispatch {
         /// this poller isn't currently in Dispatch::pollers (happens
         /// after Dispatch::reset).
         int slot;
+
         friend class Dispatch;
         DISALLOW_COPY_AND_ASSIGN(Poller);
     };
@@ -331,10 +327,10 @@ class Dispatch {
 
     // Nonzero means there is a (non-dispatch) thread trying to lock the
     // dispatcher.
-    Atomic<int> lockNeeded;
+    std::atomic<int> lockNeeded;
 
     // Nonzero means the dispatch thread is locked.
-    Atomic<int> locked;
+    std::atomic<int> locked;
 
     /**
      * True if there is a thread which owns this dispatch (this is

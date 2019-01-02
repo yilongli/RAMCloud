@@ -59,6 +59,7 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     , sendingRpc(false)
     , serverTracker(context)
     , sessions()
+    , syncCount(0)
     , syncStopTime()
 {
     assert(context->serverList);
@@ -79,6 +80,7 @@ ClockSynchronizer::computeOffset()
         // will realize that it has passed the stop time and return immediately.
         Dispatch::Lock _(context->dispatch);
         phase = -1;
+        syncCount++;
     }
     timeTrace("computeOffset released dispatch lock");
     SpinLock::Guard _(mutex);
@@ -87,10 +89,16 @@ ClockSynchronizer::computeOffset()
     ServerId ourServerId = context->getAdminService()->serverId;
     clockState[ourServerId] = {baseTsc, 0, 1.0};
 
+    uint64_t now = Cycles::rdtsc();
     for (auto& p : outgoingProbes[1]) {
         ServerId syncee = p.first;
         ClockState* clock = &clockState[syncee];
-        
+        double oldRemoteTime = 0;
+        double newRemoteTime;
+        if (std::abs(clock->skew) > 1e-3) {
+            oldRemoteTime = TimeConverter(baseTsc, clock).toRemoteTime(now);
+        }
+
         // Use the fastest probes from phase 0 and phase 2 to compute the clock
         // skew factor.
         Probe probe1 = outgoingProbes[0][syncee];
@@ -112,12 +120,14 @@ ClockSynchronizer::computeOffset()
         int64_t offset = int64_t(outgoing.clientTsc + halfRTT) -
                 static_cast<int64_t>(skew * double(outgoing.serverTsc));
         clock->offset = offset;
-        // FIXME: est. cyclesPerSec is quite different from measured one???
-        LOG(NOTICE, "Synchronized clock with server %u; est. RTT %.2f us; "
-                "est. cyclesPerSec %.0f; "
-                "TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
-                syncee.indexNumber(), Cycles::toSeconds(2*halfRTT)*1e6,
-                Cycles::perSecond() / clock->skew, ourServerId.indexNumber(),
+        newRemoteTime = TimeConverter(baseTsc, clock).toRemoteTime(now);
+        if (oldRemoteTime < 1e-3) {
+            oldRemoteTime = newRemoteTime;
+        }
+        LOG(NOTICE, "Synchronized clock %d times with server %u; RTT %.2f us; "
+                "time jump %.0f ns; TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
+                syncCount, syncee.indexNumber(), Cycles::toSeconds(2*halfRTT)*1e6,
+                newRemoteTime - oldRemoteTime, ourServerId.indexNumber(),
                 clockState[ourServerId].baseTsc, skew, syncee.indexNumber(),
                 clock->baseTsc, offset);
     }
@@ -150,6 +160,19 @@ ClockSynchronizer::computeOffset()
     outgoingProbes[2].clear();
 }
 
+TimeConverter
+ClockSynchronizer::getConverter(ServerId serverId)
+{
+    SpinLock::Guard _(mutex);
+    auto it = clockState.find(serverId);
+    if (it == clockState.end()) {
+        RAMCLOUD_CLOG(ERROR, "Clock not synchronized with server %s",
+                serverId.toString().c_str());
+        return TimeConverter();
+    }
+    return TimeConverter(baseTsc, &it->second);
+}
+
 /**
  * The actual RPC handler for CLOCK_SYNC request. AdminServer::clockSync simply
  * forwards the request here for processing so that we can easily access the
@@ -177,6 +200,8 @@ ClockSynchronizer::handleRequest(uint64_t timestamp,
         if (clockState.find(caller) == clockState.end()) {
             SpinLock::Guard _(mutex);
             clockState[caller].baseTsc = reqHdr->baseTsc;
+            clockState[caller].offset = 0;
+            clockState[caller].skew = 0;
         }
         incomingProbes[caller].clientTsc = reqHdr->fastestClientTsc;
         incomingProbes[caller].serverTsc = reqHdr->fastestServerTsc;
@@ -201,6 +226,8 @@ ClockSynchronizer::poll()
     // Clock synchronization only needs to be done infrequently. We don't want
     // to slow down the dispatch thread in common case.
     uint64_t currentTime = context->dispatch->currentTime;
+    // TODO: a better solution is dynamically register the ClockSync'er when
+    // #run is invoked and deregister it when it's done!!!!!!!!!!!!!!!!!!!!!!!!!!
     uint64_t stopTime = syncStopTime.load(std::memory_order_relaxed);
     if (currentTime > stopTime) {
         return 0;
@@ -290,21 +317,6 @@ ClockSynchronizer::run(uint32_t seconds)
     }
     computeOffset();
     LOG(NOTICE, "ClockSynchronizer stopped");
-}
-
-TimeConverter
-ClockSynchronizer::getConverter(ServerId serverId)
-{
-    SpinLock::Guard _(mutex);
-    auto it = clockState.find(serverId);
-    if (it == clockState.end()) {
-        RAMCLOUD_CLOG(ERROR, "Clock not synchronized with server %s",
-                serverId.toString().c_str());
-        return TimeConverter();
-    }
-
-    ClockState* clock = &it->second;
-    return TimeConverter(baseTsc, clock->baseTsc, clock->offset, clock->skew);
 }
 
 /**

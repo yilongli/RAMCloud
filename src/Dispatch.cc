@@ -27,6 +27,7 @@
 #include "RawMetrics.h"
 #include "PerfStats.h"
 #include "Unlock.h"
+#include "TimeTrace.h"
 
 // Uncomment to print out a human readable name for any poller that takes longer
 // than slowPollerCycles to complete. Useful for determining which poller is
@@ -147,36 +148,22 @@ Dispatch::poll()
 {
     assert(isDispatchThread());
     int result = 0;
-    uint64_t previous = currentTime;
-    currentTime = Cycles::rdtsc();
+    uint64_t now = Cycles::rdtsc();
+    uint64_t pollingTime = now - currentTime;
+    currentTime = now;
+    iteration++;
     // Dispatch::poll() execution time will be recorded if
     // profilerFlag is set to true.
     if (profilerFlag) {
-        pollingTimes[nextInd] = currentTime - previous;
+        pollingTimes[nextInd] = pollingTime;
         nextInd = (nextInd + 1) % totalElements;
     }
-    if (((currentTime - previous) > slowPollerCycles) && (previous != 0)
+    if ((pollingTime > slowPollerCycles) && (iteration > 1)
             && hasDedicatedThread) {
         LOG(WARNING, "Long gap in dispatcher: %.2f ms",
-                Cycles::toSeconds(currentTime - previous)*1e03);
+                Cycles::toSeconds(pollingTime)*1e03);
     }
-    if (lockNeeded.load() != 0) {
-        // Someone wants us locked. Indicate that we are locked,
-        // then wait for the lock to be released.
-        Fence::leave();
-        locked.store(1);
-        while (lockNeeded.load() != 0) {
-            // Empty loop body.
-        }
-        locked.store(0);
-        Fence::enter();
-        uint64_t newCurrent = Cycles::rdtsc();
-        if ((newCurrent - currentTime) > slowPollerCycles) {
-            LOG(WARNING, "Long lockout in poller: %.1f ms",
-                    Cycles::toSeconds(newCurrent - currentTime)*1e03);
-        }
-        currentTime = newCurrent;
-    }
+
     for (uint32_t i = 0; i < pollers.size(); i++) {
 #if DEBUG_SLOW_POLLERS
         uint64_t ticks = 0;
@@ -192,6 +179,7 @@ Dispatch::poll()
         }
 #endif
     }
+
     if (readyFd >= 0) {
         int fd = readyFd;
 
@@ -281,7 +269,19 @@ Dispatch::poll()
             }
         }
     }
-    iteration++;
+    if (lockNeeded.load(std::memory_order_acquire)) {
+        // Someone wants us locked. Indicate that we are locked,
+        // then wait for the lock to be released.
+        locked.store(1, std::memory_order_release);
+        while (lockNeeded.load(std::memory_order_acquire));
+        locked.store(0, std::memory_order_release);
+        uint64_t lockoutGap = Cycles::rdtsc() - currentTime;
+        if (lockoutGap > slowPollerCycles) {
+            LOG(WARNING, "Long lockout in poller: %.1f ms",
+                    Cycles::toSeconds(lockoutGap)*1e03);
+        }
+    }
+
     return result;
 }
 
@@ -425,6 +425,7 @@ Dispatch::Poller::Poller(Dispatch* dispatch, const string& pollerName)
 {
     CHECK_LOCK;
     owner->pollers.push_back(this);
+    LOG(DEBUG, "poller %d %s registered", slot, pollerName.c_str());
 }
 
 /**
@@ -832,19 +833,12 @@ Dispatch::Lock::Lock(Dispatch* dispatch)
     // We need to make sure for this to complete; otherwise we could
     // get confused below and return before the dispatch thread has
     // re-locked itself.
-    while (dispatch->locked.load() != 0) {
-        // Empty loop.
-    }
-
-    // The following statements ensure that the preceding load completes
-    // before the following store (reordering could cause deadlock).
-    Fence::sfence();
-    Fence::lfence();
-    dispatch->lockNeeded.store(1);
-    while (dispatch->locked.load() == 0) {
+    while (dispatch->locked.load(std::memory_order_acquire));
+    int empty = 0;
+    while (!dispatch->lockNeeded.compare_exchange_strong(empty, 1));
+    while (!dispatch->locked.load(std::memory_order_acquire)) {
         // Empty loop: spin-wait for the dispatch thread to lock itself.
     }
-    Fence::enter();
 }
 
 /**
@@ -861,8 +855,7 @@ Dispatch::Lock::~Lock()
     }
     assert(thisThreadHasDispatchLock);
 
-    Fence::leave();
-    dispatch->lockNeeded.store(0);
+    dispatch->lockNeeded.store(0, std::memory_order_release);
     thisThreadHasDispatchLock = false;
 }
 

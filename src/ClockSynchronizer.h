@@ -32,11 +32,11 @@ class ClockSynchronizer : Dispatch::Poller {
   public:
     explicit ClockSynchronizer(Context* context);
     ~ClockSynchronizer() {}
+    TimeConverter getConverter(ServerId serverId);
     uint64_t handleRequest(uint64_t timestamp,
             const WireFormat::ClockSync::Request* reqHdr);
     int poll();
     void run(uint32_t seconds);
-    TimeConverter getConverter(ServerId serverId);
 
   PRIVATE:
     void computeOffset();
@@ -122,8 +122,13 @@ class ClockSynchronizer : Dispatch::Poller {
     /// Cached sessions to target servers.
     std::unordered_map<ServerId, Transport::SessionRef> sessions;
 
+    /// # times we have run the syncrhonization protocol.
+    int syncCount;
+
     /// When (in rdtsc ticks) shall we we stop the synchronization process.
     std::atomic<uint64_t> syncStopTime;
+
+    friend class TimeConverter;
 
     DISALLOW_COPY_AND_ASSIGN(ClockSynchronizer);
 };
@@ -132,12 +137,12 @@ class TimeConverter {
   public:
     explicit TimeConverter() { valid = false; }
 
-    explicit TimeConverter(uint64_t localBaseTsc, uint64_t remoteBaseTsc,
-            int64_t offset, double skew)
+    explicit TimeConverter(uint64_t localBaseTsc,
+            ClockSynchronizer::ClockState* remoteClock)
         : localBaseTsc(localBaseTsc)
-        , remoteBaseTsc(remoteBaseTsc)
-        , offset(static_cast<double>(offset))
-        , skew(skew)
+        , remoteBaseTsc(remoteClock->baseTsc)
+        , offset(static_cast<double>(remoteClock->offset))
+        , skew(remoteClock->skew)
         , valid(true)
     {}
 

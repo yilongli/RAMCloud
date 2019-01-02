@@ -254,58 +254,58 @@ WorkerManager::idle()
  * This method is invoked by Dispatch during its polling loop.  It checks
  * for completion of outstanding RPCs.
  */
-int
-WorkerManager::poll()
-{
-    // TODO: kind of a hack for collective op
-    for (auto collectiveOpRpc : collectiveOpRpcs) {
-        uint32_t delayMicros = static_cast<uint32_t>(
-                Cycles::toSeconds(Cycles::rdtsc() -
-                collectiveOpRpc->arriveTime) * 1e6);
-        auto opcode = collectiveOpRpc->getOpcode();
-        if (delayMicros > 2) {
-            TimeTrace::record("opcode %u was delayed %u us; collective op not "
-                    "ready", opcode, delayMicros);
-        }
-        handleRpc(collectiveOpRpc);
-    }
-    collectiveOpRpcs.clear();
-    // end of hack
-
-    int foundWork = 0;
-
-    for (int i = downCast<int>(outstandingRpcs.size()) - 1; i >= 0; i--) {
-        Transport::ServerRpc* rpc = outstandingRpcs[i];
-        if (!rpc->finished.load(std::memory_order_acquire)) {
-//            RAMCLOUD_CLOG(NOTICE, "%s not finished, request %p",
+//int
+//WorkerManager::poll()
+//{
+//    // TODO: kind of a hack for collective op
+//    for (auto collectiveOpRpc : collectiveOpRpcs) {
+//        uint32_t delayMicros = static_cast<uint32_t>(
+//                Cycles::toSeconds(Cycles::rdtsc() -
+//                collectiveOpRpc->arriveTime) * 1e6);
+//        auto opcode = collectiveOpRpc->getOpcode();
+//        if (delayMicros > 2) {
+//            TimeTrace::record("opcode %u was delayed %u us; collective op not "
+//                    "ready", opcode, delayMicros);
+//        }
+//        handleRpc(collectiveOpRpc);
+//    }
+//    collectiveOpRpcs.clear();
+//    // end of hack
+//
+//    int foundWork = 0;
+//
+//    for (int i = downCast<int>(outstandingRpcs.size()) - 1; i >= 0; i--) {
+//        Transport::ServerRpc* rpc = outstandingRpcs[i];
+//        if (!rpc->finished.load(std::memory_order_acquire)) {
+////            RAMCLOUD_CLOG(NOTICE, "%s not finished, request %p",
+////                    WireFormat::opcodeSymbol(&rpc->requestPayload),
+////                    &rpc->requestPayload);
+//            continue;
+//        }
+//
+//        foundWork = 1;
+//
+//        timeTrace("ID %u: dispatch sending response",
+//                rpc->id, *(rpc->requestPayload.getStart<uint16_t>()));
+//
+//#ifdef LOG_RPCS
+//            LOG(NOTICE, "Sending reply for %s at %u with %u bytes",
 //                    WireFormat::opcodeSymbol(&rpc->requestPayload),
-//                    &rpc->requestPayload);
-            continue;
-        }
-
-        foundWork = 1;
-
-        timeTrace("ID %u: dispatch sending response",
-                rpc->id, *(rpc->requestPayload.getStart<uint16_t>()));
-
-#ifdef LOG_RPCS
-            LOG(NOTICE, "Sending reply for %s at %u with %u bytes",
-                    WireFormat::opcodeSymbol(&rpc->requestPayload),
-                    reinterpret_cast<uint64_t>(rpc),
-                    rpc->replyPayload.size());
-#endif
-        rpc->sendReply();
-        timeTrace("ID %u: reply sent", rpc->id);
-        numOutstandingRpcs--;
-
-        // If we are not the last rpc, store the last Rpc here so that pop-back
-        // doesn't lose data and we do not iterate here again.
-        if (rpc != outstandingRpcs.back())
-            outstandingRpcs[i] = outstandingRpcs.back();
-        outstandingRpcs.pop_back();
-    }
-    return foundWork;
-}
+//                    reinterpret_cast<uint64_t>(rpc),
+//                    rpc->replyPayload.size());
+//#endif
+//        rpc->sendReply();
+//        timeTrace("ID %u: reply sent", rpc->id);
+//        numOutstandingRpcs--;
+//
+//        // If we are not the last rpc, store the last Rpc here so that pop-back
+//        // doesn't lose data and we do not iterate here again.
+//        if (rpc != outstandingRpcs.back())
+//            outstandingRpcs[i] = outstandingRpcs.back();
+//        outstandingRpcs.pop_back();
+//    }
+//    return foundWork;
+//}
 
 /**
  * Wait for an RPC request to appear in the testRpcs queue, but give up if

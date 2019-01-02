@@ -280,9 +280,12 @@ InfUdDriver::getTransmitBuffer()
             // time is a bad sign); in the normal case this code should
             // not be invoked.
             uint64_t start = Cycles::rdtsc();
+            uint32_t count = 1;
             while (txPool->freeBuffers.empty()) {
                 reapTransmitBuffers();
+                count++;
             }
+            timeTrace("TX buffers refilled after polling CQ %u times", count);
             double waitMillis = 1e03 * Cycles::toSeconds(Cycles::rdtsc()
                     - start);
             if (waitMillis > 1.0)  {
