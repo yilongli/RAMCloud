@@ -2211,7 +2211,7 @@ double throwSwitch()
 // Measure the cost of recording a TimeTrace entry.
 double timeTrace()
 {
-    int count = 100000;
+    int count = 1000000;
     TimeTrace::Buffer* trace = new TimeTrace::Buffer();
     trace->record("warmup record");
     uint64_t start = Cycles::rdtscp();

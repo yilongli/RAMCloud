@@ -1052,24 +1052,35 @@ MilliSortService::benchmarkCollectiveOp(
                 bcast.send<BenchmarkCollectiveOpRpc>(i, reqHdr->opcode,
                         reqHdr->dataSize, serverId.getId(), startTime);
                 Buffer* result = bcast.wait();
+                uint64_t elapsedMicros =
+                        Cycles::toMicroseconds(Cycles::rdtsc() - startTime);
+                timeTrace("Broadcast of ALL_SHUFFLE operations completed");
 
                 // Get the timestamp (on the root node) when the last node
-                // completes the shuffle and convert to nanasecond.
-                uint64_t elapsedNanos = 0;
+                // completes the shuffle and convert the shuffle time to ns.
+                uint64_t shuffleNs = 0;
                 uint32_t offset = 0;
                 while (offset < result->size()) {
                     result->read<WireFormat::BenchmarkCollectiveOp::Response>(
                             &offset);
-                    uint64_t endTime = *result->read<uint64_t>(&offset);
-                    elapsedNanos = std::max(elapsedNanos,
-                            Cycles::toNanoseconds(endTime - startTime));
+                    uint64_t shuffleEndTime = *result->read<uint64_t>(&offset);
+                    shuffleNs = std::max(shuffleNs,
+                            Cycles::toNanoseconds(shuffleEndTime - startTime));
                 }
                 if (i >= WARMUP_COUNT) {
-                    rpc->replyPayload->emplaceAppend<uint64_t>(elapsedNanos);
+                    // Note: the local elapsed time is always larger than the
+                    // the shuffle completion time because the former also
+                    // includes the time to send/receive the payload RPC reply
+                    // (note: the payload RPC of bcast is currently delivered
+                    // over the network even though it's actually a local op)
+                    // and the broadcast return time.
+                    LOG(DEBUG, "Master node elapsed time %lu us, "
+                            "shuffle time %lu us", elapsedMicros,
+                            shuffleNs / 1000);
+                    rpc->replyPayload->emplaceAppend<uint64_t>(shuffleNs);
                 }
             }
         } else {
-//            timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->count);
             std::atomic<int> bytesReceived(0);
             auto merger = [&bytesReceived] (int _, Buffer* dataBuffer) {
                 bytesReceived.fetch_add(dataBuffer->size());
@@ -1085,19 +1096,23 @@ MilliSortService::benchmarkCollectiveOp(
             if (Cycles::rdtsc() > startTime) {
                 LOG(ERROR, "AllShuffle operation started %.2f us late!",
                         Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
-//            } else {
-//                timeTrace("%u us before start, %d",
-//                        Cycles::toMicroseconds(startTime - Cycles::rdtsc()),
-//                        reqHdr->count);
             }
             while (Cycles::rdtsc() < startTime) {}
-            invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
+            timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->count);
+//            invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
+            invokeShufflePull(pullRpcs.get(), world.get(), 2,
                     ALLSHUFFLE_BENCHMARK, merger, numBytes);
-//            timeTrace("ALL_SHUFFLE benchmark completes, received %u bytes",
-//                    bytesReceived.load());
-            uint64_t endTime = context->clockSynchronizer->getConverter(
-                    ServerId(reqHdr->masterId)).toRemoteTsc(Cycles::rdtsc());
-            rpc->replyPayload->emplaceAppend<uint64_t>(endTime);
+            uint64_t endTime = Cycles::rdtsc();
+            timeTrace("ALL_SHUFFLE benchmark run %d completed in %u us, "
+                    "received %u bytes", reqHdr->count,
+                    Cycles::toMicroseconds(endTime - startTime),
+                    bytesReceived.load());
+            uint64_t remoteEndTime = context->clockSynchronizer->getConverter(
+                    ServerId(reqHdr->masterId)).toRemoteTsc(endTime);
+            rpc->replyPayload->emplaceAppend<uint64_t>(remoteEndTime);
+            // It could take a while to destroy large ShufflePullRpc's; better
+            // send reply first.
+            rpc->sendReply();
         }
     } else {
         respHdr->common.status = STATUS_INVALID_PARAMETER;

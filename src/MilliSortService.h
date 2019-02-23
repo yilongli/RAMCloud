@@ -133,25 +133,26 @@ class MilliSortService : public Service {
      *
      * \param pullRpcs
      * \param dataId
-     * \param numBytes
      * \param merger
+     * \param pullSize
+     *      # bytes to pull. Only used in benchmarking.
      */
     template <typename Merger>
     void
     invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs, CommunicationGroup* group,
-            int maxRpcs, uint32_t dataId, Merger& merger, uint32_t numBytes = 0)
+            int maxRpcs, uint32_t dataId, Merger& merger, uint32_t pullSize = 0)
     {
-        int numNodes = group->size();
+        int totalRpcs = group->size() - 1;
         int outstandingRpcs = 0;
         int completedRpcs = 0;
         int sentRpcs = 0;
         int firstNotReady = 0;
-        std::vector<bool> completed(numNodes);
-        while (completedRpcs < numNodes) {
-            if ((sentRpcs < numNodes) && (outstandingRpcs < maxRpcs)) {
+        std::vector<bool> completed(totalRpcs);
+        while (completedRpcs < totalRpcs) {
+            if ((sentRpcs < totalRpcs) && (outstandingRpcs < maxRpcs)) {
                 ServerId target = group->getNode(group->rank + 1 + sentRpcs);
                 pullRpcs[sentRpcs].construct(context, target, group->rank,
-                        dataId, numBytes);
+                        dataId, pullSize);
                 sentRpcs++;
                 outstandingRpcs++;
             }
@@ -159,7 +160,7 @@ class MilliSortService : public Service {
             for (int i = firstNotReady; i < sentRpcs; i++) {
                 ShufflePullRpc* rpc = pullRpcs[i].get();
                 if (!completed[i] && rpc->isReady()) {
-                    merger((group->rank + i + 1) % numNodes, rpc->wait());
+                    merger((group->rank + i + 1) % group->size(), rpc->wait());
                     if (i == firstNotReady) {
                         firstNotReady++;
                     }

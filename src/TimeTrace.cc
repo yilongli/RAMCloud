@@ -158,8 +158,6 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s,
                 % Buffer::BUFFER_SIZE;
 
         char message[1000];
-        // FIXME: I am not sure rebase against startTime is a good idea anymore;
-        // for instance, it makes integration with OS tracing tool harder.
         double ns = (timeConverter && timeConverter->isValid()) ?
                 timeConverter->toRemoteTime(event->timestamp) :
                 Cycles::toSeconds(event->timestamp - startTime) * 1e09;
@@ -172,15 +170,15 @@ TimeTrace::printInternal(std::vector<TimeTrace::Buffer*>* buffers, string* s,
             s->append(message);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
-            snprintf(message, sizeof(message), event->format, event->arg0,
-                     event->arg1, event->arg2, event->arg3);
+            snprintf(message, sizeof(message), event->format, event->args[0],
+                     event->args[1], event->args[2], event->args[3]);
 #pragma GCC diagnostic pop
             s->append(message);
         } else {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
-            snprintf(message, sizeof(message), event->format, event->arg0,
-                     event->arg1, event->arg2, event->arg3);
+            snprintf(message, sizeof(message), event->format, event->args[0],
+                     event->args[1], event->args[2], event->args[3]);
 #pragma GCC diagnostic pop
             RAMCLOUD_LOG(NOTICE, "T%d %8.1f ns (+%6.1f ns): %s",
                     buffer->threadId, ns, ns - prevTime, message);
@@ -307,54 +305,6 @@ TimeTrace::Buffer::Buffer()
  */
 TimeTrace::Buffer::~Buffer()
 {
-}
-
-/**
- * Record an event in the buffer.
- *
- * \param timestamp
- *      Identifies the time at which the event occurred.
- * \param format
- *      A format string for snprintf that will be used, along with
- *      arg0..arg3, to generate a human-readable message describing what
- *      happened, when the time trace is printed. The message is generated
- *      by calling snprintf as follows:
- *      snprintf(buffer, size, format, arg0, arg1, arg2, arg3)
- *      where format and arg0..arg3 are the corresponding arguments to this
- *      method. This pointer is stored in the buffer, so the caller must
- *      ensure that its contents will not change over its lifetime in the
- *      trace.
- * \param arg0
- *      Argument to use when printing a message about this event.
- * \param arg1
- *      Argument to use when printing a message about this event.
- * \param arg2
- *      Argument to use when printing a message about this event.
- * \param arg3
- *      Argument to use when printing a message about this event.
- */
-void TimeTrace::Buffer::record(uint64_t timestamp, const char* format,
-        uint32_t arg0, uint32_t arg1, uint32_t arg2, uint32_t arg3)
-{
-    if (TimeTrace::activeReaders > 0) {
-        return;
-    }
-
-    Event* event = &events[nextIndex];
-    nextIndex = (nextIndex + 1) & BUFFER_MASK;
-
-    // There used to be code here for prefetching the next few events,
-    // in order to minimize cache misses on the array of events. However,
-    // performance measurements indicate that this actually slows things
-    // down by 2ns per invocation.
-    // prefetch(event+1, NUM_PREFETCH*sizeof(Event));
-
-    event->timestamp = timestamp;
-    event->format = format;
-    event->arg0 = arg0;
-    event->arg1 = arg1;
-    event->arg2 = arg2;
-    event->arg3 = arg3;
 }
 
 /**

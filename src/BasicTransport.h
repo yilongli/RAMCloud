@@ -32,6 +32,7 @@
 #include "Driver.h"
 #include "ServerRpcPool.h"
 #include "ServiceLocator.h"
+#include "TimeTrace.h"
 #include "Transport.h"
 
 namespace RAMCloud {
@@ -59,6 +60,8 @@ class BasicTransport : public Transport {
     void registerMemory(void* base, size_t bytes) {
         driver->registerMemory(base, bytes);
     }
+    template<typename... Args>
+    inline void timeTrace(const char* format, Args... args);
 
   PRIVATE:
     /// As of 08/17, std::unordered_map is significantly slower than

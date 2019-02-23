@@ -60,7 +60,7 @@ namespace {
 
 // Change 0 -> 1 in the following line to compile the code for collecting
 // detailed PerfStats metrics in this driver.
-#define COLLECT_LOW_LEVEL_PERFSTATS 1
+#define COLLECT_LOW_LEVEL_PERFSTATS 0
 
 /**
  * Construct an InfUdDriver.
@@ -119,7 +119,10 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     // This is because the throughput of the HCA has non-negligible variation:
     // when it's running faster than 24Gbps, we don't want the transport to
     // throttle the throughput and leave the HCA idle.
-    , bandwidthGbps(26)                   // Default outgoing bandwidth in gbs
+    // TODO: is it true we have to set it to 26Gbps? Is the explanation above correct?
+    // maybe it's because the grant starvation problem I just solved in basic instead?
+    , bandwidthGbps(24)                   // Default outgoing bandwidth in gbs
+//    , bandwidthGbps(26)                   // Default outgoing bandwidth in gbs
     , zeroCopyStart(NULL)
     , zeroCopyEnd(NULL)
     , zeroCopyRegion(NULL)

@@ -2606,8 +2606,8 @@ broadcast()
 
 /**
  * Run the clock synchronization protocol on all servers for a given period of
- * time. Repeat the experiment multiple times to check if the results are
- * stable.
+ * time and then wait for 10 seconds. Repeat the experiment multiple times to
+ * check if the results are stable.
  */
 void
 clockSync()
@@ -2616,6 +2616,7 @@ clockSync()
         uint32_t clockSyncSeconds = downCast<uint32_t>(seconds);
         cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
                 &clockSyncSeconds, sizeof(clockSyncSeconds));
+        Cycles::sleep(10 * 1000000);
     }
 }
 
@@ -7440,23 +7441,24 @@ allShuffle()
         }
     }
 
-    // TODO: should I (re)synchronize every iteration? Or every X secs?
-    uint32_t clockSyncSeconds = 5;
-    cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-            &clockSyncSeconds, sizeof(clockSyncSeconds));
-
     // Start performance counters.
     cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
 
-    printf("# Note: the latency numbers are displayed in microseconds.\n"
-            "#%12s%12s%12s%12s%12s%12s%12s%12s%20s\n", "nodes", "bytes/node",
-            "ops", "min", "avg", "p50", "p90", "p99", "throughput (MB/s)");
+    printf("# Note: the throughput numbers are displayed in MB/s.\n"
+            "#%12s%12s%14s%8s%12s%12s%12s%12s%12s\n", "nodes", "bytes/node",
+            "shuffleBytes", "ops", "min", "avg", "p50", "p90", "p99");
     printf("#------------------------------------------------------------------"
-            "--------------------------------------------------\n");
+            "------------------------------------------\n");
 
-    // Sweep machineCount from 1 to numMasters.
     string perfstats;
+    // Each iteration of the following loop performs a all-to-all shuffle
+    // operation between a specific number of servers.
+    uint32_t clockSyncSeconds = 5;
     for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
+        // (Re)synchronize the cluster clock before each experiment.
+        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+                &clockSyncSeconds, sizeof(clockSyncSeconds));
+
         // Initialize the millisort service.
         ServerId rootServer(1, 0);
         InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
@@ -7472,20 +7474,27 @@ allShuffle()
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
                 objectSize);
-        std::vector<uint64_t> completionTimes;
-        rpc.wait(&completionTimes);
+        std::vector<uint64_t> completionNs;
+        std::vector<double> completionSecs;
+        rpc.wait(&completionNs);
 
-        std::sort(completionTimes.begin(), completionTimes.end());
-        double min = double(completionTimes[0]) * 1e-3;
-        double avg = double(std::accumulate(completionTimes.begin(),
-                completionTimes.end(), 0ul)) / double(count) * 1e-3;
-        double p50 = double(completionTimes[int(count * 0.5)]) * 1e-3;
-        double p90 = double(completionTimes[int(count * 0.9)]) * 1e-3;
-        double p99 = double(completionTimes[int(count * 0.99)]) * 1e-3;
-        double throughput = double(objectSize) / avg;
-        printf(" %12d%12d%12d%12.2f%12.2f%12.2f%12.2f%12.2f%20.2f\n",
-                machineCount, objectSize, count, min, avg, p50, p90, p99,
-                throughput);
+        for (uint64_t ns : completionNs) {
+            completionSecs.push_back(double(ns) * 1e-9);
+        }
+        std::sort(completionSecs.begin(), completionSecs.end());
+
+        double shuffleBytes =
+                double(objectSize) * (machineCount-1) / machineCount;
+        double shuffleMBs = shuffleBytes / (1024 * 1024);
+        double min = shuffleMBs / completionSecs[0];
+        double avg = shuffleMBs / ((std::accumulate(completionSecs.begin(),
+                completionSecs.end(), .0)) / count);
+        double p50 = shuffleMBs / completionSecs[int(count * 0.5)];
+        double p90 = shuffleMBs / completionSecs[int(count * 0.9)];
+        double p99 = shuffleMBs / completionSecs[int(count * 0.99)];
+        printf(" %12d%12d%14.0f%8d%12.1f%12.1f%12.1f%12.1f%12.1f\n",
+                machineCount, objectSize, shuffleBytes, count, min, avg, p50,
+                p90, p99);
 
         // Take another PerfStats snapshot after the experiment.
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
