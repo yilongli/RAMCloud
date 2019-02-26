@@ -7393,17 +7393,22 @@ treeBcast()
         }
     }
 
-    // TODO: should I (re)synchronize every iteration? Or every X secs?
-    uint32_t clockSyncSeconds = 5;
-    cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-            &clockSyncSeconds, sizeof(clockSyncSeconds));
-
     ServerId rootServer(1, 0);
-    printf("#%12s%12s%12s%12s\n", "nodes", "size (B)", "ops", "avg (us)");
-    printf("#------------------------------------------------\n");
+    // TODO: only showing the average completion time is not enough
+    printf("# Note: Latency numbers are displayed in microseconds.\n"
+            "#%10s%10s%10s%10s%10s%10s%10s\n", "nodes", "size (B)", "ops",
+            "min", "p50", "p90", "p99");
+    printf("#------------------------------------------------------------"
+           "----------\n");
 
     // Sweep machineCount from 1 to numMasters.
+    uint32_t clockSyncSeconds = 5;
+//    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
     for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
+        // (Re)synchronize the cluster clock before each experiment.
+        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+                &clockSyncSeconds, sizeof(clockSyncSeconds));
+
         // Initialize the millisort service.
         InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
         auto initResp = initRpc.wait();
@@ -7415,10 +7420,14 @@ treeBcast()
                 objectSize);
         std::vector<uint64_t> completionTimes;
         rpc.wait(&completionTimes);
-        double elapsedMicros = double(std::accumulate(completionTimes.begin(),
-                completionTimes.end(), 0ul)) * 1e-3;
-        printf(" %12d%12d%12d%12.2f\n", machineCount, objectSize, count,
-                elapsedMicros / double(count));
+        std::sort(completionTimes.begin(), completionTimes.end());
+        double numSamples = double(completionTimes.size());
+        double min = double(completionTimes.front()) * 1e-3;
+        double p50 = double(completionTimes[int(numSamples * 0.5)]) * 1e-3;
+        double p90 = double(completionTimes[int(numSamples * 0.9)]) * 1e-3;
+        double p99 = double(completionTimes[int(numSamples * 0.99)]) * 1e-3;
+        printf(" %10d%10d%10.0f%10.2f%10.2f%10.2f%10.2f\n", machineCount,
+                objectSize, numSamples, min, p50, p90, p99);
     }
 }
 

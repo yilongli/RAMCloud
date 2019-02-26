@@ -78,6 +78,14 @@ class Service {
         /// Time, in rdtsc ticks, when the request is received from the driver.
         uint64_t receiveTime;
 
+        /// Time, in rdtsc ticks, when the request arrives at WorkerManager.
+        /// 0 means the timestamp is not recorded.
+        uint64_t arriveTime;
+
+        /// Time, in rdtsc ticks, when the request arrives at WorkerManager.
+        /// 0 means the timestamp is not recorded.
+        uint64_t dispatchTime;
+
         friend class WorkerManager;
         friend class Service;
         DISALLOW_COPY_AND_ASSIGN(Rpc);

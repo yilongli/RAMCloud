@@ -99,15 +99,17 @@ PRIVATE:
 class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
   public:
     BenchmarkCollectiveOpRpc(Context* context, int count, uint32_t opcode,
-            uint32_t dataSize);
-    BenchmarkCollectiveOpRpc(Context* context, int count, uint32_t opcode,
-            uint32_t dataSize, uint64_t masterId, uint64_t startTime);
+            uint32_t dataSize, uint64_t masterId = 0, uint64_t startTime = 0);
     ~BenchmarkCollectiveOpRpc() {}
-
     static void appendRequest(Buffer* request, int count, uint32_t opcode,
             uint32_t dataSize, uint64_t masterId, uint64_t startTime);
 
-    /// Return the time, in microseconds, to complete the collective operation.
+    /**
+     * Return times, in nanoseconds, to complete the collective operations.
+     *
+     * \param[out] completionTimes
+     *      Completion time of each operation will be pushed here upon return.
+     */
     void wait(std::vector<uint64_t>* completionTimes)
     {
         waitAndCheckErrors();

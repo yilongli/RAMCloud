@@ -56,10 +56,6 @@ WorkerManager::timeTrace(const char* format,
 #endif
 }
 
-// Change the following from 0 -> 1 to enable log statements for debugging
-// distributed deadlocks in worker threads.
-#define DEBUG_DEADLOCK 0
-
 /**
  * Default object used to make system calls.
  */
@@ -115,8 +111,11 @@ WorkerManager::WorkerManager(Context* context, uint32_t maxCores)
 void
 WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 {
-    // TODO: also useful for ramcloud?
-    rpc->arriveTime = context->dispatch->currentTime;
+    // Change the following from 0 to 1 to record RPC arrival time.
+#if 1
+    rpc->arriveTime = Cycles::rdtsc();
+#endif
+
     // Since this method should only run in the dispatch thread, there is no
     // need to synchronize this state.
     static uint32_t nextRpcId = 1;
@@ -188,10 +187,6 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
             return;
         }
     }
-
-//    if (header->opcode == WireFormat::SHUFFLE_PULL) {
-//        TimeTrace::record("received shuffle pull request");
-//    }
 
 #ifdef LOG_RPCS
     LOG(NOTICE, "Received %s RPC at %u with %u bytes",
@@ -350,12 +345,7 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
     // Cycles::rdtsc time that's updated continuously when this thread is idle.
     // Used to keep track of how much time this thread spends doing useful
     // work.
-    uint64_t lastIdle = Cycles::rdtsc();
-
-//    RAMCLOUD_LOG(NOTICE, "%s passed to handler, request %p",
-//            WireFormat::opcodeSymbol(serverRpc->getOpcode()),
-//            &serverRpc->requestPayload);
-
+    uint64_t start = Cycles::rdtsc();
     try {
        timeTrace("ID %u: Starting processing of opcode %d  on KT %d, "
             "idInCore %d", serverRpc->id, serverRpc->header->opcode,
@@ -367,18 +357,28 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
         serverRpc->epoch = LogProtector::getCurrentEpoch();
         Service::Rpc rpc(&worker, &serverRpc->requestPayload,
                 &serverRpc->replyPayload);
-        Service::handleRpc(context, &rpc);
-//        RAMCLOUD_LOG(NOTICE, "GET_SERVER_ID back from handler, request %p",
-//                &serverRpc->requestPayload);
+        rpc.arriveTime = serverRpc->arriveTime;
+        rpc.dispatchTime = start;
+
+        // TODO: bypass Service::handleRpc for broadcast operation
+        const WireFormat::RequestCommon* header =
+                serverRpc->requestPayload.getStart<WireFormat::RequestCommon>();
+        if (header->opcode == WireFormat::BCAST_TREE) {
+            MilliSortService* service = static_cast<MilliSortService*>(
+                    context->services[WireFormat::MILLISORT_SERVICE]);
+            service->dispatch(WireFormat::BCAST_TREE, &rpc);
+        } else {
+            Service::handleRpc(context, &rpc);
+        }
 
         // Pass the RPC back to the dispatch thread for completion.
         worker.sendReply();
 
         // Update performance statistics.
-        uint64_t current = Cycles::rdtsc();
-        PerfStats::threadStats.workerActiveCycles += (current - lastIdle);
+        uint64_t activeCycles = Cycles::rdtsc() - start;
+        PerfStats::threadStats.workerActiveCycles += activeCycles;
         timeTrace("ID %u: took worker time %u", serverRpc->id,
-            (uint32_t) Cycles::toNanoseconds(current - lastIdle));
+            (uint32_t) Cycles::toNanoseconds(activeCycles));
         TEST_LOG("exiting");
     } catch (std::exception& e) {
         LOG(ERROR, "worker: %s", e.what());

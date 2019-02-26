@@ -86,15 +86,15 @@ class TreeBcast {
 
     class TreeBcastRpc : public ServerIdRpcWrapper {
       public:
-        explicit TreeBcastRpc(Context* context, ServerId serverId,
-                int groupId, int root, uint32_t payloadResponseHeaderLength,
+        explicit TreeBcastRpc(Context* context, CommunicationGroup* group,
+                int root, int child, uint32_t payloadResponseHeaderLength,
                 Buffer* payloadRequest)
-            : ServerIdRpcWrapper(context, serverId,
+            : ServerIdRpcWrapper(context, group->getNode(root + child),
                 sizeof(WireFormat::TreeBcast::Response))
         {
             WireFormat::TreeBcast::Request* reqHdr(
                     allocHeader<WireFormat::TreeBcast>());
-            reqHdr->groupId = groupId;
+            reqHdr->groupId = group->id;
             reqHdr->root = root;
             reqHdr->payloadResponseHeaderLength = payloadResponseHeaderLength;
             request.appendExternal(payloadRequest);
@@ -117,12 +117,35 @@ class TreeBcast {
         DISALLOW_COPY_AND_ASSIGN(TreeBcastRpc);
     };
 
+    /**
+     * A k-nomial-tree which specifies the communication pattern of the
+     * broadcast operation. Each node in the tree is assigned a rank starting
+     * from 0.
+     */
+    struct KNomialTree {
+        /// Construct a k-nomial tree of a specific size.
+        explicit KNomialTree(int k, int nodes)
+            : k(k), nodes(nodes)
+        {}
+
+        void getChildren(int rank, std::vector<int>* children);
+
+        /// Fan-out factor of the tree.
+        int k;
+
+        /// # nodes in the tree.
+        int nodes;
+    };
+
     /// Context of the service that created this task.
     Context* context;
 
     /// All nodes that are participating in the broadcast operation, including
     /// the initial broadcaster.
     CommunicationGroup* group;
+
+    /// Specifies the broadcast communication pattern.
+    KNomialTree kNomialTree;
 
     /// Buffer used to store the processing result of #payloadRpc.
     Buffer localResult;

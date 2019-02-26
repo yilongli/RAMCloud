@@ -82,15 +82,6 @@ StartMilliSortRpc::appendRequest(Buffer* request, int requestId,
 }
 
 BenchmarkCollectiveOpRpc::BenchmarkCollectiveOpRpc(Context* context, int count,
-        uint32_t opcode, uint32_t dataSize)
-    : ServerIdRpcWrapper(context, ServerId(1, 0),
-            sizeof(WireFormat::StartMilliSort::Response))
-{
-    appendRequest(&request, count, opcode, dataSize, 0, 0);
-    send();
-}
-
-BenchmarkCollectiveOpRpc::BenchmarkCollectiveOpRpc(Context* context, int count,
         uint32_t opcode, uint32_t dataSize, uint64_t masterId,
         uint64_t startTime)
     : ServerIdRpcWrapper(context, ServerId(1, 0),

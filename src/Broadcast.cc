@@ -27,14 +27,14 @@ namespace {
     }
 }
 
-/// This table records the structure of a 100-node k-nomial-tree with node 0
-/// being the root. To be more precise, the i-th (i >= 0) element of the first-
-/// level vector is also a vector containing the children of node i. Also, to
-/// make the table more compact, leaf nodes are not present in the first-level
-/// vector.
+// FIXME: removing the following causes(?) an Arachne warning and eventually
+// segfault(?)inside arachne
 std::vector<std::vector<int>> K_NOMIAL_TREE_CHILDREN = {
 #include "k_nomial_tree.txt"
 };
+
+// TODO: remove this constant.
+#define BRANCH_FACTOR 10
 
 /**
  * Prepare to invoke a broadcast operation by constructing a tree broadcast
@@ -52,6 +52,7 @@ std::vector<std::vector<int>> K_NOMIAL_TREE_CHILDREN = {
 TreeBcast::TreeBcast(Context* context, CommunicationGroup* group)
     : context(context)
     , group(group)
+    , kNomialTree(BRANCH_FACTOR, group->size())
     , localResult()
     , root(group->rank)
     , outgoingResponse()
@@ -90,6 +91,7 @@ TreeBcast::TreeBcast(Context* context,
         const WireFormat::TreeBcast::Request* reqHdr, Service::Rpc* rpc)
     : context(context)
     , group(context->getMilliSortService()->getCommunicationGroup(reqHdr->groupId))
+    , kNomialTree(BRANCH_FACTOR, group->size())
     , localResult()
     , root(reqHdr->root)
     , outgoingResponse(rpc->replyPayload)
@@ -108,6 +110,7 @@ TreeBcast::TreeBcast(Context* context,
     // at the root node.
     respHdr->receiveTime = context->clockSynchronizer->
             getConverter(group->getNode(root)).toRemoteTsc(Cycles::rdtsc());
+    timeTrace("TreeBcast: finished converting to remote time!!!");
 
     // Copy out the payload request (from network packet buffers) to make it
     // contiguous. TreeBcast is not meant for large messages anyway.
@@ -115,6 +118,53 @@ TreeBcast::TreeBcast(Context* context,
 
     // Kick start the broadcast.
     start();
+}
+
+/**
+ * Return the children of a given parent node in the tree.
+ *
+ * \param parent
+ *      Rank of the parent node in the tree.
+ * \param[out] children
+ *      Ranks of the children nodes will be pushed here upon return.
+ */
+void
+TreeBcast::KNomialTree::getChildren(int parent, std::vector<int>* children)
+{
+    // Change the following from 0 to 1 to test with k-ary tree.
+#if 0
+    for (int i = 0; i < k; i++) {
+        int child = parent * k + i + 1;
+        if (child < nodes) {
+            children->push_back(child);
+        }
+    }
+#else
+    // If d is the number of digits in the base-k representation of parent
+    // then let delta = k^d.
+    int delta = 1;
+    int p = parent;
+    while (p > 0) {
+        p /= k;
+        delta *= k;
+    }
+
+    // The children of a node in the k-nomial tree will have exactly one more
+    // non-zero digit in a more significant position than the parent's most
+    // significant digit. For example, in a trinomial tree (i.e., k = 3) of
+    // size 27, the children of node 7 (21 in base-3) will be node 16 (121 in
+    // base-3) and 25 (221 in base-3).
+    while (true) {
+        for (int i = 1; i < k; i++) {
+            int child = parent + i * delta;
+            if (child >= nodes) {
+                return;
+            }
+            children->push_back(child);
+        }
+        delta *= k;
+    }
+#endif
 }
 
 /**
@@ -151,6 +201,12 @@ void
 TreeBcast::handleRpc(Context* context,
         const WireFormat::TreeBcast::Request* reqHdr, Service::Rpc* rpc)
 {
+#if TIME_TRACE
+    uint64_t now = Cycles::rdtsc();
+    timeTrace("TreeBcast: handleRpc invoked, arachne spawn time %u cyc, "
+            "service dispatch time %u cyc", rpc->dispatchTime - rpc->arriveTime,
+            now - rpc->dispatchTime);
+#endif
     TreeBcast treeBcast(context, reqHdr, rpc);
     while (!treeBcast.isReady()) {
         Arachne::yield();
@@ -166,20 +222,16 @@ TreeBcast::handleRpc(Context* context,
 void
 TreeBcast::start()
 {
-    // K_NOMIAL_TREE_CHILDREN assumes node 0 is the root. Therefore, to find
-    // the correct children of this node when node 0 is not the root, we need
-    // to use the relative rank of this node to look up the children table.
+    // k-nomial-tree assumes node 0 to be the root. Therefore, to find the
+    // children of this node when node 0 is not the root, we need to use the
+    // relative rank of this node to compute the children.
     int myRank = group->relativeRank(root);
-    if (myRank < int(K_NOMIAL_TREE_CHILDREN.size())) {
-        for (int child : K_NOMIAL_TREE_CHILDREN[myRank]) {
-            if (child >= group->size()) {
-                break;
-            }
-
-            outstandingRpcs.emplace_back(context, group->getNode(root + child),
-                    group->id, root, payloadResponseHeaderLength,
-                    &payloadRequest);
-        }
+    std::vector<int> children;
+    kNomialTree.getChildren(myRank, &children);
+    for (int child : children) {
+        timeTrace("TreeBcast: sending RPC to rank %u", child);
+        outstandingRpcs.emplace_back(context, group, root, child,
+                payloadResponseHeaderLength, &payloadRequest);
     }
 
     // FIXME: can we avoid using RPC to deliver payload request locally? Could
@@ -197,6 +249,8 @@ TreeBcast::start()
 bool
 TreeBcast::isReady()
 {
+    // TODO: we really need a more scalable RPC completion mechanism eventually;
+    // polling each outstanding RPC in turn sucks.
     for (OutstandingRpcs::iterator it = outstandingRpcs.begin();
             it != outstandingRpcs.end();) {
         TreeBcastRpc* rpc = &(*it);
@@ -209,12 +263,11 @@ TreeBcast::isReady()
         }
     }
 
-    if (payloadRpc) {
-        if (payloadRpc->isReady()) {
-            payloadRpc->simpleWait(context);
-            outgoingResponse->append(payloadRpc->response);
-            payloadRpc.destroy();
-        }
+    if (payloadRpc && payloadRpc->isReady()) {
+        timeTrace("TreeBcast: payload RPC is ready");
+        payloadRpc->simpleWait(context);
+        outgoingResponse->append(payloadRpc->response);
+        payloadRpc.destroy();
     }
 
     return outstandingRpcs.empty() && !payloadRpc;
