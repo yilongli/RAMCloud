@@ -54,6 +54,7 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     , nextUpdateTime(0)
     , incomingProbes()
     , outgoingProbes()
+    , outProbes()
     , phase(-1)
     , outstandingRpc()
     , sendingRpc(false)
@@ -154,6 +155,47 @@ ClockSynchronizer::computeOffset()
     }
 #endif
 
+    // FIXME: Huygens-related experiment
+    for (auto& p : outProbes) {
+        ServerId id = p.first;
+
+        // Compute the 5% percentile smallest completion time.
+        std::vector<uint64_t> vec;
+        for (auto& probe : p.second) {
+            vec.push_back(probe.completionTime);
+        }
+        std::sort(vec.begin(), vec.end());
+        int numGoodProbes = int(double(vec.size()) * 0.05) + 1;
+        uint64_t threshold = vec[numGoodProbes];
+
+        // And use that as a filter to remove noisy probes.
+        string result;
+        result.append(std::to_string(id.indexNumber()));
+        result.append("\n");
+        result.append(std::to_string(numGoodProbes));
+        result.append("\n");
+        for (int i = 0; i < 3; i++) {
+            Probe fastest = outgoingProbes[i][id];
+            result.append(std::to_string(fastest.clientTsc) + " " +
+                    std::to_string(fastest.serverTsc));
+            result.append("\n");
+        }
+        for (auto& probe : p.second) {
+            if (probe.completionTime > threshold) {
+                continue;
+            }
+            result.append(std::to_string(probe.clientTsc));
+            result.append(" ");
+            result.append(std::to_string(probe.serverTsc));
+            result.append(" ");
+            result.append(std::to_string(probe.completionTime));
+            result.append("\n");
+        }
+        printf("%s", result.c_str());
+        fflush(stdout);
+    }
+    outProbes.clear();
+
     incomingProbes.clear();
     outgoingProbes[0].clear();
     outgoingProbes[1].clear();
@@ -252,14 +294,19 @@ ClockSynchronizer::poll()
         ServerId targetId = rpc->targetId;
         int index = phase.load(std::memory_order_relaxed);
         Probe* fastestProbe = &outgoingProbes[index][targetId];
+        uint64_t serverTsc = rpc->wait();
         if (rpc->getCompletionTime() < fastestProbe->completionTime) {
             fastestProbe->clientTsc = rpc->getClientTsc();
-            fastestProbe->serverTsc = rpc->wait();
+            fastestProbe->serverTsc = serverTsc;
             fastestProbe->completionTime = rpc->getCompletionTime();
             timeTrace("update fastest probe, completion time %u ns",
                     Cycles::toNanoseconds(rpc->getCompletionTime()));
         }
         outstandingRpc.destroy();
+
+        // FIXME: Huygens-related experiment
+        outProbes[targetId].emplace_back(rpc->getClientTsc(), serverTsc,
+                rpc->getCompletionTime());
     }
 
     // Pick a random node in the cluster to probe.

@@ -96,6 +96,12 @@ class ClockSynchronizer : Dispatch::Poller {
         Probe()
             : clientTsc(), serverTsc(), completionTime(~0lu)
         {}
+
+        Probe(uint64_t clientTsc, uint64_t serverTsc, uint64_t completionTime)
+            : clientTsc(clientTsc)
+            , serverTsc(serverTsc)
+            , completionTime(completionTime)
+        {}
     };
 
     /// Records the fastest incoming ClockSync RPCs received from each server.
@@ -104,6 +110,9 @@ class ClockSynchronizer : Dispatch::Poller {
     /// Records the fastest outgoing ClockSync RPCs sent to each server, in each
     /// phase.
     std::unordered_map<ServerId, Probe> outgoingProbes[3];
+
+    // TODO: Huygens-related experiments
+    std::unordered_map<ServerId, std::vector<Probe>> outProbes;
 
     /// Current phase of the protocol. -1 means the clock sync. protocol is not
     /// running; otherwise, it must be either 0, 1, or 2.
