@@ -341,6 +341,7 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     uint32_t incomingPkts = rte_eth_rx_burst(portId, 0, mPkts,
             downCast<uint16_t>(maxPackets));
     if (incomingPkts > 0) {
+        lastReceiveTime = Cycles::rdtsc();
 #if TIME_TRACE
         TimeTrace::record(timestamp, "DpdkDriver about to receive packets");
         TimeTrace::record("DpdkDriver received %u packets", incomingPkts);
@@ -560,6 +561,7 @@ DpdkDriver::sendPacket(const Address* addr,
         return;
     }
 
+    lastTransmitTime = Cycles::rdtsc();
     uint32_t ret = rte_eth_tx_burst(portId, 0, &mbuf, 1);
     if (unlikely(ret != 1)) {
         LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
@@ -571,7 +573,6 @@ DpdkDriver::sendPacket(const Address* addr,
     }
     timeTrace("outgoing packet enqueued");
 #endif
-    lastTransmitTime = Cycles::rdtsc();
     queueEstimator.packetQueued(physPacketLength, lastTransmitTime,
             txQueueState);
     PerfStats::threadStats.networkOutputBytes += physPacketLength;

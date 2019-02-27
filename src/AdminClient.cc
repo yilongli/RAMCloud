@@ -32,26 +32,15 @@ ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
     , targetId(targetId)
     , context(context)
     , baseTsc(baseTsc)
-    , startTime(0)
-    , endTime()
 {
     this->session = session;
     WireFormat::ClockSync::Request* reqHdr(
             allocHeader<WireFormat::ClockSync>());
     reqHdr->baseTsc = baseTsc;
     reqHdr->callerId = callerId.getId();
-    reqHdr->clientTsc = startTime;
     reqHdr->fastestClientTsc = fastestClientTsc;
     reqHdr->fastestServerTsc = fastestServerTsc;
-    startTime = Cycles::rdtsc() - baseTsc;
     send();
-}
-
-// See Transport::Notifier for documentation.
-void
-ClockSyncRpc::completed() {
-    RpcWrapper::completed();
-    endTime = Cycles::rdtsc() - baseTsc;
 }
 
 /**
@@ -61,13 +50,13 @@ ClockSyncRpc::completed() {
 uint64_t
 ClockSyncRpc::getClientTsc()
 {
-    return startTime;
+    return transmitTime - baseTsc;
 }
 
 uint64_t
 ClockSyncRpc::getCompletionTime()
 {
-    return endTime - startTime;
+    return receiveTime - transmitTime;
 }
 
 /**

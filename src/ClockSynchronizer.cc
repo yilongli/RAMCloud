@@ -225,9 +225,9 @@ ClockSynchronizer::poll()
 
     // Clock synchronization only needs to be done infrequently. We don't want
     // to slow down the dispatch thread in common case.
+    // FIXME: a better solution is dynamically register the ClockSync'er when
+    // #run is invoked and deregister it when it's done!
     uint64_t currentTime = context->dispatch->currentTime;
-    // TODO: a better solution is dynamically register the ClockSync'er when
-    // #run is invoked and deregister it when it's done!!!!!!!!!!!!!!!!!!!!!!!!!!
     uint64_t stopTime = syncStopTime.load(std::memory_order_relaxed);
     if (currentTime > stopTime) {
         return 0;

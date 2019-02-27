@@ -73,6 +73,11 @@ class Service {
         /// this request.
         Worker* worker;
 
+        // The following members are for performance debugging only.
+
+        /// Time, in rdtsc ticks, when the request is received from the driver.
+        uint64_t receiveTime;
+
         friend class WorkerManager;
         friend class Service;
         DISALLOW_COPY_AND_ASSIGN(Rpc);

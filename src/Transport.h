@@ -163,6 +163,11 @@ class Transport {
         int activities;
 
         /**
+         * Cycles::rdtsc time when the request is received from the driver.
+         */
+        uint64_t receiveTime;
+
+        /**
          * Cycles::rdtsc time when this ServerRpc is passed to WorkerManager for
          * processing via WorkerManager::handleRpc.
          */
@@ -313,6 +318,15 @@ class Transport {
         virtual ~RpcNotifier() {}
         virtual void completed();
         virtual void failed();
+
+        // FIXME: is this the best place way to record probe timestamps?
+        /// The following two variables are used to record the outgoing and
+        /// incoming timestamps of a ClockSyncRpc probe, which are used in
+        /// clock synchronization process. It's updated in the code path of
+        /// a transport class that sends/receives single-packet  message
+        /// (both ClockSyncRpc's request & response are single-packet).
+        uint64_t receiveTime;
+        uint64_t transmitTime;
 
         DISALLOW_COPY_AND_ASSIGN(RpcNotifier);
     };

@@ -70,7 +70,7 @@ AdminService::clockSync(const WireFormat::ClockSync::Request* reqHdr,
              WireFormat::ClockSync::Response* respHdr,
              Rpc* rpc)
 {
-    respHdr->serverTsc = clockSynchronizer.handleRequest(Cycles::rdtsc(),
+    respHdr->serverTsc = clockSynchronizer.handleRequest(rpc->receiveTime,
             reqHdr);
 }
 

@@ -924,6 +924,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         t->timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
                 "priority %u", rpcId.clientId, rpcId.sequence, 0);
         t->driver->sendPacket(serverAddress, &header, &iter, 0);
+        notifier->transmitTime = t->driver->getLastTransmitTime();
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
         bytesSent = length;
@@ -1014,6 +1015,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                 Driver::PayloadChunk::appendToBuffer(clientRpc->response,
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
+                clientRpc->notifier->receiveTime = driver->getLastReceiveTime();
                 clientRpc->notifier->completed();
                 deleteClientRpc(clientRpc);
                 return;
@@ -1268,6 +1270,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
+                serverRpc->receiveTime = driver->getLastReceiveTime();
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }

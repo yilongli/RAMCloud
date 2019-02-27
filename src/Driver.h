@@ -215,7 +215,8 @@ class Driver {
     using TransmitQueueState = QueueEstimator::TransmitQueueState;
 
     explicit Driver()
-        : lastTransmitTime(0)
+        : lastReceiveTime(0)
+        , lastTransmitTime(0)
         , maxTransmitQueueSize(0)
         , queueEstimator(0)
     {
@@ -279,6 +280,18 @@ class Driver {
     {
         return static_cast<int>(maxTransmitQueueSize) -
                 queueEstimator.getQueueSize(currentTime);
+    }
+
+    /**
+     * The most recent time that the driver received packets from the NIC.
+     * Mainly used for performance debugging.
+     *
+     * \return
+     *      Last receive time, in Cycles::rdtsc ticks
+     */
+    uint64_t getLastReceiveTime()
+    {
+        return lastReceiveTime;
     }
 
     /**
@@ -507,6 +520,10 @@ class Driver {
     static const uint32_t MAX_DRAIN_TIME = 2000;
 
   PROTECTED:
+    /// The most recent time that the driver polled packets from the NIC,
+    /// in rdtsc ticks.
+    uint64_t lastReceiveTime;
+
     /// The most recent time that the driver handed a packet to the NIC,
     /// in rdtsc ticks.
     uint64_t lastTransmitTime;

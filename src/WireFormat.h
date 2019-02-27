@@ -675,8 +675,6 @@ struct ClockSync {
                                     // server id.
         uint64_t baseTsc;           // Rdtsc reading when we reset the timestamp
                                     // counter logically.
-        uint64_t clientTsc;         // Rdtsc reading right before sending out
-                                    // this RPC.
         uint64_t fastestClientTsc;  // clientTsc from the fastest ClockSync RPC
                                     // we sent previously.
         uint64_t fastestServerTsc;  // serverTsc from the fastest ClockSync RPC

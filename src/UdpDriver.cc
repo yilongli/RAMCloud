@@ -250,12 +250,12 @@ UdpDriver::sendPacket(const Address* addr,
     msg.msg_name = const_cast<sockaddr *>(a);
     msg.msg_namelen = sizeof(*a);
 
+    lastTransmitTime = Cycles::rdtsc();
     ssize_t r = sys->sendmsg(socketFd, &msg, 0);
     if (r == -1) {
         LOG(WARNING, "UdpDriver error sending to socket: %s", strerror(errno));
         return;
     }
-    lastTransmitTime = Cycles::rdtsc();
     queueEstimator.packetQueued(totalLength, lastTransmitTime, txQueueState);
     assert(static_cast<size_t>(r) == totalLength);
 }

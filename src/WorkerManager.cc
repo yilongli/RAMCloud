@@ -157,6 +157,7 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
             (header->opcode == WireFormat::PING)) {
         Service::Rpc serviceRpc(NULL, &rpc->requestPayload,
                 &rpc->replyPayload);
+        serviceRpc.receiveTime = rpc->receiveTime;
 #if HOMA_BENCHMARK
         // As of 2017/10, bypassing Service::handleRpc reduces ~400(!) ns
         // for short echo requests.

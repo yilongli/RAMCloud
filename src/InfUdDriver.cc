@@ -484,6 +484,7 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     uint64_t prepareWorkRequest = Cycles::rdtscp();
 #endif
     ibv_send_wr *bad_txWorkRequest;
+    lastTransmitTime = Cycles::rdtsc();
     if (ibv_post_send(qp->qp, &workRequest, &bad_txWorkRequest)) {
         LOG(WARNING, "Error posting transmit packet: %s", strerror(errno));
         txPool->freeBuffers.push_back(bd);
@@ -491,7 +492,6 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     } else {
         txBuffersInHca.push_back(bd);
     }
-    lastTransmitTime = Cycles::rdtsc();
     timeTrace("sent packet with %u bytes, %u free buffers", totalLength,
             txPool->freeBuffers.size());
 #if COLLECT_LOW_LEVEL_PERFSTATS
@@ -534,6 +534,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         }
         return;
     }
+    lastReceiveTime = Cycles::rdtsc();
     timeTrace("InfUdDriver received %d packets", numPackets);
 #if COLLECT_LOW_LEVEL_PERFSTATS
     uint64_t ibvPollCq = Cycles::rdtscp();

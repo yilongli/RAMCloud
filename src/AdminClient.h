@@ -57,7 +57,6 @@ class ClockSyncRpc : public RpcWrapper {
             uint64_t baseTsc, ServerId targetId, ServerId callerId,
             uint64_t fastestClientTsc, uint64_t fastestServerTsc);
     ~ClockSyncRpc() {}
-    void completed();
     uint64_t wait();
     uint64_t getClientTsc();
     uint64_t getCompletionTime();
@@ -70,11 +69,6 @@ class ClockSyncRpc : public RpcWrapper {
     /// this machine.
     uint64_t baseTsc;
 
-    /// Cycles::rdtsc ticks since #baseTsc when we invoke RpcWrapper::send().
-    uint64_t startTime;
-
-    /// Cycles::rdtsc ticks since #baseTsc when the RPC completes.
-    uint64_t endTime;
     DISALLOW_COPY_AND_ASSIGN(ClockSyncRpc);
 };
 
