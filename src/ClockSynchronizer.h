@@ -118,6 +118,12 @@ class ClockSynchronizer : Dispatch::Poller {
     /// running; otherwise, it must be either 0, 1, or 2.
     std::atomic<int> phase;
 
+    int probeId;
+
+    ServerId probeTarget;
+
+    Probe codedProbes[2];
+
     /// Placeholder for the outgoing ClockSync RPC.
     Tub<ClockSyncRpc> outstandingRpc;
 

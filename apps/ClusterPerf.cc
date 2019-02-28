@@ -2616,7 +2616,7 @@ clockSync()
         uint32_t clockSyncSeconds = downCast<uint32_t>(seconds);
         cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
                 &clockSyncSeconds, sizeof(clockSyncSeconds));
-        Cycles::sleep(10 * 1000000);
+//        Cycles::sleep(10 * 1000000);
     }
 }
 

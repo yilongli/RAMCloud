@@ -13,6 +13,7 @@
  * CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <cmath>
 #include "AdminService.h"
 #include "ClockSynchronizer.h"
 #include "Cycles.h"
@@ -56,6 +57,9 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
     , outgoingProbes()
     , outProbes()
     , phase(-1)
+    , probeId(0)
+    , probeTarget()
+    , codedProbes()
     , outstandingRpc()
     , sendingRpc(false)
     , serverTracker(context)
@@ -125,9 +129,9 @@ ClockSynchronizer::computeOffset()
         if (oldRemoteTime < 1e-3) {
             oldRemoteTime = newRemoteTime;
         }
-        LOG(NOTICE, "Synchronized clock %d times with server %u; RTT %.2f us; "
+        LOG(NOTICE, "Synchronized clock with server %u round %d; RTT %.2f us; "
                 "time jump %.0f ns; TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
-                syncCount, syncee.indexNumber(), Cycles::toSeconds(2*halfRTT)*1e6,
+                syncee.indexNumber(), syncCount, Cycles::toSeconds(2*halfRTT)*1e6,
                 newRemoteTime - oldRemoteTime, ourServerId.indexNumber(),
                 clockState[ourServerId].baseTsc, skew, syncee.indexNumber(),
                 clock->baseTsc, offset);
@@ -292,36 +296,55 @@ ClockSynchronizer::poll()
     if (outstandingRpc && outstandingRpc->isReady()) {
         ClockSyncRpc* rpc = outstandingRpc.get();
         ServerId targetId = rpc->targetId;
-        int index = phase.load(std::memory_order_relaxed);
-        Probe* fastestProbe = &outgoingProbes[index][targetId];
         uint64_t serverTsc = rpc->wait();
-        if (rpc->getCompletionTime() < fastestProbe->completionTime) {
-            fastestProbe->clientTsc = rpc->getClientTsc();
-            fastestProbe->serverTsc = serverTsc;
-            fastestProbe->completionTime = rpc->getCompletionTime();
-            timeTrace("update fastest probe, completion time %u ns",
-                    Cycles::toNanoseconds(rpc->getCompletionTime()));
-        }
-        outstandingRpc.destroy();
 
-        // FIXME: Huygens-related experiment
-        outProbes[targetId].emplace_back(rpc->getClientTsc(), serverTsc,
-                rpc->getCompletionTime());
+        codedProbes[probeId % 2] =
+                {rpc->getClientTsc(), serverTsc, rpc->getCompletionTime()};
+        if (probeId % 2) {
+            // Test probe pair's purity
+            uint64_t clientDelta =
+                    codedProbes[1].clientTsc - codedProbes[0].clientTsc;
+            uint64_t serverDelta =
+                    codedProbes[1].serverTsc - codedProbes[0].serverTsc;
+            uint64_t error = serverDelta > clientDelta ?
+                    serverDelta - clientDelta : clientDelta - serverDelta;
+            if (error < 50) {
+                int index = phase.load(std::memory_order_relaxed);
+                Probe* fastestProbe = &outgoingProbes[index][targetId];
+                if (rpc->getCompletionTime() < fastestProbe->completionTime) {
+                    fastestProbe->clientTsc = rpc->getClientTsc();
+                    fastestProbe->serverTsc = serverTsc;
+                    fastestProbe->completionTime = rpc->getCompletionTime();
+                    timeTrace("update fastest probe, completion time %u ns",
+                            Cycles::toNanoseconds(rpc->getCompletionTime()));
+                }
+
+                // FIXME: Huygens-related experiment
+                outProbes[targetId].emplace_back(rpc->getClientTsc(), serverTsc,
+                        rpc->getCompletionTime());
+            }
+        }
+
+        outstandingRpc.destroy();
+        probeId++;
     }
 
     // Pick a random node in the cluster to probe.
-    ServerId target = serverTracker.getRandomServerIdWithService(
-            WireFormat::ADMIN_SERVICE);
-    if (!sessions[target]) {
+    if (probeId % 2 == 0) {
+        probeTarget = serverTracker.getRandomServerIdWithService(
+                WireFormat::ADMIN_SERVICE);
+    }
+    if (!sessions[probeTarget]) {
         sendingRpc = true;
-        sessions[target] = context->serverList->getSession(target);
+        sessions[probeTarget] = context->serverList->getSession(probeTarget);
         sendingRpc = false;
     }
     ServerId ourServerId = context->getAdminService()->serverId;
-    if (target.isValid() && target != ourServerId) {
-        Probe* fastestProbe = &outgoingProbes[1][target];
-        outstandingRpc.construct(context, sessions[target], baseTsc, target,
-                ourServerId, fastestProbe->clientTsc, fastestProbe->serverTsc);
+    if (probeTarget.isValid() && probeTarget != ourServerId) {
+        Probe* fastestProbe = &outgoingProbes[1][probeTarget];
+        outstandingRpc.construct(context, sessions[probeTarget], baseTsc,
+                probeTarget, ourServerId, fastestProbe->clientTsc,
+                fastestProbe->serverTsc);
     }
 
     return 1;
