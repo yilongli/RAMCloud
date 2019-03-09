@@ -31,7 +31,8 @@ namespace RAMCloud {
  */
 class TreeBcast {
   public:
-    explicit TreeBcast(Context* context, CommunicationGroup* group);
+    explicit TreeBcast(Context* context, CommunicationGroup* group,
+            uint32_t opId = 0);
   PRIVATE:
     explicit TreeBcast(Context* context,
             const WireFormat::TreeBcast::Request* reqHdr, Service::Rpc* rpc);
@@ -74,26 +75,27 @@ class TreeBcast {
         assert(payloadRequest.size() == 0);
         payloadResponseHeaderLength = 0;
         payloadRequest.appendExternal(data, length);
-        respHdr->receiveTime = Cycles::rdtsc();
         start();
     }
 
     bool isReady();
-    Buffer* wait(uint64_t* broadcastTime = NULL);
+    Buffer* wait();
 
   PRIVATE:
     void start();
 
     class TreeBcastRpc : public ServerIdRpcWrapper {
       public:
-        explicit TreeBcastRpc(Context* context, CommunicationGroup* group,
-                int root, int child, uint32_t payloadResponseHeaderLength,
-                Buffer* payloadRequest)
+        explicit TreeBcastRpc(Context* context, uint32_t opId,
+                CommunicationGroup* group, int root, int child,
+                uint32_t payloadResponseHeaderLength, Buffer* payloadRequest)
             : ServerIdRpcWrapper(context, group->getNode(root + child),
                 sizeof(WireFormat::TreeBcast::Response))
+            , child(child)
         {
             WireFormat::TreeBcast::Request* reqHdr(
                     allocHeader<WireFormat::TreeBcast>());
+            reqHdr->opId = opId;
             reqHdr->groupId = group->id;
             reqHdr->root = root;
             reqHdr->payloadResponseHeaderLength = payloadResponseHeaderLength;
@@ -101,18 +103,11 @@ class TreeBcast {
             send();
         }
 
-        /// Return the time (in Cycles::rdtsc ticks at the root node) when the
-        /// broadcast message reached the last node in the tree.
-        uint64_t
-        wait()
-        {
-            waitAndCheckErrors();
-            uint64_t receiveTime =
-                    getResponseHeader<WireFormat::TreeBcast>()->receiveTime;
-            // Chop off the TreeBcast response header.
-            response->truncateFront(responseHeaderLength);
-            return receiveTime;
-        }
+        static const uint32_t responseHeaderLength =
+                sizeof(WireFormat::StartMilliSort::Response);
+
+        /// Rank of the child in the broadcast tree.
+        int child;
 
         DISALLOW_COPY_AND_ASSIGN(TreeBcastRpc);
     };
@@ -140,6 +135,9 @@ class TreeBcast {
     /// Context of the service that created this task.
     Context* context;
 
+    /// Unique identifier of the broadcast operation. Only used for logging.
+    uint32_t opId;
+
     /// All nodes that are participating in the broadcast operation, including
     /// the initial broadcaster.
     CommunicationGroup* group;
@@ -166,16 +164,15 @@ class TreeBcast {
     Tub<Buffer> responseStorage;
 
     // FIXME: use boost_intrusive_list?
-    /// Each outgoing RPC is represented by a RpcWrapper class as opposed to
-    /// TreeBcastRpc because all the outgoing RPCs share the same request
-    /// message. We don't want the constructor of TreeBcastRpc to duplicate
-    /// the work.
     using OutstandingRpcs = std::list<TreeBcastRpc>;
 
     /// Ongoing RPCs that are sending the broadcast request to all the direct
     /// children of this node.
     OutstandingRpcs outstandingRpcs;
 
+    /// Size, in # bytes, of the response header of the embedded RPC. This is
+    /// required when constructing #payloadRpc. 0 means there is no embedded
+    /// RPC.
     uint32_t payloadResponseHeaderLength;
 
     /// Request buffer for #payloadRpc.

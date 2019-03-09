@@ -365,6 +365,10 @@ struct TreeBcast {
     struct Request {
         RequestCommon common;
 
+        /// Unique identifier of the broadcast operation. Mostly used in
+        /// logging.
+        uint32_t opId;
+
         /// Unique identifier of the communication group that contains the
         /// nodes participating in the broadcast.
         int32_t groupId;
@@ -383,7 +387,7 @@ struct TreeBcast {
         /// Time (in Cycles::rdtsc ticks at the root node) when the last node
         /// in the broadcast tree received the broadcast. Intended only for
         /// performance benchmark.
-        uint64_t receiveTime;
+//        uint64_t receiveTime;
     } __attribute__((packed));
 };
 
@@ -675,6 +679,7 @@ struct ClockSync {
                                     // server id.
         uint64_t baseTsc;           // Rdtsc reading when we reset the timestamp
                                     // counter logically.
+        uint32_t epoch;             // Global clock sync. epoch number.
         uint64_t fastestClientTsc;  // clientTsc from the fastest ClockSync RPC
                                     // we sent previously.
         uint64_t fastestServerTsc;  // serverTsc from the fastest ClockSync RPC

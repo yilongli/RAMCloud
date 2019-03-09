@@ -79,6 +79,8 @@ class MilliSortService : public Service {
         std::sort(nodes.begin(), nodes.end(), std::less<ServerId>());
         world.construct(WORLD, serverId.indexNumber() - 1, nodes);
         registerCommunicationGroup(world.get());
+        LOG(NOTICE, "Communication group WORLD initialized, rank %u, size %lu",
+                serverId.indexNumber() - 1, nodes.size());
     }
 
     /**

@@ -26,7 +26,7 @@
 namespace RAMCloud {
 
 ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
-        uint64_t baseTsc, ServerId targetId, ServerId callerId,
+        uint32_t epoch, uint64_t baseTsc, ServerId targetId, ServerId callerId,
         uint64_t fastestClientTsc, uint64_t fastestServerTsc)
     : RpcWrapper(sizeof(WireFormat::GetServerId::Response))
     , targetId(targetId)
@@ -38,6 +38,7 @@ ClockSyncRpc::ClockSyncRpc(Context* context, Transport::SessionRef session,
             allocHeader<WireFormat::ClockSync>());
     reqHdr->baseTsc = baseTsc;
     reqHdr->callerId = callerId.getId();
+    reqHdr->epoch = epoch;
     reqHdr->fastestClientTsc = fastestClientTsc;
     reqHdr->fastestServerTsc = fastestServerTsc;
     send();

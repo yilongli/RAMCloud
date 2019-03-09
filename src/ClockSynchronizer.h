@@ -52,7 +52,13 @@ class ClockSynchronizer : Dispatch::Poller {
     /// Within a few seconds, we can only obtain 6~7 accurate digits after the
     /// decimal of the skew factor. Therefore, the larger tsc_1 and tsc_2 are,
     /// the more error we have in the computed offset.
-    const uint64_t baseTsc;
+    uint64_t baseTsc;
+    // TODO: explain how accesses to baseTsc are synchronized?
+
+    uint64_t oldBaseTsc;
+
+    /// # times method run() has been called.
+    std::atomic<uint32_t> epoch;
 
     /// Information about clock on a remote node that is sufficient to convert
     /// timestamps on that node to local timestamps.
@@ -60,11 +66,18 @@ class ClockSynchronizer : Dispatch::Poller {
         /// See docs of ClockSynchronizer::baseTsc.
         uint64_t baseTsc;
 
+        // TODO: better solution?
+        uint64_t newBaseTsc;
+
         /// See docs of ClockSynchronizer::baseTsc.
         int64_t offset;
 
         /// See docs of ClockSynchronizer::baseTsc.
         double skew;
+
+        ClockState()
+            : baseTsc(), offset(), skew()
+        {}
     };
 
     /// Stores the states of clocks on all nodes in the cluster when the

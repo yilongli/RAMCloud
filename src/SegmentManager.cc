@@ -112,6 +112,7 @@ SegmentManager::SegmentManager(Context* context,
     // buffer when running Homa benchmarks.
     context->masterZeroCopyRegion = allocator.getBaseAddress();
 #endif
+    // FIXME: wtf? is the following a temp hack for millisort shuffle benchmark?
     context->masterZeroCopyRegion = allocator.getBaseAddress();
 }
 

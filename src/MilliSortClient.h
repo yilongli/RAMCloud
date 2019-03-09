@@ -120,6 +120,16 @@ class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
         }
     }
 
+    // TODO: document this method and remove the above wait method?
+    Buffer*
+    wait()
+    {
+        waitAndCheckErrors();
+        response->truncateFront(
+                sizeof32(WireFormat::BenchmarkCollectiveOp::Response));
+        return response;
+    }
+
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::BenchmarkCollectiveOp::Response);
 

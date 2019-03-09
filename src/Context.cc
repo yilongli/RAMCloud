@@ -192,10 +192,10 @@ Context::destroy()
 
     tableManager = NULL;
 
-#if !HOMA_BENCHMARK
-    free(const_cast<void*>(masterZeroCopyRegion));
+//#if !HOMA_BENCHMARK
+//    free(const_cast<void*>(masterZeroCopyRegion));
     masterZeroCopyRegion = NULL;
-#endif
+//#endif
 
     clockSynchronizer = NULL;
 }

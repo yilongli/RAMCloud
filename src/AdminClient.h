@@ -54,8 +54,9 @@ class AdminClient {
 class ClockSyncRpc : public RpcWrapper {
   public:
     ClockSyncRpc(Context* context, Transport::SessionRef session,
-            uint64_t baseTsc, ServerId targetId, ServerId callerId,
-            uint64_t fastestClientTsc, uint64_t fastestServerTsc);
+            uint32_t epoch, uint64_t baseTsc, ServerId targetId,
+            ServerId callerId, uint64_t fastestClientTsc,
+            uint64_t fastestServerTsc);
     ~ClockSyncRpc() {}
     uint64_t wait();
     uint64_t getClientTsc();

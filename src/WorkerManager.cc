@@ -200,11 +200,21 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     // Create a new thread to handle the RPC.
     rpc->id = nextRpcId++;
     rpc->header = header;
-    timeTrace("ID %u: Dispatching opcode %d on core %d", rpc->id,
-        header->opcode, sched_getcpu());
-    Arachne::ThreadId threadId = Arachne::createThread(&WorkerManager::workerMain, this, rpc);
-    if (threadId ==
-            Arachne::NullThread) {
+    timeTrace("ID %u: Dispatching opcode %d on coreId %u", rpc->id,
+        header->opcode, Arachne::getThreadId().context->coreId);
+
+    Arachne::ThreadId threadId;
+    // FIXME: dirty hack to avoid creating the Arachne thread that handles the
+    // benchmark request on the hypertwin of the dispatch thread.
+    if (header->opcode == WireFormat::BENCHMARK_COLLECTIVE_OP) {
+        // Hmm, dispatch thread is always on T1 (i.e., coreId 0?) and coreId 1
+        // seems to be T5, which is the hypertwin of T1?
+        threadId = Arachne::createThreadOnCore(2, &WorkerManager::workerMain,
+                this, rpc);
+    } else {
+        threadId = Arachne::createThread(&WorkerManager::workerMain, this, rpc);
+    }
+    if (threadId == Arachne::NullThread) {
         // Thread creations can fail randomly due to core deallocation,
         // so first retry a few times.
         for (int i = 0; i < 10; i++) {

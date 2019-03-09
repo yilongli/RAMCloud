@@ -16,6 +16,7 @@
 #include <functional>
 #include "Logger.h"
 #include "WorkerSession.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 
@@ -91,6 +92,10 @@ WorkerSession::sendRequest(Buffer* request, Buffer* response,
     // Enqueue the request for the dispatch thread.
     context->dispatchExec->addRequest<SendRequestWrapper>(
             request, response, notifier, wrapped);
+//    if (request->getStart<WireFormat::RequestCommon>()->opcode ==
+//            WireFormat::BCAST_TREE) {
+//        TimeTrace::record("WorkerSession enqueued new SendRequest");
+//    }
 }
 
 } // namespace RAMCloud

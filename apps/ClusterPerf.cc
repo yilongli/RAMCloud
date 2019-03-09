@@ -7394,18 +7394,21 @@ treeBcast()
     }
 
     ServerId rootServer(1, 0);
-    // TODO: only showing the average completion time is not enough
     printf("# Note: Latency numbers are displayed in microseconds.\n"
             "#%10s%10s%10s%10s%10s%10s%10s\n", "nodes", "size (B)", "ops",
             "min", "p50", "p90", "p99");
     printf("#------------------------------------------------------------"
            "----------\n");
+    string rawdata;
 
     // Sweep machineCount from 1 to numMasters.
-    uint32_t clockSyncSeconds = 5;
+    uint32_t clockSyncSeconds = 2;
+//    for (int i = 0; i < 20; i++) { int machineCount = numMasters;
 //    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-    for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
+    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
+        LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
+                clockSyncSeconds);
         cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
                 &clockSyncSeconds, sizeof(clockSyncSeconds));
 
@@ -7418,9 +7421,27 @@ treeBcast()
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::BCAST_TREE,
                 objectSize);
-        std::vector<uint64_t> completionTimes;
-        rpc.wait(&completionTimes);
+        Buffer* result = rpc.wait();
+        LOG(NOTICE, "BenchmarkCollectiveOpRpc returned");
+
+        // Retrieve the broadcast latency of each node from the RPC response
+        // buffer.
+        std::vector<uint32_t> completionTimes;
+        std::unordered_map<uint32_t, std::vector<uint32_t>> nodeLatency;
+        uint32_t offset = 0;
+        while (offset < result->size()) {
+            uint32_t max = 0;
+            for (int rank = 1; rank < machineCount; rank++) {
+                uint32_t latency = *result->read<uint32_t>(&offset);
+                nodeLatency[rank].push_back(latency);
+                if (latency > max) {
+                    max = latency;
+                }
+            }
+            completionTimes.push_back(max);
+        }
         std::sort(completionTimes.begin(), completionTimes.end());
+
         double numSamples = double(completionTimes.size());
         double min = double(completionTimes.front()) * 1e-3;
         double p50 = double(completionTimes[int(numSamples * 0.5)]) * 1e-3;
@@ -7428,7 +7449,29 @@ treeBcast()
         double p99 = double(completionTimes[int(numSamples * 0.99)]) * 1e-3;
         printf(" %10d%10d%10.0f%10.2f%10.2f%10.2f%10.2f\n", machineCount,
                 objectSize, numSamples, min, p50, p90, p99);
+
+        // Output the broadcast latencies of each node from all runs (several
+        // comma-separated values on each line).
+        rawdata.append(std::to_string(machineCount));
+        rawdata.append(", ");
+        for (uint32_t ns : completionTimes) {
+            rawdata.append(",");
+            rawdata.append(std::to_string(ns));
+        }
+        rawdata.append("\n");
+        for (int rank = 1; rank < machineCount; rank++) {
+            rawdata.append(std::to_string(machineCount));
+            rawdata.append(",");
+            rawdata.append(std::to_string(rank));
+            std::sort(nodeLatency[rank].begin(), nodeLatency[rank].end());
+            for (uint32_t ns : nodeLatency[rank]) {
+                rawdata.append(",");
+                rawdata.append(std::to_string(ns));
+            }
+            rawdata.append("\n");
+        }
     }
+    printf("%s", rawdata.c_str());
 }
 
 void
@@ -7462,7 +7505,7 @@ allShuffle()
     string perfstats;
     // Each iteration of the following loop performs a all-to-all shuffle
     // operation between a specific number of servers.
-    uint32_t clockSyncSeconds = 5;
+    uint32_t clockSyncSeconds = 2;
     for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
         cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
@@ -7700,9 +7743,14 @@ try
     if (clientIndex == 0) {
         // FIXME: is it OK to assume ServerId(1,0) always exists and alive over
         // the entire lifetime of all experiments?
-        uint64_t masterId = ServerId(1, 0).getId();
-        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
-                sizeof(masterId));
+        // FIXME: timetrace doesn't really work well with clock sync. yet;
+        // the problem is that we might run clock sync. many times during the
+        // the experiment and we can't the use the sync. result in the latest
+        // epoch to print time traces from previous epochs.
+//        uint64_t masterId = ServerId(1, 0).getId();
+//        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
+//                sizeof(masterId));
+        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();

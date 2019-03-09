@@ -1028,16 +1028,22 @@ MilliSortService::benchmarkCollectiveOp(
     if (reqHdr->opcode == WireFormat::BCAST_TREE) {
         /* Broadcast benchmark */
         std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
+        std::vector<uint32_t> latencyNs(world.get()->size() - 1);
         for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
             uint64_t startTime = Cycles::rdtsc();
-            uint64_t endTime;
-            TreeBcast bcast(context, world.get());
+            TreeBcast bcast(context, world.get(), downCast<uint32_t>(i));
             bcast.send(data.get(), reqHdr->dataSize);
-            bcast.wait(&endTime);
+            Buffer* result = bcast.wait();
             if (i >= WARMUP_COUNT) {
-                uint64_t elapsedNanos =
-                        Cycles::toNanoseconds(endTime - startTime);
-                rpc->replyPayload->emplaceAppend<uint64_t>(elapsedNanos);
+                uint32_t offset = 0;
+                while (offset < result->size()) {
+                    uint32_t rank = *result->read<uint32_t>(&offset);
+                    uint64_t endTime = *result->read<uint64_t>(&offset);
+                    latencyNs[rank - 1] = downCast<uint32_t>(
+                            Cycles::toNanoseconds(endTime - startTime));
+                }
+                rpc->replyPayload->appendCopy(latencyNs.data(),
+                        downCast<uint32_t>(latencyNs.size() * 4));
             }
         }
     } else if (reqHdr->opcode == WireFormat::ALL_SHUFFLE) {

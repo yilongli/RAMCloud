@@ -44,12 +44,17 @@ namespace {
     }
 }
 
-#define PRINT_CLOCK_SYNC_MATRIX 1
+#define PRINT_CLOCK_SYNC_MATRIX 0
+
+#define HUYGENS_EXPERIMENT 0
 
 ClockSynchronizer::ClockSynchronizer(Context* context)
     : Dispatch::Poller(context->dispatch, "ClockSynchronizer")
     , context(context)
-    , baseTsc(Cycles::rdtsc())
+    , baseTsc()
+    , oldBaseTsc()
+//    , baseTsc(Cycles::rdtsc())
+    , epoch()
     , clockState()
     , mutex("ClockSynchronizer::clockState")
     , nextUpdateTime(0)
@@ -92,7 +97,8 @@ ClockSynchronizer::computeOffset()
     outstandingRpc.destroy();
 
     ServerId ourServerId = context->getAdminService()->serverId;
-    clockState[ourServerId] = {baseTsc, 0, 1.0};
+    clockState[ourServerId].baseTsc = baseTsc;
+    clockState[ourServerId].skew = 1.0;
 
     uint64_t now = Cycles::rdtsc();
     for (auto& p : outgoingProbes[1]) {
@@ -100,9 +106,10 @@ ClockSynchronizer::computeOffset()
         ClockState* clock = &clockState[syncee];
         double oldRemoteTime = 0;
         double newRemoteTime;
-        if (std::abs(clock->skew) > 1e-3) {
-            oldRemoteTime = TimeConverter(baseTsc, clock).toRemoteTime(now);
+        if (oldBaseTsc > 0) {
+            oldRemoteTime = TimeConverter(oldBaseTsc, clock).toRemoteTime(now);
         }
+        clock->baseTsc = clock->newBaseTsc;
 
         // Use the fastest probes from phase 0 and phase 2 to compute the clock
         // skew factor.
@@ -159,6 +166,7 @@ ClockSynchronizer::computeOffset()
     }
 #endif
 
+#if HUYGENS_EXPERIMENT
     // FIXME: Huygens-related experiment
     for (auto& p : outProbes) {
         ServerId id = p.first;
@@ -198,6 +206,7 @@ ClockSynchronizer::computeOffset()
         printf("%s", result.c_str());
         fflush(stdout);
     }
+#endif
     outProbes.clear();
 
     incomingProbes.clear();
@@ -239,15 +248,18 @@ ClockSynchronizer::handleRequest(uint64_t timestamp,
         const WireFormat::ClockSync::Request* reqHdr)
 {
     assert(context->dispatch->isDispatchThread());
+    if (reqHdr->epoch > epoch.load(std::memory_order_acquire)) {
+        // Client's epoch ahead of us; ignore this probe.
+        return 0;
+    }
+
     uint64_t serverTsc = timestamp - baseTsc;
     // We shall not modify incomingProbes once computeOffset() has started.
     if (phase.load(std::memory_order_acquire) >= 0) {
         ServerId caller(reqHdr->callerId);
-        if (clockState.find(caller) == clockState.end()) {
-            SpinLock::Guard _(mutex);
-            clockState[caller].baseTsc = reqHdr->baseTsc;
-            clockState[caller].offset = 0;
-            clockState[caller].skew = 0;
+        SpinLock::Guard _(mutex);
+        if (clockState[caller].newBaseTsc != reqHdr->baseTsc) {
+            clockState[caller].newBaseTsc = reqHdr->baseTsc;
         }
         incomingProbes[caller].clientTsc = reqHdr->fastestClientTsc;
         incomingProbes[caller].serverTsc = reqHdr->fastestServerTsc;
@@ -308,6 +320,10 @@ ClockSynchronizer::poll()
                     codedProbes[1].serverTsc - codedProbes[0].serverTsc;
             uint64_t error = serverDelta > clientDelta ?
                     serverDelta - clientDelta : clientDelta - serverDelta;
+            if ((codedProbes[0].serverTsc == 0) ||
+                    (codedProbes[1].serverTsc == 0)) {
+                error = 99999;
+            }
             if (error < 50) {
                 int index = phase.load(std::memory_order_relaxed);
                 Probe* fastestProbe = &outgoingProbes[index][targetId];
@@ -342,7 +358,7 @@ ClockSynchronizer::poll()
     ServerId ourServerId = context->getAdminService()->serverId;
     if (probeTarget.isValid() && probeTarget != ourServerId) {
         Probe* fastestProbe = &outgoingProbes[1][probeTarget];
-        outstandingRpc.construct(context, sessions[probeTarget], baseTsc,
+        outstandingRpc.construct(context, sessions[probeTarget], epoch, baseTsc,
                 probeTarget, ourServerId, fastestProbe->clientTsc,
                 fastestProbe->serverTsc);
     }
@@ -367,7 +383,13 @@ ClockSynchronizer::run(uint32_t seconds)
     timeNs[0] = totalTimeNs / 10;
     timeNs[2] = totalTimeNs / 10;
     timeNs[1] = totalTimeNs - timeNs[0] - timeNs[2];
-    uint64_t wakeupTime = Cycles::rdtsc() + Cycles::fromSeconds(seconds);
+    uint64_t now = Cycles::rdtsc();
+    uint64_t wakeupTime = now + Cycles::fromSeconds(seconds);
+
+    // Update baseTsc and then advance to the new epoch (the order is important)
+    oldBaseTsc = baseTsc;
+    baseTsc = now;
+    epoch.fetch_add(1, std::memory_order_release);
     phase = 0;
     syncStopTime = wakeupTime;
     Arachne::sleep(timeNs[0]);
@@ -376,7 +398,7 @@ ClockSynchronizer::run(uint32_t seconds)
     phase++;
     Arachne::sleep(timeNs[2]);
     while (true) {
-        uint64_t now = Cycles::rdtsc();
+        now = Cycles::rdtsc();
         // The following can happen because our Cycles::perSecond() is different
         // from Arachne's Cycles::perSecond().
         if (now < wakeupTime) {

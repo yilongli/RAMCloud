@@ -351,6 +351,9 @@ realMain(int argc, char *argv[])
         server.run(); // Never returns except for exceptions.
 
         return 0;
+    // Note: the following handlers run after the destructors of Server and
+    // Context so if there is a segfault in them, the following handlers would
+    // not be run!!!
     } catch (const Exception& e) {
         LOG(ERROR, "Fatal error in server: %s", e.what());
         Logger::get().sync();

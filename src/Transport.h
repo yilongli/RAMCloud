@@ -62,7 +62,8 @@ class Transport {
 #if HOMA_BENCHMARK
       static const uint32_t MAX_RPC_LEN = ((1 << 25) + 200);
 #else
-      static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
+      static const uint32_t MAX_RPC_LEN = ((1 << 25) + 200);
+//      static const uint32_t MAX_RPC_LEN = ((1 << 23) + 200);
 #endif
 
     /**

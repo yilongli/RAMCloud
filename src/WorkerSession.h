@@ -22,6 +22,7 @@
 #include "Dispatch.h"
 #include "Transport.h"
 #include "DispatchExec.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 /**
@@ -70,6 +71,10 @@ class SendRequestWrapper : public DispatchExec::Lambda {
 
     /// @copydoc DispatchExec::Lambda::invoke()
     void invoke() {
+//        if (request->getStart<WireFormat::RequestCommon>()->opcode ==
+//                WireFormat::BCAST_TREE) {
+//            TimeTrace::record("SendRequestWrapper invoked");
+//        }
         session->sendRequest(request, response, notifier);
         session = NULL;
     }

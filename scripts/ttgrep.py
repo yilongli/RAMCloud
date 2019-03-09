@@ -42,13 +42,14 @@ def scan(f, string):
     writes = 0
     for line in f:
         match = re.match('.*TimeTrace.*printInternal.* '
-                '([0-9.]+) ns \(\+ *([0-9.]+) ns\): (.*)',
+                'T([0-9]+) ([0-9.]+) ns \(\+ *([0-9.]+) ns\): (.*)',
                 line)
         if not match:
             continue
-        time = float(match.group(1))
-        interval = float(match.group(2))
-        event = match.group(3)
+        thread = float(match.group(1))
+        time = float(match.group(2))
+        interval = float(match.group(3))
+        event = match.group(4)
         if string not in event:
             continue
         if time < prevTime:
@@ -59,8 +60,8 @@ def scan(f, string):
         if startTime == 0.0:
             startTime = time
             prevTime = time
-        print("%9.3f us (+%7.3f us): %s" % ((time - startTime)/1000.0,
-                (time - prevTime)/1000.0, event))
+        print("T%d %9.3f us (+%7.3f us): %s" % (thread,
+                (time - startTime)/1000.0, (time - prevTime)/1000.0, event))
         prevTime = time
 
 if len(sys.argv) != 3:
