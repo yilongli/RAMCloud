@@ -7475,6 +7475,73 @@ treeBcast()
 }
 
 void
+flatGather()
+{
+    // Normally, cluster->serverList is NULL on clients. Get it from the
+    // coordinator.
+    ServerList serverList(context);
+    ProtoBuf::ServerList list;
+    CoordinatorClient::getServerList(context, &list);
+    serverList.applyServerList(list);
+
+    // Get the number of nodes to perform gather.
+    int numMasters = 0;
+    // FIXME: I doubt this is the best/correct way to get # masters...
+    for (uint32_t i = 0; i < serverList.size(); i++) {
+        if (serverList[i].isValid()) {
+            numMasters++;
+        }
+    }
+
+    ServerId rootServer(1, 0);
+    printf("# Note: Latency numbers are displayed in microseconds.\n"
+            "#%10s%10s%10s%10s%10s%10s%10s\n", "nodes", "size (B)", "ops",
+            "min", "p50", "p90", "p99");
+    printf("#------------------------------------------------------------"
+           "----------\n");
+
+    // Sweep machineCount from 1 to numMasters.
+    uint32_t clockSyncSeconds = 2;
+    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
+        // (Re)synchronize the cluster clock before each experiment.
+        LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
+                clockSyncSeconds);
+        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+                &clockSyncSeconds, sizeof(clockSyncSeconds));
+
+        // Initialize the millisort service.
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+        auto initResp = initRpc.wait();
+        LOG(NOTICE, "Initialized %d millisort service nodes",
+                initResp->numNodesInited);
+
+        // Start the experiment.
+        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::GATHER_FLAT,
+                objectSize);
+        Buffer* result = rpc.wait();
+        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
+                result->size());
+
+        // Retrieve the broadcast latency of each node from the RPC response
+        // buffer.
+        std::vector<uint64_t> completionTimes;
+        uint32_t offset = 0;
+        while (offset < result->size()) {
+            completionTimes.push_back(*result->read<uint64_t>(&offset));
+        }
+        std::sort(completionTimes.begin(), completionTimes.end());
+
+        double numSamples = double(completionTimes.size());
+        double min = double(completionTimes.front()) * 1e-3;
+        double p50 = double(completionTimes[int(numSamples * 0.5)]) * 1e-3;
+        double p90 = double(completionTimes[int(numSamples * 0.9)]) * 1e-3;
+        double p99 = double(completionTimes[int(numSamples * 0.99)]) * 1e-3;
+        printf(" %10d%10d%10.0f%10.2f%10.2f%10.2f%10.2f\n", machineCount,
+                objectSize, numSamples, min, p50, p90, p99);
+    }
+}
+
+void
 allShuffle()
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
@@ -7611,6 +7678,7 @@ TestInfo tests[] = {
     {"workloadThroughput", workloadThroughput},
     {"millisort", millisort},
     {"treeBcast", treeBcast},
+    {"flatGather", flatGather},
     {"allShuffle", allShuffle},
 };
 

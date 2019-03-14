@@ -25,7 +25,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -1046,6 +1046,87 @@ MilliSortService::benchmarkCollectiveOp(
                         downCast<uint32_t>(latencyNs.size() * 4));
             }
         }
+    } else if (reqHdr->opcode == WireFormat::GATHER_FLAT) {
+        /* Gather benchmark */
+
+        // The master node is responsible for running many iterations of the
+        // experiment and recording the completion time of each run. Note that
+        // the experiment relies on clock sync. to ensure all participating
+        // nodes invokes/enters the collective operation at the same time. To
+        // start a run, the master node broadcasts the BenchmarkCollectiveOpRpc
+        // to all participating nodes which includes a starting time. Upon the
+        // receipt of the benchmark RPC, a node waits until the starting time
+        // to invoke the collective op. The completion time is computed on the
+        // gather-tree root node and sends back via the response of benchmark
+        // RPC. The outer broadcast op that carries the benchmark RPC then
+        // return the completion time as result to the master node.
+        if (reqHdr->masterId == 0) {
+            for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
+                // Start the operation 100 us from now, which should be enough
+                // for the broadcast message to reach all the participants.
+                uint64_t startTime = Cycles::rdtsc() +
+                        Cycles::fromMicroseconds(100);
+                TreeBcast bcast(context, world.get());
+                bcast.send<BenchmarkCollectiveOpRpc>(i, reqHdr->opcode,
+                        reqHdr->dataSize, serverId.getId(), startTime);
+                Buffer* result = bcast.wait();
+                timeTrace("Broadcast of GATHER operations completed");
+
+                // Only one BenchmarkCollectiveOpRpc will have non-zero result
+                // (i.e., the one sent to the gather-tree root node).
+                uint32_t offset = 0;
+                uint64_t gatherNs = 0;
+                while (offset < result->size()) {
+                    result->read<WireFormat::BenchmarkCollectiveOp::Response>(
+                            &offset);
+                    uint64_t ns = *result->read<uint64_t>(&offset);
+                    if (ns > 0) {
+                        gatherNs = ns;
+                    }
+                }
+                if (i >= WARMUP_COUNT) {
+                    rpc->replyPayload->emplaceAppend<uint64_t>(gatherNs);
+                }
+            }
+        } else {
+            uint64_t startTime = context->clockSynchronizer->getConverter(
+                    ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
+            if (Cycles::rdtsc() > startTime) {
+                LOG(ERROR, "Gather operation started %.2f us late!",
+                        Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
+            }
+            while (Cycles::rdtsc() < startTime) {}
+            timeTrace("Gather benchmark started, run %d", reqHdr->count);
+
+            std::atomic<int> bytesReceived(0);
+            auto merger = [&bytesReceived] (Buffer* dataBuffer) {
+                bytesReceived.fetch_add(dataBuffer->size());
+                // TODO: Copy the pulled data into contiguous space.
+//                dataBuffer->getRange(0, dataBuffer->size());
+            };
+
+            uint32_t numElements = reqHdr->dataSize / sizeof32(PivotKey);
+            const PivotKey* elements = reinterpret_cast<const PivotKey*>(
+                    context->masterZeroCopyRegion);
+
+            const int DUMMY_OP_ID = 999;
+            Tub<FlatGather> gatherOp;
+            invokeCollectiveOp<FlatGather>(gatherOp, DUMMY_OP_ID, context,
+                    world.get(), 0, numElements, elements, &scmerger);
+            gatherOp->wait();
+            uint64_t endTime = Cycles::rdtsc();
+            // TODO: the cleanup is not very nice; how to do RAII?
+            removeCollectiveOp(DUMMY_OP_ID);
+
+            uint64_t gatherNs = 0;
+            if (world->rank == 0) {
+                gatherNs = Cycles::toNanoseconds(endTime - startTime);
+            }
+            rpc->replyPayload->emplaceAppend<uint64_t>(gatherNs);
+        }
+    } else if (reqHdr->opcode == WireFormat::ALL_GATHER) {
+        /* All-gather benchmark */
+        // TODO: implement it
     } else if (reqHdr->opcode == WireFormat::ALL_SHUFFLE) {
         /* AllShuffle benchmark */
         if (reqHdr->masterId == 0) {
