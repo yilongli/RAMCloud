@@ -123,7 +123,7 @@ class TreeBcast {
             : k(k), nodes(nodes)
         {}
 
-        void getChildren(int rank, std::vector<int>* children);
+        void getChildren(int parent, std::vector<int>* children);
 
         /// Fan-out factor of the tree.
         int k;

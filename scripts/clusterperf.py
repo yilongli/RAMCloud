@@ -925,7 +925,7 @@ simple_tests = [
     Test("readNotFound", default),
     Test("millisort", millisort),
     Test("treeBcast", millisort),
-    Test("flatGather", millisort),
+    Test("treeGather", millisort),
     Test("allShuffle", millisort),
 ]
 

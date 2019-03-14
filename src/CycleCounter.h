@@ -37,7 +37,7 @@ class CycleCounter {
      * Construct a CycleCounter, starting the timer.
      */
     CycleCounter()
-        : total(NULL), startTime(__is_empty(T) ? 0 : Cycles::rdtscp()) {}
+        : total(NULL), startTime(__is_empty(T) ? 0 : Cycles::rdtsc()) {}
 
     /**
      * Construct a CycleCounter, starting the timer.
@@ -47,7 +47,7 @@ class CycleCounter {
      *      #cancel(). May be NULL.
      */
     explicit CycleCounter(T* total)
-        : total(total), startTime(__is_empty(T) ? 0 : Cycles::rdtscp()) {}
+        : total(total), startTime(__is_empty(T) ? 0 : Cycles::rdtsc()) {}
 
     /**
      * Destructor for CycleCounter, see #stop().
@@ -76,7 +76,7 @@ class CycleCounter {
         if (startTime == ~0UL)
             return 0;
         // using 1 avoids most div by zero errors
-        uint64_t stopTime = (__is_empty(T) ? 0 : Cycles::rdtscp());
+        uint64_t stopTime = (__is_empty(T) ? 0 : Cycles::rdtsc());
         uint64_t elapsed = stopTime - startTime;
         if (total != NULL)
 #pragma GCC diagnostic warning "-Wmaybe-uninitialized"

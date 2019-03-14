@@ -127,7 +127,7 @@ opcodeSymbol(uint32_t opcode)
         case INIT_MILLISORT:               return "INIT_MILLISORT";
         case START_MILLISORT:              return "START_MILLISORT";
         case BCAST_TREE:                   return "BCAST_TREE";
-        case GATHER_FLAT:                  return "GATHER_FLAT";
+        case GATHER_TREE:                  return "GATHER_TREE";
         case ALL_GATHER:                   return "ALL_GATHER";
         case ALL_SHUFFLE:                  return "ALL_SHUFFLE";
         case SEND_DATA:                    return "SEND_DATA";

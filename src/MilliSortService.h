@@ -20,6 +20,7 @@
 #include "Context.h"
 #include "Dispatch.h"
 #include "MilliSortClient.h"
+#include "Gather.h"
 #include "Service.h"
 #include "ServerConfig.h"
 #include "WorkerManager.h"
@@ -392,8 +393,8 @@ class MilliSortService : public Service {
     void treeBcast(const WireFormat::TreeBcast::Request* reqHdr,
                 WireFormat::TreeBcast::Response* respHdr,
                 Rpc* rpc);
-    void flatGather(const WireFormat::FlatGather::Request* reqHdr,
-                WireFormat::FlatGather::Response* respHdr,
+    void flatGather(const WireFormat::TreeGather::Request* reqHdr,
+                WireFormat::TreeGather::Response* respHdr,
                 Rpc* rpc);
     void allGather(const WireFormat::AllGather::Request* reqHdr,
                 WireFormat::AllGather::Response* respHdr,
@@ -449,6 +450,51 @@ class MilliSortService : public Service {
             oldValues->reset(dest);
             dest = NULL;
         }
+    };
+
+    // TODO: add document, especially memory ownership design and thread-safety (none?)
+    class PivotMergeSorter : public TreeGather::Merger {
+      public:
+        explicit PivotMergeSorter(MilliSortService* millisort,
+                std::vector<PivotKey>* superPivots)
+            : millisort(millisort)
+            , result()
+            , superPivots(superPivots)
+            , activeCycles(0)
+            , bytesReceived(0)
+        {}
+
+        void add(Buffer* incomingPivots)
+        {
+            CycleCounter<> _(&activeCycles);
+            bytesReceived += incomingPivots->size();
+            uint32_t offset = 0;
+            size_t oldSize = incomingPivots->size();
+            while (offset < incomingPivots->size()) {
+                superPivots->push_back(
+                        *incomingPivots->read<PivotKey>(&offset));
+            }
+            millisort->inplaceMerge(*superPivots, oldSize);
+        }
+
+        Buffer* getResult()
+        {
+            if (result.size() == 0) {
+                result.appendExternal(superPivots->data(), downCast<uint32_t>(
+                        superPivots->size() * PivotKey::SIZE));
+            }
+            return &result;
+        }
+
+        MilliSortService* millisort;
+
+        Buffer result;
+
+        std::vector<PivotKey>* superPivots;
+
+        uint64_t activeCycles;
+
+        uint64_t bytesReceived;
     };
 
     /// Shared RAMCloud information.
@@ -624,6 +670,8 @@ class MilliSortService : public Service {
     // -------- Root node state --------
     /// Contains super pivots collected from all pivot servers. Always empty on
     /// non-root nodes.
+    // TODO: the last sentence is no longer strictly true as we are using it
+    // as temporary forward space in the operation of gathering super pivots.
     std::vector<PivotKey> globalSuperPivots;
 
     friend class TreeBcast;

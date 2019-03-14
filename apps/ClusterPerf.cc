@@ -7475,7 +7475,7 @@ treeBcast()
 }
 
 void
-flatGather()
+treeGather()
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7516,7 +7516,7 @@ flatGather()
                 initResp->numNodesInited);
 
         // Start the experiment.
-        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::GATHER_FLAT,
+        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::GATHER_TREE,
                 objectSize);
         Buffer* result = rpc.wait();
         LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
@@ -7678,7 +7678,7 @@ TestInfo tests[] = {
     {"workloadThroughput", workloadThroughput},
     {"millisort", millisort},
     {"treeBcast", treeBcast},
-    {"flatGather", flatGather},
+    {"treeGather", treeGather},
     {"allShuffle", allShuffle},
 };
 

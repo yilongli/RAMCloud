@@ -173,7 +173,7 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         return;
     }
 
-    if ((header->opcode >= WireFormat::GATHER_FLAT) &&
+    if ((header->opcode >= WireFormat::GATHER_TREE) &&
             (header->opcode <= WireFormat::ALL_SHUFFLE)) {
         MilliSortService* millisort = context->getMilliSortService();
         uint32_t opId = reinterpret_cast<

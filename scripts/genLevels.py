@@ -79,7 +79,7 @@ callees = {
     "WRITE":                 ["BACKUP_WRITE", "INSERT_INDEX_ENTRY",
                               "REMOVE_INDEX_ENTRY"],
     # FIXME: Not sure we want to fix those RpcLevel::checkCall warnings.
-    "BCAST_TREE":            ["GATHER_FLAT", "ALL_GATHER"],
+    "BCAST_TREE":            ["GATHER_TREE", "ALL_GATHER"],
     # "INIT_MILLISORT":        ["INIT_MILLISORT"],
     "START_MILLISORT":       ["BCAST_TREE"],
 }

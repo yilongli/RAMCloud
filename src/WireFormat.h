@@ -135,7 +135,7 @@ enum Opcode {
     INIT_MILLISORT              = 82,
     START_MILLISORT             = 83,
     BCAST_TREE                  = 84,
-    GATHER_FLAT                 = 85,
+    GATHER_TREE                 = 85,
     ALL_GATHER                  = 86,
     ALL_SHUFFLE                 = 87,
     SEND_DATA                   = 88,
@@ -391,8 +391,8 @@ struct TreeBcast {
     } __attribute__((packed));
 };
 
-struct FlatGather {
-    static const Opcode opcode = GATHER_FLAT;
+struct TreeGather {
+    static const Opcode opcode = GATHER_TREE;
     static const ServiceType service = MILLISORT_SERVICE;
     struct Request {
         RequestCommonWithOpId common;

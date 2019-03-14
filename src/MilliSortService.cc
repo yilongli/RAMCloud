@@ -148,8 +148,8 @@ MilliSortService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             callHandler<WireFormat::TreeBcast, MilliSortService,
                         &MilliSortService::treeBcast>(rpc);
             break;
-        case WireFormat::FlatGather::opcode:
-            callHandler<WireFormat::FlatGather, MilliSortService,
+        case WireFormat::TreeGather::opcode:
+            callHandler<WireFormat::TreeGather, MilliSortService,
                         &MilliSortService::flatGather>(rpc);
             break;
         case WireFormat::AllGather::opcode:
@@ -514,29 +514,18 @@ MilliSortService::localSortAndPickPivots()
 
     partition(keys.get(), numDataTuples, std::min(numDataTuples, world->size()),
             &localPivots);
-    debugLogKeys("local pivots: ", &localPivots);
-
-    // Merge pivots from slave nodes as they arrive.
-    auto merger = [this] (Buffer* pivotsBuffer) {
-        SCOPED_TIMER(gatherPivotsMergeCycles);
-        ADD_COUNTER(gatherPivotsInputBytes, pivotsBuffer->size());
-        uint32_t offset = 0;
-        size_t oldSize = gatheredPivots.size();
-        while (offset < pivotsBuffer->size()) {
-            gatheredPivots.push_back(*pivotsBuffer->read<PivotKey>(&offset));
-        }
-        inplaceMerge(gatheredPivots, oldSize);
-        timeTrace("merged %u pivots", pivotsBuffer->size() / PivotKey::SIZE);
-    };
-
-    // Initiate the gather op that collects pivots to the pivot server.
     timeTrace("sorted %d data tuples, picked %u local pivots, about to gather "
             "pivots", numDataTuples, localPivots.size());
+    debugLogKeys("local pivots: ", &localPivots);
+
+    // Initiate the gather op that collects pivots to the pivot server.
+    // Merge pivots from slave nodes as they arrive.
+    PivotMergeSorter merger(this, &gatheredPivots);
     {
         ADD_COUNTER(gatherPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(gatherPivotsElapsedTime);
-        Tub<FlatGather> gatherPivots;
-        invokeCollectiveOp<FlatGather>(gatherPivots, GATHER_PIVOTS, context,
+        Tub<TreeGather> gatherPivots;
+        invokeCollectiveOp<TreeGather>(gatherPivots, GATHER_PIVOTS, context,
                 myPivotServerGroup.get(), 0, (uint32_t) localPivots.size(),
                 localPivots.data(), &merger);
         gatherPivots->wait();
@@ -546,6 +535,8 @@ MilliSortService::localSortAndPickPivots()
         // FIXME: seems wrong division of responsibility; should I move this
         // into Gather class? Also this assumes a particular implementation of
         // Gather.
+        ADD_COUNTER(gatherPivotsMergeCycles, merger.activeCycles);
+        ADD_COUNTER(gatherPivotsInputBytes, merger.bytesReceived);
         ADD_COUNTER(gatherPivotsOutputBytes,
                 localPivots.size() * PivotKey::SIZE);
     }
@@ -558,6 +549,7 @@ MilliSortService::localSortAndPickPivots()
         pickSuperPivots();
     } else {
         timeTrace("sent %u local pivots", localPivots.size());
+        gatheredPivots.clear();
     }
 }
 
@@ -569,35 +561,26 @@ MilliSortService::pickSuperPivots()
     assert(isPivotServer);
     partition(gatheredPivots.data(), int(gatheredPivots.size()),
             allPivotServers->size(), &superPivots);
-    debugLogKeys("super-pivots: ", &superPivots);
-
-    // Merge super pivots from pivot servers as they arrive.
-    auto merger = [this] (Buffer* pivotsBuf) {
-        SCOPED_TIMER(gatherSuperPivotsMergeCycles);
-        ADD_COUNTER(gatherSuperPivotsInputBytes, pivotsBuf->size());
-        uint32_t offset = 0;
-        size_t oldSize = globalSuperPivots.size();
-        while (offset < pivotsBuf->size()) {
-            globalSuperPivots.push_back(*pivotsBuf->read<PivotKey>(&offset));
-        }
-        inplaceMerge(globalSuperPivots, oldSize);
-        timeTrace("merged %u super-pivots", pivotsBuf->size() / PivotKey::SIZE);
-    };
-
-    // Initiate the gather op that collects super pivots to the root node.
     timeTrace("picked %u super-pivots, about to gather super-pivots",
             superPivots.size());
+    debugLogKeys("super-pivots: ", &superPivots);
+
+    // Initiate the gather op that collects super pivots to the root node.
+    // Merge super pivots from pivot servers as they arrive.
+    PivotMergeSorter merger(this, &globalSuperPivots);
     {
         ADD_COUNTER(gatherSuperPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(gatherSuperPivotsElapsedTime);
-        Tub<FlatGather> gatherSuperPivots;
-        invokeCollectiveOp<FlatGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
+        Tub<TreeGather> gatherSuperPivots;
+        invokeCollectiveOp<TreeGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
                 context, allPivotServers.get(), 0,
                 (uint32_t) superPivots.size(), superPivots.data(), &merger);
         // fixme: this is duplicated everywhere
         gatherSuperPivots->wait();
         removeCollectiveOp(GATHER_SUPER_PIVOTS);
 
+        ADD_COUNTER(gatherSuperPivotsMergeCycles, merger.activeCycles);
+        ADD_COUNTER(gatherSuperPivotsInputBytes, merger.bytesReceived);
         ADD_COUNTER(gatherSuperPivotsOutputBytes,
                 superPivots.size() * PivotKey::SIZE);
     }
@@ -611,6 +594,7 @@ MilliSortService::pickSuperPivots()
         pickPivotBucketBoundaries();
     } else {
         timeTrace("sent %u super-pivots", superPivots.size());
+        globalSuperPivots.clear();
     }
 }
 
@@ -953,10 +937,10 @@ MilliSortService::treeBcast(const WireFormat::TreeBcast::Request* reqHdr,
 }
 
 void
-MilliSortService::flatGather(const WireFormat::FlatGather::Request* reqHdr,
-            WireFormat::FlatGather::Response* respHdr, Rpc* rpc)
+MilliSortService::flatGather(const WireFormat::TreeGather::Request* reqHdr,
+            WireFormat::TreeGather::Response* respHdr, Rpc* rpc)
 {
-    handleCollectiveOpRpc<FlatGather>(reqHdr, respHdr, rpc);
+    handleCollectiveOpRpc<TreeGather>(reqHdr, respHdr, rpc);
 }
 
 void
@@ -1046,7 +1030,7 @@ MilliSortService::benchmarkCollectiveOp(
                         downCast<uint32_t>(latencyNs.size() * 4));
             }
         }
-    } else if (reqHdr->opcode == WireFormat::GATHER_FLAT) {
+    } else if (reqHdr->opcode == WireFormat::GATHER_TREE) {
         /* Gather benchmark */
 
         // The master node is responsible for running many iterations of the
@@ -1089,6 +1073,18 @@ MilliSortService::benchmarkCollectiveOp(
                 }
             }
         } else {
+            class DataMerger : public TreeGather::Merger {
+              public:
+                explicit DataMerger() : localBuf() {}
+
+                void add(Buffer* dataBuf) { localBuf.appendCopy(dataBuf); }
+
+                Buffer* getResult() { return &localBuf; }
+
+                Buffer localBuf;
+            };
+            DataMerger merger;
+
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
             if (Cycles::rdtsc() > startTime) {
@@ -1098,21 +1094,14 @@ MilliSortService::benchmarkCollectiveOp(
             while (Cycles::rdtsc() < startTime) {}
             timeTrace("Gather benchmark started, run %d", reqHdr->count);
 
-            std::atomic<int> bytesReceived(0);
-            auto merger = [&bytesReceived] (Buffer* dataBuffer) {
-                bytesReceived.fetch_add(dataBuffer->size());
-                // TODO: Copy the pulled data into contiguous space.
-//                dataBuffer->getRange(0, dataBuffer->size());
-            };
-
             uint32_t numElements = reqHdr->dataSize / sizeof32(PivotKey);
             const PivotKey* elements = reinterpret_cast<const PivotKey*>(
                     context->masterZeroCopyRegion);
 
             const int DUMMY_OP_ID = 999;
-            Tub<FlatGather> gatherOp;
-            invokeCollectiveOp<FlatGather>(gatherOp, DUMMY_OP_ID, context,
-                    world.get(), 0, numElements, elements, &scmerger);
+            Tub<TreeGather> gatherOp;
+            invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
+                    world.get(), 0, numElements, elements, &merger);
             gatherOp->wait();
             uint64_t endTime = Cycles::rdtsc();
             // TODO: the cleanup is not very nice; how to do RAII?
