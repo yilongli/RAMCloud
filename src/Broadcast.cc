@@ -33,7 +33,9 @@ std::vector<std::vector<int>> K_NOMIAL_TREE_CHILDREN = {
 #include "k_nomial_tree.txt"
 };
 
-// TODO: remove this constant.
+// TODO: remove this handcoded constant; this number should be chosen dynamically
+// based on the ratio of OWD (i.e., latency) and per-RPC overhead (cpu & network
+// bw).
 #define BRANCH_FACTOR 10
 
 /**

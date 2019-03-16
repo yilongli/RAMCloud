@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_MILLISORTSERVICE_H
 #define RAMCLOUD_MILLISORTSERVICE_H
 
+#include "AllGather.h"
 #include "CommunicationGroup.h"
 #include "Context.h"
 #include "Dispatch.h"
@@ -456,10 +457,10 @@ class MilliSortService : public Service {
     class PivotMergeSorter : public TreeGather::Merger {
       public:
         explicit PivotMergeSorter(MilliSortService* millisort,
-                std::vector<PivotKey>* superPivots)
+                std::vector<PivotKey>* pivots)
             : millisort(millisort)
             , result()
-            , superPivots(superPivots)
+            , pivots(pivots)
             , activeCycles(0)
             , bytesReceived(0)
         {}
@@ -471,17 +472,16 @@ class MilliSortService : public Service {
             uint32_t offset = 0;
             size_t oldSize = incomingPivots->size();
             while (offset < incomingPivots->size()) {
-                superPivots->push_back(
-                        *incomingPivots->read<PivotKey>(&offset));
+                pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
             }
-            millisort->inplaceMerge(*superPivots, oldSize);
+            millisort->inplaceMerge(*pivots, oldSize);
         }
 
         Buffer* getResult()
         {
             if (result.size() == 0) {
-                result.appendExternal(superPivots->data(), downCast<uint32_t>(
-                        superPivots->size() * PivotKey::SIZE));
+                result.appendExternal(pivots->data(),
+                        downCast<uint32_t>(pivots->size() * PivotKey::SIZE));
             }
             return &result;
         }
@@ -490,7 +490,67 @@ class MilliSortService : public Service {
 
         Buffer result;
 
-        std::vector<PivotKey>* superPivots;
+        std::vector<PivotKey>* pivots;
+
+        uint64_t activeCycles;
+
+        uint64_t bytesReceived;
+    };
+
+    // FIXME: this is almost identical as the above! figure out the right interface
+    // of merger for gather-like operations
+    class PivotMergeSorter2 : public AllGather::Merger {
+      public:
+        explicit PivotMergeSorter2(MilliSortService* millisort,
+                std::vector<PivotKey>* pivots)
+            : millisort(millisort)
+            , pivots(pivots)
+            , result()
+            , activeCycles(0)
+            , bytesReceived(0)
+        {}
+
+        void
+        add(Buffer* incomingPivots)
+        {
+            CycleCounter<> _(&activeCycles);
+            bytesReceived += incomingPivots->size();
+            uint32_t offset = 0;
+            size_t oldSize = incomingPivots->size();
+            while (offset < incomingPivots->size()) {
+                pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
+            }
+            millisort->inplaceMerge(*pivots, oldSize);
+        }
+
+        Buffer*
+        getResult()
+        {
+            if (result.size() == 0) {
+                result.appendExternal(pivots->data(),
+                        downCast<uint32_t>(pivots->size() * PivotKey::SIZE));
+            }
+            return &result;
+        }
+
+        void
+        replace(Buffer* incomingPivots)
+        {
+            CycleCounter<> _(&activeCycles);
+            bytesReceived += incomingPivots->size();
+
+            pivots->clear();
+            uint32_t offset = 0;
+            while (offset < incomingPivots->size()) {
+                pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
+            }
+        }
+
+        MilliSortService* millisort;
+
+        std::vector<PivotKey>* pivots;
+
+        Buffer result;
 
         uint64_t activeCycles;
 

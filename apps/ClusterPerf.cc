@@ -7475,7 +7475,7 @@ treeBcast()
 }
 
 void
-treeGather()
+benchmarkCollectiveOp(WireFormat::Opcode opcode)
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7494,6 +7494,7 @@ treeGather()
     }
 
     ServerId rootServer(1, 0);
+    printf("# Benchmarking %s operation\n", WireFormat::opcodeSymbol(opcode));
     printf("# Note: Latency numbers are displayed in microseconds.\n"
             "#%10s%10s%10s%10s%10s%10s%10s\n", "nodes", "size (B)", "ops",
             "min", "p50", "p90", "p99");
@@ -7502,6 +7503,7 @@ treeGather()
 
     // Sweep machineCount from 1 to numMasters.
     uint32_t clockSyncSeconds = 2;
+//    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
     for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
         LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
@@ -7516,8 +7518,7 @@ treeGather()
                 initResp->numNodesInited);
 
         // Start the experiment.
-        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::GATHER_TREE,
-                objectSize);
+        BenchmarkCollectiveOpRpc rpc(context, count, opcode, objectSize);
         Buffer* result = rpc.wait();
         LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
                 result->size());
@@ -7540,6 +7541,20 @@ treeGather()
                 objectSize, numSamples, min, p50, p90, p99);
     }
 }
+
+void
+treeGather()
+{
+    benchmarkCollectiveOp(WireFormat::GATHER_TREE);
+}
+
+void
+allGather()
+{
+    benchmarkCollectiveOp(WireFormat::ALL_GATHER);
+}
+
+// TODO: let allShuffle and treeBcast call benchmarkCollectiveOp too?
 
 void
 allShuffle()
@@ -7679,6 +7694,7 @@ TestInfo tests[] = {
     {"millisort", millisort},
     {"treeBcast", treeBcast},
     {"treeGather", treeGather},
+    {"allGather", allGather},
     {"allShuffle", allShuffle},
 };
 

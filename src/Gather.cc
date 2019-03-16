@@ -10,7 +10,10 @@ namespace RAMCloud {
 // Change the following from 0 to 1 to test with k-ary tree.
 #define FIXED_ARY_TREE 0
 
-// TODO: remove this constant
+// TODO: remove this handcoded constant; this number should be chosen dynamically
+// based on the ratio of OWD (i.e., latency) and per-RPC CPU overhead:
+// e.g., if OWD + BW_COST at the root node = a * RPC_RX_CPU_COST, we might want
+// to have a gather tree whose root's out degree is a.
 #define BRANCH_FACTOR 10
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
@@ -54,13 +57,15 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     // If this is an interior node, wait until we have received data from
     // all its children before sending to its parent; otherwise, send out
     // the data immediately.
-    Buffer dataBuf;
-    dataBuf.appendExternal(data, numBytes);
     if (numChildren > 0) {
         nodesToGather.construct(children.begin(), children.end());
-        merger->add(&dataBuf);
+        // Don't add the data duplicately; the merger should've been initialized
+        // with the local data!
+//        merger->add(&dataBuf);
     } else {
         int parent = kNomialTree.getParent(relativeRank);
+        Buffer dataBuf;
+        dataBuf.appendExternal(data, numBytes);
         sendData.construct(context, group->getNode(root + parent), opId,
                 group->rank, &dataBuf);
     }

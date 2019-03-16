@@ -2,6 +2,7 @@
 #define GRANULARCOMPUTING_ALLGATHER_H
 
 #include <cmath>
+#include <list>
 
 #include "Buffer.h"
 #include "CommunicationGroup.h"
@@ -13,61 +14,36 @@
 
 namespace RAMCloud {
 
+/// Note: right now, I implement the recursive doubling algorithm with an extension
+/// to handle non-power-of-2 nodes by casting the original group to a smaller
+/// group with the nearest power-of-two nodes. Alternatively, we might expand
+/// the original group to a larger group with the next power-of-two number of nodes?
+/// Also, what about the factorization algorithm described in "Generalisation of
+/// recursive doubling for AllReduce"? e.g., for a group of 6, we can do an allgather
+/// inside groups of 3 and then another inside groups of 2. It seems that an ideal
+/// algorithm will have to take all the factors (e.g., message size, latency, group
+/// sizes) into consideration and dynamically picking the size of the sub-allgather-group
+/// at each stage?
+/// BTW, I didn't implement, say, recursive-tripling because the power-of-three
+/// numbers are even sparser (i.e., 3, 9, 27, 81, etc.) and the naive strategy
+/// of casting to a smaller group won't work well I think.
 class AllGather {
   public:
 
     using RpcType = WireFormat::AllGather;
 
-    /**
-     * Constructor used by nodes who are senders in the all-gather operation.
-     *
-     * \tparam Merger
-     * \param opId
-     * \param context
-     * \param group
-     * \param numElements
-     * \param elements
-     * \param merger
-     */
-    template <typename Merger>
+    class Merger {
+      public:
+        virtual void add(Buffer* incomingData) = 0;
+        virtual Buffer* getResult() = 0;
+        // Quick hack: only used to implement the final expansion step.
+        virtual void replace(Buffer* incomingData) = 0;
+    };
+
     explicit AllGather(int opId, Context* context, CommunicationGroup* group,
-            size_t length, void* data, Merger* merger)
-        : context(context)
-        , group(group)
-        , length(length)
-        , data(data)
-        , merger(*merger)
-        , opId(opId)
-        , phase(0)
-        , maxPhase(-1)
-        , outgoingRpc()
-    {
-        int n = group->size();
-        if (n > 1) {
-            maxPhase = int(std::log2(n - 1));
-        }
-
-        // FIXME: remove this limitation
-        if (!n || (n & (n - 1))) {
-            DIE("group size = %d is not a power of 2", n);
-        }
-
-        if (phase <= maxPhase) {
-            outgoingRpc.construct(context, getPeerId(0), opId, phase,
-                    group->rank, length, data);
-        }
-    }
-
+            uint32_t length, void* data, Merger* merger);
     ~AllGather() = default;
-
-    ServerId
-    getPeerId(int phase)
-    {
-        int rank = group->rank >> phase;
-        int d = (rank % 2) ? -1 : 1;
-        return group->getNode(group->rank + d * (1 << phase));
-    }
-
+    void getPeersToSend(int phase, std::vector<ServerId>* targets);
     void handleRpc(const WireFormat::AllGather::Request* reqHdr,
             WireFormat::AllGather::Response* respHdr, Service::Rpc* rpc);
     bool isReady();
@@ -77,25 +53,24 @@ class AllGather {
     class AllGatherRpc : public ServerIdRpcWrapper {
       public:
         explicit AllGatherRpc(Context* context, ServerId serverId,
-                int opId, int phase, int senderId, size_t length,
-                const void* data)
+                int opId, int phase, int senderId, Buffer* data)
             : ServerIdRpcWrapper(context, serverId,
                 sizeof(WireFormat::AllGather::Response))
         {
-            appendRequest(&request, opId, phase, senderId, length, data);
+            appendRequest(&request, opId, phase, senderId, data);
             send();
         }
 
         static void
-        appendRequest(Buffer* request, int opId, int phase,
-                int senderId, size_t length, const void* data)
+        appendRequest(Buffer* request, int opId, int phase, int senderId,
+                Buffer* data)
         {
             WireFormat::AllGather::Request* reqHdr(
                     allocHeader<WireFormat::AllGather>(request,
                     downCast<uint32_t>(opId)));
             reqHdr->phase = phase;
             reqHdr->senderId = senderId;
-            request->appendExternal(data, (uint32_t)length);
+            request->appendExternal(data);
         }
 
         /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
@@ -114,21 +89,44 @@ class AllGather {
 
     Context* context;
 
+    std::atomic<bool> completed;
+
+    // TODO: why atomic? document thread-safety
+    /// Current stage of the algorithm. Possible values are:
+    ///   0: initial contraction step; only present if the group size is not a
+    /// power of two
+    ///   1..log2(N): pair-wise exchange steps
+    ///   log2(N)+1: final expansion step; only present if the group size is not
+    /// a power of two
+    /// where N is # nodes in the communication group.
+    std::atomic<int> currentPhase;
+
+    int lastPhase;
+
+    bool expanderNode;
+
+    bool ghostNode;
+
     CommunicationGroup* group;
 
-    size_t length;
+    Merger* merger;
 
-    void* data;
-
-    std::function<std::pair<void*, size_t>(Buffer*)> merger;
-
+    /// Unique identifier of the all-gather operation.
     int opId;
 
-    std::atomic<int> phase;
+    /// Largest power of two that is smaller than or equal to the group size.
+    /// This is the effective group size used in the recursive doubling phases.
+    int nearestPowerOfTwo;
 
-    int maxPhase;
+    /// Number of pairwise exchange steps need to be performed.
+    int numRecursiveDoublingSteps;
 
-    Tub<AllGatherRpc> outgoingRpc;
+    // TODO: intrusive list?
+    using OutstandingRpcs = std::list<AllGatherRpc>;
+
+    /// Ongoing RPCs that are sending the all-gather request to all its peer
+    /// nodes in the current phase.
+    OutstandingRpcs outstandingRpcs;
 
     DISALLOW_COPY_AND_ASSIGN(AllGather)
 };

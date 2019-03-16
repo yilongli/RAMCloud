@@ -926,6 +926,7 @@ simple_tests = [
     Test("millisort", millisort),
     Test("treeBcast", millisort),
     Test("treeGather", millisort),
+    Test("allGather", millisort),
     Test("allShuffle", millisort),
 ]
 

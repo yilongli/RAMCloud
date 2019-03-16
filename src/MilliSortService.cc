@@ -15,10 +15,8 @@
 
 #include "ClockSynchronizer.h"
 #include "MilliSortService.h"
-#include "AllGather.h"
 #include "AllShuffle.h"
 #include "Broadcast.h"
-#include "Gather.h"
 #include "TimeTrace.h"
 
 namespace RAMCloud {
@@ -520,6 +518,7 @@ MilliSortService::localSortAndPickPivots()
 
     // Initiate the gather op that collects pivots to the pivot server.
     // Merge pivots from slave nodes as they arrive.
+    gatheredPivots = localPivots;
     PivotMergeSorter merger(this, &gatheredPivots);
     {
         ADD_COUNTER(gatherPivotsStartTime, Cycles::rdtsc() - startTime);
@@ -567,6 +566,7 @@ MilliSortService::pickSuperPivots()
 
     // Initiate the gather op that collects super pivots to the root node.
     // Merge super pivots from pivot servers as they arrive.
+    globalSuperPivots = superPivots;
     PivotMergeSorter merger(this, &globalSuperPivots);
     {
         ADD_COUNTER(gatherSuperPivotsStartTime, Cycles::rdtsc() - startTime);
@@ -744,22 +744,23 @@ MilliSortService::allGatherDataBucketBoundaries()
     timeTrace("=== Stage 6: allGatherDataBucketBoundaries started");
 
     // Merge data bucket boundaries from pivot servers as they arrive.
-    auto merger = [this] (Buffer* pivotsBuffer) {
-            SCOPED_TIMER(allGatherPivotsMergeCycles);
-            uint32_t offset = 0;
-            size_t oldSize = dataBucketBoundaries.size();
-            while (offset < pivotsBuffer->size()) {
-                PivotKey boundary = *pivotsBuffer->read<PivotKey>(&offset);
-                dataBucketBoundaries.push_back(boundary);
-            }
-            inplaceMerge(dataBucketBoundaries, oldSize);
-            // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
-            // are sorted globally, we know exactly where to insert even they come!
-            timeTrace("merged %u data bucket boundaries",
-                    pivotsBuffer->size() / PivotKey::SIZE);
-        return std::make_pair(dataBucketBoundaries.data(),
-                dataBucketBoundaries.size() * PivotKey::SIZE);
-    };
+//    auto merger = [this] (Buffer* pivotsBuffer) {
+//        SCOPED_TIMER(allGatherPivotsMergeCycles);
+//        uint32_t offset = 0;
+//        size_t oldSize = dataBucketBoundaries.size();
+//        while (offset < pivotsBuffer->size()) {
+//            PivotKey boundary = *pivotsBuffer->read<PivotKey>(&offset);
+//            dataBucketBoundaries.push_back(boundary);
+//        }
+//        inplaceMerge(dataBucketBoundaries, oldSize);
+//        // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
+//        // are sorted globally, we know exactly where to insert even they come!
+//        timeTrace("merged %u data bucket boundaries",
+//                pivotsBuffer->size() / PivotKey::SIZE);
+//        return std::make_pair(dataBucketBoundaries.data(),
+//                dataBucketBoundaries.size() * PivotKey::SIZE);
+//    };
+    PivotMergeSorter2 merger(this, &dataBucketBoundaries);
 
     // Gather data bucket boundaries from pivot servers to all nodes.
     timeTrace("about to all-gather data bucket boundaries");
@@ -770,10 +771,11 @@ MilliSortService::allGatherDataBucketBoundaries()
         invokeCollectiveOp<AllGather>(allGather,
                 ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
                 allGatherPeersGroup.get(),
-                dataBucketBoundaries.size() * PivotKey::SIZE,
+                uint32_t(dataBucketBoundaries.size() * PivotKey::SIZE),
                 dataBucketBoundaries.data(), &merger);
         allGather->wait();
         removeCollectiveOp(ALLGATHER_DATA_BUCKET_BOUNDARIES);
+        ADD_COUNTER(allGatherPivotsMergeCycles, merger.activeCycles);
         debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
     }
     timeTrace("gathered %u data bucket boundaries",
@@ -1083,7 +1085,6 @@ MilliSortService::benchmarkCollectiveOp(
 
                 Buffer localBuf;
             };
-            DataMerger merger;
 
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
@@ -1097,6 +1098,8 @@ MilliSortService::benchmarkCollectiveOp(
             uint32_t numElements = reqHdr->dataSize / sizeof32(PivotKey);
             const PivotKey* elements = reinterpret_cast<const PivotKey*>(
                     context->masterZeroCopyRegion);
+            DataMerger merger;
+            merger.localBuf.appendCopy(elements, reqHdr->dataSize);
 
             const int DUMMY_OP_ID = 999;
             Tub<TreeGather> gatherOp;
@@ -1110,12 +1113,110 @@ MilliSortService::benchmarkCollectiveOp(
             uint64_t gatherNs = 0;
             if (world->rank == 0) {
                 gatherNs = Cycles::toNanoseconds(endTime - startTime);
+                // Verify if the root has the right amount of data in the end.
+                if (merger.localBuf.size() !=
+                        uint32_t(world->size()) * reqHdr->dataSize) {
+                    LOG(ERROR, "Unexpected final data size %u",
+                            merger.localBuf.size());
+                }
             }
             rpc->replyPayload->emplaceAppend<uint64_t>(gatherNs);
+
         }
     } else if (reqHdr->opcode == WireFormat::ALL_GATHER) {
         /* All-gather benchmark */
-        // TODO: implement it
+
+        // The master node is responsible for running many iterations of the
+        // experiment and recording the completion time of each run. Note that
+        // the experiment relies on clock sync. to ensure all participating
+        // nodes invokes/enters the collective operation at the same time. To
+        // start a run, the master node broadcasts the BenchmarkCollectiveOpRpc
+        // to all participating nodes which includes a starting time. Upon the
+        // receipt of the benchmark RPC, a node waits until the starting time
+        // to invoke the collective op. The completion time is computed on each
+        // node independently and sent back via the response of benchmark
+        // RPC. The outer broadcast op that carries the benchmark RPC then
+        // return the completion times of all nodes to the master node.
+        if (reqHdr->masterId == 0) {
+            for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
+                // Start the operation 100 us from now, which should be enough
+                // for the broadcast message to reach all the participants.
+                uint64_t startTime = Cycles::rdtsc() +
+                        Cycles::fromMicroseconds(100);
+                TreeBcast bcast(context, world.get());
+                bcast.send<BenchmarkCollectiveOpRpc>(i, reqHdr->opcode,
+                        reqHdr->dataSize, serverId.getId(), startTime);
+                Buffer* result = bcast.wait();
+                timeTrace("Broadcast of AllGather operations completed");
+
+                // The completion time for the all-gather operation is the
+                // largest completion time on all nodes.
+                uint32_t offset = 0;
+                uint64_t allGatherNs = 0;
+                while (offset < result->size()) {
+                    result->read<WireFormat::BenchmarkCollectiveOp::Response>(
+                            &offset);
+                    uint64_t ns = *result->read<uint64_t>(&offset);
+                    if (ns > allGatherNs) {
+                        allGatherNs = ns;
+                    }
+                }
+                if (i >= WARMUP_COUNT) {
+                    rpc->replyPayload->emplaceAppend<uint64_t>(allGatherNs);
+                }
+            }
+        } else {
+            class DataMerger : public AllGather::Merger {
+              public:
+                explicit DataMerger() : localBuf() {}
+
+                void add(Buffer* dataBuf) { localBuf.appendCopy(dataBuf); }
+
+                Buffer* getResult() { return &localBuf; }
+
+                void replace(Buffer* dataBuf)
+                {
+                    localBuf.reset();
+                    localBuf.appendCopy(dataBuf);
+                }
+
+                Buffer localBuf;
+            };
+            DataMerger merger;
+            void* data = const_cast<void*>(context->masterZeroCopyRegion);
+            merger.localBuf.appendExternal(data, reqHdr->dataSize);
+
+            uint64_t startTime = context->clockSynchronizer->getConverter(
+                    ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
+            if (Cycles::rdtsc() > startTime) {
+                LOG(ERROR, "Gather operation started %.2f us late!",
+                        Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
+            }
+            while (Cycles::rdtsc() < startTime) {}
+            timeTrace("AllGather benchmark started, run %d", reqHdr->count);
+
+            const int DUMMY_OP_ID = 999;
+            Tub<AllGather> allGatherOp;
+            invokeCollectiveOp<AllGather>(allGatherOp, DUMMY_OP_ID, context,
+                    world.get(), reqHdr->dataSize, data, &merger);
+            allGatherOp->wait();
+            uint64_t endTime = Cycles::rdtsc();
+            // TODO: the cleanup is not very nice; how to do RAII?
+            removeCollectiveOp(DUMMY_OP_ID);
+
+            uint64_t allGatherNs = 0;
+            if (world->rank == 0) {
+                allGatherNs = Cycles::toNanoseconds(endTime - startTime);
+            }
+            rpc->replyPayload->emplaceAppend<uint64_t>(allGatherNs);
+
+            // Verify if we have the right amount of data in the end.
+            if (merger.localBuf.size() !=
+                    uint32_t(world->size()) * reqHdr->dataSize) {
+                LOG(ERROR, "Unexpected final data size %u",
+                        merger.localBuf.size());
+            }
+        }
     } else if (reqHdr->opcode == WireFormat::ALL_SHUFFLE) {
         /* AllShuffle benchmark */
         if (reqHdr->masterId == 0) {
