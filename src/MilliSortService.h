@@ -577,6 +577,7 @@ class MilliSortService : public Service {
         ALLSHUFFLE_KEY,
         ALLSHUFFLE_VALUE,
         ALLSHUFFLE_BENCHMARK,
+        POINT2POINT_BENCHMARK,
     };
 
     // ----------------------

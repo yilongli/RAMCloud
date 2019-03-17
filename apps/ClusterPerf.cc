@@ -7554,6 +7554,12 @@ allGather()
     benchmarkCollectiveOp(WireFormat::ALL_GATHER);
 }
 
+void
+point2point()
+{
+    benchmarkCollectiveOp(WireFormat::SEND_DATA);
+}
+
 // TODO: let allShuffle and treeBcast call benchmarkCollectiveOp too?
 
 void
@@ -7696,6 +7702,7 @@ TestInfo tests[] = {
     {"treeGather", treeGather},
     {"allGather", allGather},
     {"allShuffle", allShuffle},
+    {"point2point", point2point},
 };
 
 int

@@ -124,6 +124,15 @@ SendDataRpc::appendRequest(Buffer* request, uint32_t dataId, uint32_t length,
     request->appendExternal(data, length);
 }
 
+/// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
+Buffer*
+SendDataRpc::wait()
+{
+    waitAndCheckErrors();
+    response->truncateFront(responseHeaderLength);
+    return response;
+}
+
 ShufflePullRpc::ShufflePullRpc(Context* context, ServerId serverId,
         int32_t senderId, uint32_t dataId, uint32_t dataSize, Buffer* response)
     : ServerIdRpcWrapper(context, serverId,

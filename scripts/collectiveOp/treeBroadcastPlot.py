@@ -49,25 +49,83 @@ def binary_tree_model(num_nodes, one_way_delay, rpc_overhead):
 
     return predicted_completion_times
 
+def k_nomial_tree_get_children(k, num_nodes, parent):
+    # If d is the number of digits in the base-k representation of parent
+    # then let delta = k^d.
+    delta = 1
+    p = parent
+    while p > 0:
+        p = p // k
+        delta = delta * k
 
-ranks = [1, 3, 7, 15, 31]
-estimated_owd = mean(
-        [binary_tree[ranks[i]] / (i + 1) for i in range(len(ranks))])
+    # The children of a node in the k-nomial tree will have exactly one more
+    # non-zero digit in a more significant position than the parent's most
+    # significant digit. For example, in a trinomial tree (i.e., k = 3) of
+    # size 27, the children of node 7 (21 in base-3) will be node 16 (121 in
+    # base-3) and 25 (221 in base-3).
+    children = []
+    while True:
+        for i in range(1, k):
+            child = parent + i * delta
+            if child >= num_nodes:
+                return children
+            children.append(child)
+        delta = delta * k
 
-estimated_rpc_overhead = mean(
-        map(operator.sub, ten_nomial_tree[2:11], ten_nomial_tree[1:10]))
 
-predicted_perf = binary_tree_model(10000, estimated_owd, estimated_rpc_overhead)
-#predicted_perf = binary_tree_model(10000, 1.2, 0.1)
-print(f'1000-node latency = {predicted_perf[999]:.2f} us')
-print(f'10000-node latency = {predicted_perf[9999]:.2f} us')
+def k_nomial_tree_model(k, num_nodes, one_way_delay, rpc_overhead):
+    predicted_completion_times = [0.0]
+    node_latency = [0.0] * num_nodes
 
-plt.plot(tree_sizes,
-         binary_tree_model(num_nodes, estimated_owd, estimated_rpc_overhead),
+    for rank in range(0, num_nodes):
+        children = k_nomial_tree_get_children(k, num_nodes, rank)
+        child_idx = 0
+        for child in children:
+            node_latency[child] = \
+                node_latency[rank] + one_way_delay + child_idx * rpc_overhead
+            child_idx += 1
+
+    max_latency = 0
+    for rank in range(1, num_nodes):
+        if node_latency[rank] > max_latency:
+            max_latency = node_latency[rank]
+        node_latency[rank] = max_latency
+        predicted_completion_times.append(max_latency)
+
+    return predicted_completion_times
+
+
+# ranks = [1, 3, 7, 15, 31]
+# one_way_delay = mean(
+#         [binary_tree[ranks[i]] / (i + 1) for i in range(len(ranks))])
+#
+# rpc_overhead = mean(
+#         map(operator.sub, ten_nomial_tree[2:11], ten_nomial_tree[1:10]))
+
+one_way_delay = 3.6
+rpc_overhead = 0.6
+
+binary_predictions = binary_tree_model(1000, one_way_delay, rpc_overhead)
+binomial_predictions = k_nomial_tree_model(2, 1000, one_way_delay, rpc_overhead)
+ten_nomial_predictions = k_nomial_tree_model(10, 1000, one_way_delay, rpc_overhead)
+print(f'1000-node latency = {ten_nomial_predictions[999]:.2f} us')
+# print(f'10000-node latency = {ten_nomial_predictions[9999]:.2f} us')
+
+plt.xlabel('# Nodes')
+plt.ylabel('Latency (us)')
+plt.plot(tree_sizes, binary_tree_model(num_nodes, one_way_delay, rpc_overhead),
          marker='x',
-         label=f"binary_predict({estimated_owd:.2f},{estimated_rpc_overhead:.2f})")
+         label=f"binary_predict({one_way_delay:.2f},{rpc_overhead:.2f})")
 plt.plot(tree_sizes, binary_tree, marker='x', label="binary")
+plt.plot(tree_sizes,
+         k_nomial_tree_model(2, num_nodes, one_way_delay, rpc_overhead),
+         marker='x',
+         label=f"binomial_predict({one_way_delay:.2f},{rpc_overhead:.2f})")
 plt.plot(tree_sizes, binomial_tree, marker='x', label="binomial")
+plt.plot(tree_sizes,
+         k_nomial_tree_model(10, num_nodes, one_way_delay, rpc_overhead),
+         marker='x',
+         label=f"10-nomial_predict({one_way_delay:.2f},{rpc_overhead:.2f})")
 plt.plot(tree_sizes, ten_nomial_tree, marker='x', label="10-nomial")
 plt.legend()
 plt.show()

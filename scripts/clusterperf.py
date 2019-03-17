@@ -928,6 +928,7 @@ simple_tests = [
     Test("treeGather", millisort),
     Test("allGather", millisort),
     Test("allShuffle", millisort),
+    Test("point2point", millisort),
 ]
 
 graph_tests = [

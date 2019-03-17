@@ -149,9 +149,7 @@ class SendDataRpc : public ServerIdRpcWrapper {
 
     static void appendRequest(Buffer* request, uint32_t dataId, uint32_t length,
             const void* data);
-
-    /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
-    void wait() {waitAndCheckErrors();}
+    Buffer* wait();
 
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::SendData::Response);

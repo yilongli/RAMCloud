@@ -41,10 +41,28 @@ ten_nomial_tree_1KB = [0.0, 5.28, 6.76, 7.91, 9.37, 10.99, 12.52, 13.96, 16.15,
                        34.20, 34.84, 35.49, 36.23, 36.95, 37.21, 37.72, 39.59,
                        41.26, 41.63, 41.48, 41.70, 41.44, 41.87]
 
+flat_gather_10B_model = flat_gather_10B[:1]
+rpc_overhead_10B = flat_gather_10B[-1] / (len(flat_gather_10B) - 1)
+for i in range(2, 56):
+    completion_time = flat_gather_10B_model[-1] + rpc_overhead_10B
+    flat_gather_10B_model.append(completion_time)
+
+rpc_overhead_1KB = flat_gather_1KB[-1] / (len(flat_gather_1KB) - 1)
+flat_gather_1KB_model = flat_gather_1KB[:1]
+for i in range(2, 56):
+    completion_time = flat_gather_1KB_model[-1] + rpc_overhead_1KB
+    flat_gather_1KB_model.append(completion_time)
+
+plt.xlabel('# Nodes')
+plt.ylabel('Latency (us)')
 plt.plot(group_sizes, flat_gather_10B, marker='x', label="flat(10B)")
+plt.plot(group_sizes, flat_gather_10B_model, marker='x', label="flat_predict(10B)")
+
 plt.plot(group_sizes, flat_gather_1KB, marker='x', label="flat(1KB)")
-plt.plot(group_sizes, binomial_tree_1KB, marker='x', label="binomial(1KB)")
-plt.plot(group_sizes, five_nomial_tree_1KB, marker='x', label="5-nomial(1KB)")
-plt.plot(group_sizes, ten_nomial_tree_1KB, marker='x', label="10-nomial(1KB)")
+plt.plot(group_sizes, flat_gather_1KB_model, marker='x', label="flat_predict(1KB)")
+
+# plt.plot(group_sizes, binomial_tree_1KB, marker='x', label="binomial(1KB)")
+# plt.plot(group_sizes, five_nomial_tree_1KB, marker='x', label="5-nomial(1KB)")
+# plt.plot(group_sizes, ten_nomial_tree_1KB, marker='x', label="10-nomial(1KB)")
 plt.legend()
 plt.show()

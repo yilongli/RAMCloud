@@ -1011,9 +1011,26 @@ MilliSortService::benchmarkCollectiveOp(
         Rpc* rpc)
 {
 #define WARMUP_COUNT 10
-    if (reqHdr->opcode == WireFormat::BCAST_TREE) {
+    std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
+    if (reqHdr->opcode == WireFormat::SEND_DATA) {
+        /* Point-to-point message benchmark */
+        ServerId target = world->getNode(world->size() - 1);
+        for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
+            uint64_t startTime = Cycles::rdtsc();
+            SendDataRpc sendDataRpc(context, target, POINT2POINT_BENCHMARK,
+                    reqHdr->dataSize, data.get());
+            Buffer* result = sendDataRpc.wait();
+            if (i >= WARMUP_COUNT) {
+                uint64_t remoteEndTime = *result->getStart<uint64_t>();
+                uint64_t endTime = context->clockSynchronizer->getConverter(
+                        target).toLocalTsc(remoteEndTime);
+                uint64_t oneWayDelayNs =
+                        Cycles::toNanoseconds(endTime - startTime);
+                rpc->replyPayload->emplaceAppend<uint64_t>(oneWayDelayNs);
+            }
+        }
+    } else if (reqHdr->opcode == WireFormat::BCAST_TREE) {
         /* Broadcast benchmark */
-        std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
         std::vector<uint32_t> latencyNs(world.get()->size() - 1);
         for (int i = 0; i < WARMUP_COUNT + reqHdr->count; i++) {
             uint64_t startTime = Cycles::rdtsc();
@@ -1095,16 +1112,13 @@ MilliSortService::benchmarkCollectiveOp(
             while (Cycles::rdtsc() < startTime) {}
             timeTrace("Gather benchmark started, run %d", reqHdr->count);
 
-            uint32_t numElements = reqHdr->dataSize / sizeof32(PivotKey);
-            const PivotKey* elements = reinterpret_cast<const PivotKey*>(
-                    context->masterZeroCopyRegion);
             DataMerger merger;
-            merger.localBuf.appendCopy(elements, reqHdr->dataSize);
+            merger.localBuf.appendCopy(data.get(), reqHdr->dataSize);
 
             const int DUMMY_OP_ID = 999;
             Tub<TreeGather> gatherOp;
             invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
-                    world.get(), 0, numElements, elements, &merger);
+                    world.get(), 0, reqHdr->dataSize, data.get(), &merger);
             gatherOp->wait();
             uint64_t endTime = Cycles::rdtsc();
             // TODO: the cleanup is not very nice; how to do RAII?
@@ -1183,8 +1197,7 @@ MilliSortService::benchmarkCollectiveOp(
                 Buffer localBuf;
             };
             DataMerger merger;
-            void* data = const_cast<void*>(context->masterZeroCopyRegion);
-            merger.localBuf.appendExternal(data, reqHdr->dataSize);
+            merger.localBuf.appendExternal(data.get(), reqHdr->dataSize);
 
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
@@ -1198,7 +1211,7 @@ MilliSortService::benchmarkCollectiveOp(
             const int DUMMY_OP_ID = 999;
             Tub<AllGather> allGatherOp;
             invokeCollectiveOp<AllGather>(allGatherOp, DUMMY_OP_ID, context,
-                    world.get(), reqHdr->dataSize, data, &merger);
+                    world.get(), reqHdr->dataSize, data.get(), &merger);
             allGatherOp->wait();
             uint64_t endTime = Cycles::rdtsc();
             // TODO: the cleanup is not very nice; how to do RAII?
@@ -1343,6 +1356,11 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
                 allGatherDataBucketBoundaries();
             }
             break;
+        }
+        case POINT2POINT_BENCHMARK: {
+            // Return the local time back to the sender so it can compute the
+            // one-way delay using synchronized clock.
+            rpc->replyPayload->emplaceAppend<uint64_t>(Cycles::rdtsc());
         }
         default:
             assert(false);
