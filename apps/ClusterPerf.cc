@@ -7584,17 +7584,18 @@ allShuffle()
     // Start performance counters.
     cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
 
-    printf("# Note: the throughput numbers are displayed in MB/s.\n"
-            "#%12s%12s%14s%8s%12s%12s%12s%12s%12s\n", "nodes", "bytes/node",
-            "shuffleBytes", "ops", "min", "avg", "p50", "p90", "p99");
-    printf("#------------------------------------------------------------------"
-            "------------------------------------------\n");
+    printf("# Note: latency numbers are displayed in us.\n"
+            "#%12s%12s%8s%12s%12s%12s%12s%12s\n", "nodes", "msg (B)", "ops",
+            "min", "avg", "p50", "p90", "p99");
+    printf("#----------------------------------------------------"
+            "----------------------------------------\n");
 
     string perfstats;
+#define COLLECT_PERFSTATS 0
     // Each iteration of the following loop performs a all-to-all shuffle
     // operation between a specific number of servers.
     uint32_t clockSyncSeconds = 2;
-    for (int machineCount = 1; machineCount <= numMasters; machineCount++) {
+    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
         cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
                 &clockSyncSeconds, sizeof(clockSyncSeconds));
@@ -7606,42 +7607,63 @@ allShuffle()
         LOG(NOTICE, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);
 
+#if COLLECT_PERFSTATS
         // Take a PerfStats snapshot before the experiment.
         Buffer statsBefore, statsAfter;
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsBefore);
-
+#endif
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
                 objectSize);
+        Buffer* result = rpc.wait();
+        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
+                result->size());
+
+        // Retrieve the shuffle completion times, in ns, from the RPC response
+        // buffer.
         std::vector<uint64_t> completionNs;
         std::vector<double> completionSecs;
-        rpc.wait(&completionNs);
-
+        uint32_t offset = 0;
+        while (offset < result->size()) {
+            completionNs.push_back(*result->read<uint64_t>(&offset));
+        }
+        std::sort(completionNs.begin(), completionNs.end());
         for (uint64_t ns : completionNs) {
             completionSecs.push_back(double(ns) * 1e-9);
         }
-        std::sort(completionSecs.begin(), completionSecs.end());
 
-        double shuffleBytes =
-                double(objectSize) * (machineCount-1) / machineCount;
-        double shuffleMBs = shuffleBytes / (1024 * 1024);
+#if 0
+        double shuffleMBs = double(objectSize) * (machineCount - 1) /
+                (1024 * 1024);
         double min = shuffleMBs / completionSecs[0];
         double avg = shuffleMBs / ((std::accumulate(completionSecs.begin(),
                 completionSecs.end(), .0)) / count);
         double p50 = shuffleMBs / completionSecs[int(count * 0.5)];
         double p90 = shuffleMBs / completionSecs[int(count * 0.9)];
         double p99 = shuffleMBs / completionSecs[int(count * 0.99)];
-        printf(" %12d%12d%14.0f%8d%12.1f%12.1f%12.1f%12.1f%12.1f\n",
-                machineCount, objectSize, shuffleBytes, count, min, avg, p50,
-                p90, p99);
+        printf(" %12d%12d%8d%12.1f%12.1f%12.1f%12.1f%12.1f\n",
+                machineCount, objectSize, count, min, avg, p50, p90, p99);
+#else
+        double min = double(completionNs[0]) * 1e-3;
+        double avg = double(std::accumulate(completionNs.begin(),
+                completionNs.end(), 0ul)) / double(count) * 1e-3;
+        double p50 = double(completionNs[int(count * 0.5)]) * 1e-3;
+        double p90 = double(completionNs[int(count * 0.9)]) * 1e-3;
+        double p99 = double(completionNs[int(count * 0.99)]) * 1e-3;
+        printf(" %12d%12d%8d%12.2f%12.2f%12.2f%12.2f%12.2f\n",
+                machineCount, objectSize, count, min, avg, p50, p90, p99);
+#endif
 
+#if COLLECT_PERFSTATS
         // Take another PerfStats snapshot after the experiment.
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsAfter);
         perfstats += PerfStats::printClusterStats(&statsBefore, &statsAfter,
                 machineCount);
         perfstats += "\n\n";
+#endif
+#undef COLLECT_PERFSTATS
     }
     printf("%s", perfstats.c_str());
 }

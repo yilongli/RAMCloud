@@ -1246,16 +1246,15 @@ MilliSortService::benchmarkCollectiveOp(
                         Cycles::toMicroseconds(Cycles::rdtsc() - startTime);
                 timeTrace("Broadcast of ALL_SHUFFLE operations completed");
 
-                // Get the timestamp (on the root node) when the last node
-                // completes the shuffle and convert the shuffle time to ns.
+                // Take the completion time of the slowest node as the
+                // completion time of the shuffle operation.
                 uint64_t shuffleNs = 0;
                 uint32_t offset = 0;
                 while (offset < result->size()) {
                     result->read<WireFormat::BenchmarkCollectiveOp::Response>(
                             &offset);
-                    uint64_t shuffleEndTime = *result->read<uint64_t>(&offset);
-                    shuffleNs = std::max(shuffleNs,
-                            Cycles::toNanoseconds(shuffleEndTime - startTime));
+                    uint64_t ns = *result->read<uint64_t>(&offset);
+                    shuffleNs = std::max(shuffleNs, ns);
                 }
                 if (i >= WARMUP_COUNT) {
                     // Note: the local elapsed time is always larger than the
@@ -1280,7 +1279,6 @@ MilliSortService::benchmarkCollectiveOp(
 
             std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(
                     new Tub<ShufflePullRpc>[world->size()]);
-            uint32_t numBytes = reqHdr->dataSize / uint32_t(world->size());
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
             if (Cycles::rdtsc() > startTime) {
@@ -1290,16 +1288,20 @@ MilliSortService::benchmarkCollectiveOp(
             while (Cycles::rdtsc() < startTime) {}
             timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->count);
 //            invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
-            invokeShufflePull(pullRpcs.get(), world.get(), 2,
-                    ALLSHUFFLE_BENCHMARK, merger, numBytes);
-            uint64_t endTime = Cycles::rdtsc();
+            // FIXME: quick hack to get better perf. numbers for small & large
+            // messages; for small msgs, we need to send more concurrent rpcs to
+            // avoid bottlenecked on network latency; for large msgs, having
+            // more than 2 message at a time make the distributed matching
+            // appears to deviate from the optimal behavior.
+            int maxRpcs = reqHdr->dataSize > 100*1000 ? 2 : MAX_OUTSTANDING_RPCS;
+            invokeShufflePull(pullRpcs.get(), world.get(), maxRpcs,
+                    ALLSHUFFLE_BENCHMARK, merger, reqHdr->dataSize);
+            uint64_t shuffleNs =
+                    Cycles::toNanoseconds(Cycles::rdtsc() - startTime);
             timeTrace("ALL_SHUFFLE benchmark run %d completed in %u us, "
-                    "received %u bytes", reqHdr->count,
-                    Cycles::toMicroseconds(endTime - startTime),
+                    "received %u bytes", reqHdr->count, shuffleNs / 1000,
                     bytesReceived.load());
-            uint64_t remoteEndTime = context->clockSynchronizer->getConverter(
-                    ServerId(reqHdr->masterId)).toRemoteTsc(endTime);
-            rpc->replyPayload->emplaceAppend<uint64_t>(remoteEndTime);
+            rpc->replyPayload->emplaceAppend<uint64_t>(shuffleNs);
             // It could take a while to destroy large ShufflePullRpc's; better
             // send reply first.
             rpc->sendReply();

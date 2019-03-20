@@ -104,22 +104,6 @@ class BenchmarkCollectiveOpRpc : public ServerIdRpcWrapper {
     static void appendRequest(Buffer* request, int count, uint32_t opcode,
             uint32_t dataSize, uint64_t masterId, uint64_t startTime);
 
-    /**
-     * Return times, in nanoseconds, to complete the collective operations.
-     *
-     * \param[out] completionTimes
-     *      Completion time of each operation will be pushed here upon return.
-     */
-    void wait(std::vector<uint64_t>* completionTimes)
-    {
-        waitAndCheckErrors();
-        completionTimes->clear();
-        uint32_t offset= sizeof32(WireFormat::BenchmarkCollectiveOp::Response);
-        while (offset < response->size()) {
-            completionTimes->push_back(*response->read<uint64_t>(&offset));
-        }
-    }
-
     // TODO: document this method and remove the above wait method?
     Buffer*
     wait()
