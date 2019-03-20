@@ -56,13 +56,13 @@ for i in range(2, 56):
 plt.xlabel('# Nodes')
 plt.ylabel('Latency (us)')
 plt.plot(group_sizes, flat_gather_10B, marker='x', label="flat(10B)")
-plt.plot(group_sizes, flat_gather_10B_model, marker='x', label="flat_predict(10B)")
+# plt.plot(group_sizes, flat_gather_10B_model, marker='x', label="flat_predict(10B)")
 
 plt.plot(group_sizes, flat_gather_1KB, marker='x', label="flat(1KB)")
-plt.plot(group_sizes, flat_gather_1KB_model, marker='x', label="flat_predict(1KB)")
+# plt.plot(group_sizes, flat_gather_1KB_model, marker='x', label="flat_predict(1KB)")
 
-# plt.plot(group_sizes, binomial_tree_1KB, marker='x', label="binomial(1KB)")
-# plt.plot(group_sizes, five_nomial_tree_1KB, marker='x', label="5-nomial(1KB)")
+plt.plot(group_sizes, binomial_tree_1KB, marker='x', label="binomial(1KB)")
+plt.plot(group_sizes, five_nomial_tree_1KB, marker='x', label="5-nomial(1KB)")
 # plt.plot(group_sizes, ten_nomial_tree_1KB, marker='x', label="10-nomial(1KB)")
 plt.legend()
 plt.show()

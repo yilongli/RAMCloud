@@ -23,6 +23,8 @@ recursive_doubling_1KB = [0.0, 8.45, 27.50, 18.49, 41.68, 42.41, 41.78, 31.27,
                           128.27, 131.07, 128.69, 129.16, 132.23, 133.47,
                           133.13]
 
+plt.xlabel('# Nodes')
+plt.ylabel('Latency (us)')
 plt.plot(group_sizes, recursive_doubling_100B, marker='x', label="hypercube(100B)")
 plt.plot(group_sizes, recursive_doubling_1KB, marker='x', label="hypercube(1KB)")
 plt.legend()

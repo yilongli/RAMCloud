@@ -7471,7 +7471,7 @@ treeBcast()
             rawdata.append("\n");
         }
     }
-    printf("%s", rawdata.c_str());
+//    printf("%s", rawdata.c_str());
 }
 
 void

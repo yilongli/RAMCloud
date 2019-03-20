@@ -113,13 +113,12 @@ class TreeBcast {
     };
 
     /**
-     * A k-nomial-tree which specifies the communication pattern of the
-     * broadcast operation. Each node in the tree is assigned a rank starting
-     * from 0.
+     * Tree structure which dictates the communication pattern of the broadcast
+     * operation. Each node in the tree is assigned a rank starting from 0.
      */
-    struct KNomialTree {
-        /// Construct a k-nomial tree of a specific size.
-        explicit KNomialTree(int k, int nodes)
+    struct BroadcastTree {
+        /// Construct a broadcast tree of a specific size.
+        explicit BroadcastTree(int k, int nodes)
             : k(k), nodes(nodes)
         {}
 
@@ -143,7 +142,7 @@ class TreeBcast {
     CommunicationGroup* group;
 
     /// Specifies the broadcast communication pattern.
-    KNomialTree kNomialTree;
+    BroadcastTree broadcastTree;
 
     /// Buffer used to store the processing result of #payloadRpc.
     Buffer localResult;

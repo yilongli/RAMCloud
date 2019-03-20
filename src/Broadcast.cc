@@ -57,7 +57,7 @@ TreeBcast::TreeBcast(Context* context, CommunicationGroup* group, uint32_t opId)
     : context(context)
     , opId(opId ? opId : uint32_t(generateRandom()))
     , group(group)
-    , kNomialTree(BRANCH_FACTOR, group->size())
+    , broadcastTree(BRANCH_FACTOR, group->size())
     , localResult()
     , root(group->rank)
     , outgoingResponse()
@@ -97,7 +97,7 @@ TreeBcast::TreeBcast(Context* context,
     : context(context)
     , opId(reqHdr->opId)
     , group(context->getMilliSortService()->getCommunicationGroup(reqHdr->groupId))
-    , kNomialTree(BRANCH_FACTOR, group->size())
+    , broadcastTree(BRANCH_FACTOR, group->size())
     , localResult()
     , root(reqHdr->root)
     , outgoingResponse(rpc->replyPayload)
@@ -129,17 +129,19 @@ TreeBcast::TreeBcast(Context* context,
  *      Ranks of the children nodes will be pushed here upon return.
  */
 void
-TreeBcast::KNomialTree::getChildren(int parent, std::vector<int>* children)
+TreeBcast::BroadcastTree::getChildren(int parent, std::vector<int>* children)
 {
-    // Change the following from 0 to 1 to test with k-ary tree.
-#if 0
+    // Change the following to 0 to test with k-ary tree, or 1 to test with
+    // k-nomial tree.
+#define TREE_TYPE 2
+#if TREE_TYPE == 0
     for (int i = 0; i < k; i++) {
         int child = parent * k + i + 1;
         if (child < nodes) {
             children->push_back(child);
         }
     }
-#else
+#elif TREE_TYPE == 1
     // If d is the number of digits in the base-k representation of parent
     // then let delta = k^d.
     int delta = 1;
@@ -163,6 +165,41 @@ TreeBcast::KNomialTree::getChildren(int parent, std::vector<int>* children)
             children->push_back(child);
         }
         delta *= k;
+    }
+#else
+    // Hard-coded optimal tree structure when that one-way-delay is 6 times of
+    // the RPC send overhead; generated from treeBroadcastPlot.py.
+    static const std::vector<std::vector<int>> treeStruct = {
+        {1,  2,  3,  4,  5,  6,  7,  9,  12, 16, 21, 27, 34, 43, 55, 71, 92},
+        {8,  10, 13, 17, 22, 28, 35, 44, 56, 72, 93},
+        {11, 14, 18, 23, 29, 36, 45, 57, 73, 94},
+        {15, 19, 24, 30, 37, 46, 58, 74, 95},
+        {20, 25, 31, 38, 47, 59, 75, 96},
+        {26, 32, 39, 48, 60, 76, 97},
+        {33, 40, 49, 61, 77, 98},
+        {41, 50, 62, 78, 99},
+        {42, 51, 63, 79},
+        {52, 64, 80},
+        {53, 65, 81},
+        {54, 66, 82},
+        {67, 83},
+        {68, 84},
+        {69, 85},
+        {70, 86},
+        {87},
+        {88},
+        {89},
+        {90},
+        {91}
+    };
+    if (parent < downCast<int>(treeStruct.size())) {
+        for (int child : treeStruct[parent]) {
+            if (child < nodes) {
+                children->push_back(child);
+            } else {
+                break;
+            }
+        }
     }
 #endif
 }
@@ -237,7 +274,7 @@ TreeBcast::start()
     }
 
     std::vector<int> children;
-    kNomialTree.getChildren(myRank, &children);
+    broadcastTree.getChildren(myRank, &children);
     for (int child : children) {
         timeTrace("TreeBcast %u, size %u, rank %u, sending RPC to rank %u",
                 opId, group->size(), myRank, child);
