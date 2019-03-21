@@ -1036,7 +1036,7 @@ if __name__ == '__main__':
             help='Number of times to execute operating before '
             'starting measurements')
     parser.add_option('--workload', default=None,
-            choices=['YCSB-A', 'YCSB-B', 'YCSB-C', 'WRITE-ONLY'],
+            # choices=['YCSB-A', 'YCSB-B', 'YCSB-C', 'WRITE-ONLY'],
             help='Name of workload to run on extra clients to generate load')
     parser.add_option('--messageSizeCDF', default=None,
             help='Path to the message size CDF file. The first line of the '
