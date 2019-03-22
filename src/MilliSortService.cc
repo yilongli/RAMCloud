@@ -1248,25 +1248,25 @@ MilliSortService::benchmarkCollectiveOp(
 
                 // Take the completion time of the slowest node as the
                 // completion time of the shuffle operation.
-                uint64_t shuffleNs = 0;
                 uint32_t offset = 0;
                 while (offset < result->size()) {
                     result->read<WireFormat::BenchmarkCollectiveOp::Response>(
                             &offset);
-                    uint64_t ns = *result->read<uint64_t>(&offset);
-                    shuffleNs = std::max(shuffleNs, ns);
-                }
-                if (i >= WARMUP_COUNT) {
-                    // Note: the local elapsed time is always larger than the
-                    // the shuffle completion time because the former also
-                    // includes the time to send/receive the payload RPC reply
-                    // (note: the payload RPC of bcast is currently delivered
-                    // over the network even though it's actually a local op)
-                    // and the broadcast return time.
-                    LOG(DEBUG, "Master node elapsed time %lu us, "
-                            "shuffle time %lu us", elapsedMicros,
-                            shuffleNs / 1000);
-                    rpc->replyPayload->emplaceAppend<uint64_t>(shuffleNs);
+                    uint32_t rank = *result->read<uint32_t>(&offset);
+                    uint32_t shuffleNs = *result->read<uint32_t>(&offset);
+                    if (i >= WARMUP_COUNT) {
+                        // Note: the local elapsed time is always larger than the
+                        // the shuffle completion time because the former also
+                        // includes the time to send/receive the payload RPC reply
+                        // (note: the payload RPC of bcast is currently delivered
+                        // over the network even though it's actually a local op)
+                        // and the broadcast return time.
+                        LOG(DEBUG, "Master node elapsed time %lu us, "
+                                "shuffle time %u us", elapsedMicros,
+                                shuffleNs / 1000);
+                        rpc->replyPayload->emplaceAppend<uint32_t>(rank);
+                        rpc->replyPayload->emplaceAppend<uint32_t>(shuffleNs);
+                    }
                 }
             }
         } else {
@@ -1287,21 +1287,21 @@ MilliSortService::benchmarkCollectiveOp(
             }
             while (Cycles::rdtsc() < startTime) {}
             timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->count);
-//            invokeShufflePull(pullRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
             // FIXME: quick hack to get better perf. numbers for small & large
             // messages; for small msgs, we need to send more concurrent rpcs to
             // avoid bottlenecked on network latency; for large msgs, having
             // more than 2 message at a time make the distributed matching
             // appears to deviate from the optimal behavior.
-            int maxRpcs = reqHdr->dataSize > 100*1000 ? 2 : MAX_OUTSTANDING_RPCS;
+            int maxRpcs = reqHdr->dataSize >= 100*1000 ? 2 : MAX_OUTSTANDING_RPCS;
             invokeShufflePull(pullRpcs.get(), world.get(), maxRpcs,
                     ALLSHUFFLE_BENCHMARK, merger, reqHdr->dataSize);
-            uint64_t shuffleNs =
-                    Cycles::toNanoseconds(Cycles::rdtsc() - startTime);
+            uint32_t shuffleNs = downCast<uint32_t>(
+                    Cycles::toNanoseconds(Cycles::rdtsc() - startTime));
             timeTrace("ALL_SHUFFLE benchmark run %d completed in %u us, "
                     "received %u bytes", reqHdr->count, shuffleNs / 1000,
                     bytesReceived.load());
-            rpc->replyPayload->emplaceAppend<uint64_t>(shuffleNs);
+            rpc->replyPayload->emplaceAppend<uint32_t>(world->rank);
+            rpc->replyPayload->emplaceAppend<uint32_t>(shuffleNs);
             // It could take a while to destroy large ShufflePullRpc's; better
             // send reply first.
             rpc->sendReply();

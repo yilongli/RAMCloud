@@ -7637,15 +7637,42 @@ allShuffle()
         LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
                 result->size());
 
-        // Retrieve the shuffle completion times, in ns, from the RPC response
-        // buffer.
-        std::vector<uint64_t> completionNs;
-        std::vector<double> completionSecs;
+        // Retrieve the shuffle completion times of each machine from the RPC
+        // response buffer.
+        std::vector<uint32_t> completionNs;
+        std::unordered_map<uint32_t, std::vector<uint32_t>> perNodeShuffleNs;
+        std::unordered_map<int, std::vector<uint32_t>> perRunShuffleNs;
         uint32_t offset = 0;
-        while (offset < result->size()) {
-            completionNs.push_back(*result->read<uint64_t>(&offset));
+        for (int i = 0; i < count; i++) {
+            uint32_t max = 0;
+            for (int j = 0; j < machineCount; j++) {
+                uint32_t rank = *result->read<uint32_t>(&offset);
+                uint32_t shuffleNs = *result->read<uint32_t>(&offset);
+                perNodeShuffleNs[rank].push_back(shuffleNs);
+                perRunShuffleNs[i].push_back(shuffleNs);
+                max = std::max(max, shuffleNs);
+            }
+            completionNs.push_back(max);
+            std::sort(perRunShuffleNs[i].begin(), perRunShuffleNs[i].end());
         }
         std::sort(completionNs.begin(), completionNs.end());
+
+        // Change the following from 0 to 1 to dump per-node/run completion
+        // times.
+#if 0
+        std::string rawdata;
+        for (int i = 0; i < count; i++) {
+            for (uint32_t ns : perNodeShuffleNs[i]) {
+//            for (uint32_t ns : perRunShuffleNs[i]) {
+                rawdata.append(std::to_string(ns));
+                rawdata.append(",");
+            }
+            rawdata.append("\n");
+        }
+        printf("%s", rawdata.c_str());
+#endif
+
+        std::vector<double> completionSecs;
         for (uint64_t ns : completionNs) {
             completionSecs.push_back(double(ns) * 1e-9);
         }
