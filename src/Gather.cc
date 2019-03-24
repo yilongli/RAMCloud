@@ -7,14 +7,17 @@ namespace RAMCloud {
 // this transport.
 #define TIME_TRACE 0
 
-// Change the following from 0 to 1 to test with k-ary tree.
-#define FIXED_ARY_TREE 0
+// Change the following to 0 to test with k-ary tree, or 1 to test with
+// k-nomial tree.
+#define TREE_TYPE 2
 
-// TODO: remove this handcoded constant; this number should be chosen dynamically
-// based on the ratio of OWD (i.e., latency) and per-RPC CPU overhead:
-// e.g., if OWD + BW_COST at the root node = a * RPC_RX_CPU_COST, we might want
-// to have a gather tree whose root's out degree is a.
-#define BRANCH_FACTOR 10
+// TODO: remove this handcoded constant; can we choose it dynamically?
+// A k1-k2 tree is simple (suppose node 0 is the root):
+//  1. Node 1 to node (k1 + 1) are children of node 0
+//  2. Starting from node (k1 + 2), every k2 nodes is a group where the first
+// node is the parent of the rest of the group and a child of node 0.
+#define BRANCH_FACTOR_1 10
+#define BRANCH_FACTOR_2 8
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -43,15 +46,16 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     , root(root)
     , relativeRank(group->relativeRank(root))
     , nodesToGather()
-    , kNomialTree(BRANCH_FACTOR, group->size())
+    , gatherTree(BRANCH_FACTOR_1, BRANCH_FACTOR_2, group->size())
     , mutex("TreeGather::mutex")
+    , numPayloadsToMerge()
     , sendData()
 {
-    // k-nomial-tree assumes node 0 to be the root. Therefore, to find the
+    // The gather tree assumes node 0 to be the root. Therefore, to find the
     // children of this node when node 0 is not the root, we need to use the
     // relative rank of this node to compute the children.
     std::vector<int> children;
-    kNomialTree.getChildren(relativeRank, &children);
+    gatherTree.getChildren(relativeRank, &children);
     size_t numChildren = children.size();
 
     // If this is an interior node, wait until we have received data from
@@ -59,13 +63,16 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     // the data immediately.
     if (numChildren > 0) {
         nodesToGather.construct(children.begin(), children.end());
+        numPayloadsToMerge = downCast<int>(numChildren);
         // Don't add the data duplicately; the merger should've been initialized
         // with the local data!
 //        merger->add(&dataBuf);
     } else {
-        int parent = kNomialTree.getParent(relativeRank);
+        int parent = gatherTree.getParent(relativeRank);
         Buffer dataBuf;
         dataBuf.appendExternal(data, numBytes);
+        timeTrace("TreeGather: sending data to parent %u, size %u", parent,
+                numBytes);
         sendData.construct(context, group->getNode(root + parent), opId,
                 group->rank, &dataBuf);
     }
@@ -81,16 +88,17 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
  *      Ranks of the children nodes will be pushed here upon return.
  */
 void
-TreeGather::KNomialTree::getChildren(int parent, std::vector<int>* children)
+TreeGather::GatherTree::getChildren(int parent, std::vector<int>* children)
 {
-#if FIXED_ARY_TREE
-    for (int i = 0; i < k; i++) {
-        int child = parent * k + i + 1;
+#if TREE_TYPE == 0
+    for (int i = 0; i < k1; i++) {
+        int child = parent * k1 + i + 1;
         if (child < nodes) {
             children->push_back(child);
         }
     }
-#else
+#elif TREE_TYPE == 1
+    int k = k1;
     // If d is the number of digits in the base-k representation of parent
     // then let delta = k^d.
     int delta = 1;
@@ -115,15 +123,40 @@ TreeGather::KNomialTree::getChildren(int parent, std::vector<int>* children)
         }
         delta *= k;
     }
+#else
+    if (parent == 0) {
+        for (int i = 1; i <= k1; i++) {
+            if (i >= nodes) {
+                return;
+            }
+            children->push_back(i);
+        }
+        int child = k1 + 1;
+        while (child < nodes) {
+            children->push_back(child);
+            child += k2;
+        }
+    } else if (parent > k1) {
+        if ((parent - k1 - 1) % k2 == 0) {
+            for (int i = 1; i < k2; i++) {
+                int child = parent + i;
+                if (child >= nodes) {
+                    return;
+                }
+                children->push_back(child);
+            }
+        }
+    }
 #endif
 }
 
 int
-TreeGather::KNomialTree::getParent(int child)
+TreeGather::GatherTree::getParent(int child)
 {
-#if FIXED_ARY_TREE
-    return (rank - 1) / k;
-#else
+#if TREE_TYPE == 0
+    return (child - 1) / k1;
+#elif TREE_TYPE == 1
+    int k = k1;
     // If d is the number of digits in the base-k representation of parent
     // then let x = k^d.
     int x = 1;
@@ -134,10 +167,20 @@ TreeGather::KNomialTree::getParent(int child)
         r /= k;
         x *= k;
     }
-
     // Clear the most significant digit in the child's base-k representation of
     // its rank.
     return child - msd * x / k;
+#else
+    if (child <= k1) {
+        return 0;
+    } else {
+        child -= (k1 + 1);
+        if (child % k2 == 0) {
+            return 0;
+        } else {
+            return (k1 + 1) + (child / k2 * k2);
+        }
+    }
 #endif
 }
 
@@ -147,8 +190,7 @@ TreeGather::isReady()
     if (group->rank != root) {
         return sendData && sendData->isReady();
     } else {
-        Lock _(mutex);
-        return nodesToGather->empty();
+        return numPayloadsToMerge.load(std::memory_order_acquire) == 0;
     }
 }
 
@@ -156,26 +198,34 @@ void
 TreeGather::handleRpc(const WireFormat::TreeGather::Request* reqHdr,
         WireFormat::TreeGather::Response* respHdr, Service::Rpc* rpc)
 {
-    Lock _(mutex);
-
     assert(group->rank == 0);
     uint32_t senderId = reqHdr->senderId;
-    if (nodesToGather->find(senderId) == nodesToGather->end()) {
-        respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
-        return;
-    }
-    nodesToGather->erase(senderId);
 
-    // Chop off the TreeGather header and incorporate the data.
+    // Chop off the TreeGather header.
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
+    timeTrace("TreeGather: received new data, sender %u, size %u",
+            senderId, rpc->requestPayload->size());
+
+    // TODO: we can even eliminate this spinlock by chaning nodesToGather to
+    // be a atomic bitmask.
+    {
+        SpinLock::Guard _(mutex);
+        if (nodesToGather->erase(senderId) == 0) {
+            respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
+            return;
+        }
+    }
+
+    // Incorporate the payload.
     if (merger) {
-        timeTrace("TreeGather: about to merge payload from server %u (rank %u)",
-                group->getNode(senderId).indexNumber(), senderId);
         merger->add(rpc->requestPayload);
     }
+    bool completed = (numPayloadsToMerge.fetch_sub(1) == 1);
 
-    if (nodesToGather->empty() && (group->rank != root)) {
-        int parent = kNomialTree.getParent(relativeRank);
+    if (completed && (group->rank != root)) {
+        int parent = gatherTree.getParent(relativeRank);
+        timeTrace("TreeGather: sending data to parent %u, size %u", parent,
+                merger->getResult()->size());
         sendData.construct(context, group->getNode(root + parent), opId,
                 group->rank, merger->getResult());
     }

@@ -1,68 +1,129 @@
 #!/usr/bin/env python3
 
+from statistics import mean
 import matplotlib.pyplot as plt
 
 num_nodes = 55
 
-group_sizes = list(range(1, 56))
-flat_gather_10B = [0.0, 3.58, 4.28, 5.77, 7.03, 8.49, 10.26, 11.83, 13.07,
-                   14.82, 16.55, 18.23, 20.27, 21.75, 24.00, 25.73, 27.73,
-                   28.59, 30.76, 32.23, 34.62, 36.45, 37.87, 40.09, 39.85,
-                   43.80, 45.44, 47.12, 48.35, 51.25, 53.48, 54.81, 57.26,
-                   58.83, 60.64, 62.22, 62.59, 65.93, 67.99, 69.83, 71.44,
-                   73.90, 75.47, 78.04, 80.05, 80.92, 83.39, 84.64, 86.30,
-                   87.82, 91.83, 92.27, 93.44, 95.89, 98.39]
-flat_gather_1KB = [0.0, 4.76, 5.81, 7.02, 8.46, 10.08, 11.75, 13.67, 15.12,
-                   16.51, 18.75, 20.58, 22.24, 24.11, 25.96, 28.12, 29.09,
-                   31.87, 33.32, 34.79, 37.78, 38.17, 41.45, 43.35, 43.42,
-                   46.89, 48.14, 50.54, 51.56, 53.97, 56.18, 57.73, 59.84,
-                   61.73, 60.70, 66.26, 66.70, 68.77, 71.11, 74.08, 75.88,
-                   77.12, 78.60, 80.59, 82.69, 85.31, 84.21, 88.06, 90.08,
-                   92.22, 93.51, 95.21, 98.22, 100.13, 102.17]
-binomial_tree_1KB = [0.0, 5.27, 6.42, 11.93, 11.70, 14.90, 15.29, 20.70, 20.76,
-                     21.62, 21.46, 24.43, 24.57, 25.53, 25.55, 31.97, 32.23,
-                     33.36, 33.08, 33.95, 33.74, 34.30, 34.43, 38.38, 39.30,
-                     39.86, 40.00, 40.96, 40.62, 41.76, 41.43, 48.19, 47.87,
-                     48.63, 48.59, 50.55, 50.38, 51.66, 50.78, 52.62, 52.43,
-                     52.98, 52.72, 54.20, 53.91, 54.42, 53.82, 59.44, 59.63,
-                     60.47, 60.43, 61.68, 60.96, 61.41, 61.56]
-five_nomial_tree_1KB = [0.0, 5.25, 6.44, 8.19, 9.37, 11.06, 13.04, 13.32, 14.37,
-                        16.53, 16.88, 15.99, 16.91, 18.13, 19.66, 20.30, 20.21,
-                        21.28, 21.85, 23.44, 24.09, 24.16, 24.87, 26.38, 27.61,
-                        28.72, 28.49, 28.71, 28.43, 29.96, 29.78, 29.80, 29.91,
-                        30.46, 31.72, 31.67, 32.06, 32.06, 32.63, 33.17, 33.13,
-                        34.35, 35.05, 36.11, 37.16, 38.09, 38.11, 38.81, 39.10,
-                        40.47, 40.26, 40.19, 39.92, 41.16, 42.12]
-ten_nomial_tree_1KB = [0.0, 5.28, 6.76, 7.91, 9.37, 10.99, 12.52, 13.96, 16.15,
-                       17.72, 19.82, 20.51, 20.38, 20.96, 20.99, 21.87, 22.11,
-                       22.63, 23.78, 25.36, 25.51, 25.81, 25.96, 25.86, 26.18,
-                       26.55, 26.54, 27.05, 27.68, 28.97, 28.97, 29.74, 29.41,
-                       30.48, 30.47, 29.85, 30.88, 30.65, 31.57, 32.90, 33.88,
-                       34.20, 34.84, 35.49, 36.23, 36.95, 37.21, 37.72, 39.59,
-                       41.26, 41.63, 41.48, 41.70, 41.44, 41.87]
+group_sizes = list(range(1, num_nodes + 1))
+flat_gather_10B = [0.0, 3.60, 4.31, 5.08, 5.83, 6.69, 7.46, 8.33, 9.02, 9.90,
+                   10.60, 11.50, 12.37, 13.41, 14.18, 14.87, 15.65, 16.90,
+                   17.88, 18.46, 19.00, 19.84, 20.86, 21.45, 21.96, 23.71,
+                   24.32, 24.86, 25.85, 26.45, 27.08, 27.95, 28.89, 29.44,
+                   30.23, 31.43, 31.71, 32.80, 34.04, 34.49, 35.30, 36.60,
+                   37.35, 37.95, 38.87, 39.90, 40.62, 41.41, 41.15, 42.71,
+                   43.38, 44.00, 45.15, 46.60, 46.65]
+flat_gather_1KB = [0.0, 5.24, 5.83, 6.50, 7.73, 8.80, 9.78, 10.64, 11.36, 12.35,
+                   12.92, 13.80, 14.75, 15.33, 16.44, 17.44, 18.44, 19.75,
+                   20.07, 20.64, 21.23, 21.74, 22.86, 24.28, 24.73, 25.78,
+                   26.16, 26.90, 27.82, 28.65, 28.80, 30.47, 31.45, 32.22,
+                   32.31, 33.74, 33.85, 35.37, 36.54, 37.56, 37.76, 39.05,
+                   40.13, 41.42, 41.50, 42.22, 43.37, 44.07, 45.02, 45.26,
+                   45.86, 46.80, 47.53, 48.67, 49.00]
+flat_gather_8KB = [0.0, 9.18, 11.27, 13.33, 15.81, 18.15, 20.67, 23.07, 25.34,
+                   27.69, 30.06, 32.39, 34.84, 37.19, 39.18, 41.62, 43.91,
+                   46.33, 48.65, 50.95, 53.20, 55.44, 57.81, 59.98, 62.33,
+                   64.89, 67.11, 69.37, 71.69, 74.12, 76.20, 78.60, 80.89,
+                   83.08, 85.48, 87.83, 90.17, 92.42, 94.78, 97.06, 99.33,
+                   101.61, 103.80, 106.20, 108.56, 110.81, 113.19, 115.53,
+                   117.82, 119.99, 122.46, 124.57, 127.02, 129.33, 131.57]
+five_nomial_tree_1KB = [0.0, 5.33, 6.31, 7.17, 7.99, 8.59, 11.48, 12.38, 13.23,
+                        14.64, 14.57, 15.10, 15.36, 16.84, 17.50, 17.38, 18.05,
+                        18.59, 19.45, 20.88, 20.54, 21.27, 21.87, 22.91, 24.21,
+                        23.87, 24.13, 23.77, 24.51, 25.84, 25.78, 26.38, 26.31,
+                        27.52, 29.69, 29.75, 29.33, 30.24, 30.42, 31.39, 31.25,
+                        32.19, 32.66, 33.15, 34.36, 34.39, 34.74, 34.58, 35.09,
+                        36.27, 36.36, 36.21, 36.57, 36.80, 36.55]
+ten_nomial_tree_1KB = [0.0, 5.20, 6.19, 7.11, 7.93, 8.85, 10.05, 10.87, 11.17,
+                       12.24, 12.99, 14.10, 13.90, 14.28, 14.91, 15.62, 16.35,
+                       16.69, 18.14, 18.74, 18.85, 19.27, 19.37, 19.79, 19.58,
+                       19.67, 20.28, 21.36, 22.13, 22.63, 22.88, 23.20, 23.50,
+                       23.62, 24.08, 24.37, 24.61, 25.13, 26.12, 27.02, 27.08,
+                       27.40, 28.29, 28.91, 29.64, 30.02, 30.25, 31.19, 31.73,
+                       32.15, 32.37, 32.67, 32.50, 32.58, 32.72]
+ten_eight_tree_1KB = [0.0, 5.09, 6.06, 6.77, 7.81, 8.78, 9.77, 10.62, 11.16,
+                    12.00, 12.94, 13.84, 14.57, 15.04, 15.73, 17.23, 18.20,
+                    20.15, 20.91, 20.95, 20.83, 20.35, 20.96, 21.37, 21.93,
+                    23.02, 23.69, 23.54, 23.48, 23.35, 23.34, 23.44, 24.25,
+                    25.88, 26.42, 26.15, 25.97, 26.26, 26.19, 26.30, 27.41,
+                    28.66, 28.60, 29.00, 28.84, 28.66, 29.00, 29.39, 30.22,
+                    31.43, 31.51, 31.43, 31.36, 31.46, 31.43]
+ten_eight_tree_1KB_median = [0.0, 5.53, 6.53, 7.61, 8.62, 9.74, 10.72, 11.76,
+                             12.81, 14.94, 15.78, 16.44, 16.51, 16.83, 17.60,
+                             19.00, 20.49, 22.42, 23.50, 23.45, 23.48, 23.41,
+                             23.49, 23.57, 24.22, 25.65, 26.26, 26.09, 26.23,
+                             26.05, 26.09, 26.29, 26.93, 28.87, 29.60, 29.49,
+                             29.40, 29.32, 29.54, 29.43, 30.14, 31.51, 31.80,
+                             32.03, 32.00, 32.00, 32.23, 32.24, 33.09, 34.23,
+                             34.45, 34.33, 34.39, 34.25, 34.32]
 
-flat_gather_10B_model = flat_gather_10B[:1]
-rpc_overhead_10B = flat_gather_10B[-1] / (len(flat_gather_10B) - 1)
-for i in range(2, 56):
-    completion_time = flat_gather_10B_model[-1] + rpc_overhead_10B
-    flat_gather_10B_model.append(completion_time)
+def flat_gather_model(num_nodes, one_way_delay, rpc_overhead):
+    predicted_times = [0.0, one_way_delay]
+    for i in range(3, num_nodes + 1):
+        predicted_times.append(predicted_times[-1] + rpc_overhead)
+    return predicted_times
 
-rpc_overhead_1KB = flat_gather_1KB[-1] / (len(flat_gather_1KB) - 1)
-flat_gather_1KB_model = flat_gather_1KB[:1]
-for i in range(2, 56):
-    completion_time = flat_gather_1KB_model[-1] + rpc_overhead_1KB
-    flat_gather_1KB_model.append(completion_time)
+
+def compute_network_throughput(per_node_bytes, completion_times):
+    throughput_gbps = [0.0]
+    for i in range(1, len(completion_times)):
+        total_bytes = i * per_node_bytes
+        throughput_gbps.append(total_bytes * 8 / (completion_times[i] * 1e3))
+    return throughput_gbps
+
+def compute_k1k2_tree_step_delta(k2, completion_times):
+    step_deltas = []
+    for i in range(len(completion_times)):
+        if i >= k2:
+            step_deltas.append(completion_times[i] - completion_times[i-k2])
+    return mean(step_deltas[-25:])
+
+rpc_overhead_10B = \
+    (flat_gather_10B[-1] - flat_gather_10B[1]) / (len(flat_gather_10B) - 2)
+flat_gather_10B_model = flat_gather_model(num_nodes, flat_gather_10B[1],
+          rpc_overhead_10B)
+
+rpc_overhead_1KB = \
+    (flat_gather_1KB[-1] - flat_gather_1KB[1]) / (len(flat_gather_1KB) - 2)
+flat_gather_1KB_model = flat_gather_model(num_nodes, flat_gather_1KB[1],
+          rpc_overhead_1KB)
+
+rpc_overhead_8KB = \
+    (flat_gather_8KB[-1] - flat_gather_8KB[1]) / (len(flat_gather_8KB) - 2)
+flat_gather_8KB_model = flat_gather_model(num_nodes, flat_gather_8KB[1],
+          rpc_overhead_8KB)
+
+# Print out some estimated statistics
+print('RPC receive overhead:')
+print(f'10B : {rpc_overhead_10B:.2f} us')
+print(f'1KB : {rpc_overhead_1KB:.2f} us')
+print(f'8KB : {rpc_overhead_8KB:.2f} us')
+
+print('Avg. additional cost of gathering 8 more 1KB messages in a 10-8 tree:')
+print(f'min : {compute_k1k2_tree_step_delta(8, ten_eight_tree_1KB):.2f} us')
+print(f'p50 : {compute_k1k2_tree_step_delta(8, ten_eight_tree_1KB_median):.2f} us')
+
 
 plt.xlabel('# Nodes')
 plt.ylabel('Latency (us)')
-plt.plot(group_sizes, flat_gather_10B, marker='x', label="flat(10B)")
+# plt.plot(group_sizes, flat_gather_10B, marker='x', label="flat(10B)")
 # plt.plot(group_sizes, flat_gather_10B_model, marker='x', label="flat_predict(10B)")
 
-plt.plot(group_sizes, flat_gather_1KB, marker='x', label="flat(1KB)")
+# plt.plot(group_sizes, flat_gather_1KB, marker='x', label="flat(1KB)")
 # plt.plot(group_sizes, flat_gather_1KB_model, marker='x', label="flat_predict(1KB)")
 
-plt.plot(group_sizes, binomial_tree_1KB, marker='x', label="binomial(1KB)")
+# plt.plot(group_sizes, flat_gather_8KB, marker='x', label="flat(8KB)")
+# plt.plot(group_sizes, flat_gather_8KB_model, marker='x', label="flat_predict(8KB)")
+
 plt.plot(group_sizes, five_nomial_tree_1KB, marker='x', label="5-nomial(1KB)")
-# plt.plot(group_sizes, ten_nomial_tree_1KB, marker='x', label="10-nomial(1KB)")
+plt.plot(group_sizes, ten_nomial_tree_1KB, marker='x', label="10-nomial(1KB)")
+
+plt.plot(group_sizes, ten_eight_tree_1KB, marker='x', label="10/8-tree(1KB)")
+# plt.plot(group_sizes, compute_network_throughput(1000, ten_eight_tree_1KB),
+#          marker='+', label="10/8-tree(1KB) BW")
+# plt.plot(group_sizes, ten_eight_tree_1KB_median, marker='x', label="10/8-tree(1KB) median")
+
 plt.legend()
+plt.xlim(0, None)
+plt.ylim(0, None)
 plt.show()

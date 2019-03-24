@@ -112,24 +112,32 @@ class MilliSortService : public Service {
     invokeCollectiveOp(Tub<Op>& op, int opId, Args&&... args)
     {
         op.construct(opId, args...);
-
-        // Sync with the dispatch thread before accessing collectiveOpTable.
-        // This must be done after constructing the collective op object since
-        // the constructor might be expensive.
-        Dispatch::Lock _(context->dispatch);
-
         CollectiveOpRecord* record = getCollectiveOpRecord(opId);
-        record->op = op.get();
-//        LOG(WARNING, "about to handle early RPCs from op %d, record %p, op %p",
-//                opId, record, op.get());
-        for (Transport::ServerRpc* serverRpc : record->serverRpcList) {
-            context->workerManager->collectiveOpRpcs.push_back(serverRpc);
-//            LOG(WARNING, "RPC from collective op %d arrives early!", opId);
+        std::vector<Transport::ServerRpc*> earlyRpcs;
+        {
+            SpinLock::Guard _(record->mutex);
+            record->op = op.get();
+            earlyRpcs = std::move(record->serverRpcList);
         }
-        record->serverRpcList.clear();
+
+        // The following slow path handles the case where some collective op
+        // RPCs arrived before we create the collective op object locally;
+        // in which case, we need to sync with the dispatch thread to re-inject
+        // these RPCs for dispatching.
+        if (!earlyRpcs.empty()) {
+//            LOG(WARNING, "handle early RPCs from op %d, record %p, op %p",
+//                    opId, record, op.get());
+            // Acquire the dispatch lock before accessing collectiveOpRpcs.
+            Dispatch::Lock _(context->dispatch);
+            for (Transport::ServerRpc* serverRpc : earlyRpcs) {
+                context->workerManager->collectiveOpRpcs.push_back(serverRpc);
+//                LOG(WARNING, "RPC from collective op %d arrives early!", opId);
+            }
+        }
+
         // FIXME: can't do it here because pivotsShuffle needs a ptr to op
 //        op.wait();
-//        collectiveOpTable.erase(opId);
+//        removeCollectiveOp(opId);
     }
 
     /**
@@ -177,14 +185,6 @@ class MilliSortService : public Service {
         }
     }
 
-
-    void
-    removeCollectiveOp(int opId)
-    {
-        Dispatch::Lock _(context->dispatch);
-        collectiveOpTable.erase(opId);
-    }
-
     /**
      * Helper function for use in handling RPCs used by collective operations.
      * Record the RPC for future processing if the corresponding collective
@@ -213,13 +213,8 @@ class MilliSortService : public Service {
     handleCollectiveOpRpc(const typename Op::RpcType::Request* reqHdr,
             typename Op::RpcType::Response* respHdr, Rpc* rpc)
     {
-        Op* collectiveOp = NULL;
-        {
-            Dispatch::Lock _(context->dispatch);
-            CollectiveOpRecord* record =
-                    getCollectiveOpRecord(reqHdr->common.opId);
-            collectiveOp = record->getOp<Op>();
-        }
+        CollectiveOpRecord* record = getCollectiveOpRecord(reqHdr->common.opId);
+        Op* collectiveOp = record->getOp<Op>();
         if (collectiveOp == NULL) {
             LOG(ERROR, "unable to find the collective op object, opId %u",
                     reqHdr->common.opId);
@@ -394,7 +389,7 @@ class MilliSortService : public Service {
     void treeBcast(const WireFormat::TreeBcast::Request* reqHdr,
                 WireFormat::TreeBcast::Response* respHdr,
                 Rpc* rpc);
-    void flatGather(const WireFormat::TreeGather::Request* reqHdr,
+    void treeGather(const WireFormat::TreeGather::Request* reqHdr,
                 WireFormat::TreeGather::Response* respHdr,
                 Rpc* rpc);
     void allGather(const WireFormat::AllGather::Request* reqHdr,
@@ -467,6 +462,7 @@ class MilliSortService : public Service {
 
         void add(Buffer* incomingPivots)
         {
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
             CycleCounter<> _(&activeCycles);
             bytesReceived += incomingPivots->size();
             uint32_t offset = 0;
@@ -489,6 +485,8 @@ class MilliSortService : public Service {
         MilliSortService* millisort;
 
         Buffer result;
+
+        Arachne::SpinLock mutex;
 
         std::vector<PivotKey>* pivots;
 

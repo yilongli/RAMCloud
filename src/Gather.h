@@ -69,17 +69,18 @@ class TreeGather {
      * gather operation. Each node in the tree is assigned a rank starting
      * from 0.
      */
-    struct KNomialTree {
-        /// Construct a k-nomial tree of a specific size.
-        explicit KNomialTree(int k, int nodes)
-            : k(k), nodes(nodes)
+    struct GatherTree {
+        /// Construct a broadcast tree of certain size.
+        explicit GatherTree(int k1, int k2, int nodes)
+            : k1(k1), k2(k2), nodes(nodes)
         {}
 
         void getChildren(int parent, std::vector<int>* children);
         int getParent(int child);
 
-        /// Fan-out factor of the tree.
-        int k;
+        /// Fan-out factors of the tree.
+        int k1;
+        int k2;
 
         /// # nodes in the tree.
         int nodes;
@@ -91,6 +92,9 @@ class TreeGather {
     /// All nodes that are participating in the gather operation.
     CommunicationGroup* group;
 
+    /// Note: merger is responsible for its own thread-safety; we don't want to
+    /// enforce monitor-based synchronization on mergers, which could have more
+    /// efficient implementation.
     Merger* merger;
 
     /// Unique identifier of the gather operation.
@@ -102,19 +106,19 @@ class TreeGather {
 
     int relativeRank;
 
-    /// Holds child nodes from which we still expect to receive data. 
-    /// Only present on interior nodes (i.e., non-leaf nodes).
+    /// Holds relative ranks of the child nodes from which we still expect to
+    /// receive data. Only present on interior nodes (i.e., non-leaf nodes).
     Tub<std::unordered_set<int>> nodesToGather;
 
     /// Specifies the broadcast communication pattern.
-    KNomialTree kNomialTree;
+    GatherTree gatherTree;
 
-    /// Used to make sure that only one thread at a time attempts to access
-    /// #nodesToGather.
-    // FIXME: and ensures sequential access of the merger?
-    Arachne::SpinLock mutex;
+    /// Provides exclusive access to #nodesToGather. Note: we don't provide
+    /// synchronization to the merger.
+    SpinLock mutex;
 
-    typedef std::lock_guard<Arachne::SpinLock> Lock;
+    /// # payloads we have incorporated.
+    std::atomic<int> numPayloadsToMerge;
 
     /// RPC used to transfer data to the root node.
     Tub<TreeGatherRpc> sendData;

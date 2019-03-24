@@ -29,6 +29,7 @@ namespace RAMCloud {
 Service::Service()
     : serverId()
     , collectiveOpTable()
+    , mutex("Service::collectiveOpTable")
 {
 }
 

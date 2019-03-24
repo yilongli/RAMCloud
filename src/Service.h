@@ -215,10 +215,16 @@ class Service {
      */
     struct CollectiveOpRecord {
         explicit CollectiveOpRecord()
-            : op(NULL), serverRpcList() {}
+            : mutex("Service::CollectiveOpRecord")
+            , op()
+            , serverRpcList()
+        {}
 
         template <typename Op>
         Op* getOp() { return static_cast<Op*>(op); }
+
+        // Record-level lock
+        SpinLock mutex;
 
         // FIXME: introduce a base abstract class for all collective ops.
         void* op;
@@ -232,6 +238,7 @@ class Service {
 
     CollectiveOpRecord* getCollectiveOpRecord(int opId)
     {
+        SpinLock::Guard _(mutex);
         CollectiveOpTable::iterator it = collectiveOpTable.find(opId);
         if (it == collectiveOpTable.end()) {
             // FIXME: why can't I do this
@@ -243,9 +250,25 @@ class Service {
         }
     }
 
+    void
+    removeCollectiveOp(int opId)
+    {
+        SpinLock::Guard _(mutex);
+        collectiveOpTable.erase(opId);
+    }
+
+  PRIVATE:
+#if __cplusplus >= 201402L
+    // ska::flat_hash_map requires c++14 features to compile.
+    using CollectiveOpTable = ska::flat_hash_map<int, Tub<CollectiveOpRecord>>;
+#else
     using CollectiveOpTable = std::unordered_map<int, Tub<CollectiveOpRecord>>;
 //    using CollectiveOpTable = std::unordered_map<int, CollectiveOpRecord>;
+#endif
     CollectiveOpTable collectiveOpTable;
+
+    // Table-level lock.
+    SpinLock mutex;
 
   private:
     friend class BindTransport;

@@ -148,7 +148,7 @@ MilliSortService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             break;
         case WireFormat::TreeGather::opcode:
             callHandler<WireFormat::TreeGather, MilliSortService,
-                        &MilliSortService::flatGather>(rpc);
+                        &MilliSortService::treeGather>(rpc);
             break;
         case WireFormat::AllGather::opcode:
             callHandler<WireFormat::AllGather, MilliSortService,
@@ -939,7 +939,7 @@ MilliSortService::treeBcast(const WireFormat::TreeBcast::Request* reqHdr,
 }
 
 void
-MilliSortService::flatGather(const WireFormat::TreeGather::Request* reqHdr,
+MilliSortService::treeGather(const WireFormat::TreeGather::Request* reqHdr,
             WireFormat::TreeGather::Response* respHdr, Rpc* rpc)
 {
     handleCollectiveOpRpc<TreeGather>(reqHdr, respHdr, rpc);
@@ -1073,7 +1073,6 @@ MilliSortService::benchmarkCollectiveOp(
                 bcast.send<BenchmarkCollectiveOpRpc>(i, reqHdr->opcode,
                         reqHdr->dataSize, serverId.getId(), startTime);
                 Buffer* result = bcast.wait();
-                timeTrace("Broadcast of GATHER operations completed");
 
                 // Only one BenchmarkCollectiveOpRpc will have non-zero result
                 // (i.e., the one sent to the gather-tree root node).
@@ -1094,14 +1093,37 @@ MilliSortService::benchmarkCollectiveOp(
         } else {
             class DataMerger : public TreeGather::Merger {
               public:
-                explicit DataMerger() : localBuf() {}
+                explicit DataMerger(bool isRoot)
+                    : bytesReceived()
+                    , isRoot(isRoot)
+                    , localBuf()
+                    , mutex("DataMerger::mutex")
+                {}
 
-                void add(Buffer* dataBuf) { localBuf.appendCopy(dataBuf); }
+                void add(Buffer* dataBuf)
+                {
+                    // Quick hack to skip processing received data at the root
+                    // node.
+                    if (isRoot) {
+                        bytesReceived += downCast<int>(dataBuf->size());
+                    } else {
+                        SpinLock::Guard _(mutex);
+                        localBuf.appendCopy(dataBuf);
+                    }
+                }
 
                 Buffer* getResult() { return &localBuf; }
 
+                std::atomic<int> bytesReceived;
+
+                bool isRoot;
+
                 Buffer localBuf;
+
+                SpinLock mutex;
             };
+            DataMerger merger(world->rank == 0);
+            merger.localBuf.appendCopy(data.get(), reqHdr->dataSize);
 
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
@@ -1110,10 +1132,7 @@ MilliSortService::benchmarkCollectiveOp(
                         Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
             }
             while (Cycles::rdtsc() < startTime) {}
-            timeTrace("Gather benchmark started, run %d", reqHdr->count);
-
-            DataMerger merger;
-            merger.localBuf.appendCopy(data.get(), reqHdr->dataSize);
+            timeTrace("Gather operation started, run %d", reqHdr->count);
 
             const int DUMMY_OP_ID = 999;
             Tub<TreeGather> gatherOp;
@@ -1121,6 +1140,7 @@ MilliSortService::benchmarkCollectiveOp(
                     world.get(), 0, reqHdr->dataSize, data.get(), &merger);
             gatherOp->wait();
             uint64_t endTime = Cycles::rdtsc();
+            timeTrace("Gather operation completed");
             // TODO: the cleanup is not very nice; how to do RAII?
             removeCollectiveOp(DUMMY_OP_ID);
 
@@ -1128,10 +1148,9 @@ MilliSortService::benchmarkCollectiveOp(
             if (world->rank == 0) {
                 gatherNs = Cycles::toNanoseconds(endTime - startTime);
                 // Verify if the root has the right amount of data in the end.
-                if (merger.localBuf.size() !=
-                        uint32_t(world->size()) * reqHdr->dataSize) {
-                    LOG(ERROR, "Unexpected final data size %u",
-                            merger.localBuf.size());
+                int totalBytes = int(reqHdr->dataSize) + merger.bytesReceived;
+                if (totalBytes != world->size() * int(reqHdr->dataSize)) {
+                    LOG(ERROR, "Unexpected final data size %d", totalBytes);
                 }
             }
             rpc->replyPayload->emplaceAppend<uint64_t>(gatherNs);

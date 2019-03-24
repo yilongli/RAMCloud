@@ -92,7 +92,7 @@ WorkerManager::WorkerManager(Context* context, uint32_t maxCores)
     : Dispatch::Poller(context->dispatch, "WorkerManager")
     , context(context)
     , outstandingRpcs()
-    , numOutstandingRpcs(0)
+    , outstandingTrivialReplies()
     , testingSaveRpcs(0)
     , testRpcs()
     , collectiveOpRpcs()
@@ -173,6 +173,11 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         return;
     }
 
+    // TODO: what other collective op RPCs have trivial reply?
+    if (header->opcode == WireFormat::GATHER_TREE) {
+        rpc->trivialReply = true;
+    }
+
     if ((header->opcode >= WireFormat::GATHER_TREE) &&
             (header->opcode <= WireFormat::ALL_SHUFFLE)) {
         MilliSortService* millisort = context->getMilliSortService();
@@ -180,6 +185,7 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
                 const WireFormat::RequestCommonWithOpId*>(header)->opId;
         Service::CollectiveOpRecord* record =
                 millisort->getCollectiveOpRecord(opId);
+        SpinLock::Guard _(record->mutex);
 //        LOG(NOTICE, "%s RPC from op %u, record->op %p",
 //                WireFormat::opcodeSymbol(header->opcode), opId, record->op);
         if (record->op == NULL) {
@@ -195,7 +201,6 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
             rpc->requestPayload.size());
 #endif
 
-    numOutstandingRpcs++;
 
     // Create a new thread to handle the RPC.
     rpc->id = nextRpcId++;
@@ -221,9 +226,13 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
             LOG(NOTICE, "Incoming RPC with opcode %d failed to find a core, "
                 "reattempt %d", header->opcode, i);
             Arachne::sleep(10000);
-            if (Arachne::createThread(&WorkerManager::workerMain,
-                this, rpc) != Arachne::NullThread) {
-                outstandingRpcs.push_back(rpc);
+            if (Arachne::createThread(&WorkerManager::workerMain, this, rpc) !=
+                    Arachne::NullThread) {
+                if (rpc->trivialReply) {
+                    outstandingTrivialReplies.push_back(rpc);
+                } else {
+                    outstandingRpcs.push_back(rpc);
+                }
                 return;
             }
         }
@@ -238,22 +247,12 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 //                WireFormat::opcodeSymbol(header->opcode),
 //                threadId.context->originalCoreId, threadId.context->coreId,
 //                &rpc->requestPayload);
-        outstandingRpcs.push_back(rpc);
+        if (rpc->trivialReply) {
+            outstandingTrivialReplies.push_back(rpc);
+        } else {
+            outstandingRpcs.push_back(rpc);
+        }
     }
-}
-
-/**
- * Returns true if there are currently no RPCs being serviced, false
- * if at least one RPC is currently being executed by a worker.  If true
- * is returned, it also means that any changes to memory made by any
- * worker threads will be visible to the caller.
- *
- * This method should only be called within the dispatch thread.
- */
-bool
-WorkerManager::idle()
-{
-    return (numOutstandingRpcs == 0);
 }
 
 /**
@@ -302,7 +301,6 @@ WorkerManager::idle()
 //#endif
 //        rpc->sendReply();
 //        timeTrace("ID %u: reply sent", rpc->id);
-//        numOutstandingRpcs--;
 //
 //        // If we are not the last rpc, store the last Rpc here so that pop-back
 //        // doesn't lose data and we do not iterate here again.
@@ -370,13 +368,14 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
         rpc.arriveTime = serverRpc->arriveTime;
         rpc.dispatchTime = start;
 
-        // TODO: bypass Service::handleRpc for broadcast operation
+        // TODO: bypass Service::handleRpc for all millisort RPCs
         const WireFormat::RequestCommon* header =
                 serverRpc->requestPayload.getStart<WireFormat::RequestCommon>();
-        if (header->opcode == WireFormat::BCAST_TREE) {
+        if ((header->opcode >= WireFormat::INIT_MILLISORT) &&
+                (header->opcode <= WireFormat::BENCHMARK_COLLECTIVE_OP)) {
             MilliSortService* service = static_cast<MilliSortService*>(
                     context->services[WireFormat::MILLISORT_SERVICE]);
-            service->dispatch(WireFormat::BCAST_TREE, &rpc);
+            service->dispatch(WireFormat::Opcode(header->opcode), &rpc);
         } else {
             Service::handleRpc(context, &rpc);
         }
@@ -387,7 +386,7 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
         // Update performance statistics.
         uint64_t activeCycles = Cycles::rdtsc() - start;
         PerfStats::threadStats.workerActiveCycles += activeCycles;
-        timeTrace("ID %u: took worker time %u", serverRpc->id,
+        timeTrace("ID %u: took worker time %u ns", serverRpc->id,
             (uint32_t) Cycles::toNanoseconds(activeCycles));
         TEST_LOG("exiting");
     } catch (std::exception& e) {

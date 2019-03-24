@@ -80,7 +80,9 @@ class Transport {
             , replyPayload()
             , epoch(0)
             , activities(~0)
+            , receiveTime(0)
             , arriveTime(0)
+            , trivialReply()
             , id(0)
             , finished(0)
             , header(NULL)
@@ -173,6 +175,12 @@ class Transport {
          * processing via WorkerManager::handleRpc.
          */
         uint64_t arriveTime;
+
+        /**
+         * True if the RPC reply only serves as a receipt acknowledgement to the
+         * client. Note: this is a temporary hack to implement optional reply.
+         */
+        bool trivialReply;
 
         /**
          * Bit values for activities above.

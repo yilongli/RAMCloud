@@ -39,7 +39,6 @@ class WorkerManager : Dispatch::Poller {
     explicit WorkerManager(Context* context, uint32_t maxCores = 3);
 
     void handleRpc(Transport::ServerRpc* rpc);
-    bool idle();
 
     /**
      * This method is invoked by Dispatch during its polling loop. It checks
@@ -48,12 +47,13 @@ class WorkerManager : Dispatch::Poller {
     __always_inline
     int poll()
     {
+        int foundWork = 0;
         for (auto collectiveOpRpc : collectiveOpRpcs) {
+            foundWork = 1;
             handleRpc(collectiveOpRpc);
         }
         collectiveOpRpcs.clear();
 
-        int foundWork = 0;
         for (int i = downCast<int>(outstandingRpcs.size()) - 1; i >= 0; i--) {
             Transport::ServerRpc* rpc = outstandingRpcs[i];
             if (!rpc->finished.load(std::memory_order_acquire)) {
@@ -62,13 +62,32 @@ class WorkerManager : Dispatch::Poller {
 
             foundWork = 1;
             rpc->sendReply();
-            numOutstandingRpcs--;
 
             // If we are not the last rpc, store the last Rpc here so that pop-back
             // doesn't lose data and we do not iterate here again.
             if (rpc != outstandingRpcs.back())
                 outstandingRpcs[i] = outstandingRpcs.back();
             outstandingRpcs.pop_back();
+        }
+
+        if (!foundWork) {
+            // Only send back one trivial reply when there is nothing else to do
+            // so far.
+            for (int i = downCast<int>(outstandingTrivialReplies.size()) - 1;
+                    i >= 0; i--) {
+                Transport::ServerRpc* rpc = outstandingTrivialReplies[i];
+                if (!rpc->finished.load(std::memory_order_acquire)) {
+                    continue;
+                }
+
+                foundWork = 1;
+                rpc->sendReply();
+
+                if (rpc != outstandingTrivialReplies.back())
+                    outstandingTrivialReplies[i] = outstandingTrivialReplies.back();
+                outstandingTrivialReplies.pop_back();
+                break;
+            }
         }
         return foundWork;
     }
@@ -96,9 +115,9 @@ class WorkerManager : Dispatch::Poller {
     // but have not yet sent replies for.
     std::vector<Transport::ServerRpc*> outstandingRpcs;
 
-    // Track the current number of Rpcs that have entered the system and not
-    // yet exited.
-    uint64_t numOutstandingRpcs;
+    /// Similar to outstandingRpcs but only holds RPCs whose replies are simple
+    /// ACKs.
+    std::vector<Transport::ServerRpc*> outstandingTrivialReplies;
 
     // Nonzero means save incoming RPCs rather than executing them.
     // Intended for use in unit tests only.
