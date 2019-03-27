@@ -32,18 +32,21 @@ class AllGather {
 
     using RpcType = WireFormat::AllGather;
 
+    // FIXME: thread-unsafe for now (not necessary for recursive doubling
+    // algorithm)
     class Merger {
       public:
-        virtual void add(Buffer* incomingData) = 0;
-        virtual Buffer* getResult() = 0;
+        /// Append new data to existing data. This method is guaranteed not to
+        /// modify existing data.
+        virtual void append(Buffer* incomingData) = 0;
         // Quick hack: only used to implement the final expansion step.
-        virtual void replace(Buffer* incomingData) = 0;
+        virtual void clear() = 0;
+        virtual Buffer* getResult() = 0;
     };
 
     explicit AllGather(int opId, Context* context, CommunicationGroup* group,
             uint32_t length, void* data, Merger* merger);
     ~AllGather() = default;
-    void getPeersToSend(int phase, std::vector<ServerId>* targets);
     void handleRpc(const WireFormat::AllGather::Request* reqHdr,
             WireFormat::AllGather::Response* respHdr, Service::Rpc* rpc);
     bool isReady();
@@ -87,11 +90,14 @@ class AllGather {
         DISALLOW_COPY_AND_ASSIGN(AllGatherRpc);
     };
 
+    void checkOutgoingRpcs(bool waitOnBlock = false);
+    void getPeersToSend(int phase, std::vector<int>* targets);
+
     Context* context;
 
-    std::atomic<bool> completed;
+    /// True means the all-gather operation is completed on the local node.
+    std::atomic<bool> complete;
 
-    // TODO: why atomic? document thread-safety
     /// Current stage of the algorithm. Possible values are:
     ///   0: initial contraction step; only present if the group size is not a
     /// power of two
@@ -99,6 +105,11 @@ class AllGather {
     ///   log2(N)+1: final expansion step; only present if the group size is not
     /// a power of two
     /// where N is # nodes in the communication group.
+    ///
+    /// This is the major synchronization mechanism for #handleRpc:
+    /// it guarantees that RPCs from different phases are processed in order.
+    /// This above is sufficient to prevent data-race because there is at most
+    /// one RPC from each phase in the recursive doubling algorithm.
     std::atomic<int> currentPhase;
 
     int lastPhase;
@@ -124,8 +135,7 @@ class AllGather {
     // TODO: intrusive list?
     using OutstandingRpcs = std::list<AllGatherRpc>;
 
-    /// Ongoing RPCs that are sending the all-gather request to all its peer
-    /// nodes in the current phase.
+    /// Ongoing RPCs that are sending data to peer nodes.
     OutstandingRpcs outstandingRpcs;
 
     DISALLOW_COPY_AND_ASSIGN(AllGather)

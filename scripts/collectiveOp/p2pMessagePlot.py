@@ -231,3 +231,6 @@ plt.plot(message_sizes, one_way_delay_model_medium, c = 'r', label="model_medium
 plt.plot(message_sizes, one_way_delay_model_large, c = 'r', label="model_large")
 plt.legend()
 plt.show()
+
+# TODO: compute percentage of per-message overhead and plot; John says 135KB is
+# when per-message overhead only accounts for 10% completion time

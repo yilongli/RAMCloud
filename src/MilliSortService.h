@@ -497,9 +497,9 @@ class MilliSortService : public Service {
 
     // FIXME: this is almost identical as the above! figure out the right interface
     // of merger for gather-like operations
-    class PivotMergeSorter2 : public AllGather::Merger {
+    class PivotMerger : public AllGather::Merger {
       public:
-        explicit PivotMergeSorter2(MilliSortService* millisort,
+        explicit PivotMerger(MilliSortService* millisort,
                 std::vector<PivotKey>* pivots)
             : millisort(millisort)
             , pivots(pivots)
@@ -509,16 +509,19 @@ class MilliSortService : public Service {
         {}
 
         void
-        add(Buffer* incomingPivots)
+        append(Buffer* incomingPivots)
         {
             CycleCounter<> _(&activeCycles);
             bytesReceived += incomingPivots->size();
             uint32_t offset = 0;
-            size_t oldSize = incomingPivots->size();
             while (offset < incomingPivots->size()) {
                 pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
             }
-            millisort->inplaceMerge(*pivots, oldSize);
+        }
+
+        void clear()
+        {
+            pivots->clear();
         }
 
         Buffer*
@@ -529,19 +532,6 @@ class MilliSortService : public Service {
                         downCast<uint32_t>(pivots->size() * PivotKey::SIZE));
             }
             return &result;
-        }
-
-        void
-        replace(Buffer* incomingPivots)
-        {
-            CycleCounter<> _(&activeCycles);
-            bytesReceived += incomingPivots->size();
-
-            pivots->clear();
-            uint32_t offset = 0;
-            while (offset < incomingPivots->size()) {
-                pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
-            }
         }
 
         MilliSortService* millisort;

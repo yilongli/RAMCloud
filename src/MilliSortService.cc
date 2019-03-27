@@ -760,7 +760,7 @@ MilliSortService::allGatherDataBucketBoundaries()
 //        return std::make_pair(dataBucketBoundaries.data(),
 //                dataBucketBoundaries.size() * PivotKey::SIZE);
 //    };
-    PivotMergeSorter2 merger(this, &dataBucketBoundaries);
+    PivotMerger merger(this, &dataBucketBoundaries);
 
     // Gather data bucket boundaries from pivot servers to all nodes.
     timeTrace("about to all-gather data bucket boundaries");
@@ -780,6 +780,9 @@ MilliSortService::allGatherDataBucketBoundaries()
     }
     timeTrace("gathered %u data bucket boundaries",
             dataBucketBoundaries.size());
+
+    // Sort the gathered data bucket boundaries.
+    std::sort(dataBucketBoundaries.begin(), dataBucketBoundaries.end());
 
     // Compute data bucket ranges required by the shufflePull handler.
     int keyIdx = 0;
@@ -1180,7 +1183,6 @@ MilliSortService::benchmarkCollectiveOp(
                 bcast.send<BenchmarkCollectiveOpRpc>(i, reqHdr->opcode,
                         reqHdr->dataSize, serverId.getId(), startTime);
                 Buffer* result = bcast.wait();
-                timeTrace("Broadcast of AllGather operations completed");
 
                 // The completion time for the all-gather operation is the
                 // largest completion time on all nodes.
@@ -1203,15 +1205,11 @@ MilliSortService::benchmarkCollectiveOp(
               public:
                 explicit DataMerger() : localBuf() {}
 
-                void add(Buffer* dataBuf) { localBuf.appendCopy(dataBuf); }
+                void append(Buffer* dataBuf) { localBuf.appendCopy(dataBuf); }
+
+                void clear() { localBuf.reset(); }
 
                 Buffer* getResult() { return &localBuf; }
-
-                void replace(Buffer* dataBuf)
-                {
-                    localBuf.reset();
-                    localBuf.appendCopy(dataBuf);
-                }
 
                 Buffer localBuf;
             };
@@ -1225,7 +1223,7 @@ MilliSortService::benchmarkCollectiveOp(
                         Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
             }
             while (Cycles::rdtsc() < startTime) {}
-            timeTrace("AllGather benchmark started, run %d", reqHdr->count);
+            timeTrace("AllGather operation started, run %d", reqHdr->count);
 
             const int DUMMY_OP_ID = 999;
             Tub<AllGather> allGatherOp;
@@ -1233,6 +1231,7 @@ MilliSortService::benchmarkCollectiveOp(
                     world.get(), reqHdr->dataSize, data.get(), &merger);
             allGatherOp->wait();
             uint64_t endTime = Cycles::rdtsc();
+            timeTrace("AllGather operation completed");
             // TODO: the cleanup is not very nice; how to do RAII?
             removeCollectiveOp(DUMMY_OP_ID);
 
@@ -1246,6 +1245,8 @@ MilliSortService::benchmarkCollectiveOp(
             if (merger.localBuf.size() !=
                     uint32_t(world->size()) * reqHdr->dataSize) {
                 LOG(ERROR, "Unexpected final data size %u",
+                        merger.localBuf.size());
+                timeTrace("Unexpected final data size %d",
                         merger.localBuf.size());
             }
         }

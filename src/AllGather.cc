@@ -39,7 +39,7 @@ namespace {
 AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
         uint32_t length, void* data, Merger* merger)
     : context(context)
-    , completed(false)
+    , complete(false)
     , currentPhase()
     , lastPhase()
     , expanderNode(false)
@@ -54,7 +54,7 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
     int n = group->size();
     if (n == 1) {
         // Special case: only one node in the group; nothing to do.
-        completed = true;
+        complete = true;
         return;
     }
 
@@ -98,13 +98,36 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
 
     Buffer dataBuf;
     dataBuf.appendExternal(data, length);
-    std::vector<ServerId> targets;
+    std::vector<int> targets;
     getPeersToSend(currentPhase, &targets);
-    for (ServerId target : targets) {
-        timeTrace("about to send to server %u, phase %u", target.indexNumber(),
+    for (int target : targets) {
+        timeTrace("AllGather: sending to server %u, phase %u", target,
                 currentPhase.load());
-        outstandingRpcs.emplace_back(context, target, opId, currentPhase,
-                group->rank, &dataBuf);
+        outstandingRpcs.emplace_back(context, group->getNode(target), opId,
+                currentPhase, group->rank, &dataBuf);
+    }
+}
+
+/**
+ * Check if any outgoing RPC has finished.
+ *
+ * \param waitOnBlock
+ *      True means we should yield when an outgoing RPC is not ready and wait
+ *      for its completion. False means we should return from this method.
+ */
+void
+AllGather::checkOutgoingRpcs(bool waitOnBlock)
+{
+    while (!outstandingRpcs.empty()) {
+        if (!outstandingRpcs.front().isReady()) {
+            if (waitOnBlock) {
+                Arachne::yield();
+            } else {
+                return;
+            }
+        } else {
+            outstandingRpcs.pop_front();
+        }
     }
 }
 
@@ -114,25 +137,24 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
  * \param phase
  *      Phase in which the peer nodes belong to.
  * \param[out] targets
- *      ServerId's of the peer nodes will be pushed into this vector upon
- *      return.
+ *      Ranks of the peer nodes will be pushed into this vector upon return.
  */
 void
-AllGather::getPeersToSend(int phase, std::vector<ServerId>* targets)
+AllGather::getPeersToSend(int phase, std::vector<int>* targets)
 {
     if (phase == 0) {
-        // Initial contration step: only the larger half of the nodes in the
+        // Initial consolidation step: only the larger half of the nodes in the
         // group might need to participate.
         assert(nearestPowerOfTwo < group->size());
         if (ghostNode) {
-            targets->push_back(group->getNode(group->rank - nearestPowerOfTwo));
+            targets->push_back(group->rank - nearestPowerOfTwo);
         }
     } else if (phase > numRecursiveDoublingSteps) {
         // Final expansion step: only the smaller half of the node in the
         // group might need to participate.
         assert(nearestPowerOfTwo < group->size());
         if (expanderNode) {
-            targets->push_back(group->getNode(group->rank + nearestPowerOfTwo));
+            targets->push_back(group->rank + nearestPowerOfTwo);
         }
     } else {
         assert((1 <= phase) && (phase <= numRecursiveDoublingSteps));
@@ -140,7 +162,7 @@ AllGather::getPeersToSend(int phase, std::vector<ServerId>* targets)
             int p = phase - 1;
             int rank = group->rank >> p;
             int d = (rank % 2) ? -1 : 1;
-            targets->push_back(group->getNode(group->rank + d * (1 << p)));
+            targets->push_back(group->rank + d * (1 << p));
         }
     }
 }
@@ -149,88 +171,72 @@ void
 AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
         WireFormat::AllGather::Response* respHdr, Service::Rpc* rpc)
 {
-    timeTrace("received from server %u, local phase %u, remote phase %u",
-            group->getNode(reqHdr->senderId).indexNumber(), currentPhase.load(),
-            reqHdr->phase);
-    int msgPhase = reqHdr->phase;
-    int msgSender = reqHdr->senderId;
-    if (msgPhase < currentPhase) {
-        respHdr->common.status = STATUS_MILLISORT_REDUNDANT_DATA;
-        return;
-    }
+    // Chop off the AllGather header and incorporate the data.
+    rpc->requestPayload->truncateFront(sizeof(*reqHdr));
 
-    // Copy out the data so that we can send back the reply. Otherwise, peers on
-    // both sides will deadlock at `outgoingRpc->wait()`.
-    // FIXME: avoid deadlock without extra copy? seems to require the ability to
-    // take ownership of the incoming RPC request payload.
-    Buffer buffer;
-    buffer.appendCopy(rpc->requestPayload);
-    rpc->sendReply();
+    int msgPhase = reqHdr->phase;
+    timeTrace("AllGather: received from server %u, size %u, local phase %u, "
+            "remote phase %u", reqHdr->senderId, rpc->requestPayload->size(),
+            currentPhase.load(), msgPhase);
 
     // If this is a ghost node, advance to the last expansion phase directly
     // because it doesn't participate in the intermediate exchange steps.
     // Otherwise, we must wait for the local node to catch up before merging
     // data from the incoming RPC.
     if (ghostNode) {
+        merger->clear();
         currentPhase = lastPhase;
     }
     while (currentPhase < msgPhase) {
         Arachne::yield();
     }
 
-    // Must wait till the outgoing RPC to finish before incorporating the
-    // incoming data. Otherwise, we risk corrupting the content of the outgoing
-    // request.
-    while (!outstandingRpcs.empty()) {
-        outstandingRpcs.front().wait();
-        outstandingRpcs.pop_front();
-    }
-
-    // Chop off the AllGather header and incorporate the data.
-    buffer.truncateFront(sizeof(*reqHdr));
-    if (merger) {
-        timeTrace("AllGather: about to merge payload from server %u (rank %u)",
-                group->getNode(msgSender).indexNumber(), (uint32_t) msgSender);
-        if (ghostNode) {
-            merger->replace(&buffer);
-        } else {
-            merger->add(&buffer);
-        }
-    }
+    // Incorporate the data.
+    timeTrace("AllGather: about to merge payload from sender %u",
+            reqHdr->senderId);
+    merger->append(rpc->requestPayload);
 
     // Start the next phase unless we have reached the final one.
     int nextPhase = msgPhase + 1;
     if (nextPhase <= lastPhase) {
-        std::vector<ServerId> targets;
+        std::vector<int> targets;
         getPeersToSend(nextPhase, &targets);
-        for (ServerId target : targets) {
-            timeTrace("about to send to server %u, phase %u",
-                    target.indexNumber(), currentPhase.load());
-            outstandingRpcs.emplace_back(context, target, opId, nextPhase,
-                    group->rank, merger->getResult());
+        for (int target : targets) {
+            // Start sending RPCs of the next phase.
+            timeTrace("AllGather: sending to server %u, phase %u, size %u",
+                    target, nextPhase, merger->getResult()->size());
+            outstandingRpcs.emplace_back(context, group->getNode(target), opId,
+                    nextPhase, group->rank, merger->getResult());
         }
-        currentPhase.store(nextPhase);
+
+        // Check if some older RPCs have finished and then advance the phase.
+        // Note: the order is important to prevent data race on #outstandingRpcs.
+        checkOutgoingRpcs();
+        currentPhase.store(nextPhase, std::memory_order_release);
+        timeTrace("AllGather: increment phase to %d", nextPhase);
+
+        // Special handling for expander nodes: there will be no incoming
+        // request so we must mark our completion before we return.
+        if (expanderNode && (nextPhase == lastPhase)) {
+            rpc->sendReply();
+            checkOutgoingRpcs(true);
+            complete.store(1, std::memory_order_release);
+            timeTrace("AllGather: operation completed");
+        }
     } else {
-        completed = true;
+        // Send back the reply before waiting for outgoing RPCs; this is 
+        // necessary to avoid distributed deadlock.
+        rpc->sendReply();
+        checkOutgoingRpcs(true);
+        complete.store(1, std::memory_order_release);
+        timeTrace("AllGather: operation completed");
     }
 }
 
 bool
 AllGather::isReady()
 {
-    if (expanderNode && (currentPhase == lastPhase)) {
-        while (!outstandingRpcs.empty()) {
-            if (outstandingRpcs.front().isReady()) {
-                outstandingRpcs.pop_front();
-            } else {
-                break;
-            }
-        }
-        if (outstandingRpcs.empty()) {
-            completed = true;
-        }
-    }
-    return completed;
+    return complete.load(std::memory_order_acquire);
 }
 
 void
@@ -240,5 +246,4 @@ AllGather::wait()
         Arachne::yield();
     }
 }
-
 }
