@@ -50,7 +50,7 @@ class AllGather {
     void handleRpc(const WireFormat::AllGather::Request* reqHdr,
             WireFormat::AllGather::Response* respHdr, Service::Rpc* rpc);
     bool isReady();
-    void wait();
+    uint64_t wait();
 
   PRIVATE:
     class AllGatherRpc : public ServerIdRpcWrapper {
@@ -97,6 +97,10 @@ class AllGather {
 
     /// True means the all-gather operation is completed on the local node.
     std::atomic<bool> complete;
+
+    /// Time, in rdtsc cycles, when the merger finished appending the last piece
+    /// of data.
+    uint64_t completeTime;
 
     /// Current stage of the algorithm. Possible values are:
     ///   0: initial contraction step; only present if the group size is not a

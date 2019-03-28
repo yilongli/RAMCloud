@@ -1229,16 +1229,15 @@ MilliSortService::benchmarkCollectiveOp(
             Tub<AllGather> allGatherOp;
             invokeCollectiveOp<AllGather>(allGatherOp, DUMMY_OP_ID, context,
                     world.get(), reqHdr->dataSize, data.get(), &merger);
-            allGatherOp->wait();
-            uint64_t endTime = Cycles::rdtsc();
-            timeTrace("AllGather operation completed");
+            // For the micro-benchmark, we are going to "cheat" by using the
+            // internal merge complete time, as opposed to the time when all
+            // outgoing RPCs are done.
+//            uint64_t endTime = Cycles::rdtsc();
+            uint64_t endTime = allGatherOp->wait();
+            uint64_t allGatherNs = Cycles::toNanoseconds(endTime - startTime);
+            timeTrace("AllGather operation completed in %u ns", allGatherNs);
             // TODO: the cleanup is not very nice; how to do RAII?
             removeCollectiveOp(DUMMY_OP_ID);
-
-            uint64_t allGatherNs = 0;
-            if (world->rank == 0) {
-                allGatherNs = Cycles::toNanoseconds(endTime - startTime);
-            }
             rpc->replyPayload->emplaceAppend<uint64_t>(allGatherNs);
 
             // Verify if we have the right amount of data in the end.

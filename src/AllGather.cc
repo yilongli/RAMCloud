@@ -40,6 +40,7 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
         uint32_t length, void* data, Merger* merger)
     : context(context)
     , complete(false)
+    , completeTime(0)
     , currentPhase()
     , lastPhase()
     , expanderNode(false)
@@ -195,6 +196,12 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     timeTrace("AllGather: about to merge payload from sender %u",
             reqHdr->senderId);
     merger->append(rpc->requestPayload);
+    uint64_t mergeCompleteTime = Cycles::rdtsc();
+    timeTrace("AllGather: merge completed");
+
+    // We are done with the request buffer; send back the reply since the other
+    // end needs to wait on it eventually.
+    rpc->sendReply();
 
     // Start the next phase unless we have reached the final one.
     int nextPhase = msgPhase + 1;
@@ -218,16 +225,15 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
         // Special handling for expander nodes: there will be no incoming
         // request so we must mark our completion before we return.
         if (expanderNode && (nextPhase == lastPhase)) {
-            rpc->sendReply();
+            timeTrace("AllGather: expander node final stage");
             checkOutgoingRpcs(true);
+            completeTime = mergeCompleteTime;
             complete.store(1, std::memory_order_release);
             timeTrace("AllGather: operation completed");
         }
     } else {
-        // Send back the reply before waiting for outgoing RPCs; this is 
-        // necessary to avoid distributed deadlock.
-        rpc->sendReply();
         checkOutgoingRpcs(true);
+        completeTime = mergeCompleteTime;
         complete.store(1, std::memory_order_release);
         timeTrace("AllGather: operation completed");
     }
@@ -239,11 +245,12 @@ AllGather::isReady()
     return complete.load(std::memory_order_acquire);
 }
 
-void
+uint64_t
 AllGather::wait()
 {
     while (!isReady()) {
         Arachne::yield();
     }
+    return completeTime;
 }
 }
