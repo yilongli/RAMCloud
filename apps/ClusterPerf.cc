@@ -7503,8 +7503,8 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode)
 
     // Sweep machineCount from 1 to numMasters.
     uint32_t clockSyncSeconds = 2;
-//    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
+    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
+//    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
         LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
                 clockSyncSeconds);
@@ -7696,7 +7696,7 @@ allShuffle()
         double p90 = double(completionNs[int(count * 0.9)]) * 1e-3;
         double p99 = double(completionNs[int(count * 0.99)]) * 1e-3;
         double throughputGbps = double(messageSize) * (machineCount - 1) * 8 /
-                (1024 * 1024 * 1024) / (avg * 1e-6);
+                (p50 * 1e3);
         printf(" %12d%12d%8d%12.2f%12.2f%12.2f%12.2f%12.2f%20.2f\n",
                 machineCount, messageSize, count, min, avg, p50, p90, p99,
                 throughputGbps);
@@ -7907,10 +7907,10 @@ try
         // the problem is that we might run clock sync. many times during the
         // the experiment and we can't the use the sync. result in the latest
         // epoch to print time traces from previous epochs.
-//        uint64_t masterId = ServerId(1, 0).getId();
-//        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
-//                sizeof(masterId));
-        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
+        uint64_t masterId = ServerId(1, 0).getId();
+        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
+                sizeof(masterId));
+//        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();

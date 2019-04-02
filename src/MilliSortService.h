@@ -140,50 +140,10 @@ class MilliSortService : public Service {
 //        removeCollectiveOp(opId);
     }
 
-    /**
-     * Pull-based implementation of the all-to-all shuffle operation.
-     *
-     * \param pullRpcs
-     * \param dataId
-     * \param merger
-     * \param pullSize
-     *      # bytes to pull. Only used in benchmarking.
-     */
     template <typename Merger>
-    void
-    invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs, CommunicationGroup* group,
-            int maxRpcs, uint32_t dataId, Merger& merger, uint32_t pullSize = 0)
-    {
-        int totalRpcs = group->size() - 1;
-        int outstandingRpcs = 0;
-        int completedRpcs = 0;
-        int sentRpcs = 0;
-        int firstNotReady = 0;
-        std::vector<bool> completed(totalRpcs);
-        while (completedRpcs < totalRpcs) {
-            if ((sentRpcs < totalRpcs) && (outstandingRpcs < maxRpcs)) {
-                ServerId target = group->getNode(group->rank + 1 + sentRpcs);
-                pullRpcs[sentRpcs].construct(context, target, group->rank,
-                        dataId, pullSize);
-                sentRpcs++;
-                outstandingRpcs++;
-            }
-
-            for (int i = firstNotReady; i < sentRpcs; i++) {
-                ShufflePullRpc* rpc = pullRpcs[i].get();
-                if (!completed[i] && rpc->isReady()) {
-                    merger((group->rank + i + 1) % group->size(), rpc->wait());
-                    if (i == firstNotReady) {
-                        firstNotReady++;
-                    }
-                    completedRpcs++;
-                    completed[i] = true;
-                    outstandingRpcs--;
-                }
-            }
-            Arachne::yield();
-        }
-    }
+    void invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
+            CommunicationGroup* group, int maxRpcs, uint32_t dataId,
+            Merger &merger, uint32_t pullSize = 0);
 
     /**
      * Helper function for use in handling RPCs used by collective operations.

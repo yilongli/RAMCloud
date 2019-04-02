@@ -58,6 +58,15 @@ namespace {
     }
 }
 
+// Change 0 -> 1 to trace transmit buffers containing more than 500B data.
+// When combined with busy transmit CQ polling, it can be used to understand
+// when a packet is on the wire.
+#define TRACE_TRANSMIT_BUF 0
+
+// Used to trace packet receipt. The resulting messages can be used to plot
+// network util. graph.
+#define TRACE_RECEIVE_PACKET 1
+
 // Change 0 -> 1 in the following line to compile the code for collecting
 // detailed PerfStats metrics in this driver.
 #define COLLECT_LOW_LEVEL_PERFSTATS 0
@@ -121,7 +130,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     // throttle the throughput and leave the HCA idle.
     // TODO: is it true we have to set it to 26Gbps? Is the explanation above correct?
     // maybe it's because the grant starvation problem I just solved in basic instead?
-    , bandwidthGbps(24)                   // Default outgoing bandwidth in gbs
+    , bandwidthGbps(22)                   // Default outgoing bandwidth in gbs
 //    , bandwidthGbps(26)                   // Default outgoing bandwidth in gbs
     , zeroCopyStart(NULL)
     , zeroCopyEnd(NULL)
@@ -160,10 +169,13 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
             * MAX_DRAIN_TIME / 8.0);
     uint32_t maxPacketSize = getMaxPacketSize();
-    if (maxTransmitQueueSize < 2*maxPacketSize) {
+    // Note: we were using 2 full packets for 10Gb Ethernet; adjust it to 3 full
+    // packets for our 25Gbps infiniband network.
+#define MAX_QUEUED_PACKETS 3
+    if (maxTransmitQueueSize < MAX_QUEUED_PACKETS*maxPacketSize) {
         // Make sure that we advertise enough space in the transmit queue to
         // prepare the next packet while the current one is transmitting.
-        maxTransmitQueueSize = 2*maxPacketSize;
+        maxTransmitQueueSize = MAX_QUEUED_PACKETS*maxPacketSize;
     }
     LOG(NOTICE, "InfUdDriver bandwidth: %d Gbits/sec, maxTransmitQueueSize: "
             "%u bytes, maxPacketSize %u bytes", bandwidthGbps,
@@ -314,7 +326,7 @@ InfUdDriver::reapTransmitBuffers()
 {
 #define MAX_TO_RETRIEVE 4
     ibv_wc retArray[MAX_TO_RETRIEVE];
-    int cqes = infiniband->pollCompletionQueue(txcq, MAX_TO_RETRIEVE, retArray);
+    int cqes = ibv_poll_cq(txcq, MAX_TO_RETRIEVE, retArray);
     if (cqes) {
         timeTrace("polling TX completion queue returned %d CQEs", cqes);
     }
@@ -326,6 +338,12 @@ InfUdDriver::reapTransmitBuffers()
             BufferDescriptor* bd = txBuffersInHca.front();
             txBuffersInHca.pop_front();
             txPool->freeBuffers.push_back(bd);
+#if TRACE_TRANSMIT_BUF
+            if (bd->packetLength > 500) {
+                TimeTrace::record("infud: transmit buffer %u freed",
+                        uint32_t(uint64_t(bd)));
+            }
+#endif
             if (bd == signaledCompletion) {
                 found = true;
                 timeTrace("reaped %d TX buffers", SIGNALED_SEND_PERIOD);
@@ -491,6 +509,13 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
         return;
     } else {
         txBuffersInHca.push_back(bd);
+#if TRACE_TRANSMIT_BUF
+        if (bd->packetLength > 500) {
+            TimeTrace::record("infud: transmit buffer %u of size %u enqueued",
+                    bd->packet_len, uint32_t(uint64_t(bd)));
+            reapTransmitBuffers();
+        }
+#endif
     }
     timeTrace("sent packet with %u bytes, %u free buffers", totalLength,
             txPool->freeBuffers.size());
@@ -549,6 +574,12 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
                 reinterpret_cast<BufferDescriptor*>(incoming->wr_id);
         prefetch(bd->buffer,
                 incoming->byte_len > 256 ? 256 : incoming->byte_len);
+#if TRACE_RECEIVE_PACKET
+        if (incoming->byte_len > 500) {
+            TimeTrace::record(lastReceiveTime, "infud received packet, size %u,"
+                    " batch size %u", incoming->byte_len, uint32_t(numPackets));
+        }
+#endif
     }
     refillReceiver();
     timeTrace("receive queue refilled");
@@ -635,6 +666,12 @@ InfUdDriver::getBandwidth()
     return bandwidthGbps*1000;
 }
 
+// See docs in Driver class.
+void
+InfUdDriver::checkTxCompletionQueue()
+{
+    reapTransmitBuffers();
+}
 
 /**
  * Fill up the HCA's queue of pending receive buffers.

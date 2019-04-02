@@ -112,6 +112,32 @@ class DispatchExec : public Dispatch::Poller {
         __always_inline
         int poll()
         {
+#if 1
+            // TODO: is this approach really better than the original?
+            // We can take at most 8 cache misses concurrently.
+#define MAX_ITEMS 8
+            DispatchExec::LambdaBox* dequeued[MAX_ITEMS];
+            int numRemoved = 0;
+            while (numRemoved < MAX_ITEMS) {
+                DispatchExec::LambdaBox* request = &requests[removeIndex];
+                if (!request->data.full.load(std::memory_order_acquire)) {
+                    break;
+                }
+                dequeued[numRemoved] = request;
+                numRemoved++;
+                removeIndex++;
+                if (removeIndex == NUM_WORKER_REQUESTS) removeIndex = 0;
+                totalRemoves++;
+            }
+            for (int i = 0; i < numRemoved; i++) {
+                dequeued[i]->getLambda()->invoke();
+            }
+            for (int i = 0; i < numRemoved; i++) {
+                // TODO: should I merge this back to loop above?
+                dequeued[i]->data.full.store(0, std::memory_order_release);
+            }
+            return numRemoved;
+#else
             int foundWork = 0;
             while (true) {
                 DispatchExec::LambdaBox* request = &requests[removeIndex];
@@ -126,6 +152,7 @@ class DispatchExec : public Dispatch::Poller {
                 foundWork = 1;
             }
             return foundWork;
+#endif
         }
 
         void sync(uint64_t id);

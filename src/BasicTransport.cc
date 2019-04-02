@@ -16,6 +16,7 @@
 
 #include "BasicTransport.h"
 #include "CycleCounter.h"
+#include "CycleCounter.h"
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
@@ -25,6 +26,7 @@ namespace RAMCloud {
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
 #define TIME_TRACE 0
+#define TIME_TRACE_SHUFFLE 1
 
 #define PERF_STATS 0
 
@@ -48,6 +50,11 @@ namespace RAMCloud {
 #define INC_COUNTER(metric)
 #define ADD_COUNTER(metric, delta)
 #endif
+
+/// # SHUFFLE_PULL RPC responses being transmitted in the transport.
+volatile int numOutShuffleReplies = 0;
+
+volatile int numShuffleRepliesRecv = 0;
 
 /**
  * Construct a new BasicTransport.
@@ -184,6 +191,15 @@ void
 BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
     uint64_t sequence = clientRpc->rpcId.sequence;
+
+    if (clientRpc->isShuffleRpc) {
+        uint64_t elapsedNs = Cycles::toNanoseconds(Cycles::rdtsc() -
+                clientRpc->shuffleReplyRxStart);
+        uint64_t throughput = clientRpc->response->size() * 8000 / elapsedNs;
+        timetrace_shuffle("shuffle-client: clientId %u, seq %u, RX throughput "
+                "%u Mbps", clientId, sequence, throughput);
+    }
+
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
@@ -209,6 +225,9 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
 void
 BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
+    if (serverRpc->response.isShuffleReply) {
+        numOutShuffleReplies--;
+    }
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
@@ -249,7 +268,8 @@ BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
     // plus 2 us of grant packet one-way delay). Note: it's hacky to hardwire
     // this number in the code; a proper implementation would need to measure
     // and set the RTT dynamically.
-    uint32_t roundTripMicros = 13;
+//    uint32_t roundTripMicros = 8;
+    uint32_t roundTripMicros = 12;
 
     if (locator != NULL) {
         if (locator->hasOption("gbs")) {
@@ -550,6 +570,14 @@ BasicTransport::timeTrace(const char* format, Args... args) {
 #endif
 }
 
+template<typename... Args>
+void
+BasicTransport::timetrace_shuffle(const char* format, Args... args) {
+#if TIME_TRACE_SHUFFLE
+    TimeTrace::record(format, uint32_t(args)...);
+#endif
+}
+
 /**
  * This method queues one or more data packets for transmission, if (a) the
  * NIC queue isn't too long and (b) there is data that needs to be transmitted.
@@ -560,6 +588,9 @@ uint32_t
 BasicTransport::tryToTransmitData()
 {
     uint32_t totalBytesSent = 0;
+    if (outgoingRequests.empty() && outgoingResponses.empty()) {
+        return 0;
+    }
 
     // Check to see if we can transmit any data packets. The overall goal
     // here is not to enqueue too many data packets at the NIC at once; this
@@ -629,6 +660,7 @@ BasicTransport::tryToTransmitData()
                         overallMinBytesLeft = bytesLeft;
                         nextTopMessage = request;
                     }
+
                     if (request->transmitLimit <= request->transmitOffset) {
                         // Can't transmit this message: waiting for grants.
                         continue;
@@ -696,6 +728,14 @@ BasicTransport::tryToTransmitData()
 
             message->transmitOffset += bytesSent;
             message->lastTransmitTime = driver->getLastTransmitTime();
+
+            if (serverRpc) {
+                timetrace_shuffle("shuffle-server: dispatch iter. %u, "
+                        "transmitted %u bytes of reply, clientId %u, seq %u",
+                        context->dispatch->iteration, message->transmitOffset,
+                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
+            }
+
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             timeTrace("left %u more packets granted",
@@ -716,6 +756,15 @@ BasicTransport::tryToTransmitData()
                     // retransmit it (the whole RPC will be retried). However,
                     // this approach is simpler and faster in the common case
                     // where data isn't lost.
+                    if (message->isShuffleReply) {
+                        uint64_t elapsedNs = Cycles::toNanoseconds(
+                                Cycles::rdtsc() - message->shuffleReplyTxStart);
+                        timetrace_shuffle("shuffle-server: transmitted reply, "
+                                "clientId %u, seq %u, TX throughput %u Mbps",
+                                serverRpc->rpcId.clientId,
+                                serverRpc->rpcId.sequence,
+                                message->buffer->size() * 8000 / elapsedNs);
+                    }
                     deleteServerRpc(serverRpc);
                 }
             } else if (!message->topChoice) {
@@ -928,6 +977,12 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
         bytesSent = length;
+
+        if (request->getStart<WireFormat::RequestCommon>()->opcode ==
+                WireFormat::SHUFFLE_PULL) {
+            clientRpc->isShuffleRpc = true;
+            t->timetrace_shuffle("shuffle-client: transport sent request");
+        }
     } else {
         t->outgoingRequests.push_back(*clientRpc);
         t->maintainTopOutgoingMessages(&clientRpc->request);
@@ -1052,6 +1107,35 @@ BasicTransport::handlePacket(Driver::Received* received)
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len);
+                if (clientRpc->isShuffleRpc) {
+                    if (clientRpc->shuffleReplyRxStart == 0) {
+                        clientRpc->shuffleReplyRxStart = Cycles::rdtsc();
+                        timetrace_shuffle(
+                                "shuffle-client: received 1st packet of reply, "
+                                "clientId %u, seq %u",
+                                clientRpc->rpcId.clientId,
+                                clientRpc->rpcId.sequence);
+                    } else {
+                        timetrace_shuffle("shuffle-client: dispatch iter. %u, "
+                                "received %u bytes of reply, clientId %u, seq %u",
+                                context->dispatch->iteration,
+                                clientRpc->response->size(),
+                                clientRpc->rpcId.clientId,
+                                clientRpc->rpcId.sequence);
+                    }
+                    // Shuffle client should send out the next pull once the
+                    // current pull is almost done: i.e., less than ~RTTbytes
+                    // left in the response. Another way to say this is that,
+                    // if we send out the request of next pull now, we hope to
+                    // receive the 1st packet of the reply immediately after we
+                    // receive the last packet of the current pull reply.
+                    if (!clientRpc->shuffleReplyAlmostRx &&
+                            (clientRpc->response->size() + roundTripBytes +
+                            4*maxDataPerPacket > header->totalLength)) {
+                        clientRpc->shuffleReplyAlmostRx = true;
+                        numShuffleRepliesRecv++;
+                    }
+                }
                 if (clientRpc->response->size() >= header->totalLength) {
                     // Response complete.
                     if (clientRpc->response->size() > header->totalLength) {
@@ -1271,6 +1355,12 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
                 serverRpc->receiveTime = driver->getLastReceiveTime();
+
+                if (serverRpc->requestPayload.getStart<
+                        WireFormat::RequestCommon>()->opcode == WireFormat::SHUFFLE_PULL) {
+                       timetrace_shuffle("shuffle-server: transport received request");
+                }
+
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
@@ -1342,14 +1432,16 @@ BasicTransport::handlePacket(Driver::Received* received)
                     // See if we need to output a GRANT.
                     ScheduledMessage* schedMessage =
                             serverRpc->scheduledMessage.get();
+                    uint32_t outstandingBytes = roundTripBytes +
+                            3 * maxDataPerPacket;
                     if ((header->totalLength > header->unscheduledBytes) &&
                             (schedMessage->grantOffset <
-                            (serverRpc->requestPayload.size()
-                            + roundTripBytes)) &&
+                            (serverRpc->requestPayload.size() +
+                            outstandingBytes)) &&
                             (schedMessage->grantOffset < header->totalLength)) {
                         schedMessage->grantOffset =
                                 serverRpc->requestPayload.size()
-                                + roundTripBytes + grantIncrement;
+                                + outstandingBytes + grantIncrement;
                         if (std::find(messagesToGrant.begin(),
                                 messagesToGrant.end(), schedMessage) ==
                                 messagesToGrant.end()) {
@@ -1395,6 +1487,13 @@ BasicTransport::handlePacket(Driver::Received* received)
                     response->transmitLimit =
                             std::min(header->offset, response->buffer->size());
                     transmitDataSlowPath |= !response->topChoice;
+                    if (response->isShuffleReply) {
+                        timetrace_shuffle("shuffle-server: received grant up to "
+                                "%u bytes, clientId %u, seq %u",
+                                response->transmitLimit,
+                                serverRpc->rpcId.clientId,
+                                serverRpc->rpcId.sequence);
+                    }
                 }
                 return;
             }
@@ -1541,6 +1640,18 @@ BasicTransport::ServerRpc::sendReply()
 {
     SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = replyPayload.size();
+
+    if (requestPayload.getStart<WireFormat::RequestCommon>()->opcode ==
+            WireFormat::SHUFFLE_PULL) {
+        numOutShuffleReplies++;
+        response.isShuffleReply = true;
+        response.shuffleReplyTxStart = Cycles::rdtsc();
+        // XXX: Hack to make shuffle reply msg entirely unscheduled!
+        response.unscheduledBytes = length;
+        t->timetrace_shuffle("shuffle-server: start sending pull response, "
+                "clientId %u, seq %u", rpcId.clientId, rpcId.sequence);
+    }
+
     t->timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
             length, t->outgoingResponses.size());
@@ -1556,7 +1667,7 @@ BasicTransport::ServerRpc::sendReply()
     }
 
     uint32_t bytesSent;
-    response.transmitLimit = std::min(t->roundTripBytes, length);
+    response.transmitLimit = std::min(response.unscheduledBytes, length);
     if (length < t->smallMessageThreshold) {
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
@@ -1793,6 +1904,7 @@ BasicTransport::Poller::poll()
 {
     SCOPED_TIMER(basicTransportActiveCycles);
     int result = 0;
+    uint32_t totalBytesSent = 0;
 
 #if TIME_TRACE
     uint64_t startTime = Cycles::rdtsc();
@@ -1822,10 +1934,12 @@ BasicTransport::Poller::poll()
         TimeTrace::record(startTime, "start of polling iteration %u",
                 uint32_t(owner->iteration));
 #endif
-
         START_TIMER(basicTransportHandlePacketCycles);
         for (uint i = 0; i < numPackets; i++) {
             t->handlePacket(&t->receivedPackets[i]);
+            if (i % 4 == 0) {
+                totalBytesSent += t->tryToTransmitData();
+            }
         }
         STOP_TIMER(basicTransportHandlePacketCycles);
         t->receivedPackets.clear();
@@ -1848,6 +1962,8 @@ BasicTransport::Poller::poll()
             t->sendControlPacket(recipient->senderAddress, &grant);
         }
         t->messagesToGrant.clear();
+    } else {
+        totalBytesSent += t->tryToTransmitData();
     }
 
     // See if we should check for timeouts. Ideally, we'd like to do this
@@ -1881,13 +1997,6 @@ BasicTransport::Poller::poll()
         }
     }
 
-    // Transmit data packets if possible.
-    uint32_t totalBytesSent = 0;
-    if (!t->outgoingRequests.empty() || !t->outgoingResponses.empty()) {
-        totalBytesSent = t->tryToTransmitData();
-    }
-    result += totalBytesSent;
-
     // Provide a hint to the driver on how many packet buffers to release.
     // We try to release only a few packet buffers from large messages at
     // a time to avoid jitters. As of 02/2017, releasing one packet buffer
@@ -1908,6 +2017,13 @@ BasicTransport::Poller::poll()
     }
     t->driver->releaseHint(maxRelease);
 
+    // Change 0 -> 1 to enable busy transmit CQ polling (i.e., aggressive
+    // transmit buffer recycling).
+#if 0
+    t->driver->checkTxCompletionQueue();
+#endif
+
+    result += totalBytesSent;
     if (result) {
         t->timeTrace("end of polling iteration %u, received %u packets, "
                 "transmitted %u bytes", owner->iteration, numPackets,

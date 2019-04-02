@@ -62,6 +62,8 @@ class BasicTransport : public Transport {
     }
     template<typename... Args>
     inline void timeTrace(const char* format, Args... args);
+    template<typename... Args>
+    inline void timetrace_shuffle(const char* format, Args... args);
 
   PRIVATE:
     /// As of 08/17, std::unordered_map is significantly slower than
@@ -290,6 +292,12 @@ class BasicTransport : public Transport {
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
+        // Hack
+        bool isShuffleReply;
+
+        // Hack to compute msg tx bandwidth.
+        uint64_t shuffleReplyTxStart;
+
         OutgoingMessage(ClientRpc* clientRpc, ServerRpc* serverRpc,
                 BasicTransport* t, Buffer* buffer,
                 const Driver::Address* recipient)
@@ -303,6 +311,8 @@ class BasicTransport : public Transport {
             , lastTransmitTime(0)
             , outgoingMessageLinks()
             , unscheduledBytes(t->roundTripBytes)
+            , isShuffleReply(false)
+            , shuffleReplyTxStart(0)
         {}
 
         virtual ~OutgoingMessage() {}
@@ -351,6 +361,13 @@ class BasicTransport : public Transport {
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
+        // Hack to treat SHUFFLE_PULL RPC specially.
+        bool isShuffleRpc;
+
+        bool shuffleReplyAlmostRx;
+
+        uint64_t shuffleReplyRxStart;
+
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
             : session(session)
@@ -363,6 +380,9 @@ class BasicTransport : public Transport {
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
+            , isShuffleRpc(false)
+            , shuffleReplyAlmostRx(false)
+            , shuffleReplyRxStart(0)
         {}
 
       PRIVATE:

@@ -923,9 +923,12 @@ Logger::installCrashBacktraceHandlers()
     signalAction.sa_sigaction = criticalErrorHandler;
     signalAction.sa_flags = SA_RESTART | SA_SIGINFO;
 
-    if (sigaction(SIGSEGV, &signalAction, NULL) != 0)
-        LOG(ERROR, "Couldn't set signal handler for SIGSEGV, oh well");
-
+    int programErrorSignals[] = {SIGILL, SIGFPE, SIGBUS, SIGSEGV};
+    for (int signum : programErrorSignals) {
+        if (sigaction(signum, &signalAction, NULL) != 0) {
+            LOG(ERROR, "Couldn't set signal handler for %s", strsignal(signum));
+        }
+    }
     std::set_terminate(terminateHandler);
 }
 

@@ -510,6 +510,11 @@ class Driver {
      */
     virtual string getServiceLocator() = 0;
 
+    virtual void checkTxCompletionQueue()
+    {
+        // Default: do nothing.
+    }
+
     /**
      * The maximum amount of time it should take to drain the transmit
      * queue for this driver when it is completely full (i.e.,

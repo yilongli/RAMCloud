@@ -59,6 +59,7 @@ class InfUdDriver : public Driver {
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
     virtual string getServiceLocator();
+    virtual void checkTxCompletionQueue();
 
     virtual Driver::Address* newAddress(const ServiceLocator* serviceLocator) {
         if (localMac) {
@@ -155,7 +156,7 @@ class InfUdDriver : public Driver {
     static const uint32_t MAX_RX_QUEUE_DEPTH = 1000;
 
     /// Maximum number of transmit buffers that may be outstanding at once.
-    static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
+    static const uint32_t MAX_TX_QUEUE_DEPTH = 8;
 
     /// Post a signaled send request, which generates a work completion entry
     /// when it completes, after posting SIGNALED_SEND_PERIOD-1 unsignaled send
@@ -165,7 +166,7 @@ class InfUdDriver : public Driver {
     /// of the last send request.
     /// As of 11/2018, refilling 64 transmit buffers takes only ~250ns on our
     /// rc machines.
-    static const int SIGNALED_SEND_PERIOD = 64;
+    static const int SIGNALED_SEND_PERIOD = 4;
 
     /*
      * Note that in UD mode, Infiniband receivers prepend a 40-byte

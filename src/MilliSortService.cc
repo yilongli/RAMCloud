@@ -23,7 +23,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -42,6 +42,12 @@ namespace {
 #endif
     }
 }
+
+/// Hack to get # outgoing shuffle replies present in BasicTransport.
+extern volatile int numOutShuffleReplies;
+
+/// Hack to get # incoming shuffle replies (almost) received in BasicTransport.
+extern volatile int numShuffleRepliesRecv;
 
 // TODO: justify this number; need to be large enough to saturate the bw
 // but not too large that slows down the transport
@@ -962,6 +968,64 @@ MilliSortService::allShuffle(const WireFormat::AllShuffle::Request* reqHdr,
     handleCollectiveOpRpc<AllShuffle>(reqHdr, respHdr, rpc);
 }
 
+/**
+ * Pull-based implementation of the all-to-all shuffle operation.
+ *
+ * \param pullRpcs
+ * \param dataId
+ * \param merger
+ * \param pullSize
+ *      # bytes to pull. Only used in benchmarking.
+ */
+template <typename Merger>
+void
+MilliSortService::invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
+        CommunicationGroup* group, int maxRpcs, uint32_t dataId, Merger &merger,
+        uint32_t pullSize)
+{
+    int totalRpcs = group->size() - 1;
+    int outstandingRpcs = 0;
+    int completedRpcs = 0;
+    int sentRpcs = 0;
+    numShuffleRepliesRecv = 0;
+    int firstNotReady = 0;
+    std::vector<bool> completed(totalRpcs);
+    while (completedRpcs < totalRpcs) {
+        // Note: there are two different mechanisms to control when to send the
+        // next RPC. For large message (e.g., > 100KB), we only send the next
+        // pull request when the current response is almost done; for small
+        // messages, we simply enforce a maximum number of outgoing pull RPCs.
+        // This is kind of a dirty hack, unfortunately.
+        bool timeToSendRpc = maxRpcs > 0 ? (outstandingRpcs < maxRpcs) :
+                (numShuffleRepliesRecv == sentRpcs);
+        if ((sentRpcs < totalRpcs) && timeToSendRpc) {
+            timeTrace("shuffle-client: issue pull request %u to rank %u",
+                    sentRpcs, (group->rank + sentRpcs + 1) % group->size());
+            ServerId target = group->getNode(group->rank + sentRpcs + 1);
+            pullRpcs[sentRpcs].construct(context, target, group->rank,
+                    dataId, pullSize);
+            sentRpcs++;
+            outstandingRpcs++;
+        }
+
+        for (int i = firstNotReady; i < sentRpcs; i++) {
+            ShufflePullRpc* rpc = pullRpcs[i].get();
+            if (!completed[i] && rpc->isReady()) {
+                timeTrace("shuffle-client: pull request %u to rank %u completed",
+                        i, (group->rank + i + 1) % group->size());
+                merger((group->rank + i + 1) % group->size(), rpc->wait());
+                if (i == firstNotReady) {
+                    firstNotReady++;
+                }
+                completedRpcs++;
+                completed[i] = true;
+                outstandingRpcs--;
+            }
+        }
+        Arachne::yield();
+    }
+}
+
 void
 MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             WireFormat::ShufflePull::Response* respHdr, Rpc* rpc)
@@ -994,11 +1058,53 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             break;
         }
         case ALLSHUFFLE_BENCHMARK: {
+            static std::atomic<int> lastSenderId(-1);
+
+            uint64_t receiveTime = Cycles::rdtsc();
+            timeTrace("shuffle-server: handler received pull request from rank %u",
+                    senderId);
+/// Apply receiver-side sequencing for shuffle messages larger than the threshold.
+#define SMALL_SHUFFLE_MESSAGE 8000
+            bool orderRequests = (reqHdr->dataSize >= SMALL_SHUFFLE_MESSAGE);
+            if (orderRequests) {
+                // The first pull request we service should come from our neighbour
+                // on the left. Other pull requests must wait for their turns.
+                if (senderId != (world->rank - 1 + world->size()) % world->size()) {
+                    // Wait for its turn.
+                    while (lastSenderId.load(std::memory_order_acquire) !=
+                            (senderId + 1) % world->size()) {
+                        Arachne::yield();
+                    }
+                    // Then wait until the transport has finished transmitting all
+                    // previous shuffle replies.
+                    while (numOutShuffleReplies > 0) {
+                        Arachne::yield();
+                    }
+                }
+            } else {
+                // Bypass the shuffle request sequencing process when dealing
+                // small messages.
+            }
+
             if (reqHdr->dataSize <= Transport::MAX_RPC_LEN) {
                 rpc->replyPayload->appendExternal(
                         context->masterZeroCopyRegion, reqHdr->dataSize);
             } else {
                 respHdr->common.status = STATUS_INVALID_PARAMETER;
+            }
+            uint64_t oldDispatchIter = context->dispatch->iteration;
+            rpc->sendReply();
+            timeTrace("shuffle-server: delayed %u us, handled pull request from "
+                  "rank %u", Cycles::toMicroseconds(Cycles::rdtsc() - receiveTime),
+                  senderId);
+            if (orderRequests) {
+                // Hack: wait until the dispatch thread gets a chance to
+                // run ServerRpc::sendReply and increment `numOutShuffleReplies`
+                // before setting lastSenderId.
+                while (context->dispatch->iteration < oldDispatchIter + 2) {
+                    Arachne::yield();
+                }
+                lastSenderId.store(senderId, std::memory_order_release);
             }
             break;
         }
@@ -1263,7 +1369,6 @@ MilliSortService::benchmarkCollectiveOp(
                 Buffer* result = bcast.wait();
                 uint64_t elapsedMicros =
                         Cycles::toMicroseconds(Cycles::rdtsc() - startTime);
-                timeTrace("Broadcast of ALL_SHUFFLE operations completed");
 
                 // Take the completion time of the slowest node as the
                 // completion time of the shuffle operation.
@@ -1311,7 +1416,20 @@ MilliSortService::benchmarkCollectiveOp(
             // avoid bottlenecked on network latency; for large msgs, having
             // more than 2 message at a time make the distributed matching
             // appears to deviate from the optimal behavior.
-            int maxRpcs = reqHdr->dataSize >= 100*1000 ? 2 : MAX_OUTSTANDING_RPCS;
+            int maxRpcs;
+            if (reqHdr->dataSize < 5000) {
+                // Small message: use more concurrent RPCs to avoid being
+                // bottlenecked by network latency.
+                maxRpcs = 10;
+            } else if (reqHdr->dataSize < 25000) {
+                // Medium message: message too small to have pipelining effect
+                // when doing sender-side sequencing; use 2 concurrent messages
+                // to avoid bubbles.
+                maxRpcs = 10;
+            } else {
+                // Large message: enforce sender-side sequencing
+                maxRpcs = -1;
+            }
             invokeShufflePull(pullRpcs.get(), world.get(), maxRpcs,
                     ALLSHUFFLE_BENCHMARK, merger, reqHdr->dataSize);
             uint32_t shuffleNs = downCast<uint32_t>(
