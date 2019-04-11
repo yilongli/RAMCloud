@@ -26,7 +26,7 @@ namespace RAMCloud {
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
 #define TIME_TRACE 0
-#define TIME_TRACE_SHUFFLE 1
+#define TIME_TRACE_SHUFFLE 0
 
 #define PERF_STATS 0
 

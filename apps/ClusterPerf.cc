@@ -7907,10 +7907,10 @@ try
         // the problem is that we might run clock sync. many times during the
         // the experiment and we can't the use the sync. result in the latest
         // epoch to print time traces from previous epochs.
-        uint64_t masterId = ServerId(1, 0).getId();
-        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
-                sizeof(masterId));
-//        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
+//        uint64_t masterId = ServerId(1, 0).getId();
+//        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE, &masterId,
+//                sizeof(masterId));
+        cluster->serverControlAll(WireFormat::LOG_TIME_TRACE);
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();

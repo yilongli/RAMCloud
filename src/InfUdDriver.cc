@@ -65,7 +65,7 @@ namespace {
 
 // Used to trace packet receipt. The resulting messages can be used to plot
 // network util. graph.
-#define TRACE_RECEIVE_PACKET 1
+#define TRACE_RECEIVE_PACKET 0
 
 // Change 0 -> 1 in the following line to compile the code for collecting
 // detailed PerfStats metrics in this driver.
