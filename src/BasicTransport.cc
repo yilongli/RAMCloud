@@ -1356,8 +1356,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                 serverRpc->requestComplete = true;
                 serverRpc->receiveTime = driver->getLastReceiveTime();
 
-                if (serverRpc->requestPayload.getStart<
-                        WireFormat::RequestCommon>()->opcode == WireFormat::SHUFFLE_PULL) {
+                if (serverRpc->getOpcode() == WireFormat::SHUFFLE_PULL) {
                        timetrace_shuffle("shuffle-server: transport received request");
                 }
 
@@ -1641,8 +1640,7 @@ BasicTransport::ServerRpc::sendReply()
     SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = replyPayload.size();
 
-    if (requestPayload.getStart<WireFormat::RequestCommon>()->opcode ==
-            WireFormat::SHUFFLE_PULL) {
+    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
         numOutShuffleReplies++;
         response.isShuffleReply = true;
         response.shuffleReplyTxStart = Cycles::rdtsc();

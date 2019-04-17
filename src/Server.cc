@@ -16,6 +16,7 @@
 #include "BindTransport.h"
 #include "Server.h"
 #include "ShortMacros.h"
+#include "Util.h"
 #include "WorkerManager.h"
 
 namespace RAMCloud {
@@ -114,6 +115,9 @@ Server::run()
     // servicing requests.
     enlistTimer.construct(this, formerServerId);
 
+    LOG(NOTICE, "Dispatch thread started on coreId %u, cpu %d, tid %d",
+            Arachne::getThreadId().context->coreId, sched_getcpu(),
+            Util::gettid());
     dispatch.run();
 }
 

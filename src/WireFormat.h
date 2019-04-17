@@ -312,6 +312,10 @@ struct StartMilliSort {
         /// Identifier of the millisort request set by the client.
         int32_t requestId;
 
+        /// When (in Cycles::rdtsc ticks at the master node) shall each node
+        /// start the millisort process. Only used when #fromClient is false.
+        uint64_t startTime;
+
         /// True if this RPC is initiated from an external client outside the
         /// MilliSort service nodes.
         bool fromClient;

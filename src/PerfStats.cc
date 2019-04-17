@@ -399,6 +399,13 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricRatio(&diff, "migrationPhase1Cycles",
             "collectionTime", " %8.3f").c_str()));
 */
+
+    auto perItemCostComputer = [] (vector<double>& v) {
+        return v[1] < 1 ? 0 : v[0]/(v[1]*v[2]);
+    };
+
+#define DISPLAY_NETWORK_STATS 0
+#if DISPLAY_NETWORK_STATS
     result.append("\nNetwork:\n");
     result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
             formatMetricRate(&diff, "networkInputBytes",
@@ -419,9 +426,6 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricRatio(&diff, "networkOutputBytes",
             "networkOutputPackets", " %8.1f").c_str()));
 
-    auto perItemCostComputer = [] (vector<double>& v) {
-        return v[1] < 1 ? 0 : v[0]/(v[1]*v[2]);
-    };
     result.append("\nTransport:\n");
     result.append(format("%-40s %s\n", "  Basic load factor",
             formatMetricRatio(&diff, "basicTransportActiveCycles",
@@ -513,6 +517,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "    process packets (sec)",
             formatMetricRatio(&diff, "infudDriverRxProcessPacketCycles",
             "cyclesPerSecond", " %8.3f").c_str()));
+#endif
 
     // TODO: Arachne core util.
     auto vs = diff.find("millisortTime")->second;
@@ -521,9 +526,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     }
     result.append("\nMilliSort:\n");
     result.append("\n=== Total ===\n");
-    result.append(format("%-40s %s\n", "  Elapsed time (us)",
-            formatMetricRatio(&diff, "millisortTime", "cyclesPerMicros",
-            " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Elapsed time (ms)",
+            formatMetricRatio(&diff, "millisortTime", "cyclesPerMillis",
+            " %8.3f").c_str()));
     result.append(format("%-40s %s\n", "  Initial items",
             formatMetric(&diff, "millisortInitItems", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Final items",
@@ -875,6 +880,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         // match the declaration order in PerfStats.h.
         (*diff)["serverId"].push_back(static_cast<double>(i));
         (*diff)["cyclesPerSecond"].push_back(p1.cyclesPerSecond);
+        (*diff)["cyclesPerMillis"].push_back(p1.cyclesPerSecond * 1e-3);
         (*diff)["cyclesPerMicros"].push_back(p1.cyclesPerSecond * 1e-6);
         (*diff)["cyclesPerNanos"].push_back(p1.cyclesPerSecond * 1e-9);
         ADD_METRIC(collectionTime);

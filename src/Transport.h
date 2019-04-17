@@ -122,8 +122,7 @@ class Transport {
          */
         WireFormat::Opcode getOpcode()
         {
-            return WireFormat::Opcode(requestPayload
-                    .getStart<WireFormat::RequestCommon>()->opcode);
+            return WireFormat::Opcode(header->opcode);
         }
 
         /**
@@ -204,7 +203,7 @@ class Transport {
 
         /**
           * Cache the header so that we don't have to pay 100 ns to extract it
-          * multiple times.
+          * multiple times. Set by WorkerManager::handleRpc.
           */
         const WireFormat::RequestCommon* header;
 

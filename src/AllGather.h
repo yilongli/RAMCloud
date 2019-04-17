@@ -41,7 +41,7 @@ class AllGather {
         virtual void append(Buffer* incomingData) = 0;
         // Quick hack: only used to implement the final expansion step.
         virtual void clear() = 0;
-        virtual Buffer* getResult() = 0;
+        virtual void getResult(Buffer* out) = 0;
     };
 
     explicit AllGather(int opId, Context* context, CommunicationGroup* group,
@@ -141,6 +141,9 @@ class AllGather {
 
     /// Ongoing RPCs that are sending data to peer nodes.
     OutstandingRpcs outstandingRpcs;
+
+    /// Allocated here to pay the object creation cost only once.
+    Buffer dataBuf;
 
     DISALLOW_COPY_AND_ASSIGN(AllGather)
 };

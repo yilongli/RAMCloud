@@ -123,6 +123,7 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     // Find the service for this RPC.
     const WireFormat::RequestCommon* header;
     header = rpc->requestPayload.getStart<WireFormat::RequestCommon>();
+    rpc->header = header;
     if ((header == NULL) || (header->opcode >= WireFormat::ILLEGAL_RPC_TYPE)) {
 #if TESTING
         if (testingSaveRpcs) {
@@ -204,7 +205,6 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 
     // Create a new thread to handle the RPC.
     rpc->id = nextRpcId++;
-    rpc->header = header;
     timeTrace("ID %u: Dispatching opcode %d on coreId %u", rpc->id,
         header->opcode, Arachne::getThreadId().context->coreId);
 

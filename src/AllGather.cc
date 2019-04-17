@@ -51,6 +51,7 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
     , nearestPowerOfTwo()
     , numRecursiveDoublingSteps(0)
     , outstandingRpcs()
+    , dataBuf()
 {
     int n = group->size();
     if (n == 1) {
@@ -97,12 +98,11 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
         lastPhase++;
     }
 
-    Buffer dataBuf;
     dataBuf.appendExternal(data, length);
     std::vector<int> targets;
     getPeersToSend(currentPhase, &targets);
     for (int target : targets) {
-        timeTrace("AllGather: sending to server %u, phase %u", target,
+        timeTrace("AllGather: sending to server %d, phase %d", target,
                 currentPhase.load());
         outstandingRpcs.emplace_back(context, group->getNode(target), opId,
                 currentPhase, group->rank, &dataBuf);
@@ -176,8 +176,8 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
 
     int msgPhase = reqHdr->phase;
-    timeTrace("AllGather: received from server %u, size %u, local phase %u, "
-            "remote phase %u", reqHdr->senderId, rpc->requestPayload->size(),
+    timeTrace("AllGather: received from server %d, size %u, local phase %d, "
+            "remote phase %d", reqHdr->senderId, rpc->requestPayload->size(),
             currentPhase.load(), msgPhase);
 
     // If this is a ghost node, advance to the last expansion phase directly
@@ -193,7 +193,7 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     }
 
     // Incorporate the data.
-    timeTrace("AllGather: about to merge payload from sender %u",
+    timeTrace("AllGather: about to merge payload from sender %d",
             reqHdr->senderId);
     merger->append(rpc->requestPayload);
     uint64_t mergeCompleteTime = Cycles::rdtsc();
@@ -208,12 +208,14 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     if (nextPhase <= lastPhase) {
         std::vector<int> targets;
         getPeersToSend(nextPhase, &targets);
+        dataBuf.reset();
+        merger->getResult(&dataBuf);
         for (int target : targets) {
             // Start sending RPCs of the next phase.
-            timeTrace("AllGather: sending to server %u, phase %u, size %u",
-                    target, nextPhase, merger->getResult()->size());
+            timeTrace("AllGather: sending to server %d, phase %d, size %u",
+                    target, nextPhase, dataBuf.size());
             outstandingRpcs.emplace_back(context, group->getNode(target), opId,
-                    nextPhase, group->rank, merger->getResult());
+                    nextPhase, group->rank, &dataBuf);
         }
 
         // Check if some older RPCs have finished and then advance the phase.

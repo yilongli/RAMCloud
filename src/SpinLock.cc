@@ -49,26 +49,26 @@ namespace SpinLockTable {
     }
 } // namespace SpinLockTable
 
-/**
- * Construct a new SpinLock and give it the provided name.
- */
-SpinLock::SpinLock(string name)
-    : mutex(0)
-    , name(name)
-    , acquisitions(0)
-    , contendedAcquisitions(0)
-    , contendedTicks(0)
-    , logWaits(false)
-{
-    std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
-    SpinLockTable::allLocks()->insert(this);
-}
-
-SpinLock::~SpinLock()
-{
-    std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
-    SpinLockTable::allLocks()->erase(this);
-}
+///**
+// * Construct a new SpinLock and give it the provided name.
+// */
+//SpinLock::SpinLock(string name)
+//    : mutex(0)
+//    , name(name)
+//    , acquisitions(0)
+//    , contendedAcquisitions(0)
+//    , contendedTicks(0)
+//    , logWaits(false)
+//{
+//    std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
+//    SpinLockTable::allLocks()->insert(this);
+//}
+//
+//SpinLock::~SpinLock()
+//{
+//    std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
+//    SpinLockTable::allLocks()->erase(this);
+//}
 
 /**
  * Acquire the SpinLock; blocks the thread (by continuously polling the lock)

@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_UTIL_H
 #define RAMCLOUD_UTIL_H
 
+#include <sys/syscall.h>
 #include <time.h>
 #include "Common.h"
 
@@ -42,6 +43,18 @@ extern uint64_t mockPmcValue;
 
 /* Doxygen is stupid and cannot distinguish between attributes and arguments. */
 #define FORCE_INLINE __inline __attribute__((always_inline))
+
+/**
+ * Returns the thread id of the calling thread
+ * As long as the thread continues to run, this id is unique across all threads
+ * running on the system so it can be used to uniquely name per-thread
+ * resources
+ */
+static
+int FORCE_INLINE
+gettid() {
+    return static_cast<int>(syscall(SYS_gettid));
+}
 
 /**
  * A utility for function for calling rdpmc and reading Intel's performance

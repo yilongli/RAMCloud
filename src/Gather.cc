@@ -47,10 +47,14 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     , relativeRank(group->relativeRank(root))
     , nodesToGather()
     , gatherTree(BRANCH_FACTOR_1, BRANCH_FACTOR_2, group->size())
-    , mutex("TreeGather::mutex")
+    // FIXME: creating a SpinLock with name is quite expensive (a few us!) due
+    // to dynamic memory allocation in string creation.
+//    , mutex("TreeGather::mutex")
+    , mutex()
     , numPayloadsToMerge()
     , sendData()
 {
+    timeTrace("TreeGather: constructor invoked, opId %d", opId);
     // The gather tree assumes node 0 to be the root. Therefore, to find the
     // children of this node when node 0 is not the root, we need to use the
     // relative rank of this node to compute the children.
@@ -71,8 +75,8 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
         int parent = gatherTree.getParent(relativeRank);
         Buffer dataBuf;
         dataBuf.appendExternal(data, numBytes);
-        timeTrace("TreeGather: sending data to parent %u, size %u", parent,
-                numBytes);
+        timeTrace("TreeGather: sending data to parent %u, size %u, opId %d",
+                parent, numBytes, opId);
         sendData.construct(context, group->getNode(root + parent), opId,
                 group->rank, &dataBuf);
     }
@@ -203,8 +207,8 @@ TreeGather::handleRpc(const WireFormat::TreeGather::Request* reqHdr,
 
     // Chop off the TreeGather header.
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
-    timeTrace("TreeGather: received new data, sender %u, size %u",
-            senderId, rpc->requestPayload->size());
+    timeTrace("TreeGather: received new data, sender %u, size %u, opId %d",
+            senderId, rpc->requestPayload->size(), opId);
 
     // TODO: we can even eliminate this spinlock by chaning nodesToGather to
     // be a atomic bitmask.
@@ -224,8 +228,8 @@ TreeGather::handleRpc(const WireFormat::TreeGather::Request* reqHdr,
 
     if (completed && (group->rank != root)) {
         int parent = gatherTree.getParent(relativeRank);
-        timeTrace("TreeGather: sending data to parent %u, size %u", parent,
-                merger->getResult()->size());
+        timeTrace("TreeGather: sending data to parent %u, size %u, opId %d",
+                parent, merger->getResult()->size(), opId);
         sendData.construct(context, group->getNode(root + parent), opId,
                 group->rank, merger->getResult());
     }

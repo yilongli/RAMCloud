@@ -23,7 +23,12 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
+
+#if 0
+/// Hack: redefine timeTrace to log so that we can use it even when server crashes.
+#define timeTrace(format, ...) RAMCLOUD_LOG(NOTICE, format, ##__VA_ARGS__)
+#else
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -42,6 +47,8 @@ namespace {
 #endif
     }
 }
+
+#endif
 
 /// Hack to get # outgoing shuffle replies present in BasicTransport.
 extern volatile int numOutShuffleReplies;
@@ -67,7 +74,7 @@ extern volatile int numShuffleRepliesRecv;
 
 // Change 0 -> 1 in the following line to use pseudo-random numbers to
 // initialize the local keys.
-#define USE_PSEUDO_RANDOM 1
+#define USE_PSEUDO_RANDOM 0
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
 // each stage of the algorithm.
@@ -108,18 +115,17 @@ MilliSortService::MilliSortService(Context* context,
     , rearrangeLocalVals()
     , dataBucketBoundaries()
     , dataBucketRanges()
-    , dataBucketRangesDone(false)
+    , readyToServiceKeyShuffle(false)
+    , readyToServiceValueShuffle(false)
     , pullKeyRpcs()
     , pullValueRpcs()
     , mergeSorter()
     , world()
     , myPivotServerGroup()
-    , allGatherPeersGroup()
     , gatheredPivots()
     , superPivots()
     , pivotBucketBoundaries()
     , sortedGatheredPivots()
-    , partialDataBucketBoundaries()
     , numSmallerPivots()
     , numPivotsInTotal()
     , allPivotServers()
@@ -273,14 +279,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         allPivotServers.destroy();
     }
 
-    nodes.clear();
-    int peerRank = world->rank % nodesPerPivotServer;
-    for (int i = peerRank; i < world->size(); i += nodesPerPivotServer) {
-        nodes.push_back(world->getNode(i));
-    }
-    allGatherPeersGroup.construct(ALL_GATHER_PEERS_GROUP,
-            world->rank / nodesPerPivotServer, nodes);
-
     // Generate data tuples.
     keys.reset(new PivotKey[numDataTuples]);
     values.reset(new Value[numDataTuples]);
@@ -311,7 +309,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     localPivots.clear();
     dataBucketBoundaries.clear();
     dataBucketRanges.clear();
-    dataBucketRangesDone.store(false);
+    readyToServiceKeyShuffle = false;
+    readyToServiceValueShuffle = false;
     pullKeyRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
     pullValueRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
@@ -319,7 +318,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     superPivots.clear();
     pivotBucketBoundaries.clear();
     sortedGatheredPivots.clear();
-    partialDataBucketBoundaries.clear();
     numSmallerPivots = 0;
     numPivotsInTotal = 0;
     globalSuperPivots.clear();
@@ -337,7 +335,6 @@ void
 MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqHdr,
         WireFormat::StartMilliSort::Response* respHdr, Rpc* rpc)
 {
-    startTime = startTime > 0 ? startTime : Cycles::rdtsc();
     timeTrace("startMilliSort invoked, requestId %u, fromClient %u",
             uint(reqHdr->requestId), reqHdr->fromClient);
 
@@ -354,13 +351,23 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
             return;
         }
 
+        // Set the global time where all nodes should start millisort.
+        startTime = Cycles::rdtsc() + Cycles::fromMicroseconds(100);
+
         // Start broadcasting the start request.
         TreeBcast startBcast(context, world.get());
-        startBcast.send<StartMilliSortRpc>(reqHdr->requestId, false);
+        startBcast.send<StartMilliSortRpc>(reqHdr->requestId, startTime, false);
         startBcast.wait();
-        ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
         return;
     }
+
+    // Wait until the designated start time set by the root node.
+    startTime = context->clockSynchronizer->getConverter(world->getNode(0))
+            .toLocalTsc(reqHdr->startTime);
+    while (Cycles::rdtsc() < startTime) {
+        Arachne::yield();
+    }
+    timeTrace("MilliSort algorithm started, requestId %d", reqHdr->requestId);
 
     // Kick start the sorting process.
     ADD_COUNTER(millisortIsPivotServer, isPivotServer ? 1 : 0);
@@ -370,6 +377,7 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     while (ongoingMilliSort != NULL) {
         Arachne::yield();
     }
+    timeTrace("MilliSort algorithm stopped, requestId %d", reqHdr->requestId);
 }
 
 void
@@ -438,6 +446,7 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
     } else {
         ADD_COUNTER(rearrangeFinalValuesWorkers, numWorkers);
     }
+    // FIXME: eliminate dynamic memory allocation!
     Value* dest = new Value[totalItems];
 
     /**
@@ -462,20 +471,37 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
         uint64_t* elapsedTime = initialData ?
                 &PerfStats::threadStats.rearrangeInitValuesElapsedTime :
                 &PerfStats::threadStats.rearrangeFinalValuesElapsedTime;
-        uint64_t startTime = Cycles::rdtsc();
+        uint64_t now = Cycles::rdtsc();
+        if (initialData) {
+            timeTrace("worker started rearranging initial values, "
+                    "range [%d - %d)", startIdx, startIdx + n);
+        } else {
+            timeTrace("worker started rearranging final values, "
+                    "range [%d - %d)", startIdx, startIdx + n);
+        }
 
         // Allocate an auxilary array to hold the reordered values temporarily.
-        Value* nextValue = dest + startIdx;
+        Value* newAddress = dest + startIdx;
         for (int i = startIdx; i < startIdx + n; i++) {
             // Note: it's OK to leave the stale value in keys[i].index because
             // after rearrangement, the correspondence between keys and values
             // is trivial (ie. keys[i] -> values[i]).
-            std::memcpy(nextValue, &values[keys[i].index], Value::SIZE);
-            nextValue++;
+            Value* oldAddress = &values[keys[i].index];
+            std::memcpy(newAddress, oldAddress, Value::SIZE);
+            newAddress++;
+            // FIXME: how to choose this number?
+            if (i % 128 == 0) {
+                Arachne::yield();
+            }
         }
         uint64_t endTime = Cycles::rdtsc();
-        (*cpuTime) += (endTime - startTime);
+        (*cpuTime) += (endTime - now);
         (*elapsedTime) += (endTime - globalStartTime);
+        if (initialData) {
+            timeTrace("worker finished rearranging initial values");
+        } else {
+            timeTrace("worker finished rearranging final values");
+        }
     };
 
 
@@ -509,17 +535,20 @@ MilliSortService::localSortAndPickPivots()
         SCOPED_TIMER(localSortElapsedTime);
         SCOPED_TIMER(localSortCycles);
         ADD_COUNTER(localSortWorkers, 1);
+#if 1
+        // Bypass local sorting until we integrate the RADULS2 module
+        // Assume 30 ns/item using 8 threads...
+        Arachne::sleep(numDataTuples * 30);
+#else
         std::sort(keys.get(), keys.get() + numDataTuples);
+#endif
     }
-    // Overlap rearranging initial values with subsequent stages. This only
-    // needs to be done before key shuffle.
-    rearrangeLocalVals =
-            rearrangeValues(keys.get(), values.get(), numDataTuples, true);
+    timeTrace("sorted %d keys", numDataTuples);
 
     partition(keys.get(), numDataTuples, std::min(numDataTuples, world->size()),
             &localPivots);
-    timeTrace("sorted %d data tuples, picked %u local pivots, about to gather "
-            "pivots", numDataTuples, localPivots.size());
+    timeTrace("picked %lu local pivots, about to gather pivots",
+            localPivots.size());
     debugLogKeys("local pivots: ", &localPivots);
 
     // Initiate the gather op that collects pivots to the pivot server.
@@ -546,14 +575,24 @@ MilliSortService::localSortAndPickPivots()
                 localPivots.size() * PivotKey::SIZE);
     }
 
+    // TODO: shall we move it up to right after we initiate GATHER_PIVOTS?
+    // Overlap rearranging initial values with subsequent stages. This only
+    // needs to be done before key shuffle.
+    // FIXME: change the following back to 1!
+#define OVERLAP_REARRANGE_INIT_VALUES 0
+#if OVERLAP_REARRANGE_INIT_VALUES
+    rearrangeLocalVals =
+            rearrangeValues(keys.get(), values.get(), numDataTuples, true);
+#endif
+
     // Pivot servers will advance to pick super pivots when the gather op
     // completes. Normal nodes will wait to receive data bucket boundaries.
     if (isPivotServer) {
-        timeTrace("gathered %u pivots from %u nodes", gatheredPivots.size(),
+        timeTrace("gathered %lu pivots from %u nodes", gatheredPivots.size(),
                 uint(myPivotServerGroup->size()));
         pickSuperPivots();
     } else {
-        timeTrace("sent %u local pivots", localPivots.size());
+        timeTrace("sent %lu local pivots", localPivots.size());
         gatheredPivots.clear();
     }
 }
@@ -566,7 +605,7 @@ MilliSortService::pickSuperPivots()
     assert(isPivotServer);
     partition(gatheredPivots.data(), int(gatheredPivots.size()),
             allPivotServers->size(), &superPivots);
-    timeTrace("picked %u super-pivots, about to gather super-pivots",
+    timeTrace("picked %lu super-pivots, about to gather super-pivots",
             superPivots.size());
     debugLogKeys("super-pivots: ", &superPivots);
 
@@ -595,11 +634,11 @@ MilliSortService::pickSuperPivots()
     // gather op completes. Other pivot servers will wait to receive pivot
     // bucket boundaries.
     if (world->rank == 0) {
-        timeTrace("gathered %u super-pivots from %u pivot servers",
+        timeTrace("gathered %lu super-pivots from %u pivot servers",
                 globalSuperPivots.size(), uint(allPivotServers->size()));
         pickPivotBucketBoundaries();
     } else {
-        timeTrace("sent %u super-pivots", superPivots.size());
+        timeTrace("sent %lu super-pivots", superPivots.size());
         globalSuperPivots.clear();
     }
 }
@@ -616,7 +655,7 @@ MilliSortService::pickPivotBucketBoundaries()
     // Broadcast computed pivot bucket boundaries to the other pivot servers
     // (excluding ourselves).
     // TODO: can we unify the API of broadcast and other collective op?
-    timeTrace("picked %u pivot bucket boundaries, about to broadcast",
+    timeTrace("picked %lu pivot bucket boundaries, about to broadcast",
             pivotBucketBoundaries.size());
     {
         ADD_COUNTER(bcastPivotBucketBoundariesStartTime,
@@ -627,10 +666,12 @@ MilliSortService::pickPivotBucketBoundaries()
                 // TODO: simplify the SendDataRpc api?
                 downCast<uint32_t>(PivotKey::SIZE * pivotBucketBoundaries.size()),
                 pivotBucketBoundaries.data());
+        // FIXME: no need to wait for broadcast responses to come back; we are
+        // not gonna modify pivotBucketBoundaries.
         bcast.wait();
     }
 
-    timeTrace("broadcast to %u pivot servers", uint(allPivotServers->size()));
+    timeTrace("broadcast to %d pivot servers", allPivotServers->size());
     pivotBucketSort();
 }
 
@@ -654,7 +695,8 @@ MilliSortService::pivotBucketSort()
             sortedGatheredPivots.push_back(*data->read<PivotKey>(&offset));
         }
         inplaceMerge(sortedGatheredPivots, oldSize);
-        timeTrace("merged %u pivots", (data->size() - 8) / PivotKey::SIZE);
+        timeTrace("inplace-merged %u and %lu pivots", oldSize,
+                sortedGatheredPivots.size() - oldSize);
     };
 
     // Send pivots to their designated pivot servers determined by the pivot
@@ -664,9 +706,9 @@ MilliSortService::pivotBucketSort()
         ADD_COUNTER(bucketSortPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(bucketSortPivotsElapsedTime);
         Tub<AllShuffle> pivotsShuffle;
+        // TODO: this is out-dated; change to invokeShufflePull???
         invokeCollectiveOp<AllShuffle>(pivotsShuffle, ALLSHUFFLE_PIVOTS,
-                context,
-                allPivotServers.get(), &merger);
+                context, allPivotServers.get(), &merger);
         uint32_t k = 0;
         for (int rank = 0; rank < int(pivotBucketBoundaries.size()); rank++) {
             // Prepare the data to send to node `rank`.
@@ -718,65 +760,25 @@ MilliSortService::pickDataBucketBoundaries() {
 
         int localIdx = globalIdx - numSmallerPivots;
         if ((0 <= localIdx) && (localIdx < (int) sortedGatheredPivots.size())) {
-            partialDataBucketBoundaries.push_back(
-                    sortedGatheredPivots[localIdx]);
+            dataBucketBoundaries.push_back(sortedGatheredPivots[localIdx]);
         }
     }
+    timeTrace("pivot server picked %lu data bucket boundaries locally",
+            dataBucketBoundaries.size());
     debugLogKeys("data bucket boundaries (local portion): ",
-            &partialDataBucketBoundaries);
+            &dataBucketBoundaries);
 
-    // Broadcast computed partial data bucket boundaries to the slave nodes.
-    timeTrace("picked %u partial data bucket boundaries, about to broadcast to"
-              "slave nodes", partialDataBucketBoundaries.size());
-    {
-//        CycleCounter<> _(&PerfStats::threadStats.?);
-        TreeBcast bcast(context, myPivotServerGroup.get());
-        bcast.send<SendDataRpc>(BROADCAST_DATA_BUCKET_BOUNDARIES,
-                downCast<uint32_t>(PivotKey::SIZE * partialDataBucketBoundaries.size()),
-                partialDataBucketBoundaries.data());
-        dataBucketBoundaries = partialDataBucketBoundaries;
-        // FIXME: there is no need to wait here because the following all-gather
-        // modify dataBucketBoundaries rather than partialDataBucketBoundaries.
-        bcast.wait();
-    }
-
-    timeTrace("broadcast to %u slave nodes", uint(myPivotServerGroup->size()));
-    allGatherDataBucketBoundaries();
-}
-
-void
-MilliSortService::allGatherDataBucketBoundaries()
-{
-    timeTrace("=== Stage 6: allGatherDataBucketBoundaries started");
-
-    // Merge data bucket boundaries from pivot servers as they arrive.
-//    auto merger = [this] (Buffer* pivotsBuffer) {
-//        SCOPED_TIMER(allGatherPivotsMergeCycles);
-//        uint32_t offset = 0;
-//        size_t oldSize = dataBucketBoundaries.size();
-//        while (offset < pivotsBuffer->size()) {
-//            PivotKey boundary = *pivotsBuffer->read<PivotKey>(&offset);
-//            dataBucketBoundaries.push_back(boundary);
-//        }
-//        inplaceMerge(dataBucketBoundaries, oldSize);
-//        // TODO: shall we do the merge online? actually, even better, partialDataBucketBoundaries
-//        // are sorted globally, we know exactly where to insert even they come!
-//        timeTrace("merged %u data bucket boundaries",
-//                pivotsBuffer->size() / PivotKey::SIZE);
-//        return std::make_pair(dataBucketBoundaries.data(),
-//                dataBucketBoundaries.size() * PivotKey::SIZE);
-//    };
-    PivotMerger merger(this, &dataBucketBoundaries);
-
-    // Gather data bucket boundaries from pivot servers to all nodes.
+    // All-gather data bucket boundaries between pivot servers.
     timeTrace("about to all-gather data bucket boundaries");
     {
+//        std::vector<PivotKey> local = dataBucketBoundaries;
+        PivotMerger merger(this, &dataBucketBoundaries);
         ADD_COUNTER(allGatherPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(allGatherPivotsElapsedTime);
         Tub<AllGather> allGather;
         invokeCollectiveOp<AllGather>(allGather,
                 ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
-                allGatherPeersGroup.get(),
+                allPivotServers.get(),
                 uint32_t(dataBucketBoundaries.size() * PivotKey::SIZE),
                 dataBucketBoundaries.data(), &merger);
         allGather->wait();
@@ -784,44 +786,83 @@ MilliSortService::allGatherDataBucketBoundaries()
         ADD_COUNTER(allGatherPivotsMergeCycles, merger.activeCycles);
         debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
     }
-    timeTrace("gathered %u data bucket boundaries",
+    timeTrace("gathered %lu data bucket boundaries",
             dataBucketBoundaries.size());
 
     // Sort the gathered data bucket boundaries.
     std::sort(dataBucketBoundaries.begin(), dataBucketBoundaries.end());
 
-    // Compute data bucket ranges required by the shufflePull handler.
-    int keyIdx = 0;
-    for (const PivotKey& rightBound : dataBucketBoundaries) {
-        int numKeys = 0;
-        int oldKeyIdx = keyIdx;
-        while ((keyIdx < numDataTuples) && (keys[keyIdx] <= rightBound)) {
-            numKeys++;
-            keyIdx++;
-        }
-        dataBucketRanges.emplace_back(oldKeyIdx, numKeys);
+    // Broadcast data bucket boundaries to slave nodes.
+    timeTrace("about to broadcast %lu data bucket boundaries to %d slave nodes",
+            dataBucketBoundaries.size(), myPivotServerGroup->size());
+    {
+//        CycleCounter<> _(&PerfStats::threadStats.?);
+        TreeBcast bcast(context, myPivotServerGroup.get());
+        bcast.send<SendDataRpc>(BROADCAST_DATA_BUCKET_BOUNDARIES,
+                downCast<uint32_t>(PivotKey::SIZE * dataBucketBoundaries.size()),
+                dataBucketBoundaries.data());
+        // FIXME: there is no need to wait here we are not going to modify
+        // dataBucketBoundaries anymore.
+        bcast.wait();
     }
-    rearrangeLocalVals.wait(&values);
-    dataBucketRangesDone.store(true);
 
-    // All nodes will advance to the final data shuffle when the all-gather
-    // completes.
+    // Pivot servers can advance to the final data shuffle immediately while
+    // other nodes will have to wait until they receive the data bucket
+    // boundaries via broadcast.
     shuffleKeys();
 }
 
 void
 MilliSortService::shuffleKeys() {
-    timeTrace("=== Stage 7: shuffleKeys started");
+    timeTrace("=== Stage 6: shuffleKeys started");
+
+    // Partition the local keys and values according to the data bucket ranges;
+    // this will be used to service the ShufflePull handler.
+    // TODO: parallelize this step across all cores
+    double keysPerPartition =
+            double(numDataTuples) / double(dataBucketBoundaries.size());
+    const int step = std::max(1, int(std::sqrt(keysPerPartition)));
+    int rangeEnd = 0;
+    for (const PivotKey& rightBound : dataBucketBoundaries) {
+        int rangeStart = rangeEnd;
+        while ((rangeEnd < numDataTuples) && (keys[rangeEnd] <= rightBound)) {
+            rangeEnd = std::min(rangeEnd + step, numDataTuples);
+        }
+        while ((rangeEnd > rangeStart) && !(keys[rangeEnd-1] <= rightBound)) {
+            rangeEnd--;
+        }
+        dataBucketRanges.emplace_back(rangeStart, rangeEnd - rangeStart);
+    }
+    readyToServiceKeyShuffle.store(true);
+    timeTrace("partitioned keys to be ready for key shuffle");
+
+#if !OVERLAP_REARRANGE_INIT_VALUES
+    rearrangeLocalVals =
+            rearrangeValues(keys.get(), values.get(), numDataTuples, true);
+#endif
+    rearrangeLocalVals.wait(&values);
+    readyToServiceValueShuffle.store(true);
+
     ADD_COUNTER(shuffleKeysStartTime, Cycles::rdtsc() - startTime);
     START_TIMER(shuffleKeysElapsedTime);
 
     // TODO: move this into startMillisort? not sure it's a good idea to have
     // idle A-threads when it's not necessary.
-    mergeSorter->prepareThreads();
+//    mergeSorter->prepareThreads();
 
     // Merge keys from other nodes into a sorted array as they arrive.
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
-    std::atomic<int> sortedItemCnt(0);
+    int keyIdx, numKeys;
+    std::tie(keyIdx, numKeys) = dataBucketRanges[world->rank];
+    std::atomic<int> sortedItemCnt(numKeys);
+    valueStartIdx[world->rank] = 0;
+//    LOG(WARNING, "!!!!! keyIdx %d, numKeys %d, numDataTuples %d", keyIdx, numKeys, numDataTuples);
+    std::memcpy(&sortedKeys[0], &keys[keyIdx], numKeys * PivotKey::SIZE);
+    for (int i = 0; i < numKeys; i++) {
+        sortedKeys[i].index = uint32_t(i);
+    }
+//    LOG(WARNING, "about ot mergerSorter->poll, start 0, numKeys %d", numKeys);
+//    mergeSorter->poll(&sortedKeys[0], numKeys);
     auto keyMerger = [this, &sortedItemCnt] (int serverRank, Buffer* keyBuffer)
     {
         SCOPED_TIMER(shuffleKeysCopyResponseCycles);
@@ -833,8 +874,10 @@ MilliSortService::shuffleKeys() {
         for (int i = start; i < start + int(numKeys); i++) {
             sortedKeys[i].index = uint32_t(i);
         }
-        mergeSorter->poll(&sortedKeys[start], numKeys);
-        timeTrace("merged %u keys, %u bytes", numKeys, keyBuffer->size());
+//        LOG(WARNING, "about ot mergerSorter->poll, start %d, numKeys %d", start, numKeys);
+//        mergeSorter->poll(&sortedKeys[start], numKeys);
+        timeTrace("merged %u keys, %u bytes, total keys %d", numKeys,
+                keyBuffer->size(), start + int(numKeys));
     };
 
     timeTrace("about to shuffle keys");
@@ -851,10 +894,13 @@ MilliSortService::shuffleKeys() {
 void
 MilliSortService::shuffleValues()
 {
-    timeTrace("=== Stage 8: shuffleValues started");
+    timeTrace("=== Stage 7: shuffleValues started");
     ADD_COUNTER(shuffleValuesStartTime, Cycles::rdtsc() - startTime);
     START_TIMER(shuffleValuesElapsedTime);
 
+    int valueIdx, numValues;
+    std::tie(valueIdx, numValues) = dataBucketRanges[world->rank];
+    std::memcpy(&sortedValues[0], &values[0], numValues * Value::SIZE);
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
     auto valueMerger = [this] (int serverId, Buffer* valueBuffer) {
         SCOPED_TIMER(shuffleValuesCopyResponseCycles);
@@ -868,6 +914,13 @@ MilliSortService::shuffleValues()
     };
 
     Arachne::ThreadId mergeSortPoller = Arachne::createThread([this] () {
+        // FIXME: bypass Seojin's online parallel merger sorter (which is
+        // causing segfaults)
+#if 1
+        SCOPED_TIMER(onlineMergeSortElapsedTime)
+        std::sort(sortedKeys.get(), sortedKeys.get() + numSortedItems);
+        timeTrace("sorted %d final keys", numSortedItems);
+#else
         while (mergeSorter->poll()) {
             Arachne::yield();
         }
@@ -884,6 +937,7 @@ MilliSortService::shuffleValues()
                 sortedArray.size * PivotKey::SIZE);
         assert(int(sortedArray.size) == numSortedItems);
         timeTrace("copied %d final keys", numSortedItems);
+#endif
     });
 
     invokeShufflePull(pullValueRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
@@ -900,9 +954,7 @@ MilliSortService::shuffleValues()
             .wait(&sortedValues);
 
     // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
-    if (world->rank > 0) {
-        ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
-    }
+    ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
     ADD_COUNTER(millisortFinalItems, numSortedItems);
     timeTrace("millisort finished");
 
@@ -1034,19 +1086,20 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
 //            timeTrace("received ShufflePull for keys");
-            while (!dataBucketRangesDone) {
+            while (!readyToServiceKeyShuffle) {
                 Arachne::yield();
             }
             int keyIdx, numKeys;
             std::tie(keyIdx, numKeys) = dataBucketRanges[senderId];
-            rpc->replyPayload->appendExternal(&keys[keyIdx], numKeys * PivotKey::SIZE);
+            rpc->replyPayload->appendExternal(&keys[keyIdx],
+                    numKeys * PivotKey::SIZE);
             ADD_COUNTER(shuffleKeysOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleKeysReceivedRpcs);
 //            timeTrace("RPC handler ShufflePull finished");
             break;
         }
         case ALLSHUFFLE_VALUE: {
-            while (!dataBucketRangesDone) {
+            while (!readyToServiceValueShuffle) {
                 Arachne::yield();
             }
             int valueIdx, numValues;
@@ -1094,7 +1147,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             }
             uint64_t oldDispatchIter = context->dispatch->iteration;
             rpc->sendReply();
-            timeTrace("shuffle-server: delayed %u us, handled pull request from "
+            timeTrace("shuffle-server: delayed %lu us, handled pull request from "
                   "rank %u", Cycles::toMicroseconds(Cycles::rdtsc() - receiveTime),
                   senderId);
             if (orderRequests) {
@@ -1315,7 +1368,7 @@ MilliSortService::benchmarkCollectiveOp(
 
                 void clear() { localBuf.reset(); }
 
-                Buffer* getResult() { return &localBuf; }
+                void getResult(Buffer* out) { out->appendExternal(&localBuf); }
 
                 Buffer localBuf;
             };
@@ -1341,7 +1394,7 @@ MilliSortService::benchmarkCollectiveOp(
 //            uint64_t endTime = Cycles::rdtsc();
             uint64_t endTime = allGatherOp->wait();
             uint64_t allGatherNs = Cycles::toNanoseconds(endTime - startTime);
-            timeTrace("AllGather operation completed in %u ns", allGatherNs);
+            timeTrace("AllGather operation completed in %lu ns", allGatherNs);
             // TODO: the cleanup is not very nice; how to do RAII?
             removeCollectiveOp(DUMMY_OP_ID);
             rpc->replyPayload->emplaceAppend<uint64_t>(allGatherNs);
@@ -1467,7 +1520,7 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
                     pivotBucketBoundaries.push_back(
                             *request->read<PivotKey>(&offset));
                 }
-                timeTrace("received %u pivot bucket boundaries",
+                timeTrace("received %lu pivot bucket boundaries",
                         pivotBucketBoundaries.size());
 
                 rpc->sendReply();
@@ -1486,13 +1539,13 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
                     dataBucketBoundaries.push_back(
                             *request->read<PivotKey>(&offset));
                 }
-                timeTrace("received %u partial data bucket boundaries",
+                timeTrace("received %lu data bucket boundaries",
                         dataBucketBoundaries.size());
                 debugLogKeys("data bucket boundaries (local portion): ",
                         &dataBucketBoundaries);
 
                 rpc->sendReply();
-                allGatherDataBucketBoundaries();
+                shuffleKeys();
             }
             break;
         }

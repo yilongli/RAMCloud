@@ -426,11 +426,11 @@ class MilliSortService : public Service {
             CycleCounter<> _(&activeCycles);
             bytesReceived += incomingPivots->size();
             uint32_t offset = 0;
-            size_t oldSize = incomingPivots->size();
+            size_t numSortedPivots = pivots->size();
             while (offset < incomingPivots->size()) {
                 pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
             }
-            millisort->inplaceMerge(*pivots, oldSize);
+            millisort->inplaceMerge(*pivots, numSortedPivots);
         }
 
         Buffer* getResult()
@@ -463,7 +463,6 @@ class MilliSortService : public Service {
                 std::vector<PivotKey>* pivots)
             : millisort(millisort)
             , pivots(pivots)
-            , result()
             , activeCycles(0)
             , bytesReceived(0)
         {}
@@ -484,21 +483,16 @@ class MilliSortService : public Service {
             pivots->clear();
         }
 
-        Buffer*
-        getResult()
+        void
+        getResult(Buffer* out)
         {
-            if (result.size() == 0) {
-                result.appendExternal(pivots->data(),
-                        downCast<uint32_t>(pivots->size() * PivotKey::SIZE));
-            }
-            return &result;
+            out->appendExternal(pivots->data(),
+                    downCast<uint32_t>(pivots->size() * PivotKey::SIZE));
         }
 
         MilliSortService* millisort;
 
         std::vector<PivotKey>* pivots;
-
-        Buffer result;
 
         uint64_t activeCycles;
 
@@ -542,7 +536,6 @@ class MilliSortService : public Service {
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
     void pickDataBucketBoundaries();
-    void allGatherDataBucketBoundaries();
     void shuffleKeys();
     void shuffleValues();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
@@ -551,7 +544,6 @@ class MilliSortService : public Service {
         WORLD                   = 0,
         MY_PIVOT_SERVER_GROUP   = 1,
         ALL_PIVOT_SERVERS       = 2,
-        ALL_GATHER_PEERS_GROUP  = 3
     };
 
     /// MilliSort request in progress. NULL means the service is idle.e
@@ -619,7 +611,11 @@ class MilliSortService : public Service {
     /// True means #dataBucketRanges has been filled out and, thus, can be
     /// safely accessed by #shufflePull handler. Used to prevent data race on
     /// #dataBucketRanges.
-    std::atomic_bool dataBucketRangesDone;
+    std::atomic_bool readyToServiceKeyShuffle;
+
+    /// True means local values (i.e., #values) have been rearranged and, thus,
+    /// can be safely accessed by #shufflePull handler.
+    std::atomic_bool readyToServiceValueShuffle;
 
     /// Outgoing RPCs used to implement the key shuffle stage.
     std::unique_ptr<Tub<ShufflePullRpc>[]> pullKeyRpcs;
@@ -638,9 +634,6 @@ class MilliSortService : public Service {
     /// node itself is a pivot server), and all other nodes that are assigned to
     /// this pivot server.
     Tub<CommunicationGroup> myPivotServerGroup;
-
-
-    Tub<CommunicationGroup> allGatherPeersGroup;
 
     // -------- Pivot server state --------
     /// Pivots gathered from this pivot server's slave nodes. Always empty on
@@ -661,9 +654,6 @@ class MilliSortService : public Service {
     /// all pivot servers, this variable holds the local portion of this node.
     /// Always empty on normal nodes.
     std::vector<PivotKey> sortedGatheredPivots;
-
-    // TODO: local view of #dataBucketBoundaries
-    std::vector<PivotKey> partialDataBucketBoundaries;
 
     /// # pivots on all nodes that are smaller than #sortedGatherPivots. Only
     /// computed on pivot servers.

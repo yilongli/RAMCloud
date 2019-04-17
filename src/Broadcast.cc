@@ -282,8 +282,10 @@ TreeBcast::start()
                 payloadResponseHeaderLength, &payloadRequest);
     }
 
-    // FIXME: can we avoid using RPC to deliver payload request locally? Could
-    // save some time on the leaf nodes.
+    // FIXME: can we avoid using RPC to deliver payload request locally? This is
+    // adding ~6us latency to the RPC delivery time. One way to do it might be
+    // to handcraft a Transport::ServerRpc object and pass it to the dispatch
+    // thread via DispatchExec?
     // Deliver the payload request locally.
     if (payloadResponseHeaderLength > 0) {
         payloadRpc.construct(payloadResponseHeaderLength);
@@ -291,6 +293,7 @@ TreeBcast::start()
         ServerId id = group->getNode(group->rank);
         payloadRpc->session = context->serverList->getSession(id);
         payloadRpc->send();
+        timeTrace("TreeBcast %u, delivered payload RPC locally", opId);
     }
 }
 
@@ -314,7 +317,7 @@ TreeBcast::isReady()
     }
 
     if (payloadRpc && payloadRpc->isReady()) {
-        timeTrace("TreeBcast %u, payload RPC finished");
+        timeTrace("TreeBcast %u, payload RPC finished", opId);
         payloadRpc->simpleWait(context);
         outgoingResponse->append(payloadRpc->response);
         payloadRpc.destroy();

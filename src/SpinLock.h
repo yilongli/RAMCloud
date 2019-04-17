@@ -37,8 +37,31 @@ namespace RAMCloud {
  */
 class SpinLock {
   public:
-    explicit SpinLock(string name);
-    virtual ~SpinLock();
+    explicit SpinLock(string name)
+        : mutex(0)
+        , name(name)
+        , acquisitions(0)
+        , contendedAcquisitions(0)
+        , contendedTicks(0)
+        , logWaits(false)
+    {}
+
+    // FIXME: a quick hack to avoid the above expensive ctor (due to string
+    // creation). Also, bypass the annoying SpinLockTable manipulation.
+    explicit SpinLock()
+        : mutex(0)
+        , name()
+        , acquisitions(0)
+        , contendedAcquisitions(0)
+        , contendedTicks(0)
+        , logWaits(false)
+    {}
+
+    virtual ~SpinLock() {
+//        std::lock_guard<std::mutex> lock(*SpinLockTable::lock());
+//        SpinLockTable::allLocks()->erase(this);
+    }
+
     void lock();
     bool try_lock();
     void unlock();
