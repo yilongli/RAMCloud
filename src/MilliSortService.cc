@@ -74,7 +74,11 @@ extern volatile int numShuffleRepliesRecv;
 
 // Change 0 -> 1 in the following line to use pseudo-random numbers to
 // initialize the local keys.
-#define USE_PSEUDO_RANDOM 0
+#define USE_PSEUDO_RANDOM 1
+
+// Change 0 -> 1 in the following line to sort local keys before starting
+// millisort.
+#define BYPASS_LOCAL_SORT 1
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
 // each stage of the algorithm.
@@ -294,6 +298,9 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                 downCast<uint32_t>(i));
         new(&values[i]) Value(key);
     }
+#if BYPASS_LOCAL_SORT
+    std::sort(keys.get(), keys.get() + numDataTuples);
+#endif
 
     while (printingResult) {
         Arachne::yield();
@@ -421,9 +428,9 @@ MilliSortService::partition(PivotKey* keys, int numKeys, int numPartitions,
  *      runs the current thread; false, otherwise. Only set to true if there
  *      is no latency-sensitive task to perform.
  */
-MilliSortService::RearrangeValueTask
+void
 MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
-        bool initialData)
+        bool initialData, RearrangeValueTask* rearrangeValueTask)
 {
     uint64_t globalStartTime = Cycles::rdtsc();
     if (initialData) {
@@ -432,22 +439,26 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
         ADD_COUNTER(rearrangeFinalValuesStartTime, globalStartTime - startTime);
     }
 
-    bool useCurrentCore = !initialData;
-    int currentCore = useCurrentCore ? -1 :
-            Arachne::getThreadId().context->coreId;
-    Arachne::CorePolicy::CoreList list = Arachne::getCorePolicy()->getCores(0);
-    int numWorkers = list.size();
-    if (list.find(currentCore) >= 0) {
-        numWorkers--;
+    Arachne::CorePolicy::CoreList coreList =
+            Arachne::getCorePolicy()->getCores(0);
+    std::vector<uint8_t> coresAvailable;
+    for (uint8_t i = 0; i < coreList.size(); i++) {
+        coresAvailable.push_back(downCast<uint8_t>(coreList[i]));
     }
+    std::sort(coresAvailable.begin(), coresAvailable.end());
 
+    int numWorkers = coreList.size();
     if (initialData) {
         ADD_COUNTER(rearrangeInitValuesWorkers, numWorkers);
     } else {
         ADD_COUNTER(rearrangeFinalValuesWorkers, numWorkers);
     }
     // FIXME: eliminate dynamic memory allocation!
+    // Allocate an auxilary array to hold the reordered values temporarily.
     Value* dest = new Value[totalItems];
+    rearrangeValueTask->dest = dest;
+    std::atomic_int* valuesLeft =
+            rearrangeValueTask->valuesToArrange.construct(totalItems);
 
     /**
      * Main method of the worker thread. Each worker is responsible to rearrange 
@@ -463,63 +474,68 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
      *      # values assigned to this worker. So this worker should rearrange
      *      values corresponding to keys[startIdx...(startIdx+numValues-1)].
      */
-    auto workerMain = [keys, values, dest, initialData, globalStartTime]
-            (int startIdx, int n) {
+    auto workerMain = [keys, values, dest, valuesLeft, initialData]
+            (uint8_t workerId)
+    {
+        int cpuId = sched_getcpu();
+        timeTrace("RearrangeValue worker %u started, coreId %u, cpu %d",
+                workerId, Arachne::getThreadId().context->coreId, cpuId);
+        uint64_t workerSpawnTime = Cycles::rdtsc();
         uint64_t* cpuTime = initialData ?
                 &PerfStats::threadStats.rearrangeInitValuesCycles :
                 &PerfStats::threadStats.rearrangeFinalValuesCycles;
         uint64_t* elapsedTime = initialData ?
                 &PerfStats::threadStats.rearrangeInitValuesElapsedTime :
                 &PerfStats::threadStats.rearrangeFinalValuesElapsedTime;
-        uint64_t now = Cycles::rdtsc();
-        if (initialData) {
-            timeTrace("worker started rearranging initial values, "
-                    "range [%d - %d)", startIdx, startIdx + n);
-        } else {
-            timeTrace("worker started rearranging final values, "
-                    "range [%d - %d)", startIdx, startIdx + n);
-        }
 
-        // Allocate an auxilary array to hold the reordered values temporarily.
-        Value* newAddress = dest + startIdx;
-        for (int i = startIdx; i < startIdx + n; i++) {
-            // Note: it's OK to leave the stale value in keys[i].index because
-            // after rearrangement, the correspondence between keys and values
-            // is trivial (ie. keys[i] -> values[i]).
-            Value* oldAddress = &values[keys[i].index];
-            std::memcpy(newAddress, oldAddress, Value::SIZE);
-            newAddress++;
-            // FIXME: how to choose this number?
-            if (i % 128 == 0) {
-                Arachne::yield();
+        // FIXME: how should I choose this number? too large => load imbalance
+        // (not all HTs run equally fast: hypertwin of dispatch thread and the
+        // hypertwin of the non-Arachne core runs faster); too small => cache
+        // thrashing between HTs?? messing up with memory prefetcher?
+//        const int maxItemsPerTask = 64;
+        const int maxItemsPerTask = 512;
+        int workDone = 0;
+        uint64_t busyTime = 0;
+        while (true) {
+            uint64_t now = Cycles::rdtsc();
+            int endIdx = valuesLeft->fetch_sub(maxItemsPerTask);
+            if (endIdx <= 0) {
+                break;
             }
+
+            int numValues = std::min(maxItemsPerTask, endIdx);
+            int startIdx = endIdx - numValues;
+            workDone += numValues;
+            Value* newAddress = dest + startIdx;
+            for (int i = startIdx; i < endIdx; i++) {
+                // Note: it's OK to leave the stale value in keys[i].index
+                // because after rearrangement, the correspondence between keys
+                // and values is trivial (ie. keys[i] -> values[i]).
+//                timeTrace("%d -> %u", i, keys[i].index);
+                Value* oldAddress = &values[keys[i].index];
+                std::memcpy(newAddress, oldAddress, Value::SIZE);
+                newAddress++;
+            }
+            busyTime += (Cycles::rdtsc() - now);
+            Arachne::yield();
         }
-        uint64_t endTime = Cycles::rdtsc();
-        (*cpuTime) += (endTime - now);
-        (*elapsedTime) += (endTime - globalStartTime);
-        if (initialData) {
-            timeTrace("worker finished rearranging initial values");
-        } else {
-            timeTrace("worker finished rearranging final values");
-        }
+        const char* fmt = initialData ?
+                "Worker %u rearranged %d init. values, busy %lu us, cpu %d" :
+                "Worker %u rearranged %d final values, busy %lu us, cpu %d";
+        timeTrace(fmt, workerId, workDone, Cycles::toMicroseconds(busyTime),
+                cpuId);
+        (*cpuTime) += busyTime;
+        (*elapsedTime) += (Cycles::rdtsc() - workerSpawnTime);
     };
 
-
     // Spin up worker threads on all cores we are allowed to use.
-    std::list<Arachne::ThreadId> workers;
-    int perWorkerItems = (totalItems + numWorkers - 1) / numWorkers;
-    int start = 0;
-    for (uint i = 0; i < list.size(); i++) {
-        if (list[i] == currentCore) {
-            continue;
-        }
-
-        int n = std::max(0, std::min(perWorkerItems, totalItems - start));
-        workers.push_back(
-                Arachne::createThreadOnCore(list[i], workerMain, start, n));
-        start += n;
+    timeTrace("Spawning workers on coreId %u, cpu %d",
+            Arachne::getThreadId().context->coreId, sched_getcpu());
+    for (uint8_t coreId : coresAvailable) {
+        uint8_t workerId = coreId;
+        rearrangeValueTask->workers.push_back(
+                Arachne::createThreadOnCore(coreId, workerMain, workerId));
     }
-    return {dest, workers};
 }
 
 void
@@ -535,7 +551,7 @@ MilliSortService::localSortAndPickPivots()
         SCOPED_TIMER(localSortElapsedTime);
         SCOPED_TIMER(localSortCycles);
         ADD_COUNTER(localSortWorkers, 1);
-#if 1
+#if BYPASS_LOCAL_SORT
         // Bypass local sorting until we integrate the RADULS2 module
         // Assume 30 ns/item using 8 threads...
         Arachne::sleep(numDataTuples * 30);
@@ -578,12 +594,10 @@ MilliSortService::localSortAndPickPivots()
     // TODO: shall we move it up to right after we initiate GATHER_PIVOTS?
     // Overlap rearranging initial values with subsequent stages. This only
     // needs to be done before key shuffle.
-    // FIXME: change the following back to 1!
-#define OVERLAP_REARRANGE_INIT_VALUES 0
-#if OVERLAP_REARRANGE_INIT_VALUES
-    rearrangeLocalVals =
-            rearrangeValues(keys.get(), values.get(), numDataTuples, true);
-#endif
+//    rearrangeValues(keys.get(), values.get(), numDataTuples, true,
+//            &rearrangeLocalVals);
+//    // FIXME: remove the following line
+//    rearrangeLocalVals.wait(&values);
 
     // Pivot servers will advance to pick super pivots when the gather op
     // completes. Normal nodes will wait to receive data bucket boundaries.
@@ -695,7 +709,7 @@ MilliSortService::pivotBucketSort()
             sortedGatheredPivots.push_back(*data->read<PivotKey>(&offset));
         }
         inplaceMerge(sortedGatheredPivots, oldSize);
-        timeTrace("inplace-merged %u and %lu pivots", oldSize,
+        timeTrace("inplace-merged %lu and %lu pivots", oldSize,
                 sortedGatheredPivots.size() - oldSize);
     };
 
@@ -836,11 +850,13 @@ MilliSortService::shuffleKeys() {
     readyToServiceKeyShuffle.store(true);
     timeTrace("partitioned keys to be ready for key shuffle");
 
-#if !OVERLAP_REARRANGE_INIT_VALUES
-    rearrangeLocalVals =
-            rearrangeValues(keys.get(), values.get(), numDataTuples, true);
-#endif
+    // FIXME: change 0 to 1.
+    // TODO: Hmm, in fact, it can overlap with key shuffle as well, right?!
+#if 1
+    rearrangeValues(keys.get(), values.get(), numDataTuples, true,
+            &rearrangeLocalVals);
     rearrangeLocalVals.wait(&values);
+#endif
     readyToServiceValueShuffle.store(true);
 
     ADD_COUNTER(shuffleKeysStartTime, Cycles::rdtsc() - startTime);
@@ -950,8 +966,17 @@ MilliSortService::shuffleValues()
     // final values. Normally, the online merge to be hidden completely within
     // value shuffle.
     Arachne::join(mergeSortPoller);
-    rearrangeValues(sortedKeys.get(), sortedValues.get(), numSortedItems, false)
-            .wait(&sortedValues);
+
+#if 1
+    timeTrace("WARNING: sleep 200 us for the system to get clean?");
+    Arachne::sleep(200*1000);
+    timeTrace("WARNING: wake up!");
+#endif
+
+    RearrangeValueTask rearrangeFinalVals;
+    rearrangeValues(sortedKeys.get(), sortedValues.get(), numSortedItems, false,
+            &rearrangeFinalVals);
+    rearrangeFinalVals.wait(&sortedValues);
 
     // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
     ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
@@ -1513,7 +1538,7 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
         case BROADCAST_PIVOT_BUCKET_BOUNDARIES: {
             // FIXME: info leak in handler; have to handle differently based on
             // rank
-            if (world->rank > 0) {
+            if (world->rank > 0)
                 Buffer *request = rpc->requestPayload;
                 for (uint32_t offset = sizeof(*reqHdr);
                      offset < request->size();) {

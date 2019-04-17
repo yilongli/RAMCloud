@@ -397,6 +397,12 @@ class MilliSortService : public Service {
         /// Worker threads that rearrange the values.
         std::list<Arachne::ThreadId> workers;
 
+        Tub<std::atomic_int> valuesToArrange;
+
+        explicit RearrangeValueTask()
+            : dest(), workers(), valuesToArrange()
+        {}
+
         void
         wait(ValueArray* oldValues)
         {
@@ -530,8 +536,8 @@ class MilliSortService : public Service {
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
-    RearrangeValueTask rearrangeValues(PivotKey* keys, Value* values,
-            int totalItems, bool initialData);
+    void rearrangeValues(PivotKey* keys, Value* values, int totalItems,
+            bool initialData, RearrangeValueTask* rearrangeValueTask);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();

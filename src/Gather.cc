@@ -5,7 +5,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Change the following to 0 to test with k-ary tree, or 1 to test with
 // k-nomial tree.

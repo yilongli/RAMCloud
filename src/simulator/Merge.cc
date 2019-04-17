@@ -26,7 +26,7 @@
 #include "Arachne/DefaultCorePolicy.h"
 
 using namespace RAMCloud;
-//#define VERBOSE 1
+//#define VERBOSE 0
 
 /////////////////////////////////////////////
 // Merge policy
@@ -412,6 +412,7 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     , numArraysCompleted()
     , startTime(0)
 {
+    LOG(ERROR, "numArraysTotal %d, maxNumAllItems %d, numWorkers %d", numArraysTotal, maxNumAllItems, numWorkers);
     int arrayCount = numArraysTotal;
     while (arrayCount > 1) {
         numArraysTargets.push_back(arrayCount);
@@ -425,10 +426,12 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
 #ifdef VERBOSE
         printf("<%d, %d> ", waysList.back(), numArraysTargets.back());
 #endif
+        LOG(DEBUG, "<%d, %d>", waysList.back(), numArraysTargets.back());
     }
 #ifdef VERBOSE
-    printf(" total levels: %d\n", waysList.size());
+    printf(" total levels: %lu\n", waysList.size());
 #endif
+    LOG(DEBUG, " Merge::waysList.size() = %lu (total levels)", waysList.size());
     int numLevels = int(waysList.size());
     buffer = new T[(numLevels + 1) * numAllItems];
     bzero(buffer, sizeof(T) * (numLevels + 1) * numAllItems);
@@ -491,6 +494,8 @@ binarySearch(T* data, size_t size, const T& key)
     while( low < high )
     {
         size_t mid = ( low + high ) / 2;
+//        LOG(WARNING, "data %p, low %lu, mid %lu, high %lu, size %lu", data,
+//                low, mid, high, size);
         if (data[mid] < key)
             low = mid + 1;
         else
@@ -536,11 +541,15 @@ Merge<T>::poll()
         printf("Starting merge engine.\n");
 #endif
     }
-    
+
+    LOG(ERROR, "waysList.size %lu, level %d, numArraysTargets.size %lu",
+            waysList.size(), level, numArraysTargets.size());
     int ways = waysList[level];
     int numLevels = int(waysList.size());
     int numArraysTarget = numArraysTargets[level];
-    
+    LOG(ERROR, "ways %d, numLevels %d, numArraysTarget %d", ways, numLevels,
+            numArraysTarget);
+
     if (numArraysCompleted[level] == numArraysTarget && splittedJobs.empty()) {
         // If some worker is still working on some part of splitted array,
         // continue polling instead of completing the sort.
@@ -658,6 +667,9 @@ continuePolling:
 #else
             int splitWays = idleWorkers.size() / jobsAvailable;
 #endif
+            if (arraysToMerge[level].size() < 2) {
+                LOG(ERROR, "arraysToMerge[%d].size() = %lu", level, arraysToMerge[level].size());
+            }
             auto first = arraysToMerge[level].front();
             arraysToMerge[level].pop();
             auto second = arraysToMerge[level].front();
