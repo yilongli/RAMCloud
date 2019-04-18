@@ -730,12 +730,12 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetric(&diff, "shuffleKeysInputBytes", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Output bytes (MB)",
             formatMetric(&diff, "shuffleKeysOutputBytes", " %8.2f", 1e-6).c_str()));
-    result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
+    result.append(format("%-40s %s\n", "  Input rate (Gbps)",
             formatMetricRate(&diff, "shuffleKeysInputBytes",
-            "shuffleKeysElapsedTime", " %8.2f", 1e-6).c_str()));
-    result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
+            "shuffleKeysElapsedTime", " %8.2f", 8e-9).c_str()));
+    result.append(format("%-40s %s\n", "  Output rate (Gbps)",
             formatMetricRate(&diff, "shuffleKeysOutputBytes",
-            "shuffleKeysElapsedTime", " %8.2f", 1e-6).c_str()));
+            "shuffleKeysElapsedTime", " %8.2f", 8e-9).c_str()));
     result.append(format("%-40s %s\n", "  Received RPCs",
             formatMetric(&diff, "shuffleKeysReceivedRpcs", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Sent RPCs",
@@ -782,12 +782,12 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetric(&diff, "shuffleValuesInputBytes", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Output bytes (MB)",
             formatMetric(&diff, "shuffleValuesOutputBytes", " %8.2f", 1e-6).c_str()));
-    result.append(format("%-40s %s\n", "  Input bytes (MB/s)",
+    result.append(format("%-40s %s\n", "  Input rate (Gbps)",
             formatMetricRate(&diff, "shuffleValuesInputBytes",
-            "shuffleValuesElapsedTime", " %8.2f", 1e-6).c_str()));
-    result.append(format("%-40s %s\n", "  Output bytes (MB/s)",
+            "shuffleValuesElapsedTime", " %8.2f", 8e-9).c_str()));
+    result.append(format("%-40s %s\n", "  Output rate (Gbps)",
             formatMetricRate(&diff, "shuffleValuesOutputBytes",
-            "shuffleValuesElapsedTime", " %8.2f", 1e-6).c_str()));
+            "shuffleValuesElapsedTime", " %8.2f", 8e-9).c_str()));
     result.append(format("%-40s %s\n", "  Received RPCs",
             formatMetric(&diff, "shuffleValuesReceivedRpcs", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Sent RPCs",

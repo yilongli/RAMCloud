@@ -123,7 +123,6 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     // Find the service for this RPC.
     const WireFormat::RequestCommon* header;
     header = rpc->requestPayload.getStart<WireFormat::RequestCommon>();
-    rpc->header = header;
     if ((header == NULL) || (header->opcode >= WireFormat::ILLEGAL_RPC_TYPE)) {
 #if TESTING
         if (testingSaveRpcs) {

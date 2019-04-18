@@ -17,6 +17,7 @@
 #define RAMCLOUD_MILLISORTSERVICE_H
 
 #include "AllGather.h"
+#include "Broadcast.h"
 #include "CommunicationGroup.h"
 #include "Context.h"
 #include "Dispatch.h"
@@ -397,6 +398,12 @@ class MilliSortService : public Service {
         /// Worker threads that rearrange the values.
         std::list<Arachne::ThreadId> workers;
 
+        Tub<std::atomic_int> valuesToArrange;
+
+        explicit RearrangeValueTask()
+            : dest(), workers(), valuesToArrange()
+        {}
+
         void
         wait(ValueArray* oldValues)
         {
@@ -530,8 +537,8 @@ class MilliSortService : public Service {
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
-    RearrangeValueTask rearrangeValues(PivotKey* keys, Value* values,
-            int totalItems, bool initialData);
+    void rearrangeValues(PivotKey* keys, Value* values, int totalItems,
+            bool initialData, RearrangeValueTask* rearrangeValueTask);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
@@ -666,12 +673,17 @@ class MilliSortService : public Service {
     /// on normal nodes.
     Tub<CommunicationGroup> allPivotServers;
 
+    /// Allows the broadcast operation to execute asynchronously.
+    Tub<TreeBcast> bcastDataBucketBoundaries;
+
     // -------- Root node state --------
     /// Contains super pivots collected from all pivot servers. Always empty on
     /// non-root nodes.
     // TODO: the last sentence is no longer strictly true as we are using it
     // as temporary forward space in the operation of gathering super pivots.
     std::vector<PivotKey> globalSuperPivots;
+
+    Tub<TreeBcast> bcastPivotBucketBoundaries;
 
     friend class TreeBcast;
     friend class Merge;
