@@ -114,7 +114,7 @@ MilliSortService::MilliSortService(Context* context,
     , isPivotServer()
     , numDataTuples(-1)
     , numPivotServers(-1)
-    , keys()
+    , localKeys((PivotKey*)const_cast<void*>(context->masterZeroCopyRegion))
     , values()
     , sortedKeys()
     , sortedValues()
@@ -292,7 +292,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     }
 
     // Generate data tuples.
-    keys.reset(new PivotKey[numDataTuples]);
     values.reset(new Value[numDataTuples]);
     rand.construct(serverId.indexNumber());
     for (int i = 0; i < numDataTuples; i++) {
@@ -301,13 +300,13 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 #else
         uint64_t key = uint64_t(world->rank + i * world->size());
 #endif
-        new(&keys[i]) PivotKey(key,
+        new(&localKeys[i]) PivotKey(key,
                 downCast<uint16_t>(serverId.indexNumber()),
                 downCast<uint32_t>(i));
         new(&values[i]) Value(key);
     }
 #if BYPASS_LOCAL_SORT
-    std::sort(keys.get(), keys.get() + numDataTuples);
+    std::sort(localKeys, localKeys + numDataTuples);
 #endif
 
     while (printingResult) {
@@ -575,7 +574,7 @@ MilliSortService::localSortAndPickPivots()
     }
     timeTrace("sorted %d keys", numDataTuples);
 
-    partition(keys.get(), numDataTuples, std::min(numDataTuples, world->size()),
+    partition(localKeys, numDataTuples, std::min(numDataTuples, world->size()),
             &localPivots);
     timeTrace("picked %lu local pivots, about to gather pivots",
             localPivots.size());
@@ -848,10 +847,10 @@ MilliSortService::shuffleKeys() {
     int rangeEnd = 0;
     for (const PivotKey& rightBound : dataBucketBoundaries) {
         int rangeStart = rangeEnd;
-        while ((rangeEnd < numDataTuples) && (keys[rangeEnd] <= rightBound)) {
+        while ((rangeEnd < numDataTuples) && (localKeys[rangeEnd] <= rightBound)) {
             rangeEnd = std::min(rangeEnd + step, numDataTuples);
         }
-        while ((rangeEnd > rangeStart) && !(keys[rangeEnd-1] <= rightBound)) {
+        while ((rangeEnd > rangeStart) && !(localKeys[rangeEnd-1] <= rightBound)) {
             rangeEnd--;
         }
         dataBucketRanges.emplace_back(rangeStart, rangeEnd - rangeStart);
@@ -862,7 +861,7 @@ MilliSortService::shuffleKeys() {
     // FIXME: change 0 to 1.
     // TODO: Hmm, in fact, it can overlap with key shuffle as well, right?!
 #if 1
-    rearrangeValues(keys.get(), values.get(), numDataTuples, true,
+    rearrangeValues(localKeys, values.get(), numDataTuples, true,
             &rearrangeLocalVals);
     rearrangeLocalVals.wait(&values);
 #endif
@@ -884,7 +883,7 @@ MilliSortService::shuffleKeys() {
     std::tie(keyIdx, numKeys) = dataBucketRanges[world->rank];
     std::atomic<int> sortedItemCnt(numKeys);
     valueStartIdx[world->rank] = 0;
-    std::memcpy(&sortedKeys[0], &keys[keyIdx], numKeys * PivotKey::SIZE);
+    std::memcpy(&sortedKeys[0], &localKeys[keyIdx], numKeys * PivotKey::SIZE);
     for (int i = 0; i < numKeys; i++) {
         sortedKeys[i].index = uint32_t(i);
     }
@@ -1185,7 +1184,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             }
             int keyIdx, numKeys;
             std::tie(keyIdx, numKeys) = dataBucketRanges[senderId];
-            rpc->replyPayload->appendExternal(&keys[keyIdx],
+            rpc->replyPayload->appendExternal(&localKeys[keyIdx],
                     numKeys * PivotKey::SIZE);
             ADD_COUNTER(shuffleKeysOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleKeysReceivedRpcs);

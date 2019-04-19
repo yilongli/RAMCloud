@@ -575,7 +575,7 @@ class MilliSortService : public Service {
     int numPivotServers;
 
     /// Keys of the data tuples to be sorted.
-    PivotKeyArray keys;
+    PivotKey* const localKeys;
 
     /// Values of the data tuples to be sorted.
     ValueArray values;
@@ -596,7 +596,7 @@ class MilliSortService : public Service {
     // FIXME: this is a bad name; besides, does it have to be class member?
     std::vector<int> valueStartIdx;
 
-    /// Selected keys that evenly divide local #keys on this node into # nodes
+    /// Selected keys that evenly divide #localKeys on this node into # nodes
     /// partitions.
     std::vector<PivotKey> localPivots;
 
@@ -609,10 +609,11 @@ class MilliSortService : public Service {
     /// into 3 buckets: (-Inf, 1], (1, 5], and (5, 9].
     std::vector<PivotKey> dataBucketBoundaries;
 
-    /// Range of each data bucket in #keys. Each range is represented by a pair
-    /// of integers: the starting index and # items in the bucket. For example,
-    /// dataBucketRanges[i] = (a, b) means the first key in the (i+1)-th data
-    /// bucket is keys[a] and there are b keys in total in the bucket.
+    /// Range of each data bucket in #localKeys. Each range is represented by
+    /// a pair of integers: the starting index and # items in the bucket.
+    /// For example, dataBucketRanges[i] = (a, b) means the first key in the
+    /// (i+1)-th data bucket is keys[a] and there are b keys in total in the
+    /// bucket.
     std::vector<std::pair<int,int>> dataBucketRanges;
 
     /// True means #dataBucketRanges has been filled out and, thus, can be
