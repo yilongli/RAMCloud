@@ -392,26 +392,17 @@ class MilliSortService : public Service {
     /// Encapsulates the state of method #rearrangeValues, allowing it to finish
     /// asynchronously.
     struct RearrangeValueTask {
-        /// C-style array holding the values after rearrangement.
-        Value* dest;
-
         /// Worker threads that rearrange the values.
         std::list<Arachne::ThreadId> workers;
 
+        /// TODO: explain why it must live beyond method #rearrangeValues
         Tub<std::atomic_int> valuesToArrange;
 
         explicit RearrangeValueTask()
-            : dest(), workers(), valuesToArrange()
-        {}
+            : workers(), valuesToArrange() {}
 
-        void
-        wait(ValueArray* oldValues)
-        {
-            for (auto& tid : workers) {
-                Arachne::join(tid);
-            }
-            oldValues->reset(dest);
-            dest = NULL;
+        void wait() {
+            for (auto& tid : workers) { Arachne::join(tid); }
         }
     };
 
@@ -513,6 +504,9 @@ class MilliSortService : public Service {
     /// NULL means we'll reject curious parties.
     const ServerConfig* serverConfig;
 
+    /// Pinned memory region that supports zero-copy TX.
+    void* const zeroCopyMemoryRegion;
+
     using CommGroupTable = std::unordered_map<int, CommunicationGroup*>;
     CommGroupTable communicationGroupTable;
 
@@ -529,6 +523,9 @@ class MilliSortService : public Service {
         POINT2POINT_BENCHMARK,
     };
 
+    static const int MAX_RECORDS_PER_NODE = 1000000;
+    static const int MAX_IMBALANCE_RATIO = 2;
+
     // ----------------------
     // Computation steps
     // ----------------------
@@ -537,8 +534,9 @@ class MilliSortService : public Service {
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
-    void rearrangeValues(PivotKey* keys, Value* values, int totalItems,
-            bool initialData, RearrangeValueTask* rearrangeValueTask);
+    void rearrangeValues(PivotKey* keys, Value* src, Value* dest,
+            int totalItems, bool initialData,
+            RearrangeValueTask* rearrangeValueTask);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
@@ -574,11 +572,18 @@ class MilliSortService : public Service {
     /// # pivot servers. -1 means unknown.
     int numPivotServers;
 
-    /// Keys of the data tuples to be sorted.
+    /// Keys of the data tuples to be sorted. The backing memory must be pinned
+    /// to support zero-copy TX.
     PivotKey* const localKeys;
 
-    /// Values of the data tuples to be sorted.
-    ValueArray values;
+    /// Values of the data tuples that are sorted locally. The backing memory
+    /// must be pinned to support zero-copy TX. The content of the array is
+    /// undefined before initial value rearrangement.
+    Value* const localValues;
+
+    /// Holds the unsorted version of #localValues (i.e., the output of the
+    /// input data generator).
+    ValueArray localValues0;
 
     /// Sorted keys on this node when the sorting completes.
     PivotKeyArray sortedKeys;
@@ -621,8 +626,8 @@ class MilliSortService : public Service {
     /// #dataBucketRanges.
     std::atomic_bool readyToServiceKeyShuffle;
 
-    /// True means local values (i.e., #values) have been rearranged and, thus,
-    /// can be safely accessed by #shufflePull handler.
+    /// True means local values (i.e., #localValues) have been rearranged and,
+    /// thus, can be safely accessed by #shufflePull handler.
     std::atomic_bool readyToServiceValueShuffle;
 
     /// Outgoing RPCs used to implement the key shuffle stage.

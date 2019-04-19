@@ -96,6 +96,7 @@ Context::Context(bool hasDedicatedDispatchThread,
 #endif
     , clockSynchronizer(NULL)
 {
+    LOG(NOTICE, "Zero-copy memory region set to %p", masterZeroCopyRegion);
     try {
         Cycles::init();
 #if TESTING

@@ -106,6 +106,7 @@ MilliSortService::MilliSortService(Context* context,
         const ServerConfig* serverConfig)
     : context(context)
     , serverConfig(serverConfig)
+    , zeroCopyMemoryRegion(const_cast<void*>(context->masterZeroCopyRegion))
     , communicationGroupTable()
     , ongoingMilliSort()
     , rand()
@@ -114,8 +115,9 @@ MilliSortService::MilliSortService(Context* context,
     , isPivotServer()
     , numDataTuples(-1)
     , numPivotServers(-1)
-    , localKeys((PivotKey*)const_cast<void*>(context->masterZeroCopyRegion))
-    , values()
+    , localKeys((PivotKey*) zeroCopyMemoryRegion)
+    , localValues((Value*) localKeys + MAX_RECORDS_PER_NODE)
+    , localValues0(new Value[MAX_RECORDS_PER_NODE])
     , sortedKeys()
     , sortedValues()
     , numSortedItems(0)
@@ -228,7 +230,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     // Initialization request from an external client should only be processed
     // by the root node, which would then broadcast the request to all nodes.
     if (reqHdr->fromClient) {
-        if (world->rank > 0) {
+        if ((world->rank > 0) ||
+                (numDataTuples * MAX_IMBALANCE_RATIO > MAX_RECORDS_PER_NODE)) {
             respHdr->common.status = STATUS_MILLISORT_ERROR;
             return;
         }
@@ -292,7 +295,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     }
 
     // Generate data tuples.
-    values.reset(new Value[numDataTuples]);
     rand.construct(serverId.indexNumber());
     for (int i = 0; i < numDataTuples; i++) {
 #if USE_PSEUDO_RANDOM
@@ -303,7 +305,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         new(&localKeys[i]) PivotKey(key,
                 downCast<uint16_t>(serverId.indexNumber()),
                 downCast<uint32_t>(i));
-        new(&values[i]) Value(key);
+        new(&localValues0[i]) Value(key);
     }
 #if BYPASS_LOCAL_SORT
     std::sort(localKeys, localKeys + numDataTuples);
@@ -313,7 +315,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         Arachne::yield();
     }
     numSortedItems = 0;
-#define MAX_IMBALANCE_RATIO 2
     sortedKeys.reset(new PivotKey[numDataTuples * MAX_IMBALANCE_RATIO]);
     sortedValues.reset(new Value[numDataTuples * MAX_IMBALANCE_RATIO]);
     valueStartIdx.clear();
@@ -443,8 +444,8 @@ MilliSortService::partition(PivotKey* keys, int numKeys, int numPartitions,
  *      is no latency-sensitive task to perform.
  */
 void
-MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
-        bool initialData, RearrangeValueTask* rearrangeValueTask)
+MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
+        int totalItems, bool initialData, RearrangeValueTask* rearrangeValueTask)
 {
     uint64_t globalStartTime = Cycles::rdtsc();
     if (initialData) {
@@ -467,10 +468,6 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
     } else {
         ADD_COUNTER(rearrangeFinalValuesWorkers, numWorkers);
     }
-    // FIXME: eliminate dynamic memory allocation!
-    // Allocate an auxilary array to hold the reordered values temporarily.
-    Value* dest = new Value[totalItems];
-    rearrangeValueTask->dest = dest;
     std::atomic_int* valuesLeft =
             rearrangeValueTask->valuesToArrange.construct(totalItems);
 
@@ -488,7 +485,7 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
      *      # values assigned to this worker. So this worker should rearrange
      *      values corresponding to keys[startIdx...(startIdx+numValues-1)].
      */
-    auto workerMain = [keys, values, dest, valuesLeft, initialData]
+    auto workerMain = [keys, src, dest, valuesLeft, initialData]
             (uint8_t workerId)
     {
         int cpuId = sched_getcpu();
@@ -525,7 +522,7 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* values, int totalItems,
                 // Note: it's OK to leave the stale value in keys[i].index
                 // because after rearrangement, the correspondence between keys
                 // and values is trivial (ie. keys[i] -> values[i]).
-                Value* oldAddress = &values[keys[i].index];
+                Value* oldAddress = &src[keys[i].index];
                 std::memcpy(newAddress, oldAddress, Value::SIZE);
                 newAddress++;
             }
@@ -861,9 +858,9 @@ MilliSortService::shuffleKeys() {
     // FIXME: change 0 to 1.
     // TODO: Hmm, in fact, it can overlap with key shuffle as well, right?!
 #if 1
-    rearrangeValues(localKeys, values.get(), numDataTuples, true,
-            &rearrangeLocalVals);
-    rearrangeLocalVals.wait(&values);
+    rearrangeValues(localKeys, localValues0.get(), localValues, numDataTuples,
+            true, &rearrangeLocalVals);
+    rearrangeLocalVals.wait();
 #endif
     readyToServiceValueShuffle.store(true);
     timeTrace("rearranged init. values to be ready for value shuffle");
@@ -939,7 +936,8 @@ MilliSortService::shuffleValues()
 
     int valueIdx, numValues;
     std::tie(valueIdx, numValues) = dataBucketRanges[world->rank];
-    std::memcpy(&sortedValues[0], &values[valueIdx], numValues * Value::SIZE);
+    std::memcpy(&sortedValues[0], &localValues[valueIdx],
+            numValues * Value::SIZE);
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
     auto valueMerger = [this] (int serverRank, Buffer* valueBuffer) {
         SCOPED_TIMER(shuffleValuesCopyResponseCycles);
@@ -995,9 +993,11 @@ MilliSortService::shuffleValues()
 
     timeTrace("about to rearrange final values");
     RearrangeValueTask rearrangeFinalVals;
-    rearrangeValues(sortedKeys.get(), sortedValues.get(), numSortedItems, false,
-            &rearrangeFinalVals);
-    rearrangeFinalVals.wait(&sortedValues);
+    Value* tmp = new Value[numSortedItems];
+    rearrangeValues(sortedKeys.get(), sortedValues.get(), tmp, numSortedItems,
+            false, &rearrangeFinalVals);
+    rearrangeFinalVals.wait();
+    sortedValues.reset(tmp);
 
     // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
     ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
@@ -1197,7 +1197,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             }
             int valueIdx, numValues;
             std::tie(valueIdx, numValues) = dataBucketRanges[senderId];
-            rpc->replyPayload->appendExternal(&values[valueIdx],
+            rpc->replyPayload->appendExternal(&localValues[valueIdx],
                     numValues * Value::SIZE);
             ADD_COUNTER(shuffleValuesOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleValuesReceivedRpcs);

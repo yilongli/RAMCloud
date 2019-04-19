@@ -114,6 +114,8 @@ SegmentManager::SegmentManager(Context* context,
 #endif
     // FIXME: wtf? is the following a temp hack for millisort shuffle benchmark?
     context->masterZeroCopyRegion = allocator.getBaseAddress();
+    LOG(NOTICE, "Zero-copy memory region set to %p",
+            context->masterZeroCopyRegion);
 }
 
 /**
