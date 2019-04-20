@@ -184,6 +184,10 @@ class MilliSortService : public Service {
         }
     }
 
+    static const int MAX_RECORDS_PER_NODE = 1000000;
+
+    static const int MAX_IMBALANCE_RATIO = 2;
+
     /**
      * A pivot consists of the original key of the data tuple plus some
      * metadata.
@@ -385,10 +389,6 @@ class MilliSortService : public Service {
         uint64_t state;
     };
 
-    using PivotKeyArray = std::unique_ptr<PivotKey[]>;
-
-    using ValueArray = std::unique_ptr<Value[]>;
-
     /// Encapsulates the state of method #rearrangeValues, allowing it to finish
     /// asynchronously.
     struct RearrangeValueTask {
@@ -396,10 +396,10 @@ class MilliSortService : public Service {
         std::list<Arachne::ThreadId> workers;
 
         /// TODO: explain why it must live beyond method #rearrangeValues
-        Tub<std::atomic_int> valuesToArrange;
+        Tub<std::atomic_int> numSortedValues;
 
         explicit RearrangeValueTask()
-            : workers(), valuesToArrange() {}
+            : workers(), numSortedValues() {}
 
         void wait() {
             for (auto& tid : workers) { Arachne::join(tid); }
@@ -500,9 +500,10 @@ class MilliSortService : public Service {
     /// Shared RAMCloud information.
     Context* context;
 
-    /// This server's ServerConfig, which we export to curious parties.
-    /// NULL means we'll reject curious parties.
-    const ServerConfig* serverConfig;
+    /// TODO: coreAvailable[i] = Arachne coreId of cpu i; -1 means core not
+    /// allocated to us; this mapping won't be necessary if we are using the
+    /// latest Arachne.
+    std::vector<int> coresAvailable;
 
     /// Pinned memory region that supports zero-copy TX.
     void* const zeroCopyMemoryRegion;
@@ -523,16 +524,15 @@ class MilliSortService : public Service {
         POINT2POINT_BENCHMARK,
     };
 
-    static const int MAX_RECORDS_PER_NODE = 1000000;
-    static const int MAX_IMBALANCE_RATIO = 2;
-
     // ----------------------
     // Computation steps
     // ----------------------
 
+    static inline void copyValue(void* dst, const void* src);
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
+    static void prefetchArray(void* address, int numItems, bool isKey);
     void localSortAndPickPivots();
     void rearrangeValues(PivotKey* keys, Value* src, Value* dest,
             int totalItems, bool initialData,
@@ -577,19 +577,25 @@ class MilliSortService : public Service {
     PivotKey* const localKeys;
 
     /// Values of the data tuples that are sorted locally. The backing memory
-    /// must be pinned to support zero-copy TX. The content of the array is
-    /// undefined before initial value rearrangement.
+    /// must be pinned to support zero-copy TX. Note: the content of the array
+    /// is undefined before initial value rearrangement.
     Value* const localValues;
 
     /// Holds the unsorted version of #localValues (i.e., the output of the
     /// input data generator).
-    ValueArray localValues0;
+    Value* const localValues0;
 
     /// Sorted keys on this node when the sorting completes.
-    PivotKeyArray sortedKeys;
+    PivotKey* const sortedKeys;
 
-    /// Sorted values on this node when the sorting completes.
-    ValueArray sortedValues;
+    /// Sorted values on this node when the sorting completes. Note: the content
+    /// of the array is undefined before final value rearrangement.
+    Value* const sortedValues;
+
+    /// Holds the unsorted version of #sortedValues. That is, the data received
+    /// during value shuffle are stored in this array before final value
+    /// rearrangement.
+    Value* const sortedValues0;
 
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;

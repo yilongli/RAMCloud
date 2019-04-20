@@ -623,11 +623,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricLambda(&diff, perItemCostComputer,
             {"rearrangeInitValuesElapsedTime", "millisortInitItems", "cyclesPerNanos"},
             " %8.1f").c_str()));
-    result.append(format("%-40s %s\n", "  Slack time (pre. \"Shuffle Keys\") (us)",
+    result.append(format("%-40s %s\n", "  Slack time (pre. \"Shuffle Val.\") (us)",
             formatMetricLambda(&diff,
             [] (vector<double>& v) { return (v[2]-(v[0]+v[1]))/v[3]; },
             {"rearrangeInitValuesStartTime", "rearrangeInitValuesElapsedTime",
-            "shuffleKeysStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
+            "shuffleValuesStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
 
     result.append("\n=== Gather Pivots ===\n");
     result.append(format("%-40s %s\n", "  Start time (us)",
