@@ -62,6 +62,10 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     gatherTree.getChildren(relativeRank, &children);
     size_t numChildren = children.size();
 
+    if (group->size() == 1) {
+        DIE("Gather of 1 node is currently broken!!!!");
+    }
+
     // If this is an interior node, wait until we have received data from
     // all its children before sending to its parent; otherwise, send out
     // the data immediately.

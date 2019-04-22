@@ -7509,8 +7509,8 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode)
 
     // Sweep machineCount from 1 to numMasters.
     uint32_t clockSyncSeconds = 2;
-    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-//    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
+//    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
+    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
         LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
                 clockSyncSeconds);

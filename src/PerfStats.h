@@ -383,6 +383,8 @@ struct PerfStats {
 
     uint64_t rearrangeInitValuesWorkers;
 
+    uint64_t partitionElapsedTime;
+
     /// Starting time of the gather pivots stage.
     uint64_t gatherPivotsStartTime;
 
@@ -467,6 +469,8 @@ struct PerfStats {
     uint64_t shuffleValuesReceivedRpcs;
 
     uint64_t shuffleValuesCopyResponseCycles;
+
+    uint64_t shuffleValuesCopyResponseElapsedTime;
 
     uint64_t rearrangeFinalValuesStartTime;
 

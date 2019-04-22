@@ -392,17 +392,30 @@ class MilliSortService : public Service {
     /// Encapsulates the state of method #rearrangeValues, allowing it to finish
     /// asynchronously.
     struct RearrangeValueTask {
+        uint64_t startTime;
+
+        /// When, in Cycles::rdtsc, the last worker completed.
+        std::atomic<uint64_t> completeTime;
+
         /// Worker threads that rearrange the values.
         std::list<Arachne::ThreadId> workers;
+
+        PivotKey* keys;
+        Value* src;
+        Value* dst;
 
         /// TODO: explain why it must live beyond method #rearrangeValues
         Tub<std::atomic_int> numSortedValues;
 
         explicit RearrangeValueTask()
-            : workers(), numSortedValues() {}
+            : startTime(), completeTime(), workers(), numSortedValues() {}
 
         void wait() {
             for (auto& tid : workers) { Arachne::join(tid); }
+        }
+
+        uint64_t getElapsedTime() {
+            return completeTime - startTime;
         }
     };
 
@@ -529,6 +542,7 @@ class MilliSortService : public Service {
     // ----------------------
 
     static inline void copyValue(void* dst, const void* src);
+    static void copyValues(Value* dst, const Value* src, int numValues);
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
@@ -558,6 +572,8 @@ class MilliSortService : public Service {
 
     uint64_t startTime;
 
+    uint64_t partitionStartTime;
+
     /// Rank of the pivot server this node belongs to. -1 means unknown.
     int pivotServerRank;
 
@@ -576,6 +592,9 @@ class MilliSortService : public Service {
     /// to support zero-copy TX.
     PivotKey* const localKeys;
 
+    /// Sorted keys on this node when the sorting completes.
+    PivotKey* const sortedKeys;
+
     /// Values of the data tuples that are sorted locally. The backing memory
     /// must be pinned to support zero-copy TX. Note: the content of the array
     /// is undefined before initial value rearrangement.
@@ -584,9 +603,6 @@ class MilliSortService : public Service {
     /// Holds the unsorted version of #localValues (i.e., the output of the
     /// input data generator).
     Value* const localValues0;
-
-    /// Sorted keys on this node when the sorting completes.
-    PivotKey* const sortedKeys;
 
     /// Sorted values on this node when the sorting completes. Note: the content
     /// of the array is undefined before final value rearrangement.
@@ -612,7 +628,7 @@ class MilliSortService : public Service {
     std::vector<PivotKey> localPivots;
 
     /// Represents the task of rearranging local values.
-    RearrangeValueTask rearrangeLocalVals;
+    Tub<RearrangeValueTask> rearrangeLocalVals;
 
     /// Data bucket boundaries that determine the final destination of each data
     /// tuple on this node. Same on all nodes.
@@ -641,6 +657,8 @@ class MilliSortService : public Service {
 
     /// Outgoing RPCs used to implement the value shuffle stage.
     std::unique_ptr<Tub<ShufflePullRpc>[]> pullValueRpcs;
+
+    std::array<Buffer*, 100> serverRank2ValueBuf;
 
     // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.

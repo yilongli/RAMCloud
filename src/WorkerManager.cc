@@ -355,7 +355,7 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
     uint64_t start = Cycles::rdtsc();
     try {
        timeTrace("ID %u: Starting processing of opcode %d  on KT %d, "
-            "idInCore %d", serverRpc->id, serverRpc->header->opcode,
+            "idInCore %d", serverRpc->id, serverRpc->getOpcode(),
             Arachne::core.kernelThreadId,
             Arachne::core.loadedContext->idInCore);
         Worker worker(context, serverRpc,

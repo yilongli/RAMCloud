@@ -54,7 +54,8 @@ struct LargeBlockOfMemory {
      */
     explicit LargeBlockOfMemory(size_t length)
         : length(length)
-        , block(static_cast<T*>(mmapGigabyteAligned(length, MAP_ANONYMOUS)))
+        , block(static_cast<T*>(mmapGigabyteAligned(length,
+                MAP_ANONYMOUS | MAP_HUGETLB)))
     {
         if (block == MAP_FAILED) {
             if (length == 0)
@@ -168,7 +169,7 @@ struct LargeBlockOfMemory {
      * well-aligned, which makes things like computing base addresses of
      * Segments from random pointers really easy if Segments are aligned as
      * well (to a power-of-two less than or equal to 1GB).
-     * 
+     *
      * One gigabyte alignment should be enough for anybody. Come find me in 30
      * years and tell me how foolishly shortsighted I was.
      *

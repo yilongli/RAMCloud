@@ -36,22 +36,21 @@ for node_id in range(num_nodes):
         for line in file:
             words = line.strip().split()
             time = float(words[1])
-            message = words[-2]
             # Example: ALL_SHUFFLE benchmark started, run 50
-            if message == 'run':
+            if words[-2] == 'run' and words[-5] == "ALL_SHUFFLE":
                 operation_start.append(time)
             # Example: infud received packet, size 4096, batch size 2
-            elif message == 'size':
+            elif words[-2] == 'size' and words[-5] == "size":
                 receive_packets.append((time, int(words[-4][:-1])))
             # Example: infud: transmit buffer XYZ of size B enqueued
             elif words[-1] == 'enqueued':
                 transmit_packets.append((time, int(words[-2])))
             # Example: shuffle-server: delayed 10 us, handled pull request from
             # rank 0
-            elif words[-6] == 'handled':
+            elif words[-6] == 'handled' and words[-2] == "rank":
                 handle_pull_rpc.append((time, int(words[-1])))
             # Example: shuffle-client: pull request 22 to rank 7 completed
-            elif words[-1] == 'completed':
+            elif words[-1] == 'completed' and words[-3] == "rank":
                 rpc_complete.append((time, int(words[-5])))
 
         offset = .0
