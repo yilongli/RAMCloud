@@ -113,25 +113,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     , qpn(0)
     , localMac()
     , locatorString("infud:")
-    // As of 11/2018, the network bandwidth of our RC machines at Stanford is
-    // actually limited by the effective bandwidth of PCIe 2.0x4, which should
-    // be ~29Gbps when taking into account the overhead of PCIe headers.
-    // For example, suppose the HCA's MTU is 256B and the PCIe headers are 24B
-    // in total, the effective bandwidth of PCIe 2.0x4 is
-    //      32Gbps * 256 / (256 + 24) = 29.25Gbps
-    // Unfortunately, it appears that our ConnextX-2 HCA somehow cannot fully
-    // utilize the 29Gbps PCIe bandwidth when sending UD packets. This can be
-    // verified by running one or more ib_send_bw programs on two machines.
-    // The maximum outgoing bandwidth we can achieve in practice is ~3020MB/s,
-    // or 23.6Gbps. Note that we need to set the outgoing bandwidth slightly
-    // higher than 24Gbps in order to saturate the 23.6Gbps outgoing bandwidth.
-    // This is because the throughput of the HCA has non-negligible variation:
-    // when it's running faster than 24Gbps, we don't want the transport to
-    // throttle the throughput and leave the HCA idle.
-    // TODO: is it true we have to set it to 26Gbps? Is the explanation above correct?
-    // maybe it's because the grant starvation problem I just solved in basic instead?
-    , bandwidthGbps(22)                   // Default outgoing bandwidth in gbs
-//    , bandwidthGbps(26)                   // Default outgoing bandwidth in gbs
+    , bandwidthGbps(~0u)
     , zeroCopyStart(NULL)
     , zeroCopyEnd(NULL)
     , zeroCopyRegion(NULL)
@@ -160,10 +142,31 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
         } catch (ServiceLocator::NoSuchKeyException& e) {}
 
         try {
-            bandwidthGbps = sl->getOption<int>("gbs");
+            bandwidthGbps = sl->getOption<uint32_t>("gbs");
         } catch (ServiceLocator::NoSuchKeyException& e) {}
     }
     infiniband = realInfiniband.construct(ibDeviceName);
+#if 1
+    bandwidthGbps = std::min(bandwidthGbps,
+            infiniband->getBandwidthGbps(ibPhysicalPort));
+#else
+    // As of 11/2018, the network bandwidth of our RC machines at Stanford is
+    // actually limited by the effective bandwidth of PCIe 2.0x4, which should
+    // be ~29Gbps when taking into account the overhead of PCIe headers.
+    // For example, suppose the HCA's MTU is 256B and the PCIe headers are 24B
+    // in total, the effective bandwidth of PCIe 2.0x4 is
+    //      32Gbps * 256 / (256 + 24) = 29.25Gbps
+    // Unfortunately, it appears that our ConnextX-2 HCA somehow cannot fully
+    // utilize the 29Gbps PCIe bandwidth when sending UD packets. This can be
+    // verified by running one or more ib_send_bw programs on two machines.
+    // The maximum outgoing bandwidth we can achieve in practice is ~3020MB/s,
+    // or 23.6Gbps. Note that we need to set the outgoing bandwidth slightly
+    // higher than 24Gbps in order to saturate the 23.6Gbps outgoing bandwidth.
+    // This is because the throughput of the HCA has non-negligible variation:
+    // when it's running faster than 24Gbps, we don't want the transport to
+    // throttle the throughput and leave the HCA idle.
+    bandwidthGbps = std::min(bandwidthGbps, 26u);
+#endif
     mtu = infiniband->getMtu(ibPhysicalPort);
     queueEstimator.setBandwidth(1000*bandwidthGbps);
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
@@ -177,7 +180,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
         // prepare the next packet while the current one is transmitting.
         maxTransmitQueueSize = MAX_QUEUED_PACKETS*maxPacketSize;
     }
-    LOG(NOTICE, "InfUdDriver bandwidth: %d Gbits/sec, maxTransmitQueueSize: "
+    LOG(NOTICE, "InfUdDriver bandwidth: %u Gbits/sec, maxTransmitQueueSize: "
             "%u bytes, maxPacketSize %u bytes", bandwidthGbps,
             maxTransmitQueueSize, maxPacketSize);
 

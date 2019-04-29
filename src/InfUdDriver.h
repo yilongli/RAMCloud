@@ -260,7 +260,7 @@ class InfUdDriver : public Driver {
     string locatorString;
 
     // Effective outgoing network bandwidth, in Gbits/second.
-    int bandwidthGbps;
+    uint32_t bandwidthGbps;
 
     /// Address of the first byte of the "zero-copy region". This is an area
     /// of memory that is addressable directly by the HCA. When transmitting
