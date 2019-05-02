@@ -70,6 +70,10 @@ class Dispatch {
     int poll();
     void run() __attribute__ ((noreturn));
 
+    /// CPU core (identified by Arachne core ID) where the dispatch thread is
+    /// running on.
+    int coreId;
+
     /// The return value from rdtsc at the beginning of the last call to
     /// #poll.  May be read from multiple threads, so must be volatile.
     /// This value is relatively accurate for any code running in a Dispatch

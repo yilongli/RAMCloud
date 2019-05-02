@@ -63,7 +63,8 @@ Syscall* Dispatch::sys = &defaultSyscall;
  *      themselves.
  */
 Dispatch::Dispatch(bool hasDedicatedThread)
-    : currentTime(0)
+    : coreId(-1)
+    , currentTime(0)
     , iteration(0)
     , pollers()
     , files()
@@ -294,6 +295,7 @@ void
 Dispatch::run()
 {
     PerfStats::registerStats(&PerfStats::threadStats);
+    coreId = Arachne::core.id;
     uint64_t prevPollTime = Cycles::rdtsc();
     int prevResult = 0;
     uint64_t idleTime = 0;

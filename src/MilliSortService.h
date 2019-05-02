@@ -513,11 +513,6 @@ class MilliSortService : public Service {
     /// Shared RAMCloud information.
     Context* context;
 
-    /// TODO: coreAvailable[i] = Arachne coreId of cpu i; -1 means core not
-    /// allocated to us; this mapping won't be necessary if we are using the
-    /// latest Arachne.
-    std::vector<int> coresAvailable;
-
     /// Pinned memory region that supports zero-copy TX.
     void* const zeroCopyMemoryRegion;
 

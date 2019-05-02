@@ -32,7 +32,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 #if 0
 /// Hack: redefine timeTrace to log so that we can use it even when server crashes.
@@ -118,7 +118,6 @@ extern volatile int numShuffleRepliesRecv;
 MilliSortService::MilliSortService(Context* context,
         const ServerConfig* serverConfig)
     : context(context)
-    , coresAvailable()
     , zeroCopyMemoryRegion(const_cast<void*>(context->masterZeroCopyRegion))
     , communicationGroupTable()
     , ongoingMilliSort()
@@ -292,22 +291,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         respHdr->keySize = 10;
         respHdr->valueSize = 90;
         return;
-    }
-
-    // Compute the mapping from cpu id to Arachne coreId. Note: won't be
-    // necessary for newer Arachne.
-    coresAvailable = {-1, -1, -1, -1, -1, -1, -1, -1, -1};
-    Arachne::CorePolicy::CoreList coreList =
-            Arachne::getCorePolicy()->getCores(0);
-    for (uint i = 0; i < coreList.size(); i++) {
-        auto getCpuId = [this] (uint32_t coreId) {
-            int cpuId = sched_getcpu();
-            coresAvailable[cpuId] = coreId;
-            timeTrace("cpu %d mapped to Arachne coreId %u", cpuId, coreId);
-            LOG(NOTICE, "cpu %d mapped to Arachne coreId %u", cpuId, coreId);
-        };
-        Arachne::join(Arachne::createThreadOnCore(
-                coreList[i], getCpuId, coreList[i]));
     }
 
     startTime = 0;
@@ -585,7 +568,6 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
      *      values corresponding to keys[startIdx...(startIdx+numValues-1)].
      */
     auto workerMain = [task, numSortedValues, totalItems, initialData]
-            (uint8_t workerId)
     {
         // Unpack arguments.
         PivotKey* keys = task->keys;
@@ -593,9 +575,7 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
         Value* dest = task->dst;
         std::atomic<uint64_t>* completeTime = &task->completeTime;
 
-        int cpuId = sched_getcpu();
-        timeTrace("RearrangeValue worker %u started, coreId %u, cpu %d",
-                workerId, Arachne::getThreadId().context->coreId, cpuId);
+        timeTrace("RearrangeValue worker started, coreId %d", Arachne::core.id);
         uint64_t* cpuTime = initialData ?
                 &PerfStats::threadStats.rearrangeInitValuesCycles :
                 &PerfStats::threadStats.rearrangeFinalValuesCycles;
@@ -649,42 +629,38 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
         }
         completeTime->store(Cycles::rdtsc());
         const char* fmt = initialData ?
-                "Worker %u rearranged %d init. values, busy %lu us, cpu %d" :
-                "Worker %u rearranged %d final values, busy %lu us, cpu %d";
-        timeTrace(fmt, workerId, workDone, Cycles::toMicroseconds(busyTime),
-                cpuId);
+                "Worker rearranged %d init. values, busy %lu us, cpu %d" :
+                "Worker rearranged %d final values, busy %lu us, cpu %d";
+        timeTrace(fmt, workDone, Cycles::toMicroseconds(busyTime),
+                Arachne::core.id);
         (*cpuTime) += busyTime;
     };
 
     // Spin up worker threads on all cores we are allowed to use.
-    timeTrace("Spawning workers on coreId %u, cpu %d",
-            Arachne::getThreadId().context->coreId, sched_getcpu());
-    std::vector<int> cpuList;
-    if (initialData) {
-        cpuList = {3, 4, 7};
-        // Policy: just the hypertwin of the non-Arachne core; ???MB/s
+    timeTrace("Spawning workers on coreId %d", Arachne::core.id);
+//    std::vector<int> cpuList;
+//    if (initialData) {
+//        cpuList = {3, 4, 7};
+//        // Policy: just the hypertwin of the non-Arachne core; ???MB/s
 //        cpuList = {4};
-        // Policy: no hypertwins (including dispatcher's); ???MB/s
+//        // Policy: no hypertwins (including dispatcher's); ???MB/s
 //        cpuList = {4, 6, 7};
-        // Policy: no hypertwins (but can use dispatcher's); ???MB/s
+//        // Policy: no hypertwins (but can use dispatcher's); ???MB/s
 //        cpuList = {4, 1, 5, 6, 7};
-        // Policy: all HTs we can use; ??? MB/s
+//        // Policy: all HTs we can use; ??? MB/s
 //        cpuList = {1, 2, 3, 4, 5, 6, 7};
-    } else {
-        cpuList = {1, 2, 3, 4, 5, 6, 7};
-    }
-    for (int cpuId : cpuList) {
-        int coreId = coresAvailable[cpuId];
-        if (coreId < 0) {
-            timeTrace("Can't use cpu %d (coreId %d)", cpuId, coreId);
+//    } else {
+//        cpuList = {1, 2, 3, 4, 5, 6, 7};
+//    }
+    Arachne::CorePolicy::CoreList coreList =
+            Arachne::getCorePolicy()->getCores(0);
+    for (uint i = 0; i < coreList.size(); i++) {
+        int coreId = coreList[i];
+        if (initialData && (coreId == Arachne::core.id)) {
             continue;
         }
-        if (initialData && (coreId == Arachne::getThreadId().context->coreId)) {
-            continue;
-        }
-        uint8_t workerId = downCast<uint8_t>(coreId);
         task->workers.push_back(
-                Arachne::createThreadOnCore(coreId, workerMain, workerId));
+                Arachne::createThreadOnCore(coreId, workerMain));
         (*numWorkers)++;
     }
 }
@@ -1349,13 +1325,13 @@ MilliSortService::invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
     // shuffle-value handler do not clash with the merger cores; otherwise, we
     // may delay the start of sending responses... Geeez! So tricky. Is there
     // a cleaner way to implement shuffle?
-    std::vector<int> cpuList = {2, 3, 4, 6, 7};
+    Arachne::CorePolicy::CoreList coreList =
+            Arachne::getCorePolicy()->getCores(0);
     std::vector<int> mergerCores;
-    int currentCore = Arachne::getThreadId().context->coreId;
-    for (int cpu : cpuList) {
-        int coreId = coresAvailable[cpu];
-        if ((coreId >= 0) && (coreId != currentCore)) {
-            mergerCores.push_back(coreId);
+    int currentCore = Arachne::core.id;
+    for (uint i = 0; i < coreList.size(); i++) {
+        if (coreList[i] != currentCore) {
+            mergerCores.push_back(coreList[i]);
         }
     }
     // FIXME: remove this?

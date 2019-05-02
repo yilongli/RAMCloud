@@ -371,6 +371,7 @@ realMain(int argc, char *argv[])
 int
 main(int argc, const char *argv[]) {
     FileLogger arachneLogger(NOTICE, "ARACHNE: ");
+    Arachne::Logger::setLogLevel(Arachne::SILENT);
     Arachne::setErrorStream(arachneLogger.getFile());
 
     Arachne::minNumCores = 3;

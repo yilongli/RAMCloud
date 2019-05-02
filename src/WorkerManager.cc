@@ -204,8 +204,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 
     // Create a new thread to handle the RPC.
     rpc->id = nextRpcId++;
-    timeTrace("ID %u: Dispatching opcode %d on coreId %u", rpc->id,
-        header->opcode, Arachne::getThreadId().context->coreId);
+    timeTrace("ID %u: Dispatching opcode %d on coreId %d", rpc->id,
+        header->opcode, Arachne::core.id);
 
     Arachne::ThreadId threadId;
     // FIXME: dirty hack to avoid creating the Arachne thread that handles the
