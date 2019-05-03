@@ -36,6 +36,7 @@ class AllGather {
     // algorithm)
     class Merger {
       public:
+        virtual ~Merger() {}
         /// Append new data to existing data. This method is guaranteed not to
         /// modify existing data.
         virtual void append(Buffer* incomingData) = 0;

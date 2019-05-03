@@ -17,10 +17,18 @@
 #define RAMCLOUD_SERVICE_H
 
 #include <algorithm>
+#if __cplusplus >= 201402L
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Weffc++"
+#include "flat_hash_map.h"
+#pragma GCC diagnostic warning "-Wconversion"
+#pragma GCC diagnostic warning "-Weffc++"
+#endif
 
 #include "Common.h"
 #include "ClientException.h"
 #include "Buffer.h"
+#include "ObjectPool.h"
 #include "ServerId.h"
 #include "Transport.h"
 #include "WireFormat.h"
@@ -59,7 +67,11 @@ class Service {
         Rpc(Worker* worker, Buffer* requestPayload, Buffer* replyPayload)
             : requestPayload(requestPayload)
             , replyPayload(replyPayload)
-            , worker(worker) {}
+            , worker(worker)
+            , receiveTime()
+            , arriveTime()
+            , dispatchTime()
+        {}
 
         void sendReply();
 
@@ -241,12 +253,10 @@ class Service {
         SpinLock::Guard _(mutex);
         CollectiveOpTable::iterator it = collectiveOpTable.find(opId);
         if (it == collectiveOpTable.end()) {
-            // FIXME: why can't I do this
-//            collectiveOpTable.emplace(opId);
-            collectiveOpTable[opId].construct();
-            return collectiveOpTable[opId].get();
+            collectiveOpTable[opId] = collectiveOpRecordPool.construct();
+            return collectiveOpTable[opId];
         } else {
-            return it->second.get();
+            return it->second;
         }
     }
 
@@ -254,18 +264,20 @@ class Service {
     removeCollectiveOp(int opId)
     {
         SpinLock::Guard _(mutex);
+        collectiveOpRecordPool.destroy(collectiveOpTable[opId]);
         collectiveOpTable.erase(opId);
     }
 
   PRIVATE:
 #if __cplusplus >= 201402L
     // ska::flat_hash_map requires c++14 features to compile.
-    using CollectiveOpTable = ska::flat_hash_map<int, Tub<CollectiveOpRecord>>;
+    using CollectiveOpTable = ska::flat_hash_map<int, CollectiveOpRecord*>;
 #else
-    using CollectiveOpTable = std::unordered_map<int, Tub<CollectiveOpRecord>>;
-//    using CollectiveOpTable = std::unordered_map<int, CollectiveOpRecord>;
+    using CollectiveOpTable = std::unordered_map<int, CollectiveOpRecord*>;
 #endif
     CollectiveOpTable collectiveOpTable;
+
+    ObjectPool<CollectiveOpRecord> collectiveOpRecordPool;
 
     // Table-level lock.
     SpinLock mutex;

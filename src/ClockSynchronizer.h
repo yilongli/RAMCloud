@@ -76,7 +76,7 @@ class ClockSynchronizer : Dispatch::Poller {
         double skew;
 
         ClockState()
-            : baseTsc(), offset(), skew()
+            : baseTsc(), newBaseTsc(), offset(), skew()
         {}
     };
 
@@ -163,7 +163,13 @@ class ClockSynchronizer : Dispatch::Poller {
 
 class TimeConverter {
   public:
-    explicit TimeConverter() { valid = false; }
+    explicit TimeConverter()
+        : localBaseTsc()
+        , remoteBaseTsc()
+        , offset()
+        , skew()
+        , valid(false)
+    {}
 
     explicit TimeConverter(uint64_t localBaseTsc,
             ClockSynchronizer::ClockState* remoteClock)
