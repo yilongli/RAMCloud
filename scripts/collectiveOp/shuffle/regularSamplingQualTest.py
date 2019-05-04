@@ -50,6 +50,7 @@ def generate_keys(distribution):
     if distribution == 0:
         # Uniform distribution.
         keys = np.random.random_integers(0, 2**62, size=num_records_per_node)
+        # keys = np.random.random_integers(0, 100, size=num_records_per_node)
     elif distribution == 1:
         # Normal/gaussian distribution
         mu, sigma = 0, 100
@@ -102,6 +103,53 @@ def partition(keys, num_parts):
     return splitters
 
 
+def compute_splitters(tagged_pivots, data_units_per_bucket):
+    '''
+    Implements an approximation of the gradient-based splitter selection
+    algorithm proposed by John. The original gradient-based algorithm doesn't
+    apply to arbitrary (e.g., non-numeric) keys; it's also harder to implement
+    efficiently.
+
+    :param tagged_pivots:
+        A list of sorted pivots; a tag is attached each pivot indicating its
+        original position in the local node (e.g., start pivot, end pivot, or
+        none of the above).
+    :param data_units_per_bucket:
+         Ideal # data units between two splitters.
+    :return:
+        A list of splitters selected to
+    '''
+
+    # Number of non-begin pivots we have passed so far.
+    num_nb_pivots_passed = 0
+    # Number of local nodes whose end pivots are yet to pass.
+    num_active_sources = 0
+    splitters = []
+
+    next_split_point = data_units_per_bucket
+    for pivot, tag in tagged_pivots:
+        if tag < 0:
+            # begin pivot
+            num_active_sources += 1
+        elif tag > 0:
+            # end pivot
+            num_active_sources -= 1
+            num_nb_pivots_passed += 1
+        else:
+            # normal pivot
+            num_nb_pivots_passed += 1
+
+        approx_cml_data = num_nb_pivots_passed + (num_active_sources - 1) * 0.5
+        if approx_cml_data >= next_split_point:
+            splitters.append(pivot)
+            next_split_point += data_units_per_bucket
+
+    if num_nb_pivots_passed + (num_active_sources - 1) * 0.5 < next_split_point:
+        last_pivot, _ = tagged_pivots[-1]
+        splitters.append(last_pivot)
+    return splitters
+
+
 if len(sys.argv) != 6:
     print('./test num_sims num_nodes num_records_per_node num_pivots input_distribution')
     quit()
@@ -114,6 +162,7 @@ for simulation_id in range(num_sims):
     keys_at_node = []
     # pivots are always *inclusive* right bound
     pivots = []
+    tagged_pivots = []
     for node_id in range(num_nodes):
         keys = generate_keys(distribution)
         keys.sort()
@@ -122,18 +171,25 @@ for simulation_id in range(num_sims):
             extended_keys.append((keys[i], node_id, i))
         keys_at_node.append(extended_keys)
 
-        # Draw samples (or, local pivots) from the local data.
-        # Note: we must add the smallest key to our samples to better
-        # approximate our key distribution since pivots are right bounds.
-        local_pivots = \
-            [extended_keys[0]] + partition(extended_keys, num_pivots)
+        # Select pivots from keys. Tag a key with -1, 0, or 1 to specify if it's
+        # a start pivot, a normal pivot, or a end pivot; this tag is used in the
+        # gradient-based splitter selection algorithm.
+        local_pivots = partition(extended_keys, num_pivots)
         pivots.extend(local_pivots)
+        tagged_local_pivots = [(extended_keys[0], -1)] + \
+                [(x, 0) for x in local_pivots[:-1]] + [(local_pivots[-1], 1)]
+        tagged_pivots.extend(tagged_local_pivots)
         if DEBUG:
             print(f"pivots@node {node_id} = {local_pivots}")
 
     # Compute final splitters based on all the samples.
-    pivots.sort()
-    splitters = partition(pivots, num_nodes)
+    GRADIENT_BASED = True
+    if GRADIENT_BASED:
+        tagged_pivots.sort()
+        splitters = compute_splitters(tagged_pivots, num_pivots)
+    else:
+        pivots.sort()
+        splitters = partition(pivots, num_nodes)
     if DEBUG:
         print(f"splitters = {splitters}")
 
