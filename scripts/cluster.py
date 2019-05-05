@@ -267,6 +267,8 @@ class Cluster(object):
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
 
+            if self.verbose:
+                print('Coordinator command line arguments %s' % command)
             self.coordinator = self.sandbox.rsh(self.coordinator_host[0],
                         command, bg=True, stderr=subprocess.STDOUT)
         else:
@@ -280,6 +282,8 @@ class Cluster(object):
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
 
+            if self.verbose:
+                print('Coordinator command line arguments %s' % command)
             self.coordinator = self.sandbox.rsh(self.coordinator_host[0],
                         command, bg=True, stderr=subprocess.STDOUT)
 
@@ -300,7 +304,6 @@ class Cluster(object):
         if self.verbose:
             print('Coordinator started on %s at %s' %
                    (self.coordinator_host[0], self.coordinator_locator))
-            print('Coordinator command line arguments %s' % command)
         return self.coordinator
 
     def start_server(self,

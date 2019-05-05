@@ -178,7 +178,7 @@ class InfRcTransport : public Transport {
         uint64_t nonce;
     };
 
-    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 63;
+    static const uint32_t MAX_SHARED_RX_QUEUE_DEPTH = 32;
 
     // Since we always use at most 1 SGE per receive request, there is no need
     // to set this parameter any higher. In fact, larger values for this

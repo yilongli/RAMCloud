@@ -319,6 +319,8 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
     // but it will work for now.
     uint32_t bufferSize = (getMaxRpcSize() + 4095) & ~0xfff;
 
+    LOG(NOTICE, "allocating %u RX buffers, bufferSize %.2f MB",
+            MAX_SHARED_RX_QUEUE_DEPTH * 2, double(bufferSize)*1e-6);
     rxBuffers.construct(infiniband->pd,
                         bufferSize,
                         uint32_t(MAX_SHARED_RX_QUEUE_DEPTH * 2));
@@ -332,6 +334,8 @@ InfRcTransport::InfRcTransport(Context* context, const ServiceLocator *sl,
     }
     assert(numUsedClientSrqBuffers == 0);
 
+    LOG(NOTICE, "allocating %u TX buffers, bufferSize %.2f MB",
+            MAX_TX_QUEUE_DEPTH, double(bufferSize)*1e-6);
     txBuffers.construct(infiniband->pd,
                         bufferSize,
                         uint32_t(MAX_TX_QUEUE_DEPTH));

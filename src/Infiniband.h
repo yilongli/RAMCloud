@@ -355,6 +355,8 @@ class Infiniband {
             , descriptors()
         {
             const size_t bytes = bufferSize * bufferCount;
+            RAMCLOUD_LOG(NOTICE, "allocating %.2f MB for buffer descriptors",
+                    double(bytes)*1e-6);
             basePointer = Memory::xmemalign(HERE, 4096, bytes);
 
             ibv_mr *mr = ibv_reg_mr(pd.pd, basePointer, bytes,

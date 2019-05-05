@@ -452,7 +452,7 @@ def clockSync(name, options, cluster_args, client_args):
 
 def echo(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '-t 4000'
+        cluster_args['master_args'] = '--totalMasterMemory 1000'
     if cluster_args['timeout'] < 250:
         cluster_args['timeout'] = 250
     cluster_args['replicas'] = 0
@@ -462,7 +462,7 @@ def echo(name, options, cluster_args, client_args):
 
 def echoWorkload(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
-        cluster_args['master_args'] = '-t 4000'
+        cluster_args['master_args'] = '--totalMasterMemory 1000'
     if cluster_args['timeout'] < 250:
         cluster_args['timeout'] = 250
     cluster_args['replicas'] = 0
@@ -819,6 +819,8 @@ def millisort(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         # Force Arachne CoreArbiter to allocate static number of cores.
         cluster_args['master_args'] = '--minNumCores 7 --maxNumCores 7'
+        # No need to use too much memory on masters; 1GB should be enough.
+        cluster_args['master_args'] += '--totalMasterMemory 1000'
 
     default(name, options, cluster_args, client_args)
 
