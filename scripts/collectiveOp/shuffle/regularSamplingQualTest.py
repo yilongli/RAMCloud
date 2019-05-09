@@ -54,8 +54,7 @@ def generate_keys(distribution):
     elif distribution == 1:
         # Normal/gaussian distribution
         mu, sigma = 0, 100
-        keys = np.random.normal(mu, sigma, size=num_records_per_node)\
-                .round().astype(np.int)
+        keys = np.random.normal(mu, sigma, size=num_records_per_node)
         if DEBUG:
             # https://docs.scipy.org/doc/numpy/reference/generated/numpy.random.normal.html
             count, bins, ignored = plt.hist(keys, 100, density=True)
@@ -117,7 +116,7 @@ def compute_splitters(tagged_pivots, data_units_per_bucket):
     :param data_units_per_bucket:
          Ideal # data units between two splitters.
     :return:
-        A list of splitters selected to
+        A list of splitters selected to divide the pivots evenly.
     '''
 
     # Number of non-begin pivots we have passed so far.
@@ -196,12 +195,20 @@ for simulation_id in range(num_sims):
     # Evaluate the quality of final splitters based on two metrics: individual
     # shuffle message size and final data skewness factor.
     final_data_sizes = [0] * num_nodes
+    largest_msg_per_step = [0] * num_nodes
     messages_at_node = []
     for node_id in range(num_nodes):
         shuffle_msg_sizes = eval_splitter(keys_at_node[node_id], splitters)
         for i in range(num_nodes):
             final_data_sizes[i] += shuffle_msg_sizes[i] / num_nodes
+            largest_msg_per_step[i] = max(largest_msg_per_step[i],
+                    shuffle_msg_sizes[i])
         messages_at_node.append(shuffle_msg_sizes)
+
+    PRINT_SKEWNESS_ONLY = True
+    if PRINT_SKEWNESS_ONLY:
+        print(f"{max(final_data_sizes):.5f}", flush=True)
+        continue
 
     dist_str = ['UNIFORM', 'GAUSS', 'ZIPF']
     print(f"Simulation {simulation_id}: #nodes = {num_nodes}, "
@@ -210,11 +217,15 @@ for simulation_id in range(num_sims):
           f"skewness = {max(final_data_sizes):.5f}")
 
     for node_id in range(num_nodes):
-        print(f"{node_id}", end='')
+        print(f"Node {node_id}", end='')
         for size in messages_at_node[node_id]:
             print(f", {size:.3f}", end='')
         print()
-    print("S", end='')
+    print("MaxShuffleMsg", end='')
+    for largest_msg in largest_msg_per_step:
+        print(f", {largest_msg:.3f}", end='')
+    print()
+    print("FinalBucketSize", end='')
     for skew in final_data_sizes:
         print(f", {skew:.3f}", end='')
     print()
