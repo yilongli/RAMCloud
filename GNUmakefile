@@ -273,6 +273,7 @@ else
 DPDK_AR_LIBS := $(DPDK_LIB_DIR)/libdpdk.a
 ## --whole-archive is required to link the pmd objects.
 LIBS := -Wl,--whole-archive $(DPDK_AR_LIBS) -Wl,--no-whole-archive -ldl $(LIBS)
+LIBS := $(LIBS) -lrte_pmd_mlx4 -lrte_pmd_mlx5 -libverbs -lmlx4 -lmlx5 -lmnl
 endif
 
 # libnuma required by eal_memory.c starting from DPDK 17.11
