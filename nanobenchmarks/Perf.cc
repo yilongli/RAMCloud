@@ -41,6 +41,7 @@
 #endif
 #include <sys/time.h>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -52,6 +53,12 @@
 #pragma GCC diagnostic warning "-Wconversion"
 #pragma GCC diagnostic warning "-Weffc++"
 #endif
+
+#pragma GCC diagnostic ignored "-Wcast-qual"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#include "memcpy/FastMemcpy.h"
+#pragma GCC diagnostic warning "-Wcast-qual"
+#pragma GCC diagnostic warning "-Wunused-function"
 
 #include "Common.h"
 #include "Atomic.h"
@@ -2348,6 +2355,186 @@ double vectorPushPop()
     return Cycles::toSeconds(stop - start)/(count*3);
 }
 
+double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
+        int memOp = 0)
+{
+#define KEY_SIZE 10
+#define VALUE_SIZE 90
+//#define VALUE_SIZE 64
+#define NUM_RECORDS 10000
+    const int numCores = std::thread::hardware_concurrency();
+    printf("# workers %d, key size %d, value size %d, # records %d, "
+           "prefetch src values %d, memOp %d\n", numWorkers, KEY_SIZE,
+           VALUE_SIZE, NUM_RECORDS, prefetchSrcValues, memOp);
+
+    struct PivotKey {
+        uint32_t index;
+        uint16_t serverId;
+        char bytes[KEY_SIZE];
+    };
+    struct Value {
+        char bytes[VALUE_SIZE];
+    };
+
+    PivotKey* keys = new PivotKey[NUM_RECORDS];
+    Value* oldValues = new Value[NUM_RECORDS];
+    Value* newValues = new Value[NUM_RECORDS];
+
+    // Generate a pseudo-random permutation for key indexes.
+    for (uint32_t i = 0; i < NUM_RECORDS; i++) {
+        keys[i].index = i;
+    }
+    std::srand(1997);
+    std::random_shuffle(keys, keys + NUM_RECORDS);
+
+    // Touch the two value arrays.
+    std::memset(oldValues, 1, NUM_RECORDS * VALUE_SIZE);
+    std::memset(newValues, 1, NUM_RECORDS * VALUE_SIZE);
+
+    std::atomic<uint64_t> startTime;
+    std::atomic_int threadsReady;
+    auto task = [keys, oldValues, newValues, &startTime, &threadsReady, memOp]
+            (int cpu, int startIdx, int numRecords,
+            std::promise<uint64_t>* endTime) {
+        // Signal the test driver that we are ready to run and wait for the
+        // start signal.
+        pinThread(cpu);
+        threadsReady += 1;
+        while (Cycles::rdtsc() < startTime) {}
+
+        // Start the experiment.
+        if (memOp == 0) {
+            // Copy value from src to dest.
+            for (int i = startIdx; i < startIdx + numRecords; i++) {
+                if (VALUE_SIZE == 64) {
+                    *((uint64_t*) newValues[i].bytes) =
+                            *((uint64_t*) oldValues[keys[i].index].bytes);
+                } else if (VALUE_SIZE == 90) {
+                    void* dst = &newValues[i];
+                    const void* src = &oldValues[keys[i].index];
+                    unsigned char* dd = ((unsigned char*)dst) + 90;
+                    const unsigned char* ss = ((const unsigned char*)src) + 90;
+                    memcpy_sse2_64(dd - 90, ss - 90);
+                    memcpy_sse2_16(dd - 26, ss - 26);
+                    memcpy_sse2_16(dd - 16, ss - 16);
+                } else {
+                    std::memcpy(&newValues[i], &oldValues[keys[i].index],
+                            VALUE_SIZE);
+                }
+            }
+        } else if (memOp == 1) {
+            // Only prefetch src value (random access)
+            for (int i = startIdx; i < startIdx + numRecords; i++) {
+                prefetch(&oldValues[keys[i].index], VALUE_SIZE, 0);
+            }
+        } else if (memOp == 2) {
+            // Only prefetch src value (sequential)
+            for (int i = startIdx; i < startIdx + numRecords; i++) {
+                prefetch(&oldValues[i], VALUE_SIZE, 0, 0);
+            }
+        } else {
+            // Sequential prefetch + copy
+            for (int i = startIdx; i < startIdx + numRecords; i++) {
+                prefetch(&oldValues[i], VALUE_SIZE, 0, 3);
+            }
+            for (int i = startIdx; i < startIdx + numRecords; i++) {
+                if (VALUE_SIZE == 64) {
+                    *((uint64_t*)newValues[i].bytes) =
+                            *((uint64_t*) oldValues[keys[i].index].bytes);
+                } else {
+                    std::memcpy(&newValues[i], &oldValues[keys[i].index],
+                            VALUE_SIZE);
+                }
+            }
+        }
+        uint64_t stop = Cycles::rdtscp();
+        endTime->set_value(stop);
+
+        // Compute how fast we can rearrange the value in MB/s (or bytes/us).
+        double bytesPerMicros = (numRecords * VALUE_SIZE) /
+                (Cycles::toSeconds(stop - startTime) * 1e6);
+//        printf("Value moved rate = %.2f MB/s, cpu %d\n", bytesPerMicros, cpu);
+    };
+
+    int count = 5;
+    for (int c = 0; c < count; c++) {
+        // Before each run of the benchmark, we flush the LLC and then bring
+        // the keys array back into cache.
+        flushLLC();
+        uint64_t prefetchTime = 0;
+        {
+            CycleCounter<uint64_t> _(&prefetchTime);
+            prefetch(keys, KEY_SIZE * NUM_RECORDS, 0, 0);
+            if (prefetchSrcValues) {
+                prefetch(oldValues, VALUE_SIZE * NUM_RECORDS, 0, 0);
+            }
+            Fence::lfence();
+        }
+
+        // Start the experiment.
+        threadsReady = 0;
+        startTime = ~0lu;
+        std::array<Tub<std::thread>, 32> workers;
+        std::array<Tub<std::promise<uint64_t>>, 32> results;
+        int recordsPerWorker = NUM_RECORDS / numWorkers;
+        for (int i = 0; i < numWorkers; i++) {
+            // Spread worker threads evenly across cores; core 0 is reserved for
+            // the master thread.
+            workers[i].construct(task, (1 + i) % numCores, recordsPerWorker * i,
+                    recordsPerWorker, results[i].construct());
+        }
+        while (threadsReady < numWorkers) {}
+        startTime = Cycles::rdtsc() + Cycles::fromMicroseconds(100);
+
+        // Join on worker threads. Compute the aggregated performance.
+        uint64_t endTime = 0;
+        for (int i = 0; i < numWorkers; i++) {
+            workers[i]->join();
+            endTime = std::max(endTime, results[i]->get_future().get());
+        }
+        double elapsedMicros = (Cycles::toSeconds(endTime - startTime) * 1e6);
+        double bytesPerMicros = (NUM_RECORDS * VALUE_SIZE) / elapsedMicros;
+        printf("Value copy throughput = %.2f MB/s, elapsed %.2f us, "
+               "prefetch %.2f us\n",
+                bytesPerMicros, elapsedMicros,
+                Cycles::toSeconds(prefetchTime)*1e6);
+    }
+    return 0;
+}
+
+double valueRearrangeStrongScaling0()
+{
+    pinThread(0);
+    for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
+        valueRearrange(i, false, 0);
+    }
+    return 0;
+}
+double valueRearrangeStrongScaling1()
+{
+    pinThread(0);
+    for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
+        valueRearrange(i, false, 1);
+    }
+    return 0;
+}
+double valueRearrangeStrongScaling2()
+{
+    pinThread(0);
+    for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
+        valueRearrange(i, false, 2);
+    }
+    return 0;
+}
+double valueRearrangeStrongScaling3()
+{
+    pinThread(0);
+    for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
+        valueRearrange(i, false, 3);
+    }
+    return 0;
+}
+
 // The following struct and table define each performance test in terms of
 // a string name and a function that implements the test.
 struct TestInfo {
@@ -2576,6 +2763,14 @@ TestInfo tests[] = {
 #endif
     {"vectorPushPop", vectorPushPop,
      "Push and pop a std::vector"},
+    {"valueRearrange0", valueRearrangeStrongScaling0,
+     "Millisort value rearrangement (naive copy)"},
+    {"valueRearrange1", valueRearrangeStrongScaling1,
+     "Millisort value rearrangement (only random prefetch)"},
+    {"valueRearrange2", valueRearrangeStrongScaling2,
+     "Millisort value rearrangement (only sequential prefetch"},
+    {"valueRearrange3", valueRearrangeStrongScaling3,
+     "Millisort value rearrangement (seq. prefetch + copy)"},
 };
 
 /**

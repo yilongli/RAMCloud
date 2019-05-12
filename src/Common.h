@@ -217,6 +217,22 @@ get(const Map& map, const typename Map::key_type& key)
 #define CACHE_ALIGN  __attribute__((aligned(CACHE_LINE_SIZE)))
 
 /**
+ * Flush the last level cache by dynamically allocating and initializing
+ * a chunk of memory (much) larger than the size of LLC.
+ */
+static inline void
+flushLLC()
+{
+    // TODO: this approach is probably not very reliable. See:
+    //    https://stackoverflow.com/a/34461372
+    //    https://stackoverflow.com/a/48533834
+#define LAST_LEVEL_CACHE_SIZE (32 * 1000000)
+    char* p = new char[LAST_LEVEL_CACHE_SIZE * 2];
+    memset(p, 1, LAST_LEVEL_CACHE_SIZE * 2);
+    delete p;
+}
+
+/**
  * Prefetch the cache lines containing [object, object + numBytes) into the
  * processor's caches.
  * The best docs for this are in the Intel instruction set reference under
@@ -225,14 +241,25 @@ get(const Map& map, const typename Map::key_type& key)
  *      The start of the region of memory to prefetch.
  * \param numBytes
  *      The size of the region of memory to prefetch.
+ * \param rw
+ *      One means that the prefetch is preparing for a write to the memory
+ *      address and zero, the default, means that the prefetch is preparing
+ *      for a read.
+ * \param locality
+ *      A value of zero means that the data has no temporal locality, so it
+ *      need not be left in the cache after the access. A value of three means
+ *      that the data has a high degree of temporal locality and should be left
+ *      in all levels of cache possible. Values of one and two mean,
+ *      respectively, a low or moderate degree of temporal locality.
+ *      The default is three.
  */
 static inline void
-prefetch(const void* object, uint64_t numBytes)
+prefetch(const void* object, uint64_t numBytes, int rw = 0, int locality = 3)
 {
     uint64_t offset = reinterpret_cast<uint64_t>(object) & 0x3fUL;
     const char* p = reinterpret_cast<const char*>(object) - offset;
     for (uint64_t i = 0; i < offset + numBytes; i += 64)
-        _mm_prefetch(p + i, _MM_HINT_T0);
+        __builtin_prefetch(p + i, rw, locality);
 }
 
 /**
