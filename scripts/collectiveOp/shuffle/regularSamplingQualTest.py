@@ -49,8 +49,9 @@ def generate_keys(distribution):
     '''
     if distribution == 0:
         # Uniform distribution.
-        keys = np.random.random_integers(0, 2**62, size=num_records_per_node)
-        # keys = np.random.random_integers(0, 100, size=num_records_per_node)
+        # keys = np.random.random_integers(0, 2**62, size=num_records_per_node)
+        # keys = np.random.random_integers(0, 10000, size=num_records_per_node)
+        keys = np.random.random_integers(0, 10*1000*1000, size=num_records_per_node)
     elif distribution == 1:
         # Normal/gaussian distribution
         mu, sigma = 0, 100
@@ -189,23 +190,25 @@ for simulation_id in range(num_sims):
     else:
         pivots.sort()
         splitters = partition(pivots, num_nodes)
+        PRINT_PIVOT_ONLY = False
+        if PRINT_PIVOT_ONLY:
+            for key, _, _ in pivots:
+                print(key)
+            exit()
     if DEBUG:
         print(f"splitters = {splitters}")
 
     # Evaluate the quality of final splitters based on two metrics: individual
     # shuffle message size and final data skewness factor.
     final_data_sizes = [0] * num_nodes
-    largest_msg_per_step = [0] * num_nodes
-    messages_at_node = []
+    buckets_at_node = []
     for node_id in range(num_nodes):
-        shuffle_msg_sizes = eval_splitter(keys_at_node[node_id], splitters)
+        bucket_sizes = eval_splitter(keys_at_node[node_id], splitters)
         for i in range(num_nodes):
-            final_data_sizes[i] += shuffle_msg_sizes[i] / num_nodes
-            largest_msg_per_step[i] = max(largest_msg_per_step[i],
-                    shuffle_msg_sizes[i])
-        messages_at_node.append(shuffle_msg_sizes)
+            final_data_sizes[i] += bucket_sizes[i] / num_nodes
+        buckets_at_node.append(bucket_sizes)
 
-    PRINT_SKEWNESS_ONLY = True
+    PRINT_SKEWNESS_ONLY = False
     if PRINT_SKEWNESS_ONLY:
         print(f"{max(final_data_sizes):.5f}", flush=True)
         continue
@@ -218,14 +221,50 @@ for simulation_id in range(num_sims):
 
     for node_id in range(num_nodes):
         print(f"Node {node_id}", end='')
-        for size in messages_at_node[node_id]:
+        for size in buckets_at_node[node_id]:
             print(f", {size:.3f}", end='')
         print()
+
+    print()
+    largest_msg_per_step = [0.0] * num_nodes
+    print(f"{'Node ID'}", end="")
+    for node_id in range(num_nodes):
+        print(f"  {node_id:>5d}", end="")
+    print(f"  {'Max':>5s}")
+    for lock_step in range(num_nodes):
+        print(f"Step {lock_step:2d}", end="")
+        for i in range(num_nodes):
+            # Everyone sends to its i-th left-neighbor at step i.
+            msg_size = buckets_at_node[i][(i + num_nodes - lock_step) % num_nodes]
+            largest_msg_per_step[i] = max(largest_msg_per_step[i], msg_size)
+            print(f", {msg_size:5.2f}", end="")
+        print(f", {largest_msg_per_step[lock_step]:5.2f}")
+
+    # TODO: 2-level shuffle
+    group_size = math.ceil(math.sqrt(num_nodes))
+
+
     print("MaxShuffleMsg", end='')
     for largest_msg in largest_msg_per_step:
         print(f", {largest_msg:.3f}", end='')
     print()
-    print("FinalBucketSize", end='')
-    for skew in final_data_sizes:
-        print(f", {skew:.3f}", end='')
+
     print()
+    print("FinalBucketSize", end='')
+    max_skew = max(final_data_sizes)
+    max_bucket_ids = []
+    cml_data = 0
+    bucket_id = 0
+    for skew in final_data_sizes:
+        cml_data += skew
+        print(f", {skew:.3f} ({cml_data:.3f})", end='')
+
+        if max_skew - skew < 1e-6:
+            max_bucket_ids.append(bucket_id)
+        bucket_id = bucket_id + 1
+    print()
+    final_data_sizes.sort()
+    top_ten_buckets = ", ".join(
+            f"{x:.3f}" for x in reversed(final_data_sizes[-10:]))
+    print(f"Top 10 buckets: {top_ten_buckets}");
+    print(f"MaxBucketIDs: {max_bucket_ids}")

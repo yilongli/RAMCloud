@@ -8,7 +8,18 @@ num_records_per_node=$3
 num_pivots=$4
 dist=$5
 
-sim_id=simulation_${num_nodes}_${num_records_per_node}_${num_pivots}_${dist}
+if [ $dist -eq 0 ]
+then
+dist_sym=UNIF
+elif [ $dist -eq 1 ]
+then
+dist_sym=NORM
+elif [ $dist -eq 2 ]
+then
+dist_sym=ZIPF
+fi
+
+sim_id=finalBucketSkewness_${num_nodes}_${num_records_per_node}_${num_pivots}_${dist_sym}
 work_dir=/tmp/$sim_id
 mkdir -p $work_dir
 
