@@ -217,19 +217,97 @@ get(const Map& map, const typename Map::key_type& key)
 #define CACHE_ALIGN  __attribute__((aligned(CACHE_LINE_SIZE)))
 
 /**
- * Flush the last level cache by dynamically allocating and initializing
- * a chunk of memory (much) larger than the size of LLC.
+ * Internal implementation of #flushPerCoreCache and #flushSharedCache.
+ *
+ * \param cpu
+ *      Specify the target core whose private cache should be flushed.
+ *      Negative values mean flushing the shared cache (i.e., L3) instead.
  */
-static inline void
-flushLLC()
+static void
+flushCacheInternal(int cpu)
 {
-    // TODO: this approach is probably not very reliable. See:
+    // Note: unfortunately, it's very difficult to implement this function
+    // in a reliable and portable way. Some of the ideas in this method are
+    // borrowed from the following SO answers:
     //    https://stackoverflow.com/a/34461372
     //    https://stackoverflow.com/a/48533834
-#define LAST_LEVEL_CACHE_SIZE (32 * 1000000)
-    char* p = new char[LAST_LEVEL_CACHE_SIZE * 2];
-    memset(p, 1, LAST_LEVEL_CACHE_SIZE * 2);
-    delete p;
+
+    // For each core, allocate a per-core buffer at least 2x as large as L2.
+    // Also, allocate a shared buffer at least 2x as large as L3. Only needs
+    // to be done once at startup.
+    static const size_t CORE_BUF_SIZE = 2 * 1000000 * 2;
+    static const size_t SHARED_BUF_SIZE = 32 * 1000000 * 2;
+    static char* coreBuf[256] = {};
+    static char* sharedBuf = NULL;
+
+    char* &buffer = cpu < 0 ? sharedBuf : coreBuf[cpu];
+    size_t bufferSize = cpu < 0 ? SHARED_BUF_SIZE : CORE_BUF_SIZE;
+
+    if (buffer == NULL) {
+        // Allocate memory backed by hugepage's to reduce TLB pollution.
+        buffer = static_cast<char*>(mmap(NULL, bufferSize,
+                PROT_READ | PROT_WRITE,
+                MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0));
+        if (buffer == MAP_FAILED) {
+            perror("mmap");
+            exit(1);
+        }
+
+        // Write to the space to ensure they are not zero-mapped pages.
+        memset(buffer, 1, bufferSize);
+
+        // Flush the dirty cache lines back to memory.
+        cacheflush(buffer, bufferSize);
+    }
+
+    // Read from the space randomly until we have touch each cache line 10 times
+    // on average. This should defeat CPU's LRU/MRU policy and leave all cache
+    // lines in E (exclusive) and not M (modified) mode.
+    uint32_t numCacheLines = bufferSize / 64;
+    char r = 0;
+    for (uint32_t i = 0; i < numCacheLines * 10; i++) {
+        r += *(buffer + (wyhash64() % numCacheLines) * 64);
+    }
+    doNotOptimizeAway(r);
+
+    if (cpu < 0) {
+        // Make sure no cache line is left in S (shared) mode (which cannot be
+        // dropped immediately upon eviction).
+        cacheflush(buffer, bufferSize);
+    }
+}
+
+/**
+ * Flush the last level cache shared by all cores (on the same socket).
+ * Intended only for benchmarking.
+ *
+ * Note: it does *not* guarantee to flush the private cache of other cores;
+ * however, for processors with inclusive L3 cache (e.g., Intel processors
+ * prior to Skylake), this would effectively flush the L2 cache of each core.
+ */
+static void
+flushSharedCache()
+{
+    std::atomic_flag lock = ATOMIC_FLAG_INIT;
+    while (lock.test_and_set());
+    flushCacheInternal(-1);
+    lock.clear();
+}
+
+/**
+ * Flush the private cache of the running core. Intended only for benchmarking.
+ */
+static void
+flushPerCoreCache(int cpu)
+{
+    cpu_set_t set;
+    sched_getaffinity((pid_t)syscall(SYS_gettid), sizeof(set), &set);
+    if ((CPU_COUNT(&set) == 1) && CPU_ISSET(cpu, &set)) {
+        flushCacheInternal(cpu);
+    } else {
+        printf("Calling thread not pinned to cpu %d!\n", cpu);
+        exit(1);
+    }
 }
 
 /**

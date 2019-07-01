@@ -378,6 +378,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 
     //
     respHdr->numNodesInited = 1;
+
+    // Flush LLC to avoid generating unrealistic numbers; we are doing
+    // memory-to-memory sorting (not cache-to-cache sorting)!
+    flushSharedCache();
 }
 
 /**
@@ -584,7 +588,7 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
         // (not all HTs run equally fast: hypertwin of dispatch thread and the
         // hypertwin of the non-Arachne core runs faster); too small => cache
         // thrashing between HTs?? messing up with memory prefetcher?
-        const int maxItemsPerTask = 128;
+        const int maxItemsPerTask = 2048;
         int workDone = 0;
         uint64_t busyTime = 0;
         while (true) {
@@ -638,20 +642,6 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
 
     // Spin up worker threads on all cores we are allowed to use.
     timeTrace("Spawning workers on coreId %d", Arachne::core.id);
-//    std::vector<int> cpuList;
-//    if (initialData) {
-//        cpuList = {3, 4, 7};
-//        // Policy: just the hypertwin of the non-Arachne core; ???MB/s
-//        cpuList = {4};
-//        // Policy: no hypertwins (including dispatcher's); ???MB/s
-//        cpuList = {4, 6, 7};
-//        // Policy: no hypertwins (but can use dispatcher's); ???MB/s
-//        cpuList = {4, 1, 5, 6, 7};
-//        // Policy: all HTs we can use; ??? MB/s
-//        cpuList = {1, 2, 3, 4, 5, 6, 7};
-//    } else {
-//        cpuList = {1, 2, 3, 4, 5, 6, 7};
-//    }
     Arachne::CorePolicy::CoreList coreList =
             Arachne::getCorePolicy()->getCores(0);
     for (uint i = 0; i < coreList.size(); i++) {

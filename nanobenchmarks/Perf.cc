@@ -54,6 +54,9 @@
 #pragma GCC diagnostic warning "-Weffc++"
 #endif
 
+#include <stdlib.h>
+#include <emmintrin.h>
+
 #pragma GCC diagnostic ignored "-Wcast-qual"
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "memcpy/FastMemcpy.h"
@@ -2355,12 +2358,30 @@ double vectorPushPop()
     return Cycles::toSeconds(stop - start)/(count*3);
 }
 
+static inline
+void cpy_nt_line(void *f, void *t) {
+    __m128i dummy = {0, 0};
+    __asm volatile(
+                   "movdqa (%2), %0\n\t"
+                   "movntdq %0, (%1)\n\t"
+                   "movdqa 16(%2), %0\n\t"
+                   "movntdq %0, 16(%1)\n\t"
+                   "movdqa 32(%2), %0\n\t"
+                   "movntdq %0, 32(%1)\n\t"
+                   "movdqa 48(%2), %0\n\t"
+                   "movntdq %0, 48(%1)"
+                   : "=x" (dummy)
+                   : "r" (t), "r" (f)
+                   : "memory");
+}
+
+
 double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
         int memOp = 0)
 {
 #define KEY_SIZE 10
-#define VALUE_SIZE 90
-//#define VALUE_SIZE 64
+//#define VALUE_SIZE 90
+#define VALUE_SIZE 64
 #define NUM_RECORDS 10000
     const int numCores = std::thread::hardware_concurrency();
     printf("# workers %d, key size %d, value size %d, # records %d, "
@@ -2376,9 +2397,9 @@ double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
         char bytes[VALUE_SIZE];
     };
 
-    PivotKey* keys = new PivotKey[NUM_RECORDS];
-    Value* oldValues = new Value[NUM_RECORDS];
-    Value* newValues = new Value[NUM_RECORDS];
+    PivotKey* keys = (PivotKey*) aligned_alloc(4096, sizeof(PivotKey) * (NUM_RECORDS + 100));
+    Value* oldValues = (Value*) aligned_alloc(4096, sizeof(Value) * (NUM_RECORDS + 100));
+    Value* newValues = (Value*) aligned_alloc(4096, sizeof(Value) * (NUM_RECORDS + 100));
 
     // Generate a pseudo-random permutation for key indexes.
     for (uint32_t i = 0; i < NUM_RECORDS; i++) {
@@ -2407,8 +2428,19 @@ double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
             // Copy value from src to dest.
             for (int i = startIdx; i < startIdx + numRecords; i++) {
                 if (VALUE_SIZE == 64) {
-                    *((uint64_t*) newValues[i].bytes) =
-                            *((uint64_t*) oldValues[keys[i].index].bytes);
+                    // FIXME: this is wrong! only copying 8B (64bits) data!
+//                    *((uint64_t*) newValues[i].bytes) =
+//                            *((uint64_t*) oldValues[keys[i].index].bytes);
+                    void* dst = &newValues[i];
+                    const void* src = &oldValues[keys[i].index];
+                    __m128i m0 = _mm_loadu_si128(((const __m128i*)src) + 0);
+                    __m128i m1 = _mm_loadu_si128(((const __m128i*)src) + 1);
+                    __m128i m2 = _mm_loadu_si128(((const __m128i*)src) + 2);
+                    __m128i m3 = _mm_loadu_si128(((const __m128i*)src) + 3);
+                    _mm_storeu_si128(((__m128i*)dst) + 0, m0);
+                    _mm_storeu_si128(((__m128i*)dst) + 1, m1);
+                    _mm_storeu_si128(((__m128i*)dst) + 2, m2);
+                    _mm_storeu_si128(((__m128i*)dst) + 3, m3);
                 } else if (VALUE_SIZE == 90) {
                     void* dst = &newValues[i];
                     const void* src = &oldValues[keys[i].index];
@@ -2432,7 +2464,37 @@ double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
             for (int i = startIdx; i < startIdx + numRecords; i++) {
                 prefetch(&oldValues[i], VALUE_SIZE, 0, 0);
             }
-        } else {
+        } else if (memOp == 3) {
+            // unroll loop + prefetch src values
+#if VALUE_SIZE == 64
+#define COPY_VALUE(x) *((uint64_t*) newValues[i+x].bytes) = *((uint64_t*) oldValues[keys[i+x].index].bytes);
+#else
+#define COPY_VALUE(x) std::memcpy(&newValues[i + x], &oldValues[keys[i + x].index], VALUE_SIZE);
+#endif
+            for (int i = startIdx; i < startIdx + numRecords; i += 10) {
+                COPY_VALUE(0)
+                COPY_VALUE(1)
+                COPY_VALUE(2)
+                COPY_VALUE(3)
+                COPY_VALUE(4)
+                COPY_VALUE(5)
+                COPY_VALUE(6)
+                COPY_VALUE(7)
+                COPY_VALUE(8)
+                COPY_VALUE(9)
+                prefetch(&oldValues[keys[i+20].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+21].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+22].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+23].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+24].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+25].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+26].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+27].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+28].index], VALUE_SIZE, 0, 0);
+                prefetch(&oldValues[keys[i+29].index], VALUE_SIZE, 0, 0);
+            }
+#undef COPY_VALUE
+        } else if (memOp == 4) {
             // Sequential prefetch + copy
             for (int i = startIdx; i < startIdx + numRecords; i++) {
                 prefetch(&oldValues[i], VALUE_SIZE, 0, 3);
@@ -2444,6 +2506,18 @@ double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
                 } else {
                     std::memcpy(&newValues[i], &oldValues[keys[i].index],
                             VALUE_SIZE);
+                }
+            }
+        } else if (memOp == 5) {
+            // Non-temporal write to dst values.
+            for (int i = startIdx; i < startIdx + numRecords; i++) {
+                if (VALUE_SIZE == 64) {
+//                    _mm_stream_si64((long long int*) newValues[i].bytes,
+//                            *((int64_t*) oldValues[keys[i].index].bytes));
+                    cpy_nt_line(oldValues[keys[i].index].bytes, newValues[i].bytes);
+                } else {
+                    // TODO: unimplemented
+                    throw 1;
                 }
             }
         }
@@ -2499,6 +2573,10 @@ double valueRearrange(const int numWorkers, const bool prefetchSrcValues,
                 bytesPerMicros, elapsedMicros,
                 Cycles::toSeconds(prefetchTime)*1e6);
     }
+
+    free(keys);
+    free(oldValues);
+    free(newValues);
     return 0;
 }
 
@@ -2531,6 +2609,24 @@ double valueRearrangeStrongScaling3()
     pinThread(0);
     for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
         valueRearrange(i, false, 3);
+    }
+    return 0;
+}
+
+double valueRearrangeStrongScaling4()
+{
+    pinThread(0);
+    for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
+        valueRearrange(i, false, 4);
+    }
+    return 0;
+}
+
+double valueRearrangeStrongScaling5()
+{
+    pinThread(0);
+    for (int i = 1; i < std::thread::hardware_concurrency(); i++) {
+        valueRearrange(i, false, 5);
     }
     return 0;
 }
@@ -2768,9 +2864,13 @@ TestInfo tests[] = {
     {"valueRearrange1", valueRearrangeStrongScaling1,
      "Millisort value rearrangement (only random prefetch)"},
     {"valueRearrange2", valueRearrangeStrongScaling2,
-     "Millisort value rearrangement (only sequential prefetch"},
+     "Millisort value rearrangement (only sequential prefetch)"},
     {"valueRearrange3", valueRearrangeStrongScaling3,
+     "Millisort value rearrangement (unroll + prefetch + copy)"},
+    {"valueRearrange4", valueRearrangeStrongScaling4,
      "Millisort value rearrangement (seq. prefetch + copy)"},
+    {"valueRearrange5", valueRearrangeStrongScaling5,
+     "Millisort value rearrangement (non-temporal write)"},
 };
 
 /**
