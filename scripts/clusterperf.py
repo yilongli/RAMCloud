@@ -44,6 +44,7 @@ import glob
 import os
 import pprint
 import re
+import subprocess
 import sys
 import time
 from optparse import OptionParser
@@ -818,7 +819,11 @@ def millisort(name, options, cluster_args, client_args):
     cluster_args['num_clients'] = 1
     if 'master_args' not in cluster_args:
         # Force Arachne CoreArbiter to allocate static number of cores.
-        cluster_args['master_args'] = '--minNumCores 7 --maxNumCores 7'
+        # Use all but one lcores available in the system.
+        ncores = int(subprocess.Popen(['nproc'], stdout=subprocess.PIPE)
+                .communicate()[0]) - 1
+        cluster_args['master_args'] = '--minNumCores ' + str(ncores)
+        cluster_args['master_args'] += ' --maxNumCores ' + str(ncores)
         # No need to use too much memory on masters; 1GB should be enough.
         cluster_args['master_args'] += ' --totalMasterMemory 1000'
 

@@ -152,8 +152,19 @@ DpdkDriver::DpdkDriver(Context* context, int port)
                 strerror(errno)));
     }
     nameBuffer[sizeof(nameBuffer)-1] = 0;   // Needed if name was too long.
-    const char *argv[] = {"rc", "--file-prefix", nameBuffer, "-c", "1",
-            "-n", "1", NULL};
+    // Compute the list of cores the current thread pinned to.
+    string coreList;
+    int lcore = 0;
+    for (char c : Util::getCpuAffinityString()) {
+        if (c == 'X') {
+            coreList.append(std::to_string(lcore));
+            coreList.append(",");
+        }
+        lcore++;
+    }
+    coreList.pop_back();
+    const char *argv[] = {"rc", "--file-prefix", nameBuffer,
+            "-l", coreList.c_str(), "-n", "4", NULL};
     int argc = static_cast<int>(sizeof(argv) / sizeof(argv[0])) - 1;
 
     rte_openlog_stream(fileLogger.getFile());
@@ -281,7 +292,9 @@ DpdkDriver::DpdkDriver(Context* context, int port)
     // essentially kills performance, as every thread is contenting for a
     // single core. Revert this, by restoring the affinity to the default
     // (all cores).
-    Util::clearCpuAffinity();
+    // FIXME: we are using Arachne! can't clear affinity; no need to worry
+    // master worker threads affinity anyway; they are arachnified
+//    Util::clearCpuAffinity();
 }
 
 /**
