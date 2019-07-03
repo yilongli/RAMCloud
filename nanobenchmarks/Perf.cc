@@ -57,12 +57,6 @@
 #include <stdlib.h>
 #include <emmintrin.h>
 
-#pragma GCC diagnostic ignored "-Wcast-qual"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "memcpy/FastMemcpy.h"
-#pragma GCC diagnostic warning "-Wcast-qual"
-#pragma GCC diagnostic warning "-Wunused-function"
-
 #include "Common.h"
 #include "Atomic.h"
 #include "Cycles.h"

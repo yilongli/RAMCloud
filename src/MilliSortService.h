@@ -322,7 +322,8 @@ class MilliSortService : public Service {
 
     struct Value {
 
-        static const uint32_t SIZE = 90;
+        static const uint32_t SIZE = 96;
+//        static const uint32_t SIZE = 90;
 
         char bytes[SIZE];
 
@@ -394,8 +395,11 @@ class MilliSortService : public Service {
     struct RearrangeValueTask {
         uint64_t startTime;
 
-        /// When, in Cycles::rdtsc, the last worker completed.
-        std::atomic<uint64_t> completeTime;
+        /// Time, in Cycles::rdtsc, when the last worker completed.
+        uint64_t stopTime;
+
+        /// Provides mutual exclusion to #stopTime;
+        SpinLock mutex;
 
         /// Worker threads that rearrange the values.
         std::list<Arachne::ThreadId> workers;
@@ -407,15 +411,33 @@ class MilliSortService : public Service {
         /// TODO: explain why it must live beyond method #rearrangeValues
         Tub<std::atomic_int> numSortedValues;
 
-        explicit RearrangeValueTask()
-            : startTime(), completeTime(), workers(), numSortedValues() {}
-
-        void wait() {
-            for (auto& tid : workers) { Arachne::join(tid); }
+        explicit RearrangeValueTask(PivotKey* keys, Value* src, Value* dst)
+            : startTime()
+            , stopTime()
+            , mutex()
+            , workers()
+            , keys(keys)
+            , src(src)
+            , dst(dst)
+            , numSortedValues()
+        {
+            numSortedValues.construct(0);
         }
 
-        uint64_t getElapsedTime() {
-            return completeTime - startTime;
+        void complete(uint64_t time) {
+            SpinLock::Guard _(mutex);
+            stopTime = std::max(stopTime, time);
+        }
+
+        /**
+         * Block until the rearrangement operation has finished.
+         *
+         * \return
+         *      Elapsed time, in rdtsc ticks, of the rearrangement operation.
+         */
+        uint64_t wait() {
+            for (auto& tid : workers) { Arachne::join(tid); }
+            return stopTime - startTime;
         }
     };
 
@@ -426,6 +448,7 @@ class MilliSortService : public Service {
                 std::vector<PivotKey>* pivots)
             : millisort(millisort)
             , result()
+            , mutex()
             , pivots(pivots)
             , activeCycles(0)
             , bytesReceived(0)
@@ -537,15 +560,12 @@ class MilliSortService : public Service {
     // ----------------------
 
     static inline void copyValue(void* dst, const void* src);
-    static void copyValues(Value* dst, const Value* src, int numValues);
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
-    static void prefetchArray(void* address, int numItems, bool isKey);
     void localSortAndPickPivots();
-    void rearrangeValues(PivotKey* keys, Value* src, Value* dest,
-            int totalItems, bool initialData,
-            RearrangeValueTask* rearrangeValueTask);
+    void rearrangeValues(RearrangeValueTask* rearrangeValueTask, int totalItems,
+            bool initialData);
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();

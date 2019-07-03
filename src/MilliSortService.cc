@@ -14,12 +14,7 @@
  */
 
 #include <emmintrin.h>
-
-#pragma GCC diagnostic ignored "-Wcast-qual"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#include "memcpy/FastMemcpy.h"
-#pragma GCC diagnostic warning "-Wcast-qual"
-#pragma GCC diagnostic warning "-Wunused-function"
+#include <immintrin.h>
 
 #include "Arachne/DefaultCorePolicy.h"
 #include "ClockSynchronizer.h"
@@ -89,7 +84,9 @@ extern volatile int numShuffleRepliesRecv;
 // millisort.
 #define BYPASS_LOCAL_SORT 1
 
-#define SHUFFLE_VALUE_BARRIER 1
+// Change 0 -> 1 in the following line to overlap init. value rearrangement
+// with subsequent partition steps.
+#define OVERLAP_INIT_VAL_REARRANGE 0
 
 // Hack to avoid segfaults inside SJP's online merger sorter.
 #define BYPASS_ONLINE_MERGE_SORTER 1
@@ -288,8 +285,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                 Arachne::numActiveCores.load());
         respHdr->numPivotsPerNode = respHdr->numNodes;
         respHdr->maxOutstandingRpcs = MAX_OUTSTANDING_RPCS;
-        respHdr->keySize = 10;
-        respHdr->valueSize = 90;
+        respHdr->keySize = PivotKey::KEY_SIZE;
+        respHdr->valueSize = Value::SIZE;
         return;
     }
 
@@ -353,7 +350,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 
     //
     localPivots.clear();
-    rearrangeLocalVals.construct();
+    rearrangeLocalVals.construct(localKeys, localValues0, localValues);
     dataBucketBoundaries.clear();
     dataBucketRanges.clear();
     readyToServiceKeyShuffle = false;
@@ -445,20 +442,14 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
 void
 MilliSortService::copyValue(void* dst, const void* src)
 {
-    static_assert(Value::SIZE == 90);
-	unsigned char* dd = ((unsigned char*)dst) + 90;
-	const unsigned char* ss = ((const unsigned char*)src) + 90;
-    memcpy_sse2_64(dd - 90, ss - 90);
-    memcpy_sse2_16(dd - 26, ss - 26);
-    memcpy_sse2_16(dd - 16, ss - 16);
-}
-
-void
-MilliSortService::copyValues(Value* dst, const Value* src, int numValues)
-{
-    for (int i = 0; i < numValues; i++) {
-        copyValue(dst + i, src + i);
-    }
+//    memcpy(dst, src, Value::SIZE);
+    static_assert(Value::SIZE == 96, "Illegal Value::SIZE!");
+    __m256i ymm1 = _mm256_stream_load_si256((__m256i*)src + 0);
+    __m256i ymm2 = _mm256_stream_load_si256((__m256i*)src + 1);
+    __m256i ymm3 = _mm256_stream_load_si256((__m256i*)src + 2);
+    _mm256_stream_si256((__m256i*)dst + 0, ymm1);
+    _mm256_stream_si256((__m256i*)dst + 1, ymm2);
+    _mm256_stream_si256((__m256i*)dst + 2, ymm3);
 }
 
 void
@@ -495,40 +486,6 @@ MilliSortService::partition(PivotKey* keys, int numKeys, int numPartitions,
 }
 
 /**
- * Bring a block of memory into L3 cache that is shared by all processors within
- * the same socket of the caller.
- *
- * \param address
- *      Starting address of the key or value array.
- * \param numItems
- *      # items to prefetch.
- * \param isKey
- *      True if the array contains PivotKey's; otherwise, it contains Value's.
- */
-void
-MilliSortService::prefetchArray(void* address, int numItems, bool isKey)
-{
-    uint64_t sum = 0;
-    if (isKey) {
-        PivotKey* pivotKey = (PivotKey*) address;
-        for (int i = 0; i < numItems; i++) {
-            sum += pivotKey->keyAsUint64();
-            pivotKey++;
-        }
-    } else {
-        Value* value = (Value*) address;
-        for (int i = 0; i < numItems; i++) {
-            sum += value->asUint64();
-            value++;
-        }
-    }
-    int x = *reinterpret_cast<int*>(&sum);
-    if (x == 0x43924776) {
-        LOG(ERROR, "Value was 0x%x", x);
-    }
-}
-
-/**
  *
  *
  * \param useCurrentCore
@@ -537,8 +494,8 @@ MilliSortService::prefetchArray(void* address, int numItems, bool isKey)
  *      is no latency-sensitive task to perform.
  */
 void
-MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
-        int totalItems, bool initialData, RearrangeValueTask* task)
+MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
+        bool initialData)
 {
 //    LOG(NOTICE, "keys at %p (seq. read), src. values at %p (random read) "
 //            "dest. values at %p (seq. write)", keys, src, dest);
@@ -551,11 +508,6 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
         ADD_COUNTER(rearrangeFinalValuesStartTime, task->startTime - startTime);
         numWorkers = &PerfStats::threadStats.rearrangeFinalValuesWorkers;
     }
-
-    std::atomic_int* numSortedValues = task->numSortedValues.construct(0);
-    task->keys = keys;
-    task->src = src;
-    task->dst = dest;
 
     /**
      * Main method of the worker thread. Each worker is responsible to rearrange 
@@ -571,13 +523,12 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
      *      # values assigned to this worker. So this worker should rearrange
      *      values corresponding to keys[startIdx...(startIdx+numValues-1)].
      */
-    auto workerMain = [task, numSortedValues, totalItems, initialData]
+    auto workerMain = [task, totalItems, initialData]
     {
         // Unpack arguments.
         PivotKey* keys = task->keys;
         Value* src = task->src;
         Value* dest = task->dst;
-        std::atomic<uint64_t>* completeTime = &task->completeTime;
 
         timeTrace("RearrangeValue worker started, coreId %d", Arachne::core.id);
         uint64_t* cpuTime = initialData ?
@@ -588,37 +539,17 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
         // (not all HTs run equally fast: hypertwin of dispatch thread and the
         // hypertwin of the non-Arachne core runs faster); too small => cache
         // thrashing between HTs?? messing up with memory prefetcher?
-        const int maxItemsPerTask = 2048;
+        const int maxItemsPerTask = 128;
         int workDone = 0;
         uint64_t busyTime = 0;
         while (true) {
             uint64_t now = Cycles::rdtsc();
-            int startIdx = numSortedValues->fetch_add(maxItemsPerTask);
+            int startIdx = task->numSortedValues->fetch_add(maxItemsPerTask);
             int numItems = std::min(maxItemsPerTask, totalItems - startIdx);
             if (numItems <= 0) {
                 break;
             }
 
-#define UNROLL_LOOP 0
-#if UNROLL_LOOP
-            Value* newAddress = dest + startIdx;
-            int endIdx = startIdx + numItems;
-            endIdx -= endIdx % 4;
-            for (int i = startIdx; i < endIdx; i += 4) {
-                // Note: it's OK to leave the stale value in keys[i].index
-                // because after rearrangement, the correspondence between keys
-                // and values is trivial (ie. keys[i] -> values[i]).
-                copyValue(newAddress + 0, &src[keys[i + 0].index]);
-                copyValue(newAddress + 1, &src[keys[i + 1].index]);
-                copyValue(newAddress + 2, &src[keys[i + 2].index]);
-                copyValue(newAddress + 3, &src[keys[i + 3].index]);
-                newAddress += 4;
-            }
-            for (int i = endIdx; i < startIdx + numItems; i++) {
-                copyValue(newAddress, &src[keys[i].index]);
-                newAddress++;
-            }
-#else
             int endIdx = startIdx + numItems;
             for (int i = startIdx; i < endIdx; i++) {
                 // Note: it's OK to leave the stale value in keys[i].index
@@ -626,12 +557,12 @@ MilliSortService::rearrangeValues(PivotKey* keys, Value* src, Value* dest,
                 // and values is trivial (ie. keys[i] -> values[i]).
                 copyValue(dest + i, &src[keys[i].index]);
             }
-#endif
+
             workDone += numItems;
             busyTime += (Cycles::rdtsc() - now);
             Arachne::yield();
         }
-        completeTime->store(Cycles::rdtsc());
+        task->complete(Cycles::rdtsc());
         const char* fmt = initialData ?
                 "Worker rearranged %d init. values, busy %lu us, cpu %d" :
                 "Worker rearranged %d final values, busy %lu us, cpu %d";
@@ -669,25 +600,15 @@ MilliSortService::localSortAndPickPivots()
         SCOPED_TIMER(localSortCycles);
         ADD_COUNTER(localSortWorkers, 1);
 #if BYPASS_LOCAL_SORT
-        // Bypass local sorting until we integrate the RADULS2 module
-        // Assume 30 ns/item using 8 threads...
-        uint64_t localSortCostMicros = 0;
-        if (numDataTuples == 4775) {
-            localSortCostMicros = 200;
-        } else if (numDataTuples == 9550) {
-            localSortCostMicros = 299;
-        } else if (numDataTuples == 19100) {
-            localSortCostMicros = 498;
-        } else {
-            localSortCostMicros = uint64_t(double(numDataTuples) * 30 / 1000.0);
-        }
+        // Bypass local sorting until we integrate the ips4o module.
+        // Assume ~11 ns/item using 10 physical cores (or 20 lcores).
+        uint64_t localSortCostMicros =
+                uint64_t(double(numDataTuples) * 11 / 1000.0);
         uint64_t deadline = Cycles::rdtsc() +
                 Cycles::fromMicroseconds(localSortCostMicros);
-        prefetchArray(localKeys, numDataTuples, true);
-        prefetchArray(localValues0, numDataTuples, false);
-        // Note: there is not enough time to overlap prefetching localValues
-        // with sorting.
-//        prefetchArray(localValues, numDataTuples, false);
+        // Prefetch sorted keys into LLC to simulate the cache state after sort.
+        prefetchMemoryBlock<_MM_HINT_T2>(localKeys,
+                downCast<uint32_t>(numDataTuples) * PivotKey::SIZE);
         while (Cycles::rdtsc() < deadline) {
             Arachne::yield();
         }
@@ -697,13 +618,16 @@ MilliSortService::localSortAndPickPivots()
     }
     timeTrace("sorted %d keys", numDataTuples);
 
-    // FIXME: I have to move it into the barrier before shuffle values to avoid
-    // interfering with the partition phase... Bummer:(
-#if !SHUFFLE_VALUE_BARRIER
     // Overlap rearranging initial values with subsequent stages. This only
     // needs to be done before key (actually, value) shuffle.
-    rearrangeValues(localKeys, localValues0, localValues, numDataTuples,
-            true, rearrangeLocalVals.get());
+    rearrangeValues(rearrangeLocalVals.get(), numDataTuples, true);
+
+    // FIXME: to avoid interfering with the partition phase, block till finish.
+#if !OVERLAP_INIT_VAL_REARRANGE
+    uint64_t elapsedTime = rearrangeLocalVals->wait();
+    readyToServiceValueShuffle = true;
+    timeTrace("rearranging init. values completed");
+    ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
 #endif
 
     // Pick local pivots that partitions the local keys evenly.
@@ -1114,15 +1038,6 @@ MilliSortService::shuffleValues()
     // (TODO: figure out why? e.g., memory/cache interference)
     Arachne::join(mergeSortPoller);
 
-#if SHUFFLE_VALUE_BARRIER
-    rearrangeValues(localKeys, localValues0, localValues, numDataTuples,
-            true, rearrangeLocalVals.get());
-
-    while (Cycles::rdtsc() < startTime + Cycles::fromMicroseconds(2000)) {
-        Arachne::yield();
-    }
-    timeTrace("shuffle value barrier released");
-#endif
     ADD_COUNTER(shuffleValuesStartTime, Cycles::rdtsc() - startTime);
     START_TIMER(shuffleValuesElapsedTime);
     timeTrace("about to shuffle values");
@@ -1135,7 +1050,7 @@ MilliSortService::shuffleValues()
 
     int valueIdx, numValues;
     std::tie(valueIdx, numValues) = dataBucketRanges[world->rank];
-    copyValues(&sortedValues0[0], &localValues[valueIdx], numValues);
+    memcpy(&sortedValues0[0], &localValues[valueIdx], numValues * Value::SIZE);
     timeTrace("copied local values");
 
     // Make sure the online merge of final keys completes before rearranging
@@ -1187,12 +1102,11 @@ MilliSortService::shuffleValues()
 #endif
 
     timeTrace("about to rearrange final values");
-    RearrangeValueTask rearrangeFinalVals;
-    rearrangeValues(sortedKeys, sortedValues0, sortedValues, numSortedItems,
-            false, &rearrangeFinalVals);
-    rearrangeFinalVals.wait();
-    ADD_COUNTER(rearrangeFinalValuesElapsedTime,
-            rearrangeFinalVals.getElapsedTime())
+    RearrangeValueTask rearrangeFinalVals(sortedKeys, sortedValues0,
+            sortedValues);
+    rearrangeValues(&rearrangeFinalVals, numSortedItems, false);
+    uint64_t elapsedTime = rearrangeFinalVals.wait();
+    ADD_COUNTER(rearrangeFinalValuesElapsedTime, elapsedTime)
 
     // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
     ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
@@ -1408,19 +1322,17 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             timeTrace("shuffle-value-server: handler received pull request from"
                     " rank %u", senderId);
             if (!readyToServiceValueShuffle) {
-                timeTrace("check if rearranged init. values has completed?");
-                // Note: can't wait on worker threads immediately; there is a
-                // rare chance that we haven't even started the workers?
-                while (rearrangeLocalVals->completeTime.load() == 0) {
-                    Arachne::yield();
+                uint64_t elapsedTime = rearrangeLocalVals->wait();
+                bool expected = false;
+                bool success = readyToServiceValueShuffle
+                        .compare_exchange_strong(expected, true);
+                if (success) {
+                    ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
+                    timeTrace("rearranged init. values completed; ready for "
+                              "value shuffle");
                 }
-                rearrangeLocalVals->wait();
-                ADD_COUNTER(rearrangeInitValuesElapsedTime,
-                        rearrangeLocalVals->getElapsedTime())
-                readyToServiceValueShuffle.store(true);
-                timeTrace("rearranged init. values completed; ready for value "
-                        "shuffle");
             }
+
             int valueIdx, numValues;
             std::tie(valueIdx, numValues) = dataBucketRanges[senderId];
             rpc->replyPayload->appendExternal(&localValues[valueIdx],

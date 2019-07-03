@@ -234,6 +234,27 @@ void flushSharedCache();
 //void flushPerCoreCache(int cpu);
 
 /**
+ * Prefetch a consecutive range of memory into cache. The precise behavior of
+ * the prefetch (e.g., which cache level, read or write intent, temporal or not)
+ * can be controlled by the locality hint.
+ *
+ * \param addr
+ *      Starting address of the memory range
+ * \param numBytes
+ *      Size of the memory range in bytes
+ */
+template <_mm_hint locality = _MM_HINT_T2>
+static inline void
+prefetchMemoryBlock(void* addr, size_t numBytes)
+{
+    // https://stackoverflow.com/questions/46521694/what-are-mm-prefetch-
+    // locality-hints
+    for (char* p = (char*)addr; p < (char*)addr + numBytes; p += 64) {
+        _mm_prefetch(p, locality);
+    }
+}
+
+/**
  * Prefetch the cache lines containing [object, object + numBytes) into the
  * processor's caches.
  * The best docs for this are in the Intel instruction set reference under
@@ -242,25 +263,14 @@ void flushSharedCache();
  *      The start of the region of memory to prefetch.
  * \param numBytes
  *      The size of the region of memory to prefetch.
- * \param rw
- *      One means that the prefetch is preparing for a write to the memory
- *      address and zero, the default, means that the prefetch is preparing
- *      for a read.
- * \param locality
- *      A value of zero means that the data has no temporal locality, so it
- *      need not be left in the cache after the access. A value of three means
- *      that the data has a high degree of temporal locality and should be left
- *      in all levels of cache possible. Values of one and two mean,
- *      respectively, a low or moderate degree of temporal locality.
- *      The default is three.
  */
 static inline void
-prefetch(const void* object, uint64_t numBytes, int rw = 0, int locality = 3)
+prefetch(const void* object, uint64_t numBytes)
 {
     uint64_t offset = reinterpret_cast<uint64_t>(object) & 0x3fUL;
     const char* p = reinterpret_cast<const char*>(object) - offset;
     for (uint64_t i = 0; i < offset + numBytes; i += 64)
-        __builtin_prefetch(p + i, rw, locality);
+        _mm_prefetch(p + i, _MM_HINT_T0);
 }
 
 /**
