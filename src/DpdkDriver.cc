@@ -503,8 +503,7 @@ DpdkDriver::sendPacket(const Address* addr,
     if (unlikely(NULL == mbuf)) {
         uint32_t numMbufsAvail = rte_mempool_avail_count(mbufPool);
         uint32_t numMbufsInUse = rte_mempool_in_use_count(mbufPool);
-        RAMCLOUD_CLOG(WARNING,
-                "Failed to allocate a packet buffer; dropping packet; "
+        DIE("Failed to allocate a packet buffer; dropping packet; "
                 "%u mbufs available, %u mbufs in use, %lu payloads to release",
                 numMbufsAvail, numMbufsInUse, payloadsToRelease.size());
         return;

@@ -126,6 +126,7 @@ private:
         // Description of merge job. Worker will merge #arrays to #dest.
         std::vector<ArrayPtr> arrays;
         ArrayPtr dest;
+        bool isSplittedSubJob;
         
         // Current level in the big merge tree. Used by dispatch only.
         int currentLevel = 0;
@@ -208,6 +209,7 @@ private:
         ArrayPtr src1;
         ArrayPtr src2;
         ArrayPtr dest;
+        bool isSubJob;
     };
     std::queue<SplittedMergeJob> splittedJobs;
     void scheduleSplitted(SplittedMergeJob job, int tid);

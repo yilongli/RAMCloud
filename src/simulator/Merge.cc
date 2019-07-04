@@ -412,7 +412,16 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     , numArraysCompleted()
     , startTime(0)
 {
-    int arrayCount = numArraysTotal;
+    int nextPowerOfTwo = pow(2, ceil(log(numArraysTotal)/log(2)));
+    // Fake the total array count to be a power of 2 by adding dummies.
+    for (int i = 0; i < nextPowerOfTwo - numArraysTotal; ++i) {
+        ArrayPtr ptr;
+        ptr.data = 0;
+        ptr.size = 0;
+        arraysToMerge[0].push(ptr);
+    }
+
+    int arrayCount = nextPowerOfTwo;
     while (arrayCount > 1) {
         numArraysTargets.push_back(arrayCount);
         if (arrayCount / numWorkers > maxWays) {
@@ -471,7 +480,7 @@ void Merge<T>::prepareThreads()
         uint32_t coreId = downCast<uint32_t>(list[i % list.size()]);
         threads[i] = Arachne::createThreadOnCore(coreId, MERGE_WORKER,
                 &contexts[i]);
-        LOG(NOTICE, "spawn worker %d on core %u", i, threads[i].context->originalCoreId);
+//        LOG(DEBUG, "spawn worker %d on core %u", i, threads[i].context->originalCoreId);
 //        threads[i] = Arachne::createThreadWithClass(
 //                Arachne::DefaultCorePolicy::EXCLUSIVE, MERGE_WORKER,
 //                &contexts[i]);
@@ -508,6 +517,7 @@ Merge<T>::scheduleSplitted(SplittedMergeJob job, int tid)
     contexts[tid].arrays.push_back(job.src1);
     contexts[tid].arrays.push_back(job.src2);
     contexts[tid].dest = job.dest;
+    contexts[tid].isSplittedSubJob = job.isSubJob;
 
     contexts[tid].currentLevel = level;
     contexts[tid].state = 2;
@@ -608,10 +618,12 @@ continuePolling:
         if (contexts[tid].state == 1) { // Done working.
 //                    printf("Level%d thread %d done.\n", mergeLevel, tid);
             int mergeLevel = contexts[tid].currentLevel;
-            if (contexts[tid].dest.size > 0) {
+//            if (contexts[tid].dest.size > 0) {
+            if (!contexts[tid].isSplittedSubJob) {
                 numArraysCompleted[mergeLevel] += int(contexts[tid].arrays.size());
                 arraysToMerge[mergeLevel + 1].push(contexts[tid].dest);
             }
+
             perfStats.busyCyclesByThreadAndLevel[tid][mergeLevel] +=
                     contexts[tid].currentJobCycles;
 #if VERBOSE
@@ -684,6 +696,7 @@ continuePolling:
                 // It is a bit hacky... worker doesn't use this size.
                 // Use size 0 to indicate that no need to add it in arraysToSort later.
                 job.dest.size = (part == 0) ? (first.size + second.size) : 0;
+                job.isSubJob = (part == 0) ? false : true;
 
                 int scheduledTid = -1;
                 _unused(scheduledTid);
@@ -733,6 +746,7 @@ continuePolling:
             contexts[tid].dest.data = &buffer[(level + 1) * numAllItems]
                     + nextAvailable[level + 1];
             contexts[tid].dest.size = afterMergeSize;
+            contexts[tid].isSplittedSubJob = false;
             nextAvailable[level + 1] += afterMergeSize;
             contexts[tid].currentLevel = level;
 #if VERBOSE

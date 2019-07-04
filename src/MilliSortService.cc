@@ -931,7 +931,7 @@ MilliSortService::shuffleKeys() {
     }
 
 #if !BYPASS_ONLINE_MERGE_SORTER
-    LOG(WARNING, "about ot mergerSorter->poll, start 0, numKeys %d", numKeys);
+    timeTrace("mergerSorter->add, start 0, numKeys %d", numKeys);
     mergeSorter->poll(&sortedKeys[0], numKeys);
 #endif
     auto keyMerger = [this, &sortedItemCnt] (int serverRank, Buffer* keyBuffer)
@@ -946,7 +946,7 @@ MilliSortService::shuffleKeys() {
             sortedKeys[i].index = uint32_t(i);
         }
 #if !BYPASS_ONLINE_MERGE_SORTER
-        LOG(WARNING, "about ot mergerSorter->poll, start %d, numKeys %d", start, numKeys);
+        timeTrace("mergerSorter->add, start %d, numKeys %d", start, numKeys);
         mergeSorter->poll(&sortedKeys[start], numKeys);
 #endif
         timeTrace("merged %u keys, %u bytes, total keys %d", numKeys,
@@ -1013,7 +1013,13 @@ MilliSortService::shuffleValues()
         std::sort(sortedKeys, sortedKeys + numSortedItems);
         timeTrace("sorted %d final keys", numSortedItems);
 #else
+        uint64_t _s = Cycles::rdtsc();
         while (mergeSorter->poll()) {
+            // FIXME: the mergeSorter still has some wierd liveness issue
+            // `scripts/clusterperf.py -r 0 --transport basic+dpdk --dpdkPort 1 --servers 7 --superuser millisort --verbose --nodesPerPivotServer 10 --dataTuplesPerNode 9550 --count 5`
+            if (Cycles::rdtsc() > _s + Cycles::fromMicroseconds(1000)) {
+                raise(SIGSEGV);
+            }
             Arachne::yield();
         }
         assert(int(mergeSorter->getSortedArray().size) == numSortedItems);
@@ -1025,8 +1031,7 @@ MilliSortService::shuffleValues()
         timeTrace("sorted %d final keys", numSortedItems);
         // FIXME: the following copy is not necessary and should be removed!
         auto sortedArray = mergeSorter->getSortedArray();
-        memcpy(sortedKeys.get(), sortedArray.data,
-                sortedArray.size * PivotKey::SIZE);
+        memcpy(sortedKeys, sortedArray.data, sortedArray.size * PivotKey::SIZE);
         assert(int(sortedArray.size) == numSortedItems);
         timeTrace("copied %d final keys", numSortedItems);
 #endif
@@ -1048,54 +1053,48 @@ MilliSortService::shuffleValues()
     ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
     timeTrace("shuffle values completed");
 
-    int valueIdx, numValues;
-    std::tie(valueIdx, numValues) = dataBucketRanges[world->rank];
-    memcpy(&sortedValues0[0], &localValues[valueIdx], numValues * Value::SIZE);
-    timeTrace("copied local values");
-
     // Make sure the online merge of final keys completes before rearranging
     // final values. Normally, the online merge to be hidden completely within
     // value shuffle.
 //    Arachne::join(mergeSortPoller);
 
-#if !OVERLAP_SHUFFLE_AND_COPY
+    // TODO: eventually, I believe we still want to overlap shuffle and copy-out resp buffer.
+#if OVERLAP_SHUFFLE_AND_COPY
+    int valueIdx, numValues;
+    std::tie(valueIdx, numValues) = dataBucketRanges[world->rank];
+    memcpy(&sortedValues0[0], &localValues[valueIdx], numValues * Value::SIZE);
+    timeTrace("copied local values");
+#else
     timeTrace("about to copy shuffle-value RPC responses");
-//    std::atomic<int> nextServerRank(0);
-//    auto copyOutValues = [this, &nextServerRank] () {
-//        while (true) {
-//            int serverRank = nextServerRank.fetch_add(1);
-//            if (serverRank >= world->size()) {
-//                break;
-//            }
-//            Buffer* valueBuffer = serverRank2ValueBuf[serverRank];
-//            if (!valueBuffer) {
-//                continue;
-//            }
-//            valueBuffer->copy(0, ~0u, &sortedValues0[valueStartIdx[serverRank]]);
-//        }
-//    };
-//    std::vector<Arachne::ThreadId> copyWorkers;
-//    for (int coreId : coresAvailable) {
-//        if (coreId < 0) {
-//            continue;
-//        }
-//        copyWorkers.push_back(
-//                Arachne::createThreadOnCore(coreId, copyOutValues));
-//        if (copyWorkers.size() >= 2) {
-//            break;
-//        }
-//    }
-//    for (auto& threadId : copyWorkers) {
-//        Arachne::join(threadId);
-//    }
+    std::atomic<int> nextServer(0);
+    auto copyOutValues = [this, &nextServer] () {
+        while (true) {
+            int rank = nextServer.fetch_add(1);
+            if (rank >= world->size()) {
+                break;
+            }
+            if (rank == world->rank) {
+                int idx, n;
+                std::tie(idx, n) = dataBucketRanges[rank];
+                memcpy(&sortedValues0[0], &localValues[idx], n * Value::SIZE);
+            } else {
+                Buffer* valueBuffer = serverRank2ValueBuf[rank];
+                valueBuffer->copy(0, ~0u, &sortedValues0[valueStartIdx[rank]]);
+            }
+        }
+    };
     {
         SCOPED_TIMER(shuffleValuesCopyResponseElapsedTime);
-        for (int serverRank = 0; serverRank < world->size(); serverRank++) {
-            Buffer* valueBuffer = serverRank2ValueBuf[serverRank];
-            if (valueBuffer) {
-                valueBuffer->copy(0, ~0u,
-                        &sortedValues0[valueStartIdx[serverRank]]);
-            }
+        std::vector<Arachne::ThreadId> workers;
+        Arachne::CorePolicy::CoreList coreList =
+                Arachne::getCorePolicy()->getCores(0);
+        for (uint i = 0; i < coreList.size(); i++) {
+            int coreId = coreList[i];
+            workers.push_back(
+                    Arachne::createThreadOnCore(coreId, copyOutValues));
+        }
+        for (auto& threadId : workers) {
+            Arachne::join(threadId);
         }
     }
     timeTrace("copied shuffled values out of RPC responses");

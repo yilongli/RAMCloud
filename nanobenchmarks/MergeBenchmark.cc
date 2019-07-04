@@ -38,21 +38,8 @@
 using namespace RAMCloud;
 
 static int numMergeWorkers;
-
-/*
- * This function just discards its argument. It's used to make it
- * appear that data is used,  so that the compiler won't optimize
- * away the code we're trying to measure.
- *
- * \param value
- *      Pointer to arbitrary value; it's discarded.
- */
-void discard(void* value) {
-    int x = *reinterpret_cast<int*>(value);
-    if (x == 0x43924776) {
-        printf("Value was 0x%x\n", x);
-    }
-}
+static int numArrays;
+static int numArrayItems;
 
 //----------------------------------------------------------------------
 // Test functions start here
@@ -207,8 +194,8 @@ double mergeModule()
 {
     int count = 100;
     uint64_t totalTime = 0;
-    int numMasters = 1024;
-    int numItemsPerNode = 50;
+    int numMasters = numArrays;
+    int numItemsPerNode = numArrayItems;
 
 #if USE_ARACHNE
 // TODO: shall I make sure # cores available >= numWorkers + 1 (dispatch)?
@@ -323,6 +310,10 @@ AppMain(int argc, const char** argv) {
         ("help", "Print this help message and exit")
         ("mergeWorkers", po::value<int>(&numMergeWorkers)->default_value(6),
                  "Number of merge workers to create")
+        ("numArrays", po::value<int>(&numArrays)->default_value(1000),
+                 "Number of sorted arrays to merge")
+        ("arrayItems", po::value<int>(&numArrayItems)->default_value(50),
+                 "Number of items in the sorted array")
         ("testName", po::value<vector<string>>(&testNames),
                 "A test is run if its name contains any of the testName"
                 "arguments as a substring");
@@ -372,6 +363,7 @@ void AppMainWrapper(int argc, const char** argv) {
 }
 int
 main(int argc, const char** argv) {
+    Arachne::Logger::setLogLevel(Arachne::SILENT);
     Arachne::init(&argc, argv);
     Arachne::createThread(&AppMainWrapper, argc, argv);
     Arachne::waitForTermination();

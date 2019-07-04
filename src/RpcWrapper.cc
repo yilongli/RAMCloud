@@ -155,6 +155,10 @@ RpcWrapper::handleTransportError()
 {
     // Default version that does not handle errors; probably only useful
     // for testing.
+#if !TESTING
+    LOG(WARNING, "RpcWrapper::handleTransportError() invoked; "
+            "forgot to override?");
+#endif
     return true;
 }
 
@@ -337,7 +341,9 @@ void
 RpcWrapper::simpleWait(Context* context)
 {
     waitInternal(context->dispatch);
-    if (responseHeader->status != STATUS_OK)
+    // Note: responseHeader could be NULL here if this RPC failed but the
+    // subclass does not override handleTransportError.
+    if (responseHeader && responseHeader->status != STATUS_OK)
         ClientException::throwException(HERE, responseHeader->status);
 }
 

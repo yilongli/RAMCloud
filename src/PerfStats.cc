@@ -601,6 +601,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  All-gather & bcast pivots (us)",
             formatMetricRatio(&diff, "allGatherPivotsElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "  Partitioning (us)",
+            formatMetricRatio(&diff, "partitionElapsedTime", "cyclesPerMicros",
+            " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Shuffle keys (us)",
             formatMetricRatio(&diff, "shuffleKeysElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
@@ -612,9 +615,6 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Rearrange final values (us)",
             formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime", "cyclesPerMicros",
-            " %8.2f").c_str()));
-    result.append(format("%-40s %s\n", "  Partition (us)",
-            formatMetricRatio(&diff, "partitionElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Total time (us)",
             formatMetricLambda(&diff,
