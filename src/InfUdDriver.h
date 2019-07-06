@@ -53,13 +53,12 @@ class InfUdDriver : public Driver {
     virtual void receivePackets(uint32_t maxPackets,
             std::vector<Received>* receivedPackets);
     virtual void registerMemory(void* base, size_t bytes);
-    virtual void release(char *payload);
+    virtual void release();
     virtual void sendPacket(const Driver::Address* addr, const void* header,
                             uint32_t headerLen, Buffer::Iterator* payload,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
     virtual string getServiceLocator();
-    virtual void checkTxCompletionQueue();
 
     virtual Driver::Address* newAddress(const ServiceLocator* serviceLocator) {
         if (localMac) {
@@ -186,9 +185,6 @@ class InfUdDriver : public Driver {
                                     // packets
     } __attribute__((packed));
 
-    /// Shared RAMCloud information.
-    Context* context;
-
     /// See #infiniband.
     Tub<Infiniband> realInfiniband;
 
@@ -199,12 +195,6 @@ class InfUdDriver : public Driver {
 
     /// Packet buffers used for receiving incoming packets.
     Tub<BufferPool> rxPool;
-
-    /// Must be held whenever accessing rxPool.freeBuffers: it is shared
-    /// between worker threads (returning packet buffers when they are
-    /// finished) and the dispatch thread (moving buffers from there to the
-    /// HCA).
-    SpinLock mutex;
 
     /// Number of receive buffers currently in the possession of the
     /// HCA.

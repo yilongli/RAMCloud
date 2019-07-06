@@ -94,11 +94,10 @@ namespace {
  */
 InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
         bool ethernet)
-    : context(context)
+    : Driver(context)
     , realInfiniband()
     , infiniband()
     , rxPool()
-    , mutex("InfUdDriver")
     , rxBuffersInHca(0)
     , rxBufferLogThreshold(0)
     , txPool()
@@ -390,23 +389,25 @@ InfUdDriver::registerMemory(void* base, size_t bytes)
  * See docs in the ``Driver'' class.
  */
 void
-InfUdDriver::release(char *payload)
+InfUdDriver::release()
 {
-    SpinLock::Guard guard(mutex);
-
-    // Payload points to the first byte of the packet buffer after the
-    // Ethernet header or GRH header; from that, compute the address of its
-    // corresponding buffer descriptor.
-    if (localMac) {
-        payload -= sizeof(EthernetHeader);
-    } else {
-        payload -= GRH_SIZE;
+    while (!packetsToRelease.empty()) {
+        // Payload points to the first byte of the packet buffer after the
+        // Ethernet header or GRH header; from that, compute the address of its
+        // corresponding buffer descriptor.
+        char* payload = packetsToRelease.back();
+        packetsToRelease.pop_back();
+        if (localMac) {
+            payload -= sizeof(EthernetHeader);
+        } else {
+            payload -= GRH_SIZE;
+        }
+        int index = downCast<int>((payload - rxPool->bufferMemory)
+                /rxPool->descriptors[0].length);
+        BufferDescriptor* bd = &rxPool->descriptors[index];
+        assert(payload == bd->buffer);
+        rxPool->freeBuffers.push_back(bd);
     }
-    int index = downCast<int>((payload - rxPool->bufferMemory)
-            /rxPool->descriptors[0].length);
-    BufferDescriptor* descriptor = &rxPool->descriptors[index];
-    assert(payload == descriptor->buffer);
-    rxPool->freeBuffers.push_back(descriptor);
 }
 
 /*
@@ -638,7 +639,6 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         continue;
 
       error:
-        SpinLock::Guard guard(mutex);
         rxPool->freeBuffers.push_back(bd);
     }
     timeTrace("InfUdDriver::receivePackets done");
@@ -669,20 +669,12 @@ InfUdDriver::getBandwidth()
     return bandwidthGbps*1000;
 }
 
-// See docs in Driver class.
-void
-InfUdDriver::checkTxCompletionQueue()
-{
-    reapTransmitBuffers();
-}
-
 /**
  * Fill up the HCA's queue of pending receive buffers.
  */
 void
 InfUdDriver::refillReceiver()
 {
-    SpinLock::Guard guard(mutex);
     while ((rxBuffersInHca < MAX_RX_QUEUE_DEPTH)
             && !rxPool->freeBuffers.empty()) {
         BufferDescriptor* bd = rxPool->freeBuffers.back();

@@ -68,10 +68,6 @@ namespace {
     }
 }
 
-// Short-hand to obtain a reference to the metadata storage space that we
-// used to store the PacketBufType.
-#define packet_buf_type(payload) *(payload - PACKETBUF_TYPE_SIZE)
-
 // Short-hand to obtain the starting address of a DPDK rte_mbuf based on its
 // payload address.
 #define payload_to_mbuf(payload) reinterpret_cast<struct rte_mbuf*>( \
@@ -84,10 +80,8 @@ constexpr uint16_t DpdkDriver::PRIORITY_TO_PCP[8];
  * Construct a mock DpdkDriver, used for testing only.
  */
 DpdkDriver::DpdkDriver()
-    : context(NULL)
-    , packetBufPool()
+    : Driver(NULL)
     , packetBufsUtilized(0)
-    , payloadsToRelease()
     , locatorString()
     , localMac()
     , portId(0)
@@ -120,10 +114,8 @@ DpdkDriver::DpdkDriver()
  */
 
 DpdkDriver::DpdkDriver(Context* context, int port)
-    : context(context)
-    , packetBufPool()
+    : Driver(context)
     , packetBufsUtilized(0)
-    , payloadsToRelease()
     , locatorString()
     , localMac()
     , portId(0)
@@ -203,8 +195,15 @@ DpdkDriver::DpdkDriver(Context* context, int port)
 
     // configure some default NIC port parameters
     memset(&portConf, 0, sizeof(portConf));
-    portConf.rxmode.max_rx_pkt_len = ETHER_MAX_VLAN_FRAME_LEN;
-    rte_eth_dev_configure(portId, 1, 1, &portConf);
+//    portConf.rxmode.max_rx_pkt_len = ETHER_MAX_VLAN_FRAME_LEN;
+    // FIXME: why doesn't vlan strip offload work on xl170?
+    // https://stackoverflow.com/q/52330474/11495205
+    portConf.rxmode.offloads = DEV_RX_OFFLOAD_VLAN_STRIP;
+    ret = rte_eth_dev_configure(portId, 1, 1, &portConf);
+    if (ret < 0) {
+        throw DriverException(HERE, format(
+                "Failed to configure port %d", portId));
+    }
 
     // Set up a NIC/HW-based filter on the ethernet type so that only
     // traffic to a particular port is received by this driver.
@@ -302,7 +301,6 @@ DpdkDriver::DpdkDriver(Context* context, int port)
  */
 DpdkDriver::~DpdkDriver()
 {
-    releaseHint(-1);
     if (packetBufsUtilized != 0)
         LOG(ERROR, "DpdkDriver deleted with %d packets still in use",
             packetBufsUtilized);
@@ -373,15 +371,6 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
     // Process received packets by constructing appropriate Received objects.
     for (uint32_t i = 0; i < totalPkts; i++) {
         struct rte_mbuf* m = mPkts[i];
-        rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-        if (unlikely(m->nb_segs > 1)) {
-            RAMCLOUD_CLOG(WARNING,
-                    "Can't handle packet with %u segments; discarding",
-                    m->nb_segs);
-            rte_pktmbuf_free(m);
-            continue;
-        }
-
         struct ether_hdr* ethHdr = rte_pktmbuf_mtod(m, struct ether_hdr*);
         uint16_t ether_type = ethHdr->ether_type;
         uint32_t headerLength = ETHER_HDR_LEN;
@@ -393,16 +382,8 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
             headerLength += VLAN_TAG_LEN;
             payload += VLAN_TAG_LEN;
         }
-        if (!hasHardwareFilter) {
-            // Perform packet filtering by software to skip irrelevant
-            // packets such as ipmi or kernel TCP/IP traffics.
-            if (ether_type !=
-                    rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD)) {
-                rte_pktmbuf_free(m);
-                continue;
-            }
-        }
-        PerfStats::threadStats.networkInputBytes += rte_pktmbuf_pkt_len(m);
+        assert(ether_type == rte_cpu_to_be_16(
+                NetUtil::EthPayloadType::RAMCLOUD));
 
         // By default, we would like to construct the Received object using
         // the payload directly (as opposed to copying out the payload to a
@@ -411,69 +392,27 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         // and the packet buf type (so we know where this payload comes from).
         // See http://dpdk.org/doc/guides/prog_guide/mbuf_lib.html for the
         // diagram of rte_mbuf's internal structure.
+        assert(m->data_off <= sizeof(MacAddress));
         MacAddress* sender = reinterpret_cast<MacAddress*>(m->buf_addr);
-        if (unlikely(reinterpret_cast<char*>(sender + 1) >
-                rte_pktmbuf_mtod(m, char*))) {
-            LOG(ERROR, "Not enough headroom in the packet mbuf; "
-                    "dropping packet");
-            rte_pktmbuf_free(m);
-            continue;
-        }
         new(sender) MacAddress(ethHdr->s_addr.addr_bytes);
-        packet_buf_type(payload) = DPDK_MBUF;
-        packetBufsUtilized++;
         uint32_t length = rte_pktmbuf_pkt_len(m) - headerLength;
-        assert(length <= MAX_PAYLOAD_SIZE);
         receivedPackets->emplace_back(sender, this, length, payload);
+        PerfStats::threadStats.networkInputBytes += rte_pktmbuf_pkt_len(m);
+        packetBufsUtilized++;
         timeTrace("received packet processed, payload size %u", length);
     }
 }
 
 // See docs in Driver class.
 void
-DpdkDriver::release(char *payload)
+DpdkDriver::release()
 {
-    // Must sync with the dispatch thread, since this method could potentially
-    // be invoked in a worker.
-    Dispatch::Lock _(context->dispatch);
-    payloadsToRelease.push_back(payload);
-}
-
-// See docs in Driver class.
-void
-DpdkDriver::releaseHint(int maxCount)
-{
-    while ((maxCount != 0) && !payloadsToRelease.empty()) {
-        maxCount--;
-        char* payload = payloadsToRelease.back();
-        payloadsToRelease.pop_back();
-
-        packetBufsUtilized--;
-        assert(packetBufsUtilized >= 0);
-        if (packet_buf_type(payload) == DPDK_MBUF) {
-            rte_pktmbuf_free(payload_to_mbuf(payload));
-        } else {
-            packetBufPool.destroy(reinterpret_cast<PacketBuf*>(
-                    payload - OFFSET_OF(PacketBuf, payload)));
-        }
+    packetBufsUtilized -= static_cast<int>(packetsToRelease.size());
+    assert(packetBufsUtilized >= 0);
+    while (!packetsToRelease.empty()) {
+        rte_pktmbuf_free(payload_to_mbuf(packetsToRelease.back()));
+        packetsToRelease.pop_back();
     }
-}
-
-// See docs in Driver class.
-void
-DpdkDriver::releaseHwPacketBuf(Driver::Received* received)
-{
-    struct rte_mbuf* mbuf = payload_to_mbuf(received->payload);
-    MacAddress* sender = reinterpret_cast<MacAddress*>(mbuf->buf_addr);
-    // Copy the sender address and payload to our PacketBuf.
-    PacketBuf* packetBuf = packetBufPool.construct();
-    packetBuf->sender.construct(*sender);
-    packet_buf_type(packetBuf->payload) = RAMCLOUD_PACKET_BUF;
-    rte_memcpy(packetBuf->payload, received->payload, received->len);
-    // Replace rte_mbuf with our PacketBuf and release it.
-    received->sender = packetBuf->sender.get();
-    received->payload = packetBuf->payload;
-    rte_pktmbuf_free(mbuf);
 }
 
 // See docs in Driver class.
@@ -501,12 +440,10 @@ DpdkDriver::sendPacket(const Address* addr,
     struct rte_mbuf* mbuf = rte_pktmbuf_alloc(mbufPool);
 #endif
     if (unlikely(NULL == mbuf)) {
-        uint32_t numMbufsAvail = rte_mempool_avail_count(mbufPool);
-        uint32_t numMbufsInUse = rte_mempool_in_use_count(mbufPool);
         DIE("Failed to allocate a packet buffer; dropping packet; "
-                "%u mbufs available, %u mbufs in use, %lu payloads to release",
-                numMbufsAvail, numMbufsInUse, payloadsToRelease.size());
-        return;
+                "%u mbufs available, %u mbufs in use",
+                rte_mempool_avail_count(mbufPool),
+                rte_mempool_in_use_count(mbufPool));
     }
 
 #if TESTING

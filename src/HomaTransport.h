@@ -289,6 +289,10 @@ class HomaTransport : public Transport {
      */
     class OutgoingMessage {
       public:
+        /// True if we have not transmitted every byte up to transmitLimit
+        /// (and this object is linked in t->activeOutgoingMessages).
+        bool active;
+
         /// Holds the contents of the message.
         Buffer* buffer;
 
@@ -297,9 +301,6 @@ class HomaTransport : public Transport {
         /// about the containing RPC.
         ClientRpc* clientRpc;
         ServerRpc* serverRpc;
-
-        /// Where to send the message.
-        const Driver::Address* recipient;
 
         /// Offset within the message of the next byte we should transmit to
         /// the recipient; all preceding bytes have already been sent.
@@ -315,38 +316,32 @@ class HomaTransport : public Transport {
         /// them. Must be always smaller than or equal to the message size.
         uint32_t transmitLimit;
 
-        /// True means this message is among the sender's top outgoing
-        /// messages with fewest bytes left (and this object is linked in
-        /// t->topOutgoingMessages).
-        bool topChoice;
-
         /// Cycles::rdtsc time of the most recent time that we transmitted
         /// data bytes of the message.
         uint64_t lastTransmitTime;
 
-        /// Used to link this object into t->topOutgoingMessages.
+        /// Used to link this object into t->activeOutgoingMessages.
         IntrusiveListHook outgoingMessageLinks;
 
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
         OutgoingMessage(ClientRpc* clientRpc, ServerRpc* serverRpc,
-                HomaTransport* t, Buffer* buffer,
-                const Driver::Address* recipient)
-            : buffer(buffer)
+                HomaTransport* t, Buffer* buffer)
+            : active(false)
+            , buffer(buffer)
             , clientRpc(clientRpc)
             , serverRpc(serverRpc)
-            , recipient(recipient)
             , transmitOffset(0)
             , transmitPriority(0)
             , transmitLimit()
-            , topChoice(false)
             , lastTransmitTime(0)
             , outgoingMessageLinks()
             , unscheduledBytes(t->roundTripBytes)
         {}
 
         virtual ~OutgoingMessage() {}
+        void activate(HomaTransport* t);
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(OutgoingMessage);
@@ -395,7 +390,7 @@ class HomaTransport : public Transport {
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
             : session(session)
-            , request(this, NULL, session->t, request, session->serverAddress)
+            , request(this, NULL, session->t, request)
             , response(response)
             , notifier(notifier)
             , rpcId(session->t->clientId, sequence)
@@ -432,6 +427,10 @@ class HomaTransport : public Transport {
         /// (e.g., it's being executed); we use this flag to indicate that
         /// this RPC should be removed at the server's earliest convenience.
         bool cancelled;
+
+        /// Address of the client to which the RPC response will be sent.
+        /// Not owned by this class.
+        const Driver::Address* clientAddress;
 
         /// Unique identifier for this RPC.
         RpcId rpcId;
@@ -470,12 +469,13 @@ class HomaTransport : public Transport {
             : t(transport)
             , sequence(sequence)
             , cancelled(false)
+            , clientAddress(clientAddress)
             , rpcId(rpcId)
             , silentIntervals(0)
             , requestComplete(false)
             , sendingResponse(false)
             , accumulator()
-            , response(NULL, this, transport, &replyPayload, clientAddress)
+            , response(NULL, this, transport, &replyPayload)
             , scheduledMessage()
             , timerLinks()
             , outgoingResponseLinks()
@@ -708,12 +708,10 @@ class HomaTransport : public Transport {
     static string opcodeSymbol(uint8_t opcode);
     uint32_t sendBytes(const Driver::Address* address, RpcId rpcId,
             Buffer* message, uint32_t offset, uint32_t maxBytes,
-            uint32_t unscheduedBytes, uint8_t priority, uint8_t flags,
-            bool partialOK = false);
+            uint32_t unscheduedBytes, uint8_t priority, uint8_t flags);
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
-    void maintainTopOutgoingMessages(OutgoingMessage* candidate);
     void tryToSchedule(ScheduledMessage* message);
     void adjustSchedulingPrecedence(ScheduledMessage* message);
     void replaceActiveMessage(ScheduledMessage* oldMessage,
@@ -738,16 +736,6 @@ class HomaTransport : public Transport {
 
     /// Maximum # bytes of message data that can fit in one packet.
     CONST uint32_t maxDataPerPacket;
-
-    /// Messages smaller than or equal to this many bytes are received in
-    /// a zero-copy fashion in their entireties, if the underlying driver
-    /// permits. The larger this number is set, the more hardware packet
-    /// buffers we will likely retain at any given time, and the more we
-    /// deviate from the SRPT policy. If this number is set too large, we
-    /// may run out of hardware packet buffers and have to stop receiving
-    /// packets (even worse, we can't complete any message to free up the
-    /// hardware packet buffers; thus, a deadlock!).
-    const uint32_t messageZeroCopyThreshold;
 
     /// Maximum # bytes of a message that we consider as small. For small
     /// messages, the tryToTransmitData mechanism takes more time then just
@@ -814,22 +802,11 @@ class HomaTransport : public Transport {
             OutgoingRequestList;
     OutgoingRequestList outgoingRequests;
 
-    /// Holds the sender's top K outgoing messages with the fewest bytes
-    /// remaining to be transmitted. K varies dynamically but is limited to
-    /// a small constant so that scanning the list is efficient. This is used
-    /// to handle situations where there are very large numbers of outgoing
-    /// messages: the sender only needs to scan this list in the common case
-    /// of transmitting a message (i.e., at least one message in this list has
-    /// bytes ready to transmit).
+    /// List of active outgoing messages (i.e., those with grants available)
+    /// sorted in ascending order of remaining bytes.
     INTRUSIVE_LIST_TYPEDEF(OutgoingMessage, outgoingMessageLinks)
             OutgoingMessageList;
-    OutgoingMessageList topOutgoingMessages;
-
-    /// Is there any message outside t->topOutgoingMessages that has bytes
-    /// ready to be transmitted? If yes, when all messages in our top outgoing
-    /// message set are waiting for grants, we have to scan all outgoing
-    /// messages to find the next message to transmit.
-    bool transmitDataSlowPath;
+    OutgoingMessageList activeOutgoingMessages;
 
     /// An RPC is in this map if (a) is one for which we are the server,
     /// (b) at least one byte of the request message has been received, and

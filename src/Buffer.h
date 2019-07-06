@@ -282,7 +282,24 @@ class Buffer {
         return result;
     }
 
-    void reserve(uint32_t numBytes);
+    /**
+     * Reserve a contiguous region of storage for future use by Buffer::alloc;
+     * the storage is managed internally by the buffer.
+     *
+     * Note: This method must only be called when the buffer is in its pristine
+     * state (i.e., after calling constructor or reset()).
+     *
+     * \param numBytes
+     *      # bytes to reserve.
+     */
+    void
+    reserve(uint32_t numBytes)
+    {
+        assert((totalLength == 0) && (firstChunk == NULL));
+        uint32_t bytesAllocated;
+        firstAvailable = getNewAllocation(numBytes, &bytesAllocated);
+        availableLength = bytesAllocated;
+    }
 
     virtual void reset();
 

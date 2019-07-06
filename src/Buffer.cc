@@ -655,30 +655,6 @@ Buffer::prependChunk(Chunk* chunk)
 }
 
 /**
- * Reserve a contiguous region of storage for an empty buffer; the storage is
- * managed internally by the buffer.
- * TODO: explain why useful
- *
- * \param[in] numBytes
- *      The number of bytes to reserve.
- */
-void
-Buffer::reserve(uint32_t numBytes)
-{
-    assert(!lastChunk && (totalLength == 0));
-    uint32_t allocatedLength;
-    char* firstByte = getNewAllocation(numBytes, &allocatedLength);
-
-    // Create an empty Chunk at the end of the available space.
-    allocatedLength -= sizeof32(Buffer::Chunk);
-    Buffer::Chunk *chunk = new(firstByte + allocatedLength) Buffer::Chunk(
-            firstByte, 0);
-    chunk->internal = 1;
-    extraAppendBytes = allocatedLength;
-    firstChunk = lastChunk = chunk;
-}
-
-/**
  * Restore the Buffer to its initial pristine state: it will have 0 length,
  * and all existing internal storage for the Buffer will be freed.
  */
