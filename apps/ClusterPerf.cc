@@ -7351,7 +7351,7 @@ millisort()
                 downCast<uint32_t>(dataTuplesPerNode),
                 downCast<uint32_t>(nodesPerPivotServer));
         auto initResp = initRpc.wait();
-        LOG(NOTICE, "Initialized %d millisort service nodes",
+        LOG(DEBUG, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);
 
         Buffer statsBefore, statsAfter;

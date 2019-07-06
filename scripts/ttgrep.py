@@ -30,14 +30,14 @@ import re
 import string
 import sys
 
-def scan(f, string):
+def scan(f, string, startTime=0.0):
     """
     Scan the log file given by 'f' (handle for an open file) and output
     all-time trace records containing string, with times renormalized
     relative to the time of the first matching record.
     """
 
-    startTime = 0.0
+    # startTime = 0.0
     prevTime = 0.0
     writes = 0
     for line in f:
@@ -64,8 +64,10 @@ def scan(f, string):
                 (time - startTime)/1000.0, (time - prevTime)/1000.0, event))
         prevTime = time
 
-if len(sys.argv) != 3:
-    print("Usage: %s string logFile" % (sys.argv[0]))
+if len(sys.argv) == 3:
+    scan(open(sys.argv[2]), sys.argv[1])
+elif len(sys.argv) == 4:
+    scan(open(sys.argv[2]), sys.argv[1], float(sys.argv[3]))
+else:
+    print("Usage: %s string logFile [startTime]" % (sys.argv[0]))
     sys.exit(1)
-
-scan(open(sys.argv[2]), sys.argv[1])

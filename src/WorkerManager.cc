@@ -210,14 +210,15 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
     Arachne::ThreadId threadId;
     // FIXME: dirty hack to avoid creating the Arachne thread that handles the
     // benchmark request on the hypertwin of the dispatch thread.
-    if (header->opcode == WireFormat::BENCHMARK_COLLECTIVE_OP) {
-        // Hmm, dispatch thread is always on T1 (i.e., coreId 0?) and coreId 1
-        // seems to be T5, which is the hypertwin of T1?
-        threadId = Arachne::createThreadOnCore(2, &WorkerManager::workerMain,
-                this, rpc);
-    } else {
-        threadId = Arachne::createThread(&WorkerManager::workerMain, this, rpc);
-    }
+//    if (header->opcode == WireFormat::BENCHMARK_COLLECTIVE_OP) {
+//        // Hmm, dispatch thread is always on T1 (i.e., coreId 0?) and coreId 1
+//        // seems to be T5, which is the hypertwin of T1?
+//        threadId = Arachne::createThreadOnCore(2, &WorkerManager::workerMain,
+//                this, rpc);
+//    } else {
+//        threadId = Arachne::createThread(&WorkerManager::workerMain, this, rpc);
+//    }
+    threadId = Arachne::createThread(&WorkerManager::workerMain, this, rpc);
     if (threadId == Arachne::NullThread) {
         // Thread creations can fail randomly due to core deallocation,
         // so first retry a few times.
@@ -354,7 +355,7 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
     // work.
     uint64_t start = Cycles::rdtsc();
     try {
-       timeTrace("ID %u: Starting processing of opcode %d  on KT %d, "
+       timeTrace("ID %u: Starting processing of opcode %d on core %d, "
             "idInCore %d", serverRpc->id, serverRpc->getOpcode(),
             Arachne::core.id,
             Arachne::core.loadedContext->idInCore);

@@ -1433,7 +1433,7 @@ MilliSortService::benchmarkCollectiveOp(
         WireFormat::BenchmarkCollectiveOp::Response* respHdr,
         Rpc* rpc)
 {
-#define WARMUP_COUNT 10
+#define WARMUP_COUNT 20
     std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
     if (reqHdr->opcode == WireFormat::SEND_DATA) {
         /* Point-to-point message benchmark */
@@ -1720,7 +1720,8 @@ MilliSortService::benchmarkCollectiveOp(
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
             if (Cycles::rdtsc() > startTime) {
-                LOG(ERROR, "AllShuffle operation started %.2f us late!",
+                LOG(ERROR, "AllShuffle operation %d started %.2f us late!",
+                        reqHdr->count,
                         Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
             }
             while (Cycles::rdtsc() < startTime) {}
@@ -1751,10 +1752,11 @@ MilliSortService::benchmarkCollectiveOp(
             timeTrace("ALL_SHUFFLE benchmark run %d completed in %u us, "
                     "received %u bytes", reqHdr->count, shuffleNs / 1000,
                     bytesReceived.load());
+            pullRpcs.reset();
+            timeTrace("ALL_SHUFFLE benchmark: destroyed ShufflePullRpc's");
+
             rpc->replyPayload->emplaceAppend<uint32_t>(world->rank);
             rpc->replyPayload->emplaceAppend<uint32_t>(shuffleNs);
-            // It could take a while to destroy large ShufflePullRpc's; better
-            // send reply first.
             rpc->sendReply();
         }
     } else {
