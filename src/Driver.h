@@ -496,6 +496,15 @@ class Driver {
                 txQueueState);
     }
 
+    virtual void sendPackets(const Address* recipient,
+                            const void* headers,
+                            uint32_t headerLen,
+                            Buffer::Iterator* payload,
+                            int maxDataPerPacket,
+                            int numPackets,
+                            int priority = 0,
+                            TransmitQueueState* txQueueState = NULL);
+
     /**
      * Return the ServiceLocator for this Driver (which shouldn't contain
      * any transport-level information). If the Driver was not provided

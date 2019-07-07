@@ -928,6 +928,33 @@ Buffer::Iterator::operator=(const Iterator& other)
 }
 
 /**
+ * Move the current iterator position forward by a number of bytes.
+ */
+void
+Buffer::Iterator::advance(uint32_t bytes)
+{
+    assert(bytesLeft >= bytes);
+    while (bytes > 0) {
+        if (currentData == NULL) {
+            RAMCLOUD_DIE("advance too much!");
+            break;
+        }
+
+        if (currentLength > bytes) {
+            // The size of the current chunk is *strictly* larger than # bytes
+            // to advance; no need to advance to the next chunk.
+            currentLength -= bytes;
+            currentData += bytes;
+            bytesLeft -= bytes;
+            bytes = 0;
+        } else {
+            bytes -= currentLength;
+            next();
+        }
+    }
+}
+
+/**
  * Count the number of distinct chunks of storage covered by the
  * remaining bytes of this iterator.
  */

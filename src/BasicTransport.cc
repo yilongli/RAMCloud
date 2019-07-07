@@ -370,6 +370,56 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         Buffer* message, uint32_t offset, uint32_t maxBytes,
         uint32_t unscheduledBytes, uint8_t flags)
 {
+#if 1
+    SCOPED_TIMER(basicTransportSendDataCycles);
+    uint32_t curOffset = offset;
+    uint32_t transmitLimit = std::min(message->size(), curOffset + maxBytes);
+    uint32_t bytesSent = 0;
+    QueueEstimator::TransmitQueueState txQueueState;
+
+    // Case 1: the entire message fits in a single packet.
+    if (message->size() <= maxDataPerPacket) {
+        assert((curOffset == 0) && (maxBytes >= maxDataPerPacket));
+        AllDataHeader header(rpcId, flags, (uint16_t)message->size());
+        Buffer::Iterator iter(message);
+        const char* fmt = (flags & FROM_CLIENT) ?
+                "client sending ALL_DATA, clientId %u, sequence %u" :
+                "server sending ALL_DATA, clientId %u, sequence %u";
+        timeTrace(fmt, rpcId.clientId, rpcId.sequence);
+        driver->sendPacket(address, &header, &iter, 0, &txQueueState);
+        ADD_COUNTER(basicTransportOutputDataBytes, sizeof(AllDataHeader));
+        return message->size();
+    }
+
+    // Case 2: the message spans multiple packets.
+    // TODO: turn the following into a class member so that we can use a vector?
+    char dataHeader[sizeof(DataHeader) * 8];
+    DataHeader* header = reinterpret_cast<DataHeader*>(dataHeader);
+    int numPackets = 0;
+    while (curOffset < transmitLimit) {
+        // Never send less-than-full-size packets except for the last one
+        // of the message.
+        uint32_t bytesThisPacket = transmitLimit - curOffset;
+        if (bytesThisPacket >= maxDataPerPacket) {
+            bytesThisPacket = maxDataPerPacket;
+        } else if (transmitLimit < message->size()) {
+            break;
+        }
+
+        // TODO: check numPackets < 8
+        new(header) DataHeader(rpcId, message->size(), curOffset,
+                unscheduledBytes, flags);
+        header++;
+        numPackets++;
+        bytesSent += bytesThisPacket;
+        curOffset += bytesThisPacket;
+    }
+    Buffer::Iterator iter(message, offset, bytesSent);
+    driver->sendPackets(address, dataHeader, sizeof(DataHeader), &iter,
+            maxDataPerPacket, numPackets);
+    ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
+    return bytesSent;
+#else
     SCOPED_TIMER(basicTransportSendDataCycles);
     uint32_t curOffset = offset;
     uint32_t transmitLimit = std::min(message->size(), curOffset + maxBytes);
@@ -421,6 +471,7 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
 
     ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
     return bytesSent;
+#endif
 }
 
 /**
@@ -621,6 +672,9 @@ BasicTransport::tryToTransmitData()
                         "transmitted %u bytes of reply, clientId %u, seq %u",
                         context->dispatch->iteration, message->transmitOffset,
                         serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
+                timetrace_shuffle("sent %u packets, left %u more packets granted",
+                        bytesSent / maxDataPerPacket,
+                        (bytesGranted - bytesSent) / maxDataPerPacket);
             }
 
             transmitQueueSpace -= bytesSent;

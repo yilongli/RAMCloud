@@ -18,6 +18,23 @@
 namespace RAMCloud {
 uint32_t Driver::Received::stealCount = 0;
 
+void
+Driver::sendPackets(const Address* recipient, const void* headers,
+        uint32_t headerLen, Buffer::Iterator* payload, int maxDataPerPacket,
+        int numPackets, int priority, TransmitQueueState* txQueueState)
+{
+    RAMCLOUD_DIE("not implemented!");
+    // Naive implementation: just invoke sendPacket for each packet
+    char* header = (char*)headers;
+    for (int i = 0; i < numPackets; i++) {
+        sendPacket(recipient, header, headerLen, payload, priority,
+                txQueueState);
+        header += headerLen;
+        payload->advance(maxDataPerPacket);
+    }
+}
+
+
 /**
  * If this Received is associated with a Driver and its payload
  * hasn't been stolen then release the payload data to the Driver
