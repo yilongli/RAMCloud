@@ -719,6 +719,10 @@ class BasicTransport : public Transport {
     /// when the poll method is receiving and processing incoming packets.
     std::vector<ScheduledMessage*> messagesToGrant;
 
+    /// Holds DataHeader's in packets we are about to send. Always empty,
+    /// except during #sendBytes.
+    std::vector<DataHeader> dataHeadersToSend;
+
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
 

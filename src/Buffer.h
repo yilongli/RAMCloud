@@ -543,6 +543,8 @@ class Buffer {
          */
         uint32_t size() {return bytesLeft;}
 
+        void truncate(uint32_t length);
+
       PRIVATE:
         /// The current chunk over which we're iterating.  May be NULL.
         Chunk* current;

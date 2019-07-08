@@ -935,22 +935,17 @@ Buffer::Iterator::advance(uint32_t bytes)
 {
     assert(bytesLeft >= bytes);
     while (bytes > 0) {
-        if (currentData == NULL) {
-            RAMCLOUD_DIE("advance too much!");
-            break;
-        }
-
         if (currentLength > bytes) {
-            // The size of the current chunk is *strictly* larger than # bytes
-            // to advance; no need to advance to the next chunk.
-            currentLength -= bytes;
+            // The bytes left in the current chunk is *strictly* larger than
+            // the offset; no need to advance to the next chunk.
             currentData += bytes;
+            currentLength -= bytes;
             bytesLeft -= bytes;
-            bytes = 0;
-        } else {
-            bytes -= currentLength;
-            next();
+            return;
         }
+        // Advance to the next chunk.
+        bytes -= currentLength;
+        next();
     }
 }
 
@@ -996,6 +991,16 @@ Buffer::Iterator::next()
         currentData = NULL;
         currentLength = 0;
     }
+}
+
+/**
+ * Truncate the byte range of the buffer this iterator can walk over.
+ */
+void
+Buffer::Iterator::truncate(uint32_t length)
+{
+    bytesLeft = std::min(bytesLeft, length);
+    currentLength = std::min(currentLength, bytesLeft);
 }
 
 }  // namespace RAMCloud

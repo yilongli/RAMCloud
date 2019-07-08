@@ -75,9 +75,7 @@ class DpdkDriver : public Driver
     virtual void sendPackets(const Address* addr,
                             const void* headers,
                             uint32_t headerLen,
-                            Buffer::Iterator* payload,
-                            int maxDataPerPacket,
-                            int numPackets,
+                            Buffer::Iterator* messageIt,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
     virtual string getServiceLocator();

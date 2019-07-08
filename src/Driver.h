@@ -496,14 +496,40 @@ class Driver {
                 txQueueState);
     }
 
+    /**
+     * Send one or more packets that are contiguous in some message out over
+     * this Driver. This is equivalent to invoking #sendPacket multiple times.
+     *
+     * Also see docs for #sendPacket.
+     *
+     * \param recipient
+     *      The address the packets should go to.
+     * \param headers
+     *      An array of transport headers to be placed ahead of the payloads.
+     *      The driver will make a copy of this data, so the caller need not
+     *      preserve it after the method returns, even if the packet hasn't
+     *      yet been transmitted.
+     * \param headerLen
+     *      Length in bytes of the data in header.
+     * \param messageIt
+     *      A buffer iterator describing the bytes for the message chunk (the
+     *      portion of the packet after the header).  May be NULL to
+     *      indicate "no payload". Note: caller must preserve the buffer
+     *      data (but not the actual iterator) even after the method returns,
+     *      since the data may not yet have been transmitted.
+     * \param priority
+     *      The priority level of the packets. 0 is the lowest priority.
+     * \param[out] txQueueState
+     *      Used to retrieve state of the NIC's transmit queue just before
+     *      the packets were handed to the NIC. NULL means the caller doesn't
+     *      care about this value.
+     */
     virtual void sendPackets(const Address* recipient,
-                            const void* headers,
-                            uint32_t headerLen,
-                            Buffer::Iterator* payload,
-                            int maxDataPerPacket,
-                            int numPackets,
-                            int priority = 0,
-                            TransmitQueueState* txQueueState = NULL);
+                             const void* headers,
+                             uint32_t headerLen,
+                             Buffer::Iterator* messageIt,
+                             int priority = 0,
+                             TransmitQueueState* txQueueState = NULL);
 
     /**
      * Return the ServiceLocator for this Driver (which shouldn't contain

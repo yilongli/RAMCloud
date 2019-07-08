@@ -20,17 +20,23 @@ uint32_t Driver::Received::stealCount = 0;
 
 void
 Driver::sendPackets(const Address* recipient, const void* headers,
-        uint32_t headerLen, Buffer::Iterator* payload, int maxDataPerPacket,
-        int numPackets, int priority, TransmitQueueState* txQueueState)
+        uint32_t headerLen, Buffer::Iterator* messageIt, int priority,
+        TransmitQueueState* txQueueState)
 {
-    RAMCLOUD_DIE("not implemented!");
-    // Naive implementation: just invoke sendPacket for each packet
-    char* header = (char*)headers;
-    for (int i = 0; i < numPackets; i++) {
-        sendPacket(recipient, header, headerLen, payload, priority,
+    // Naive implementation: just invoke sendPacket multiple times.
+    uint32_t maxPayload = getMaxPacketSize() - headerLen;
+    uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
+
+    // Each iteration of the following loop transmits one packet; it's done by
+    // constructing a buffer iterator over just the byte range of the payload.
+    const char* header = reinterpret_cast<const char*>(headers);
+    for (uint32_t i = 0; i < numPackets; i++) {
+        Buffer::Iterator payload(*messageIt);
+        payload.truncate(maxPayload);
+        messageIt->advance(payload.size());
+        sendPacket(recipient, header, headerLen, &payload, priority,
                 txQueueState);
         header += headerLen;
-        payload->advance(maxDataPerPacket);
     }
 }
 

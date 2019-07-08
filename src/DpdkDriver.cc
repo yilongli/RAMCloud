@@ -388,11 +388,11 @@ DpdkDriver::receivePackets(uint32_t maxPackets,
         // By default, we would like to construct the Received object using
         // the payload directly (as opposed to copying out the payload to a
         // PacketBuf first). Therefore, we use the headroom in rte_mbuf to
-        // store the packet sender address (as required by the Received object)
+        // store the packet sender address (required by the Received object)
         // and the packet buf type (so we know where this payload comes from).
         // See http://dpdk.org/doc/guides/prog_guide/mbuf_lib.html for the
         // diagram of rte_mbuf's internal structure.
-        assert(m->data_off <= sizeof(MacAddress));
+        assert(rte_pktmbuf_headroom(m) > sizeof(MacAddress));
         MacAddress* sender = reinterpret_cast<MacAddress*>(m->buf_addr);
         new(sender) MacAddress(ethHdr->s_addr.addr_bytes);
         uint32_t length = rte_pktmbuf_pkt_len(m) - headerLength;
@@ -414,179 +414,6 @@ DpdkDriver::release()
         packetsToRelease.pop_back();
     }
 }
-
-void
-DpdkDriver::sendPackets(const Address* addr,
-                 const void* headers,
-                 uint32_t headerLen,
-                 Buffer::Iterator* payload,
-                 int maxPayloadPerPacket,
-                 int numPackets,
-                 int priority,
-                 TransmitQueueState* txQueueState)
-{
-    // Convert transport-level packet priority to Ethernet priority.
-    assert(priority >= 0 && priority <= getHighestPacketPriority());
-
-#define MAX_TX_PACKETS 8
-    rte_mbuf* mbufs[MAX_TX_PACKETS];
-
-    // Fill out headers.
-    char* header = (char*)headers;
-    for (int i = 0; i < numPackets; i++) {
-        mbufs[i] = rte_pktmbuf_alloc(mbufPool);
-        if (unlikely(NULL == mbufs[i])) {
-            DIE("Failed to allocate a packet buffer; dropping packet; "
-                    "%u mbufs available, %u mbufs in use",
-                    rte_mempool_avail_count(mbufPool),
-                    rte_mempool_in_use_count(mbufPool));
-        }
-
-        uint32_t payloadBytes = std::min(
-                downCast<uint32_t>(maxPayloadPerPacket), payload->size());
-        char* dst = rte_pktmbuf_append(mbufs[i],
-                ETHER_VLAN_HDR_LEN + headerLen + payloadBytes);
-
-        // Fill out the destination and source MAC addresses plus the Ethernet
-        // frame type (i.e., IEEE 802.1Q VLAN tagging).
-//        char* dst = rte_pktmbuf_mtod(mbufs[i], char*);
-        struct ether_hdr* ethHdr = reinterpret_cast<struct ether_hdr*>(dst);
-        rte_memcpy(&ethHdr->d_addr, static_cast<const MacAddress*>(addr)->address,
-                ETHER_ADDR_LEN);
-        rte_memcpy(&ethHdr->s_addr, localMac->address, ETHER_ADDR_LEN);
-        ethHdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_VLAN);
-        dst += ETHER_HDR_LEN;
-
-        // Fill out the PCP field and the Ethernet frame type of the encapsulated
-        // frame (DEI and VLAN ID are not relevant and trivially set to 0).
-        struct vlan_hdr* vlanHdr = reinterpret_cast<struct vlan_hdr*>(dst);
-        vlanHdr->vlan_tci = rte_cpu_to_be_16(PRIORITY_TO_PCP[priority]);
-        vlanHdr->eth_proto = rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD);
-        dst += VLAN_TAG_LEN;
-
-        // Copy RAMCloud transport protocol header.
-        rte_memcpy(dst, header, headerLen);
-        header += headerLen;
-        dst += headerLen;
-        uint32_t bytesToCopy = payloadBytes;
-        while (payload->size() > 0) {
-            // The current buffer chunk contains the rest of the packet.
-            if (payload->getLength() >= bytesToCopy) {
-                rte_memcpy(dst, payload->getData(), bytesToCopy);
-//                dst += bytesToCopy;
-                payload->advance(bytesToCopy);
-                break;
-            }
-
-            rte_memcpy(dst, payload->getData(), payload->getLength());
-            dst += payload->getLength();
-            bytesToCopy -= payload->getLength();
-            payload->next();
-        }
-    }
-
-    // FIXME: figure out why we have to handle loopback here in SW.
-    if (!memcmp(static_cast<const MacAddress*>(addr)->address,
-            localMac->address, 6)) {
-        for (int i = 0; i < numPackets; i++) {
-            rte_ring_enqueue(loopbackRing, mbufs[i]);
-        }
-        return;
-    }
-
-    lastTransmitTime = Cycles::rdtsc();
-    uint32_t ret = rte_eth_tx_burst(portId, 0, mbufs, numPackets);
-    if (unlikely(ret < numPackets)) {
-        LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
-        // The congestion at the TX queue must be pretty bad if we got here:
-        // set the queue size to be relatively large.
-//        queueEstimator.setQueueSize(maxTransmitQueueSize*2, Cycles::rdtsc());
-//        rte_pktmbuf_free(mbuf);
-//        return;
-    }
-
-/*
-    uint32_t etherPayloadLength = headerLen + (payload ? payload->size() : 0);
-    assert(etherPayloadLength <= MAX_PAYLOAD_SIZE);
-    timeTrace("sendPacket invoked, payload size %u", etherPayloadLength);
-    uint32_t frameLength = etherPayloadLength + ETHER_VLAN_HDR_LEN;
-    uint32_t physPacketLength = frameLength + ETHER_PACKET_OVERHEAD;
-
-    struct rte_mbuf* mbuf = rte_pktmbuf_alloc(mbufPool);
-    if (unlikely(NULL == mbuf)) {
-        DIE("Failed to allocate a packet buffer; dropping packet; "
-                "%u mbufs available, %u mbufs in use",
-                rte_mempool_avail_count(mbufPool),
-                rte_mempool_in_use_count(mbufPool));
-    }
-
-    char* data = rte_pktmbuf_append(mbuf, downCast<uint16_t>(frameLength));
-    if (unlikely(NULL == data)) {
-        RAMCLOUD_CLOG(NOTICE,
-                "rte_pktmbuf_append call failed; dropping packet");
-        rte_pktmbuf_free(mbuf);
-        return;
-    }
-
-    // Fill out the destination and source MAC addresses plus the Ethernet
-    // frame type (i.e., IEEE 802.1Q VLAN tagging).
-    char *p = data;
-    struct ether_hdr* ethHdr = reinterpret_cast<struct ether_hdr*>(p);
-    rte_memcpy(&ethHdr->d_addr, static_cast<const MacAddress*>(addr)->address,
-            ETHER_ADDR_LEN);
-    rte_memcpy(&ethHdr->s_addr, localMac->address, ETHER_ADDR_LEN);
-    ethHdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_VLAN);
-    p += ETHER_HDR_LEN;
-
-    // Fill out the PCP field and the Ethernet frame type of the encapsulated
-    // frame (DEI and VLAN ID are not relevant and trivially set to 0).
-    struct vlan_hdr* vlanHdr = reinterpret_cast<struct vlan_hdr*>(p);
-    vlanHdr->vlan_tci = rte_cpu_to_be_16(PRIORITY_TO_PCP[priority]);
-    vlanHdr->eth_proto = rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD);
-    p += VLAN_TAG_LEN;
-
-    // Copy `header` and `payload`.
-    rte_memcpy(p, header, headerLen);
-    p += headerLen;
-    while (payload && !payload->isDone())
-    {
-        rte_memcpy(p, payload->getData(), payload->getLength());
-        p += payload->getLength();
-        payload->next();
-    }
-    timeTrace("about to enqueue outgoing packet");
-
-    // loopback if src mac == dst mac
-    if (!memcmp(static_cast<const MacAddress*>(addr)->address,
-            localMac->address, 6)) {
-        int ret = rte_ring_enqueue(loopbackRing, mbuf);
-        if (unlikely(ret != 0)) {
-            LOG(WARNING, "rte_ring_enqueue returned %d; packet may be lost?",
-                    ret);
-            rte_pktmbuf_free(mbuf);
-        }
-        timeTrace("loopback packet enqueued");
-        return;
-    }
-
-    lastTransmitTime = Cycles::rdtsc();
-    uint32_t ret = rte_eth_tx_burst(portId, 0, &mbuf, 1);
-    if (unlikely(ret != 1)) {
-        LOG(WARNING, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
-        // The congestion at the TX queue must be pretty bad if we got here:
-        // set the queue size to be relatively large.
-        queueEstimator.setQueueSize(maxTransmitQueueSize*2, Cycles::rdtsc());
-        rte_pktmbuf_free(mbuf);
-        return;
-    }
-    timeTrace("outgoing packet enqueued");
-
-    queueEstimator.packetQueued(physPacketLength, lastTransmitTime,
-            txQueueState);
-    PerfStats::threadStats.networkOutputBytes += physPacketLength;
-*/
-}
-
 
 // See docs in Driver class.
 void
@@ -696,6 +523,105 @@ DpdkDriver::sendPacket(const Address* addr,
     queueEstimator.packetQueued(physPacketLength, lastTransmitTime,
             txQueueState);
     PerfStats::threadStats.networkOutputBytes += physPacketLength;
+}
+
+// See docs in Driver class.
+void
+DpdkDriver::sendPackets(const Address* addr,
+                        const void* headers,
+                        uint32_t headerLen,
+                        Buffer::Iterator* messageIt,
+                        int priority,
+                        TransmitQueueState* txQueueState)
+{
+    assert(priority >= 0 && priority <= getHighestPacketPriority());
+    const uint32_t messageBytes = messageIt->size();
+    timeTrace("sendPackets invoked, message bytes %u", messageBytes);
+
+#define MAX_TX_PACKETS 16
+    rte_mbuf* mbufs[MAX_TX_PACKETS];
+    uint32_t maxPayload = getMaxPacketSize() - headerLen;
+    uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
+    assert(numPackets <= MAX_TX_PACKETS);
+
+    // Each iteration of the following loop fills out the header and payload
+    // of one mbuf.
+    const char* header = reinterpret_cast<const char*>(headers);
+    for (uint32_t i = 0; i < numPackets; i++) {
+        mbufs[i] = rte_pktmbuf_alloc(mbufPool);
+        if (unlikely(NULL == mbufs[i])) {
+            DIE("Failed to allocate a packet buffer; dropping packet; "
+                    "%u mbufs available, %u mbufs in use",
+                    rte_mempool_avail_count(mbufPool),
+                    rte_mempool_in_use_count(mbufPool));
+        }
+
+        uint32_t payloadSize = std::min(maxPayload, messageIt->size());
+        char* dst = rte_pktmbuf_append(mbufs[i], downCast<uint16_t>(
+                ETHER_VLAN_HDR_LEN + headerLen + payloadSize));
+
+        // Fill out the destination and source MAC addresses plus the Ethernet
+        // frame type (i.e., IEEE 802.1Q VLAN tagging).
+        struct ether_hdr* ethHdr = reinterpret_cast<struct ether_hdr*>(dst);
+        rte_memcpy(&ethHdr->d_addr, static_cast<const MacAddress*>(addr)->address,
+                ETHER_ADDR_LEN);
+        rte_memcpy(&ethHdr->s_addr, localMac->address, ETHER_ADDR_LEN);
+        ethHdr->ether_type = rte_cpu_to_be_16(ETHER_TYPE_VLAN);
+        dst += ETHER_HDR_LEN;
+
+        // Fill out the PCP field and the Ethernet frame type of the encapsulated
+        // frame (DEI and VLAN ID are not relevant and trivially set to 0).
+        struct vlan_hdr* vlanHdr = reinterpret_cast<struct vlan_hdr*>(dst);
+        vlanHdr->vlan_tci = rte_cpu_to_be_16(PRIORITY_TO_PCP[priority]);
+        vlanHdr->eth_proto = rte_cpu_to_be_16(NetUtil::EthPayloadType::RAMCLOUD);
+        dst += VLAN_TAG_LEN;
+
+        // Copy RAMCloud transport protocol header into mbuf.
+        rte_memcpy(dst, header, headerLen);
+        header += headerLen;
+        dst += headerLen;
+        uint32_t bytesToCopy = payloadSize;
+
+        // Copy payload into mbuf.
+        while (messageIt->size() > 0) {
+            // The current buffer chunk contains the rest of the packet.
+            if (messageIt->getLength() >= bytesToCopy) {
+                rte_memcpy(dst, messageIt->getData(), bytesToCopy);
+                messageIt->advance(bytesToCopy);
+                break;
+            }
+
+            rte_memcpy(dst, messageIt->getData(), messageIt->getLength());
+            dst += messageIt->getLength();
+            bytesToCopy -= messageIt->getLength();
+            messageIt->next();
+        }
+    }
+
+    // FIXME: figure out why we have to handle loopback here in SW.
+    if (!memcmp(static_cast<const MacAddress*>(addr)->address,
+            localMac->address, 6)) {
+        for (int i = 0; i < numPackets; i++) {
+            rte_ring_enqueue(loopbackRing, mbufs[i]);
+        }
+        timeTrace("loopback packets enqueued");
+        return;
+    }
+
+    lastTransmitTime = Cycles::rdtsc();
+    uint32_t ret = rte_eth_tx_burst(portId, 0, mbufs, numPackets);
+    if (unlikely(ret < numPackets)) {
+        LOG(ERROR, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
+        for (uint32_t i = ret; i < numPackets; i++) {
+            rte_pktmbuf_free(mbufs[i]);
+        }
+    }
+    timeTrace("outgoing packets enqueued");
+
+    uint32_t rawBytes = messageBytes + numPackets *
+            (ETHER_PACKET_OVERHEAD + ETHER_VLAN_HDR_LEN + headerLen);
+    queueEstimator.packetQueued(rawBytes, lastTransmitTime, txQueueState);
+    PerfStats::threadStats.networkOutputBytes += rawBytes;
 }
 
 // See docs in Driver class.
