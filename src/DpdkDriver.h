@@ -40,6 +40,7 @@
                    + RTE_PKTMBUF_HEADROOM)
 
 // Forward declarations, so we don't have to include DPDK headers here.
+struct rte_mbuf;
 struct rte_mempool;
 struct rte_ring;
 
@@ -134,6 +135,11 @@ class DpdkDriver : public Driver
     /// Holds packets that are addressed to localhost instead of going through
     /// the HW queues.
     struct rte_ring* loopbackRing;
+
+    /// Holds pointers to packet buffers about to enqueue for transmission.
+    /// This is only used temporarily during the sendPackets method, but it's
+    /// allocated here so that we only pay the cost for storage allocation once.
+    std::vector<rte_mbuf*> transmitBufs;
 
     /// Hardware packet filter is provided by the NIC
     bool hasHardwareFilter;

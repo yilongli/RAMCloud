@@ -87,6 +87,7 @@ DpdkDriver::DpdkDriver()
     , portId(0)
     , mbufPool(NULL)
     , loopbackRing(NULL)
+    , transmitBufs()
     , hasHardwareFilter(true)
     , bandwidthMbps(10000)
     , fileLogger(NOTICE, "DPDK: ")
@@ -121,6 +122,7 @@ DpdkDriver::DpdkDriver(Context* context, int port)
     , portId(0)
     , mbufPool(NULL)
     , loopbackRing(NULL)
+    , transmitBufs()
     , hasHardwareFilter(true)             // Cleared later if not applicable
     , bandwidthMbps(10000)                // Default bandwidth = 10 gbs
     , fileLogger(NOTICE, "DPDK: ")
@@ -538,18 +540,19 @@ DpdkDriver::sendPackets(const Address* addr,
     const uint32_t messageBytes = messageIt->size();
     timeTrace("sendPackets invoked, message bytes %u", messageBytes);
 
-#define MAX_TX_PACKETS 16
-    rte_mbuf* mbufs[MAX_TX_PACKETS];
     uint32_t maxPayload = getMaxPacketSize() - headerLen;
     uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
-    assert(numPackets <= MAX_TX_PACKETS);
+    if (unlikely(numPackets > transmitBufs.size())) {
+        transmitBufs.resize(numPackets);
+    }
 
     // Each iteration of the following loop fills out the header and payload
     // of one mbuf.
     const char* header = reinterpret_cast<const char*>(headers);
     for (uint32_t i = 0; i < numPackets; i++) {
-        mbufs[i] = rte_pktmbuf_alloc(mbufPool);
-        if (unlikely(NULL == mbufs[i])) {
+        rte_mbuf* mbuf = rte_pktmbuf_alloc(mbufPool);
+        transmitBufs[i] = mbuf;
+        if (unlikely(NULL == mbuf)) {
             DIE("Failed to allocate a packet buffer; dropping packet; "
                     "%u mbufs available, %u mbufs in use",
                     rte_mempool_avail_count(mbufPool),
@@ -557,7 +560,7 @@ DpdkDriver::sendPackets(const Address* addr,
         }
 
         uint32_t payloadSize = std::min(maxPayload, messageIt->size());
-        char* dst = rte_pktmbuf_append(mbufs[i], downCast<uint16_t>(
+        char* dst = rte_pktmbuf_append(mbuf, downCast<uint16_t>(
                 ETHER_VLAN_HDR_LEN + headerLen + payloadSize));
 
         // Fill out the destination and source MAC addresses plus the Ethernet
@@ -602,18 +605,18 @@ DpdkDriver::sendPackets(const Address* addr,
     if (!memcmp(static_cast<const MacAddress*>(addr)->address,
             localMac->address, 6)) {
         for (int i = 0; i < numPackets; i++) {
-            rte_ring_enqueue(loopbackRing, mbufs[i]);
+            rte_ring_enqueue(loopbackRing, transmitBufs[i]);
         }
         timeTrace("loopback packets enqueued");
         return;
     }
 
     lastTransmitTime = Cycles::rdtsc();
-    uint32_t ret = rte_eth_tx_burst(portId, 0, mbufs, numPackets);
+    uint32_t ret = rte_eth_tx_burst(portId, 0, transmitBufs.data(), numPackets);
     if (unlikely(ret < numPackets)) {
         LOG(ERROR, "rte_eth_tx_burst returned %u; packet may be lost?", ret);
         for (uint32_t i = ret; i < numPackets; i++) {
-            rte_pktmbuf_free(mbufs[i]);
+            rte_pktmbuf_free(transmitBufs[i]);
         }
     }
     timeTrace("outgoing packets enqueued");
