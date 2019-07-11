@@ -65,7 +65,8 @@ class InfUdDriver : public Driver {
             return new MacAddress(
                 serviceLocator->getOption<const char*>("mac"));
         } else {
-            return new Address(*infiniband, ibPhysicalPort, serviceLocator);
+            return new Address(*infiniband, isRoCE, ibPhysicalPort, ibGidIndex,
+                    serviceLocator);
         }
     }
 
@@ -193,6 +194,9 @@ class InfUdDriver : public Driver {
     /// mock object.
     Infiniband* infiniband;
 
+    /// True if this driver is operating over RoCE (as opposed to Infiniband).
+    bool isRoCE;
+
     /// Packet buffers used for receiving incoming packets.
     Tub<BufferPool> rxPool;
 
@@ -229,7 +233,14 @@ class InfUdDriver : public Driver {
     /// Physical port on the HCA used by this transport.
     int ibPhysicalPort;
 
-    /// Identifies our HCA uniquely among all those in the Infiband
+    /// Index of the global identifier (GID) this driver uses.
+    int ibGidIndex;
+
+    /// Global Identifier (GID) of our HCA; a 128-bit identifier modeled after
+    /// IPv6 addresses. Only intended to be used in RoCE mode for now.
+    ibv_gid gid;
+
+    /// Identifies our HCA uniquely among all those in the Infiniband
     /// network; roughly equivalent to a host address.
     int lid;
 

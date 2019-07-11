@@ -17,6 +17,12 @@
 #include <netinet/in.h>
 #include <infiniband/verbs.h>
 
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Weffc++"
+#include "flat_hash_map.h"
+#pragma GCC diagnostic warning "-Wconversion"
+#pragma GCC diagnostic warning "-Weffc++"
+
 #include "Common.h"
 #include "Driver.h"
 #include "MacAddress.h"
@@ -39,6 +45,7 @@ class Infiniband {
 
     static const char*
     wcStatusToString(int status);
+    const string gidToString(ibv_gid gid);
 
     // this class exists simply for passing queue pair handshake information
     // back and forth.
@@ -255,13 +262,16 @@ class Infiniband {
         uint64_t getHash() const;
         string toString() const;
 
-        Address(Infiniband& infiniband, int physicalPort,
-                   const ServiceLocator* serviceLocator);
-        Address(Infiniband& infiniband, int physicalPort,
-                   uint16_t lid, uint32_t qpn)
+        Address(Infiniband& infiniband, bool isRoCE, int physicalPort,
+                int localGidIndex, const ServiceLocator* serviceLocator);
+        Address(Infiniband& infiniband, bool isRoCE, int physicalPort,
+                int localGidIndex, ibv_gid gid, uint16_t lid, uint32_t qpn)
             : Driver::Address()
             , infiniband(infiniband)
+            , isRoCE(isRoCE)
             , physicalPort(physicalPort)
+            , localGidIndex(localGidIndex)
+            , gid(gid)
             , lid(lid)
             , qpn(qpn)
             , ah(NULL)
@@ -270,7 +280,10 @@ class Infiniband {
         Address(const Address& other)
             : Driver::Address(other)
             , infiniband(other.infiniband)
+            , isRoCE(other.isRoCE)
             , physicalPort(other.physicalPort)
+            , localGidIndex(other.localGidIndex)
+            , gid(other.gid)
             , lid(other.lid)
             , qpn(other.qpn)
             , ah(NULL) // don't want multiple ibv_destroy_ah calls
@@ -288,8 +301,19 @@ class Infiniband {
       private:
         Infiniband& infiniband; // Infiniband instance under which this address
                                 // is valid.
+        bool isRoCE;        // True if the underlying protocol is RoCE (as
+                            // opposed to Infiniband)
+
         int physicalPort;   // physical port number on local device
-        uint16_t lid;       // local id (address)
+        int localGidIndex;  // GID index of the local HCA
+
+        // TODO: explain why we need this
+        // https://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
+        // https://www.rdmamojo.com/2012/09/22/ibv_create_ah/
+        // https://www.rdmamojo.com/2012/08/02/ibv_query_gid/
+        ibv_gid gid;        // global id (address) of the remote HCA; only used
+                            // in RoCE
+        uint16_t lid;       // local id (address) of the remote HCA
         uint32_t qpn;       // queue pair number
         mutable ibv_ah* ah; // address handle, may be NULL
     };
@@ -456,16 +480,10 @@ class Infiniband {
                     uint32_t maxRecvWr,
                     uint32_t QKey = 0);
 
-    int
-    getLid(int port);
+    ibv_gid getGid(int port, int index);
+    int getLid(int port);
     uint32_t getBandwidthGbps(int port);
     uint32_t getMtu(int port);
-
-    BufferDescriptor*
-    tryReceive(QueuePair* qp, Tub<Address>* sourceAddress = NULL);
-
-    BufferDescriptor*
-    receive(QueuePair* qp, Tub<Address>* sourceAddress = NULL);
 
     void
     postReceive(QueuePair* qp, BufferDescriptor* bd);
@@ -515,7 +533,7 @@ class Infiniband {
     // (as of 11/2015, these calls take 40-50us!). These entries are never
     // garbage collected, but there will be only one entry per host (and the
     // lids are only 16 bits), so the memory usage should be tolerable.
-    typedef std::unordered_map<uint16_t, ibv_ah*> AddressHandleMap;
+    typedef ska::flat_hash_map<uint64_t, ibv_ah*> AddressHandleMap;
     AddressHandleMap ahMap;
 
     uint64_t totalAddressHandleAllocCalls;

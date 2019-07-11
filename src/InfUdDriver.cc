@@ -97,6 +97,8 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     : Driver(context)
     , realInfiniband()
     , infiniband()
+    // FIXME: accept config from service locator
+    , isRoCE(true)
     , rxPool()
     , rxBuffersInHca(0)
     , rxBufferLogThreshold(0)
@@ -107,6 +109,9 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     , txcq(0)
     , qp()
     , ibPhysicalPort(ethernet ? 2 : 1)
+    // FIXME: on xl170 index 2 of IB device mlx5_3 has RoCE v1; index 3 has v2!
+    , ibGidIndex(2)
+    , gid()
     , lid(0)
     , mtu(0)
     , qpn(0)
@@ -118,7 +123,9 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     , zeroCopyRegion(NULL)
     , sendsSinceLastSignal(0)
 {
-    const char *ibDeviceName = NULL;
+    // FIXME: pass dev=mlx5_3 via serviceLocator?
+//    const char *ibDeviceName = NULL;
+    const char *ibDeviceName = "mlx5_3";
     bool macAddressProvided = false;
 
     if (sl != NULL) {
@@ -171,13 +178,10 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
             * MAX_DRAIN_TIME / 8.0);
     uint32_t maxPacketSize = getMaxPacketSize();
-    // Note: we were using 2 full packets for 10Gb Ethernet; adjust it to 3 full
-    // packets for our 25Gbps infiniband network.
-#define MAX_QUEUED_PACKETS 3
-    if (maxTransmitQueueSize < MAX_QUEUED_PACKETS*maxPacketSize) {
+    if (maxTransmitQueueSize < 2*maxPacketSize) {
         // Make sure that we advertise enough space in the transmit queue to
         // prepare the next packet while the current one is transmitting.
-        maxTransmitQueueSize = MAX_QUEUED_PACKETS*maxPacketSize;
+        maxTransmitQueueSize = 2*maxPacketSize;
     }
     LOG(NOTICE, "InfUdDriver bandwidth: %u Gbits/sec, maxTransmitQueueSize: "
             "%u bytes, maxPacketSize %u bytes", bandwidthGbps,
@@ -225,6 +229,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
                                      QKEY);
 
     // Cache these for easier access.
+    gid = infiniband->getGid(ibPhysicalPort, ibGidIndex);
     lid = infiniband->getLid(ibPhysicalPort);
     qpn = qp->getLocalQpNumber();
 
@@ -239,7 +244,8 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
             if (!macAddressProvided)
                 locatorString += "mac=" + localMac->toString();
         } else {
-            locatorString += format("lid=%u,qpn=%u", lid, qpn);
+            locatorString += format("gid=%s,lid=%u,qpn=%u",
+                    infiniband->gidToString(gid).c_str(), lid, qpn);
         }
         LOG(NOTICE, "Locator for InfUdDriver: %s", locatorString.c_str());
     }
@@ -576,6 +582,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         ibv_wc* incoming = &wc[i];
         BufferDescriptor *bd =
                 reinterpret_cast<BufferDescriptor*>(incoming->wr_id);
+        // TODO: remove this prefetch?
         prefetch(bd->buffer,
                 incoming->byte_len > 256 ? 256 : incoming->byte_len);
 #if TRACE_RECEIVE_PACKET
@@ -631,8 +638,20 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
             receivedPackets->emplace_back(bd->macAddress.get(), this,
                     length, bd->buffer + sizeof(EthernetHeader));
         } else {
-            bd->infAddress.construct(*infiniband,
-                    ibPhysicalPort, incoming->slid, incoming->src_qp);
+//            bd->infAddress.construct(*infiniband,
+//                    ibPhysicalPort, incoming->slid, incoming->src_qp);
+            // https://community.mellanox.com/s/article/lrh-and-grh-infiniband-headers
+//            auto sgid = hexStr(bd->buffer + 8, 16);
+//            auto dgid = hexStr(bd->buffer + 24, 16);
+//
+//            LOG(WARNING, "incoming gid = %lu, sgid = %s, dgid = %s",
+//                    ((ibv_gid*)(bd->buffer + 8))->global.interface_id,
+//                    sgid.c_str(), dgid.c_str());
+            // TODO: should we copy ibv_gid or pass a ptr? only 128-bit
+            // FIXME: why do we have to construct such a heavy-weight IB address object?
+            // e.g., MAC address is only 6-byte!
+            bd->infAddress.construct(*infiniband, isRoCE, ibPhysicalPort, ibGidIndex,
+                    *(ibv_gid*)(bd->buffer + 8), incoming->slid, incoming->src_qp);
             receivedPackets->emplace_back(bd->infAddress.get(), this,
                     bd->packetLength - GRH_SIZE, bd->buffer + GRH_SIZE);
         }

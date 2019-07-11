@@ -116,6 +116,30 @@ Infiniband::wcStatusToString(int status)
     return lookup[status];
 }
 
+const string
+Infiniband::gidToString(ibv_gid gid)
+{
+    uint8_t* raw = gid.raw;
+    return format("%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+            "%02x%02x:%02x%02x:%02x%02x:%02x%02x", raw[0], raw[1], raw[2],
+            raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10],
+            raw[11], raw[12], raw[13], raw[14], raw[15]);
+}
+
+
+ibv_gid
+Infiniband::getGid(int port, int index)
+{
+    ibv_gid gid;
+    int ret = ibv_query_gid(device.ctxt, downCast<uint8_t>(port), index, &gid);
+    if (ret) {
+        RAMCLOUD_LOG(ERROR, "ibv_query_gid failed on port %u\n", port);
+        throw TransportException(HERE, ret);
+    }
+    return gid;
+}
+
+
 /**
  * Obtain the infiniband "local ID" of the device corresponding to
  * the provided context and port number.
@@ -215,76 +239,6 @@ Infiniband::getMtu(int port)
         default:
             DIE("Illegal enum ibv_mtu value %u", ipa.active_mtu);
     }
-}
-
-/**
- * Try to receive a message from the given Queue Pair if one
- * is available. Do not block.
- *
- * \param[in] qp
- *      The queue pair to poll for a received message.
- * \param[in] sourceAddress
- *      Optional. If not NULL, store the sender's address here. 
- * \return
- *      NULL if no message is available. Otherwise, a pointer to
- *      a BufferDescriptor containing the message.
- * \throw TransportException
- *      if polling failed.  
- */
-Infiniband::BufferDescriptor*
-Infiniband::tryReceive(QueuePair *qp, Tub<Address>* sourceAddress)
-{
-    ibv_wc wc;
-    int r = ibv_poll_cq(qp->rxcq, 1, &wc);
-
-    if (r == 0)
-        return NULL;
-
-    if (r < 0) {
-        RAMCLOUD_LOG(ERROR, "ibv_poll_cq failed: %d", r);
-        throw TransportException(HERE, r);
-    }
-
-    if (wc.status != IBV_WC_SUCCESS) {
-        LOG(ERROR, "wc.status != IBV_WC_SUCCESS; is %d", wc.status);
-        throw TransportException(HERE, wc.status);
-    }
-
-    BufferDescriptor *bd = reinterpret_cast<BufferDescriptor*>(wc.wr_id);
-    bd->messageBytes = wc.byte_len;
-
-    if (sourceAddress != NULL) {
-        sourceAddress->construct(*this, qp->ibPhysicalPort,
-                                 wc.slid, wc.src_qp);
-    }
-
-    return bd;
-}
-
-/**
- * Try to receive a message from the given Queue Pair if one
- * is available. If one is not, keep trying.
- *
- * \param[in] qp
- *      The queue pair to poll for a received message.
- * \param[in] sourceAddress
- *      For UD queue pairs only. If not NULL, store the sender's
- *      address here. 
- * \return
- *      A pointer to a BufferDescriptor containing the message.
- * \throw TransportException
- *      if polling failed.  
- */
-Infiniband::BufferDescriptor *
-Infiniband::receive(QueuePair *qp, Tub<Address>* sourceAddress)
-{
-    BufferDescriptor *bd = NULL;
-
-    do {
-        bd = tryReceive(qp, sourceAddress);
-    } while (bd == NULL);
-
-    return bd;
 }
 
 /**
@@ -771,8 +725,8 @@ Infiniband::QueuePair::activate(const Tub<MacAddress>& localMac)
     // now switch to RTR
     memset(&qpa, 0, sizeof(qpa));
     qpa.qp_state = IBV_QPS_RTR;
-
-    int ret = ibv_modify_qp(qp, &qpa, IBV_QP_STATE);
+    int rtr_flags = IBV_QP_STATE;
+    int ret = ibv_modify_qp(qp, &qpa, rtr_flags);
     if (ret) {
         LOG(ERROR, "failed to transition to RTR state");
         throw TransportException(HERE, ret);
@@ -780,12 +734,12 @@ Infiniband::QueuePair::activate(const Tub<MacAddress>& localMac)
 
     // now move to RTS state
     qpa.qp_state = IBV_QPS_RTS;
-    int flags = IBV_QP_STATE;
+    int rts_flags = IBV_QP_STATE;
     if (type != IBV_QPT_RAW_ETH) {
         qpa.sq_psn = initialPsn;
-        flags |= IBV_QP_SQ_PSN;
+        rts_flags |= IBV_QP_SQ_PSN;
     }
-    ret = ibv_modify_qp(qp, &qpa, flags);
+    ret = ibv_modify_qp(qp, &qpa, rts_flags);
     if (ret) {
         LOG(ERROR, "failed to transition to RTS state");
         throw TransportException(HERE, ret);
@@ -937,8 +891,12 @@ Infiniband::QueuePair::getSinName() const
  * Construct an Address from the information in a ServiceLocator.
  * \param infiniband
  *      Infiniband instance under which this address is valid.
+ * \param isRoCE
+ *      TODO:
  * \param physicalPort
  *      The physical port number on the local device through which to send.
+ * \param localGidIndex
+ *      TODO:
  * \param serviceLocator
  *      The "lid" and "qpn" options describe the desired address.
  * \throw BadAddress
@@ -946,11 +904,14 @@ Infiniband::QueuePair::getSinName() const
  *      (e.g. a required option was missing, or the host name
  *      couldn't be parsed).
  */
-Infiniband::Address::Address(Infiniband& infiniband,
-                             int physicalPort,
-                             const ServiceLocator* serviceLocator)
+Infiniband::Address::Address(Infiniband& infiniband, bool isRoCE,
+        int physicalPort, int localGidIndex,
+        const ServiceLocator* serviceLocator)
     : infiniband(infiniband)
+    , isRoCE(isRoCE)
     , physicalPort(physicalPort)
+    , localGidIndex(localGidIndex)
+    , gid()
     , lid()
     , qpn()
     , ah(NULL)
@@ -977,6 +938,29 @@ Infiniband::Address::Address(Infiniband& infiniband,
         throw BadAddressException(HERE,
             "Could not parse qpn. Invalid or out of range.",
             serviceLocator);
+    }
+
+    if (isRoCE) {
+        try {
+            const char* gidStr = serviceLocator->getOption<const char*>("gid");
+            uint8_t* raw = gid.raw;
+            int r = sscanf(gidStr, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
+                    "%02x%02x:%02x%02x:%02x%02x:%02x%02x", &raw[0], &raw[1],
+                    &raw[2], &raw[3], &raw[4], &raw[5], &raw[6], &raw[7],
+                    &raw[8], &raw[9], &raw[10], &raw[11], &raw[12], &raw[13],
+                    &raw[14], &raw[15]);
+            if (r != 16) {
+                throw 0;
+            }
+        } catch (NoSuchKeyException &e) {
+            throw BadAddressException(HERE,
+                "Mandatory RoCE option ``gid'' missing from infiniband "
+                "ServiceLocator.", serviceLocator);
+        } catch (...) {
+            throw BadAddressException(HERE,
+                "Could not parse gid. Invalid or out of range.",
+                serviceLocator);
+        }
     }
 }
 
@@ -1021,7 +1005,8 @@ Infiniband::Address::getHandle() const
     }
 
     // See if we have a cached value.
-    AddressHandleMap::iterator it = infiniband.ahMap.find(lid);
+    uint64_t ahKey = isRoCE ? gid.global.interface_id : lid;
+    AddressHandleMap::iterator it = infiniband.ahMap.find(ahKey);
     if (it != infiniband.ahMap.end()) {
         ah = it->second;
         return ah;
@@ -1031,7 +1016,14 @@ Infiniband::Address::getHandle() const
     ibv_ah_attr attr;
     attr.dlid = lid;
     attr.src_path_bits = 0;
-    attr.is_global = 0;
+    attr.is_global = isRoCE ? 1 : 0;
+    if (isRoCE) {
+        attr.is_global = 1;
+        attr.grh.dgid = gid;
+        attr.grh.sgid_index = localGidIndex;
+        attr.grh.hop_limit = 1;
+        attr.grh.traffic_class = 0;
+    }
     attr.sl = 0;
     attr.port_num = downCast<uint8_t>(physicalPort);
     infiniband.totalAddressHandleAllocCalls += 1;
@@ -1040,7 +1032,7 @@ Infiniband::Address::getHandle() const
     infiniband.totalAddressHandleAllocTime += Cycles::rdtsc() - start;
     if (ah == NULL)
         throw TransportException(HERE, "failed to create ah", errno);
-    infiniband.ahMap[lid] = ah;
+    infiniband.ahMap[ahKey] = ah;
     return ah;
 }
 
