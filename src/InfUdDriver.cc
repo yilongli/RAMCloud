@@ -118,10 +118,11 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     , localMac()
     , locatorString("infud:")
     , bandwidthGbps(~0u)
+    , sendRequests()
+    , sendsSinceLastSignal(0)
     , zeroCopyStart(NULL)
     , zeroCopyEnd(NULL)
     , zeroCopyRegion(NULL)
-    , sendsSinceLastSignal(0)
 {
     // FIXME: pass dev=mlx5_3 via serviceLocator?
 //    const char *ibDeviceName = NULL;
@@ -514,9 +515,7 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     ibv_send_wr *bad_txWorkRequest;
     lastTransmitTime = Cycles::rdtsc();
     if (ibv_post_send(qp->qp, &workRequest, &bad_txWorkRequest)) {
-        LOG(WARNING, "Error posting transmit packet: %s", strerror(errno));
-        txPool->freeBuffers.push_back(bd);
-        return;
+        DIE("Error posting transmit packet: %s", strerror(errno));
     } else {
         txBuffersInHca.push_back(bd);
 #if TRACE_TRANSMIT_BUF
@@ -546,6 +545,135 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     PerfStats::threadStats.infudDriverTxPostProcessCycles +=
             stopTime - ibvPostSend;
 #endif
+}
+
+/*
+ * See docs in the ``Driver'' class.
+ */
+void
+InfUdDriver::sendPackets(const Driver::Address* addr,
+                         const void* headers,
+                         uint32_t headerLen,
+                         Buffer::Iterator* messageIt,
+                         int priority,
+                         TransmitQueueState* txQueueState)
+{
+    const uint32_t messageBytes = messageIt->size();
+    timeTrace("sendPackets invoked, message bytes %u", messageBytes);
+
+    uint32_t maxPayload = getMaxPacketSize() - headerLen;
+    uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
+    sendRequests.clear();
+
+    // Each iteration of the following loop creates one send work request
+    // (i.e. ibv_send_wr); each work request has a list of scatter-gather
+    // entries (i.e. ibv_sge). All work requests are organized into a linked
+    // list to be passed to ibv_post_send.
+    const char* header = reinterpret_cast<const char*>(headers);
+    for (uint32_t i = 0; i < numPackets; i++) {
+        // Chain work requests into a linked list.
+        ibv_send_wr* lastRequest = i ? &sendRequests.back().wr : NULL;
+        sendRequests.emplace_back();
+        if (lastRequest) {
+            lastRequest->next = &sendRequests.back().wr;
+        }
+
+        // Get a packet buffer.
+        uint32_t payloadSize = std::min(maxPayload, messageIt->size());
+        BufferDescriptor* bd = getTransmitBuffer();
+        bd->packetLength = headerLen + payloadSize;
+        sendRequests.back().bd = bd;
+
+        // Copy transport header into packet buffer.
+        char* dst = bd->buffer;
+        memcpy(dst, header, headerLen);
+        header += headerLen;
+        dst += headerLen;
+
+        // Create a scatter-gather list for the packet (i.e., header & payload).
+        ibv_sge* sges = sendRequests.back().sges;
+        sges[0].addr = reinterpret_cast<uint64_t>(bd->buffer);
+        sges[0].length = headerLen;
+        sges[0].lkey = bd->memoryRegion->lkey;
+        int numSges;
+
+        const char* payloadStart =
+                reinterpret_cast<const char*>(messageIt->getData());
+        if ((messageIt->getLength() >= payloadSize) &&
+                (zeroCopyStart <= payloadStart) &&
+                (payloadStart + payloadSize <= zeroCopyEnd)) {
+            // Add a new scatter-gather entry that points to the payload.
+            numSges = 2;
+            sges[1].addr = reinterpret_cast<uint64_t>(payloadStart);
+            sges[1].length = payloadSize;
+            sges[1].lkey = zeroCopyRegion->lkey;
+            messageIt->advance(payloadSize);
+        } else {
+            // Copy payload into packet buffer.
+            numSges = 1;
+            sges[0].length = bd->packetLength;
+            uint32_t bytesToCopy = payloadSize;
+            while (messageIt->size() > 0) {
+                // The current buffer chunk contains the rest of the packet.
+                if (messageIt->getLength() >= bytesToCopy) {
+                    memcpy(dst, messageIt->getData(), bytesToCopy);
+                    messageIt->advance(bytesToCopy);
+                    break;
+                }
+
+                memcpy(dst, messageIt->getData(), messageIt->getLength());
+                dst += messageIt->getLength();
+                bytesToCopy -= messageIt->getLength();
+                messageIt->next();
+            }
+        }
+
+        // Fill out info in the work request.
+        ibv_send_wr& workRequest = sendRequests.back().wr;
+
+        // This id is used to locate the BufferDescriptor from the
+        // completion notification.
+        workRequest.wr_id = reinterpret_cast<uint64_t>(bd);
+        const Address* address = static_cast<const Address*>(addr);
+        // FIXME: InfUdDriver::Address can be really lightweight: just ibv_ah* + qpn
+        workRequest.wr.ud.ah = address->getHandle();
+        workRequest.wr.ud.remote_qpn = address->getQpn();
+        workRequest.wr.ud.remote_qkey = QKEY;
+        workRequest.next = NULL;
+        workRequest.sg_list = sges;
+        workRequest.num_sge = numSges;
+        workRequest.opcode = IBV_WR_SEND;
+        sendsSinceLastSignal++;
+        if (sendsSinceLastSignal >= SIGNALED_SEND_PERIOD) {
+            workRequest.send_flags = IBV_SEND_SIGNALED;
+            sendsSinceLastSignal = 0;
+        }
+
+        // Note: we do NOT consider inline data here because this method is
+        // meant for large messages.
+        // workRequest.send_flags |= IBV_SEND_INLINE;
+    }
+
+    uint32_t bytesSent = 0;
+    ibv_send_wr* wr = messageBytes > 0 ? &sendRequests[0].wr : NULL;
+    ibv_send_wr* bad_txWorkRequest;
+    lastTransmitTime = Cycles::rdtsc();
+    if (ibv_post_send(qp->qp, wr, &bad_txWorkRequest)) {
+        if (numPackets > MAX_TX_QUEUE_DEPTH) {
+            LOG(ERROR, "Trying to send too many (%u) packets!", numPackets);
+        }
+        DIE("Error posting transmit packet: %s", strerror(errno));
+    } else {
+        for (SendRequest& sr : sendRequests) {
+            txBuffersInHca.push_back(sr.bd);
+            bytesSent += sr.bd->packetLength;
+        }
+    }
+    timeTrace("sent packets with %u bytes, %u free buffers", bytesSent,
+            txPool->freeBuffers.size());
+    queueEstimator.packetQueued(bytesSent, lastTransmitTime, txQueueState);
+    PerfStats::threadStats.networkOutputBytes += bytesSent;
+    PerfStats::threadStats.networkOutputPackets += numPackets;
 }
 
 /*

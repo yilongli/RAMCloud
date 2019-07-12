@@ -58,6 +58,11 @@ class InfUdDriver : public Driver {
                             uint32_t headerLen, Buffer::Iterator* payload,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
+    virtual void sendPackets(const Driver::Address* addr, const void* headers,
+                             uint32_t headerLen, Buffer::Iterator* messageIt,
+                             int priority = 0,
+                             TransmitQueueState* txQueueState = NULL);
+
     virtual string getServiceLocator();
 
     virtual Driver::Address* newAddress(const ServiceLocator* serviceLocator) {
@@ -140,6 +145,15 @@ class InfUdDriver : public Driver {
         DISALLOW_COPY_AND_ASSIGN(BufferPool);
     };
 
+    // TODO:
+    struct SendRequest {
+        ibv_send_wr wr;
+
+        ibv_sge sges[2];
+
+        BufferDescriptor* bd;
+    };
+
     BufferDescriptor* getTransmitBuffer();
     void reapTransmitBuffers();
     void refillReceiver();
@@ -156,7 +170,7 @@ class InfUdDriver : public Driver {
     static const uint32_t MAX_RX_QUEUE_DEPTH = 1000;
 
     /// Maximum number of transmit buffers that may be outstanding at once.
-    static const uint32_t MAX_TX_QUEUE_DEPTH = 8;
+    static const uint32_t MAX_TX_QUEUE_DEPTH = 128;
 
     /// Post a signaled send request, which generates a work completion entry
     /// when it completes, after posting SIGNALED_SEND_PERIOD-1 unsignaled send
@@ -166,7 +180,7 @@ class InfUdDriver : public Driver {
     /// of the last send request.
     /// As of 11/2018, refilling 64 transmit buffers takes only ~250ns on our
     /// rc machines.
-    static const int SIGNALED_SEND_PERIOD = 4;
+    static const int SIGNALED_SEND_PERIOD = 16;
 
     /*
      * Note that in UD mode, Infiniband receivers prepend a 40-byte
@@ -260,8 +274,14 @@ class InfUdDriver : public Driver {
     /// Our ServiceLocator, including the dynamic lid and qpn
     string locatorString;
 
-    // Effective outgoing network bandwidth, in Gbits/second.
+    /// Effective outgoing network bandwidth, in Gbits/second.
     uint32_t bandwidthGbps;
+
+    /// TODO:
+    std::vector<SendRequest> sendRequests;
+
+    /// Used to post a signaled send request after every Nth packet is sent.
+    int sendsSinceLastSignal;
 
     /// Address of the first byte of the "zero-copy region". This is an area
     /// of memory that is addressable directly by the HCA. When transmitting
@@ -277,9 +297,6 @@ class InfUdDriver : public Driver {
     /// Infiniband memory region associated with the zero-copy region, or
     /// NULL if there is no zero-copy region.
     ibv_mr* zeroCopyRegion;
-
-    /// Used to post a signaled send request after every Nth packet is sent.
-    int sendsSinceLastSignal;
 
     DISALLOW_COPY_AND_ASSIGN(InfUdDriver);
 };

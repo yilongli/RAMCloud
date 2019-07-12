@@ -410,15 +410,20 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         curOffset += bytesThisPacket;
         ADD_COUNTER(basicTransportOutputDataBytes, sizeof(DataHeader));
     }
-    Buffer::Iterator iter(message, offset, bytesSent);
-    const char* fmt = (flags & FROM_CLIENT) ?
-        "client sending DATA, clientId %u, sequence %u, offset %u, bytes %u" :
-        "server sending DATA, clientId %u, sequence %u, offset %u, bytes %u";
-    timeTrace(fmt, rpcId.clientId, rpcId.sequence, offset, bytesSent);
-    driver->sendPackets(address, dataHeadersToSend.data(), sizeof(DataHeader),
-            &iter);
-    dataHeadersToSend.clear();
-    ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
+
+    if (bytesSent > 0) {
+        Buffer::Iterator iter(message, offset, bytesSent);
+        const char* fmt = (flags & FROM_CLIENT) ?
+                "client sending DATA, clientId %u, sequence %u, offset %u, "
+                "bytes %u" :
+                "server sending DATA, clientId %u, sequence %u, offset %u, "
+                "bytes %u";
+        timeTrace(fmt, rpcId.clientId, rpcId.sequence, offset, bytesSent);
+        driver->sendPackets(address, dataHeadersToSend.data(),
+                sizeof(DataHeader), &iter);
+        dataHeadersToSend.clear();
+        ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
+    }
     return bytesSent;
 }
 
