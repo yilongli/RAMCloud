@@ -490,8 +490,8 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     // completion notification.
     workRequest.wr_id = reinterpret_cast<uint64_t>(bd);
     const Address* address = static_cast<const Address*>(addr);
-    workRequest.wr.ud.ah = address->getHandle();
-    workRequest.wr.ud.remote_qpn = address->getQpn();
+    workRequest.wr.ud.ah = address->ah;
+    workRequest.wr.ud.remote_qpn = address->qpn;
     workRequest.wr.ud.remote_qkey = QKEY;
     workRequest.next = NULL;
     workRequest.sg_list = sges;
@@ -635,9 +635,8 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
         // completion notification.
         workRequest.wr_id = reinterpret_cast<uint64_t>(bd);
         const Address* address = static_cast<const Address*>(addr);
-        // FIXME: InfUdDriver::Address can be really lightweight: just ibv_ah* + qpn
-        workRequest.wr.ud.ah = address->getHandle();
-        workRequest.wr.ud.remote_qpn = address->getQpn();
+        workRequest.wr.ud.ah = address->ah;
+        workRequest.wr.ud.remote_qpn = address->qpn;
         workRequest.wr.ud.remote_qkey = QKEY;
         workRequest.next = NULL;
         workRequest.sg_list = sges;
@@ -766,21 +765,28 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
             receivedPackets->emplace_back(bd->macAddress.get(), this,
                     length, bd->buffer + sizeof(EthernetHeader));
         } else {
-//            bd->infAddress.construct(*infiniband,
-//                    ibPhysicalPort, incoming->slid, incoming->src_qp);
-            // https://community.mellanox.com/s/article/lrh-and-grh-infiniband-headers
-//            auto sgid = hexStr(bd->buffer + 8, 16);
-//            auto dgid = hexStr(bd->buffer + 24, 16);
-//
-//            LOG(WARNING, "incoming gid = %lu, sgid = %s, dgid = %s",
-//                    ((ibv_gid*)(bd->buffer + 8))->global.interface_id,
-//                    sgid.c_str(), dgid.c_str());
-            // TODO: should we copy ibv_gid or pass a ptr? only 128-bit
-            // FIXME: why do we have to construct such a heavy-weight IB address object?
-            // e.g., MAC address is only 6-byte!
-            bd->infAddress.construct(*infiniband, isRoCE, ibPhysicalPort, ibGidIndex,
-                    *(ibv_gid*)(bd->buffer + 8), incoming->slid, incoming->src_qp);
-            receivedPackets->emplace_back(bd->infAddress.get(), this,
+            // Address handle and qpn are all we need to identify the sender.
+            // In RoCE v1, the source GID starts at the 8-th byte of GRH:
+            // https://community.mellanox.com/s/article/lrh-and-grh-infiniband-
+            // headers
+            ibv_ah* ah;
+            ibv_gid* sgid = reinterpret_cast<ibv_gid*>(bd->buffer + 8);
+            uint64_t ahKey =
+                    isRoCE ? sgid->global.interface_id : incoming->slid;
+            auto it = infiniband->ahMap.find(ahKey);
+            if (unlikely(it == infiniband->ahMap.end())) {
+                Infiniband::Address infAddress(*infiniband, isRoCE,
+                        ibPhysicalPort, ibGidIndex, *sgid, incoming->slid,
+                        incoming->src_qp);
+                ah = infAddress.getHandle();
+            } else {
+                ah = it->second;
+            }
+
+            static_assert(GRH_SIZE >= sizeof(Address), "Not enough space");
+            new(bd->buffer) Address(ah, incoming->src_qp);
+            receivedPackets->emplace_back(
+                    reinterpret_cast<Address*>(bd->buffer), this,
                     bd->packetLength - GRH_SIZE, bd->buffer + GRH_SIZE);
         }
         continue;

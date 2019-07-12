@@ -41,7 +41,6 @@ namespace RAMCloud {
  */
 class InfUdDriver : public Driver {
     typedef Infiniband::QueuePair QueuePair;
-    typedef Infiniband::Address Address;
 
   public:
     explicit InfUdDriver(Context* context,
@@ -65,17 +64,46 @@ class InfUdDriver : public Driver {
 
     virtual string getServiceLocator();
 
-    virtual Driver::Address* newAddress(const ServiceLocator* serviceLocator) {
+    virtual Address* newAddress(const ServiceLocator* serviceLocator) {
         if (localMac) {
             return new MacAddress(
                 serviceLocator->getOption<const char*>("mac"));
         } else {
-            return new Address(*infiniband, isRoCE, ibPhysicalPort, ibGidIndex,
-                    serviceLocator);
+            Infiniband::Address ibAddress(*infiniband, isRoCE, ibPhysicalPort,
+                    ibGidIndex, serviceLocator);
+            return new Address(ibAddress.getHandle(), ibAddress.getQpn());
         }
     }
 
   PRIVATE:
+    /**
+     * Identifies the infiniband address of an UD queue pair.
+     */
+    class Address : public Driver::Address {
+      public:
+        Address(ibv_ah* ah, uint32_t qpn)
+            : Driver::Address()
+            , ah(ah)
+            , qpn(qpn)
+        {}
+
+        virtual ~Address() {}
+
+        virtual uint64_t getHash() const {
+            return (uint64_t(qpn) << 32) || uint32_t(uint64_t(ah));
+        }
+
+        virtual string toString() const {
+            return format("%p:%u", ah, qpn);
+        }
+
+        /// Infiniband address handle that identifies the host machine.
+        /// Not owned by this class.
+        ibv_ah* ah;
+
+        /// Queue pair number within the host.
+        uint32_t qpn;
+    };
 
     /**
      * Stores information about a single packet buffer (used for both
@@ -103,14 +131,14 @@ class InfUdDriver : public Driver {
         /// be sent (or from which the packet was received).
         uint16_t remoteLid;
 
-        /// One of the following addresses is used for each received packet
-        /// to identify the sender. Not used for transmitted packets.
-        Tub<Address> infAddress;
+        /// Source MAC address of the received packet. Used to identify the
+        /// sender when operating in raw Ethernet mode. Not for transmitted
+        /// packets.
         Tub<MacAddress> macAddress;
 
         BufferDescriptor(char *buffer, uint32_t length, ibv_mr *region)
             : buffer(buffer), length(length), memoryRegion(region),
-              packetLength(0), remoteLid(0), infAddress(), macAddress() {}
+              packetLength(0), remoteLid(0), macAddress() {}
 
       private:
         DISALLOW_COPY_AND_ASSIGN(BufferDescriptor);
@@ -145,12 +173,18 @@ class InfUdDriver : public Driver {
         DISALLOW_COPY_AND_ASSIGN(BufferPool);
     };
 
-    // TODO:
+    /**
+     * Stores information about a work request that will be posted to the TX
+     * queue (i.e., a send request).
+     */
     struct SendRequest {
+        /// Work request to be posted to the TX queue.
         ibv_send_wr wr;
 
+        /// Scatter-gather list within the work request.
         ibv_sge sges[2];
 
+        /// Packet buffer containing the data to send.
         BufferDescriptor* bd;
     };
 
@@ -277,7 +311,10 @@ class InfUdDriver : public Driver {
     /// Effective outgoing network bandwidth, in Gbits/second.
     uint32_t bandwidthGbps;
 
-    /// TODO:
+    /// Holds send requests to be posted to the TX queue: one send request for
+    /// each outgoing packet. This is only used temporarily during #sendPackets,
+    /// but it's allocated here so that we only pay the cost for storage
+    /// allocation once.
     std::vector<SendRequest> sendRequests;
 
     /// Used to post a signaled send request after every Nth packet is sent.
