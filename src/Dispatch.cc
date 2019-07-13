@@ -181,7 +181,17 @@ Dispatch::poll()
 #endif
     }
 
-    if (readyFd >= 0) {
+    // Test if we need to communicate with the epoll thread, invoke triggered
+    // timers, or give the dispatch lock to some worker thread. Return early
+    // if none applies.
+    bool epollReady = (readyFd >= 0);
+    bool timerReady = (currentTime >= earliestTriggerTime);
+    bool dispatchLocked = lockNeeded.load(std::memory_order_acquire);
+    if (likely(!epollReady && !timerReady && !dispatchLocked)) {
+        return result;
+    }
+
+    if (epollReady) {
         int fd = readyFd;
 
         // Make sure that the read of readyEvents doesn't get reordered either
@@ -220,7 +230,8 @@ Dispatch::poll()
             }
         }
     }
-    if (currentTime >= earliestTriggerTime) {
+
+    if (timerReady) {
         std::lock_guard<SpinLock> lock(timerMutex);
         // Looks like a timer may have triggered. Check all the timers and
         // invoke any that have triggered.
@@ -270,7 +281,8 @@ Dispatch::poll()
             }
         }
     }
-    if (lockNeeded.load(std::memory_order_acquire)) {
+
+    if (dispatchLocked) {
         // Someone wants us locked. Indicate that we are locked,
         // then wait for the lock to be released.
         locked.store(1, std::memory_order_release);

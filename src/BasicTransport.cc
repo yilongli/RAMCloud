@@ -190,7 +190,7 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
     if (clientRpc->isShuffleRpc) {
         uint64_t elapsedNs = Cycles::toNanoseconds(Cycles::rdtsc() -
                 clientRpc->shuffleReplyRxStart);
-        uint64_t throughput = clientRpc->response->size() * 8000 / elapsedNs;
+        uint64_t throughput = clientRpc->response->size() * 8000ul / elapsedNs;
         timetrace_shuffle("shuffle-client: clientId %u, seq %u, RX throughput "
                 "%u Mbps", clientId, sequence, throughput);
     }
@@ -386,6 +386,12 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         driver->sendPacket(address, &header, &iter, 0, &txQueueState);
         ADD_COUNTER(basicTransportOutputDataBytes, sizeof(AllDataHeader));
         ADD_COUNTER(basicTransportOutputDataBytes, message->size());
+        if (txQueueState.outstandingBytes > 0) {
+            timeTrace("sent data, %u bytes queued ahead",
+                    txQueueState.outstandingBytes);
+        } else {
+            timeTrace("sent data, tx queue idle %u cyc", txQueueState.idleTime);
+        }
         return message->size();
     }
 
@@ -420,10 +426,19 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
                 "bytes %u";
         timeTrace(fmt, rpcId.clientId, rpcId.sequence, offset, bytesSent);
         driver->sendPackets(address, dataHeadersToSend.data(),
-                sizeof(DataHeader), &iter);
+                sizeof(DataHeader), &iter, 0, &txQueueState);
         dataHeadersToSend.clear();
         ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
+        if (txQueueState.outstandingBytes > 0) {
+//            timeTrace("sent data, %u bytes queued ahead",
+            timetrace_shuffle("sent data, %u bytes queued ahead",
+                    txQueueState.outstandingBytes);
+        } else {
+//            timeTrace("sent data, tx queue idle %u cyc", txQueueState.idleTime);
+            timetrace_shuffle("sent data, tx queue idle %u cyc", txQueueState.idleTime);
+        }
     }
+
     return bytesSent;
 }
 
@@ -657,7 +672,7 @@ BasicTransport::tryToTransmitData()
                             "clientId %u, seq %u, TX throughput %u Mbps",
                             serverRpc->rpcId.clientId,
                             serverRpc->rpcId.sequence,
-                            message->buffer->size() * 8000 / elapsedNs);
+                            message->buffer->size() * 8000ul / elapsedNs);
                 }
                 deleteServerRpc(serverRpc);
             }
@@ -1787,6 +1802,11 @@ BasicTransport::Poller::poll()
     uint64_t startTime = Cycles::rdtsc();
 #endif
 
+    // Try to fill up the transmit queue.
+    // TODO: doing TX before RX helps reducing TX queue bubble because we might
+    // have just experienced some slow pollers... but it hurts latency? not exactly
+    totalBytesSent += t->tryToTransmitData();
+
     // Process available incoming packets. Try to receive MAX_PACKETS packets
     // at a time (an optimized driver implementation may prefetch the payloads
     // for us). As of 07/2016, MAX_PACKETS is set to 8 because our CPU can
@@ -1814,9 +1834,6 @@ BasicTransport::Poller::poll()
         START_TIMER(basicTransportHandlePacketCycles);
         for (uint i = 0; i < numPackets; i++) {
             t->handlePacket(&t->receivedPackets[i]);
-            if (i % 4 == 0) {
-                totalBytesSent += t->tryToTransmitData();
-            }
         }
         STOP_TIMER(basicTransportHandlePacketCycles);
         t->receivedPackets.clear();
@@ -1839,8 +1856,6 @@ BasicTransport::Poller::poll()
             t->sendControlPacket(recipient->senderAddress, &grant);
         }
         t->messagesToGrant.clear();
-    } else {
-        totalBytesSent += t->tryToTransmitData();
     }
 
     // See if we should check for timeouts. Ideally, we'd like to do this

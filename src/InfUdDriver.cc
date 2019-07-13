@@ -709,9 +709,9 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         ibv_wc* incoming = &wc[i];
         BufferDescriptor *bd =
                 reinterpret_cast<BufferDescriptor*>(incoming->wr_id);
-        // TODO: remove this prefetch?
-        prefetch(bd->buffer,
-                incoming->byte_len > 256 ? 256 : incoming->byte_len);
+        // TODO: remove this prefetch? even if we prefetch, no need to prefetch GRH header?
+//        prefetch(bd->buffer,
+//                incoming->byte_len > 256 ? 256 : incoming->byte_len);
 #if TRACE_RECEIVE_PACKET
         if (incoming->byte_len > 500) {
             TimeTrace::record(lastReceiveTime, "infud received packet, size %u,"

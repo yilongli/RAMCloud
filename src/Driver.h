@@ -549,7 +549,8 @@ class Driver {
      * getTransmitQueueSpace for motivation. Specified in units of
      * nanoseconds.
      */
-    static const uint32_t MAX_DRAIN_TIME = 2000;
+    static const uint32_t MAX_DRAIN_TIME = 3000;
+//    static const uint32_t MAX_DRAIN_TIME = 2000;
 
   PROTECTED:
     /// Shared RAMCloud information.
