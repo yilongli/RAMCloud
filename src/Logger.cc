@@ -31,7 +31,6 @@
 #include "TimeTrace.h"
 #include "Unlock.h"
 #include "Util.h"
-#include "PerfUtils/Util.h"
 
 namespace RAMCloud {
 
@@ -864,6 +863,13 @@ Logger::assertionError(const char *assertion, const char *file,
 static void
 criticalErrorHandler(int signal, siginfo_t* info, void* ucontext)
 {
+    // Dump the time trace (which often contains useful debugging information)
+    // to the system log before generating the backtrace and exiting. This also
+    // provides a handy command line alternative for dumping time traces that
+    // doesn't rely on ServerControl RPC: "pkill -SEGV -f obj.master/server".
+    TimeTrace::record("criticalErrorHandler invoked");
+    TimeTrace::printToLog();
+
     ucontext_t* uc = static_cast<ucontext_t*>(ucontext);
     void* callerAddress =
         reinterpret_cast<void*>(uc->uc_mcontext.gregs[REG_RIP]);
@@ -904,6 +910,10 @@ criticalErrorHandler(int signal, siginfo_t* info, void* ucontext)
 static void
 terminateHandler()
 {
+    // Dump the time trace first.
+    TimeTrace::record("terminateHandler invoked");
+    TimeTrace::printToLog();
+
     BACKTRACE(ERROR);
 
     // use abort, rather than exit, to dump core/trap in gdb

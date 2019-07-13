@@ -1341,21 +1341,24 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
 
             // FIXME: a static variable is very hacky (e.g., make it a class
             // member var.?)
-            static std::atomic<int> lastSenderId(-1);
-            // The first pull request we service should come from our neighbour
-            // on the left. Other pull requests must wait for their turns.
-            if (senderId != (world->rank - 1 + world->size()) % world->size()) {
-                // Wait for its turn.
-                while (lastSenderId.load(std::memory_order_acquire) !=
-                        (senderId + 1) % world->size()) {
-                    Arachne::yield();
-                }
-                // Then wait until the transport has finished transmitting all
-                // previous shuffle replies.
-                while (numOutShuffleReplies > 0) {
+            static std::atomic<int> lastRelRank(0);
+            int relRank = world->relativeRank(senderId);
+            // The first pull request we service should come from our left
+            // neighbour X. The second pull request should come from the
+            // left neighbor of X, and so on and so forth.
+            if (relRank <= lastRelRank) {
+                // Corner case: this is a duplicate request; let it through
+            } else {
+                while (lastRelRank + 1 != relRank) {
                     Arachne::yield();
                 }
             }
+            // Then wait until the transport has finished transmitting all
+            // previous shuffle replies.
+            while (numOutShuffleReplies > 0) {
+                Arachne::yield();
+            }
+
             uint64_t oldDispatchIter = context->dispatch->iteration;
             rpc->sendReply();
             timeTrace("shuffle-value-server: delayed %lu us, handled pull "
@@ -1364,15 +1367,20 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
                   senderId);
             // Hack: wait until the dispatch thread gets a chance to
             // run ServerRpc::sendReply and increment `numOutShuffleReplies`
-            // before setting lastSenderId.
+            // before setting lastRelRank.
             while (context->dispatch->iteration < oldDispatchIter + 2) {
                 Arachne::yield();
             }
-            lastSenderId.store(senderId, std::memory_order_release);
+            // Only update lastRelRank for non-duplicate requests.
+            if (relRank == lastRelRank + 1) {
+                lastRelRank += 1;
+            }
             break;
         }
         case ALLSHUFFLE_BENCHMARK: {
-            static std::atomic<int> lastSenderId(-1);
+            // FIXME: need a better way to implement this w/o static var.
+            static std::atomic<int> lastRelRank(0);
+            int relRank = world->relativeRank(senderId);
 
             uint64_t receiveTime = Cycles::rdtsc();
             timeTrace("shuffle-server: handler received pull request from rank %u",
@@ -1381,19 +1389,20 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
 #define SMALL_SHUFFLE_MESSAGE 8000
             bool orderRequests = (reqHdr->dataSize >= SMALL_SHUFFLE_MESSAGE);
             if (orderRequests) {
-                // The first pull request we service should come from our neighbour
-                // on the left. Other pull requests must wait for their turns.
-                if (senderId != (world->rank - 1 + world->size()) % world->size()) {
-                    // Wait for its turn.
-                    while (lastSenderId.load(std::memory_order_acquire) !=
-                            (senderId + 1) % world->size()) {
+                // The first pull request we service should come from our left
+                // neighbour X. The second pull request should come from the
+                // left neighbor of X, and so on and so forth.
+                if (relRank <= lastRelRank) {
+                    // Corner case: this is a duplicate request; let it through
+                } else {
+                    while (lastRelRank + 1 != relRank) {
                         Arachne::yield();
                     }
-                    // Then wait until the transport has finished transmitting all
-                    // previous shuffle replies.
-                    while (numOutShuffleReplies > 0) {
-                        Arachne::yield();
-                    }
+                }
+                // Then wait until the transport has finished transmitting all
+                // previous shuffle replies.
+                while (numOutShuffleReplies > 0) {
+                    Arachne::yield();
                 }
             } else {
                 // Bypass the shuffle request sequencing process when dealing
@@ -1414,11 +1423,14 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             if (orderRequests) {
                 // Hack: wait until the dispatch thread gets a chance to
                 // run ServerRpc::sendReply and increment `numOutShuffleReplies`
-                // before setting lastSenderId.
+                // before setting lastRelRank.
                 while (context->dispatch->iteration < oldDispatchIter + 2) {
                     Arachne::yield();
                 }
-                lastSenderId.store(senderId, std::memory_order_release);
+                // Only update lastRelRank for non-duplicate requests.
+                if (relRank == lastRelRank + 1) {
+                    lastRelRank += 1;
+                }
             }
             break;
         }
