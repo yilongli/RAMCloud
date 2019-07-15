@@ -435,7 +435,7 @@ InfUdDriver::release()
  */
 void
 InfUdDriver::sendLoopbackPacket(const void* header, uint32_t headerLen,
-        Buffer::Iterator* payload)
+        Buffer::Iterator* messageIt, uint32_t payloadSize)
 {
     // This method bypasses the underlying NIC driver: the payload is copied
     // directly into a receive buffer and delivered via the loopback queue
@@ -448,18 +448,28 @@ InfUdDriver::sendLoopbackPacket(const void* header, uint32_t headerLen,
 
     BufferDescriptor* bd = rxPool->freeBuffers.back();
     rxPool->freeBuffers.pop_back();
-    bd->packetLength = ETH_HEADER_SIZE + headerLen +
-            (payload ? payload->size() : 0);
+    bd->packetLength = ETH_HEADER_SIZE + headerLen + payloadSize;
 
     // Optimization: for loopback packets, no need to build the ethernet header
     char* dst = bd->buffer + ETH_HEADER_SIZE;
     memcpy(dst, header, headerLen);
     dst += headerLen;
-    while (payload && !payload->isDone()) {
-        memcpy(dst, payload->getData(), payload->getLength());
-        dst += payload->getLength();
-        payload->next();
+
+    uint32_t bytesToCopy = payloadSize;
+    while (bytesToCopy > 0) {
+        // The current buffer chunk contains the rest of the packet.
+        if (messageIt->getLength() >= bytesToCopy) {
+            memcpy(dst, messageIt->getData(), bytesToCopy);
+            messageIt->advance(bytesToCopy);
+            break;
+        }
+
+        memcpy(dst, messageIt->getData(), messageIt->getLength());
+        dst += messageIt->getLength();
+        bytesToCopy -= messageIt->getLength();
+        messageIt->next();
     }
+
     loopbackPkts.push_back(bd);
 }
 
@@ -477,14 +487,15 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
 #if COLLECT_LOW_LEVEL_PERFSTATS
     uint64_t startTime = Cycles::rdtscp();
 #endif
-    uint32_t totalLength = headerLen + (payload ? payload->size() : 0);
+    uint32_t payloadSize = payload ? payload->size() : 0;
+    uint32_t totalLength = headerLen + payloadSize;
     assert(totalLength <= getMaxPacketSize());
 
     // In raw ethernet mode, loopback packets must be handled specially on
     // CloudLab xl170 machines.
     const MacAddress* destMac = static_cast<const MacAddress*>(addr);
     if (unlikely(localMac && destMac->equal(*localMac.get()))) {
-        sendLoopbackPacket(header, headerLen, payload);
+        sendLoopbackPacket(header, headerLen, payload, payloadSize);
         return;
     }
 
@@ -608,7 +619,6 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
 /*
  * See docs in the ``Driver'' class.
  */
-/*
 void
 InfUdDriver::sendPackets(const Driver::Address* addr,
                          const void* headers,
@@ -624,18 +634,32 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
     uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
     sendRequests.clear();
 
+    // In raw ethernet mode, loopback packets must be handled specially on
+    // CloudLab xl170 machines.
+    const MacAddress* destMac = static_cast<const MacAddress*>(addr);
+    if (unlikely(localMac && destMac->equal(*localMac.get()))) {
+        const char* header = static_cast<const char*>(headers);
+        for (uint32_t i = 0; i < numPackets; i++) {
+            uint32_t payloadSize = std::min(maxPayload, messageIt->size());
+            sendLoopbackPacket(header, headerLen, messageIt, payloadSize);
+            header += headerLen;
+        }
+        return;
+    }
+
     // Each iteration of the following loop creates one send work request
     // (i.e. ibv_send_wr); each work request has a list of scatter-gather
     // entries (i.e. ibv_sge). All work requests are organized into a linked
     // list to be passed to ibv_post_send.
     const char* header = reinterpret_cast<const char*>(headers);
+    ibv_send_wr* lastRequest = NULL;
     for (uint32_t i = 0; i < numPackets; i++) {
         // Chain work requests into a linked list.
-        ibv_send_wr* lastRequest = i ? &sendRequests.back().wr : NULL;
         sendRequests.emplace_back();
         if (lastRequest) {
             lastRequest->next = &sendRequests.back().wr;
         }
+        lastRequest = &sendRequests.back().wr;
 
         // Get a packet buffer.
         uint32_t payloadSize = std::min(maxPayload, messageIt->size());
@@ -643,8 +667,19 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
         bd->packetLength = headerLen + payloadSize;
         sendRequests.back().bd = bd;
 
-        // Copy transport header into packet buffer.
+        // Construct the ethernet header when running in raw ethernet mode.
         char* dst = bd->buffer;
+        if (localMac) {
+            EthernetHeader* ethHdr = reinterpret_cast<EthernetHeader*>(dst);
+            MacAddress::copy(ethHdr->destAddress, destMac->address);
+            MacAddress::copy(ethHdr->srcAddress, localMac->address);
+            // TODO: get vlan to work
+            ethHdr->etherType = HTONS(NetUtil::EthPayloadType::RAMCLOUD);
+            dst += ETH_HEADER_SIZE;
+            bd->packetLength += ETH_HEADER_SIZE;
+        }
+
+        // Copy transport header into packet buffer.
         memcpy(dst, header, headerLen);
         header += headerLen;
         dst += headerLen;
@@ -652,7 +687,7 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
         // Create a scatter-gather list for the packet (i.e., header & payload).
         ibv_sge* sges = sendRequests.back().sges;
         sges[0].addr = reinterpret_cast<uint64_t>(bd->buffer);
-        sges[0].length = headerLen;
+        sges[0].length = headerLen + (localMac ? ETH_HEADER_SIZE : 0);
         sges[0].lkey = bd->memoryRegion->lkey;
         int numSges;
 
@@ -672,7 +707,7 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
             numSges = 1;
             sges[0].length = bd->packetLength;
             uint32_t bytesToCopy = payloadSize;
-            while (messageIt->size() > 0) {
+            while (bytesToCopy > 0) {
                 // The current buffer chunk contains the rest of the packet.
                 if (messageIt->getLength() >= bytesToCopy) {
                     memcpy(dst, messageIt->getData(), bytesToCopy);
@@ -690,13 +725,14 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
         // Fill out info in the work request.
         ibv_send_wr& workRequest = sendRequests.back().wr;
 
-        // This id is used to locate the BufferDescriptor from the
-        // completion notification.
+        // Create the IB work request.
         workRequest.wr_id = reinterpret_cast<uint64_t>(bd);
-        const Address* address = static_cast<const Address*>(addr);
-        workRequest.wr.ud.ah = address->ah;
-        workRequest.wr.ud.remote_qpn = address->qpn;
-        workRequest.wr.ud.remote_qkey = QKEY;
+        if (!localMac) {
+            const Address* address = static_cast<const Address*>(addr);
+            workRequest.wr.ud.ah = address->ah;
+            workRequest.wr.ud.remote_qpn = address->qpn;
+            workRequest.wr.ud.remote_qkey = QKEY;
+        }
         workRequest.next = NULL;
         workRequest.sg_list = sges;
         workRequest.num_sge = numSges;
@@ -733,7 +769,6 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
     PerfStats::threadStats.networkOutputBytes += bytesSent;
     PerfStats::threadStats.networkOutputPackets += numPackets;
 }
-*/
 
 /*
  * See docs in the ``Driver'' class.

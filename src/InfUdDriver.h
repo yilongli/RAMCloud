@@ -57,10 +57,10 @@ class InfUdDriver : public Driver {
                             uint32_t headerLen, Buffer::Iterator* payload,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
-//    virtual void sendPackets(const Driver::Address* addr, const void* headers,
-//                             uint32_t headerLen, Buffer::Iterator* messageIt,
-//                             int priority = 0,
-//                             TransmitQueueState* txQueueState = NULL);
+    virtual void sendPackets(const Driver::Address* addr, const void* headers,
+                             uint32_t headerLen, Buffer::Iterator* messageIt,
+                             int priority = 0,
+                             TransmitQueueState* txQueueState = NULL);
 
     virtual string getServiceLocator();
 
@@ -77,7 +77,7 @@ class InfUdDriver : public Driver {
 
   PRIVATE:
     void sendLoopbackPacket(const void* header, uint32_t headerLen,
-            Buffer::Iterator* payload);
+            Buffer::Iterator* messageIt, uint32_t payloadSize);
 
     /**
      * Identifies the infiniband address of an UD queue pair.
