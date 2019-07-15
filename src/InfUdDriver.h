@@ -57,10 +57,10 @@ class InfUdDriver : public Driver {
                             uint32_t headerLen, Buffer::Iterator* payload,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
-    virtual void sendPackets(const Driver::Address* addr, const void* headers,
-                             uint32_t headerLen, Buffer::Iterator* messageIt,
-                             int priority = 0,
-                             TransmitQueueState* txQueueState = NULL);
+//    virtual void sendPackets(const Driver::Address* addr, const void* headers,
+//                             uint32_t headerLen, Buffer::Iterator* messageIt,
+//                             int priority = 0,
+//                             TransmitQueueState* txQueueState = NULL);
 
     virtual string getServiceLocator();
 
@@ -76,6 +76,9 @@ class InfUdDriver : public Driver {
     }
 
   PRIVATE:
+    void sendLoopbackPacket(const void* header, uint32_t headerLen,
+            Buffer::Iterator* payload);
+
     /**
      * Identifies the infiniband address of an UD queue pair.
      */
@@ -225,15 +228,6 @@ class InfUdDriver : public Driver {
      */
     static const uint32_t GRH_SIZE = 40;
 
-    struct EthernetHeader {
-        uint8_t destAddress[6];
-        uint8_t sourceAddress[6];
-        uint16_t etherType;         // network order
-        uint16_t length;            // host order, length of payload,
-                                    // used to drop padding from end of short
-                                    // packets
-    } __attribute__((packed));
-
     /// See #infiniband.
     Tub<Infiniband> realInfiniband;
 
@@ -244,6 +238,10 @@ class InfUdDriver : public Driver {
 
     /// True if this driver is operating over RoCE (as opposed to Infiniband).
     bool isRoCE;
+
+    /// FIFO queue which holds packets addressed to the local host. Only used
+    /// in raw ethernet mode.
+    std::deque<BufferDescriptor*> loopbackPkts;
 
     /// Packet buffers used for receiving incoming packets.
     Tub<BufferPool> rxPool;
