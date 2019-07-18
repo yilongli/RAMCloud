@@ -225,7 +225,7 @@ double mergeModule()
         
         // Run merge. First add all input arrays. Then keep polling to finish.
         for (auto array : testSetup.initialArrays) {
-            merger.poll(array.data, array.size);
+            merger.add(array.data, array.size);
             // We may add intentional delays here to simulate online merge.
         }
         while (merger.poll()) {

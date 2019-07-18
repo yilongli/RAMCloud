@@ -88,9 +88,6 @@ extern volatile int numShuffleRepliesRecv;
 // with subsequent partition steps.
 #define OVERLAP_INIT_VAL_REARRANGE 0
 
-// Hack to avoid segfaults inside SJP's online merger sorter.
-#define BYPASS_ONLINE_MERGE_SORTER 1
-
 #define OVERLAP_SHUFFLE_AND_COPY 0
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
@@ -913,11 +910,9 @@ MilliSortService::shuffleKeys() {
     readyToServiceKeyShuffle.store(true);
     timeTrace("partitioned keys to be ready for key shuffle");
 
-#if !BYPASS_ONLINE_MERGE_SORTER
     // TODO: move this into startMillisort? not sure it's a good idea to have
     // idle A-threads when it's not necessary.
     mergeSorter->prepareThreads();
-#endif
 
     // Merge keys from other nodes into a sorted array as they arrive.
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
@@ -930,10 +925,7 @@ MilliSortService::shuffleKeys() {
         sortedKeys[i].index = uint32_t(i);
     }
 
-#if !BYPASS_ONLINE_MERGE_SORTER
-    timeTrace("mergerSorter->add, start 0, numKeys %d", numKeys);
-    mergeSorter->poll(&sortedKeys[0], numKeys);
-#endif
+    mergeSorter->add(&sortedKeys[0], numKeys);
     auto keyMerger = [this, &sortedItemCnt] (int serverRank, Buffer* keyBuffer)
     {
         SCOPED_TIMER(shuffleKeysCopyResponseCycles);
@@ -945,10 +937,7 @@ MilliSortService::shuffleKeys() {
         for (int i = start; i < start + int(numKeys); i++) {
             sortedKeys[i].index = uint32_t(i);
         }
-#if !BYPASS_ONLINE_MERGE_SORTER
-        timeTrace("mergerSorter->add, start %d, numKeys %d", start, numKeys);
-        mergeSorter->poll(&sortedKeys[start], numKeys);
-#endif
+        mergeSorter->add(&sortedKeys[start], numKeys);
         timeTrace("merged %u keys, %u bytes, total keys %d", numKeys,
                 keyBuffer->size(), start + int(numKeys));
     };
@@ -1005,21 +994,7 @@ MilliSortService::shuffleValues()
 #endif
 
     Arachne::ThreadId mergeSortPoller = Arachne::createThread([this] () {
-        // FIXME: bypass Seojin's online parallel merger sorter (which is
-        // causing segfaults)
-#if BYPASS_ONLINE_MERGE_SORTER
-        ADD_COUNTER(onlineMergeSortStartTime, Cycles::rdtsc() - startTime);
-        SCOPED_TIMER(onlineMergeSortElapsedTime)
-        std::sort(sortedKeys, sortedKeys + numSortedItems);
-        timeTrace("sorted %d final keys", numSortedItems);
-#else
-        uint64_t _s = Cycles::rdtsc();
         while (mergeSorter->poll()) {
-            // FIXME: the mergeSorter still has some wierd liveness issue
-            // `scripts/clusterperf.py -r 0 --transport basic+dpdk --dpdkPort 1 --servers 7 --superuser millisort --verbose --nodesPerPivotServer 10 --dataTuplesPerNode 9550 --count 5`
-            if (Cycles::rdtsc() > _s + Cycles::fromMicroseconds(1000)) {
-                raise(SIGSEGV);
-            }
             Arachne::yield();
         }
         assert(int(mergeSorter->getSortedArray().size) == numSortedItems);
@@ -1034,7 +1009,6 @@ MilliSortService::shuffleValues()
         memcpy(sortedKeys, sortedArray.data, sortedArray.size * PivotKey::SIZE);
         assert(int(sortedArray.size) == numSortedItems);
         timeTrace("copied %d final keys", numSortedItems);
-#endif
     });
 
     // Ideally, online merge of final keys only need to complete before

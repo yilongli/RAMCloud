@@ -410,6 +410,7 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     , numAllItems(maxNumAllItems)
     , numWorkers(numWorkers)
     , numArraysCompleted()
+    , dispatchLock()
     , startTime(0)
 {
     int nextPowerOfTwo = pow(2, ceil(log(numArraysTotal)/log(2)));
@@ -533,8 +534,17 @@ Merge<T>::scheduleSplitted(SplittedMergeJob job, int tid)
  */
 template<class T>
 bool
-Merge<T>::poll()
+Merge<T>::poll(bool needLock)
 {
+#if USE_ARACHNE
+    Tub<std::lock_guard<Arachne::SpinLock>> lock;
+    if (needLock) {
+        lock.construct(dispatchLock);
+    }
+#else
+    DIE("not implemented");
+#endif
+
     assert(preparedThreads);
     if (!isStarted) {
         isStarted = true;
@@ -601,7 +611,7 @@ Merge<T>::poll()
         printf("\n");
 #endif
         // go to begining?
-        return poll();
+        return poll(false);
     }
     
 continuePolling:
@@ -781,8 +791,14 @@ continuePolling:
  */
 template<class T>
 bool
-Merge<T>::poll(T* newData, size_t size)
+Merge<T>::add(T* newData, size_t size)
 {
+#if USE_ARACHNE
+    std::lock_guard<Arachne::SpinLock> _(dispatchLock);
+#else
+    DIE("not implemented!");
+#endif
+
     assert(preparedThreads);
     if (startTime == 0) {
         startTime = Cycles::rdtsc();
@@ -792,7 +808,7 @@ Merge<T>::poll(T* newData, size_t size)
     ptr.data = newData;
     ptr.size = size;
     arraysToMerge[0].push(ptr);
-    return poll();
+    return poll(false);
 }
 
 template<class T>
