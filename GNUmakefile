@@ -125,7 +125,10 @@ endif
 # Failed deconstructor inlines are generating noise
 # -Winline
 
-LIBS := $(EXTRALIBS) $(LOGCABIN_LIB) $(ZOOKEEPER_LIB) \
+# Library paths that will be searched by the linker before default system
+# locations; one -L option for each search directory.
+LIB_PATHS ?=
+LIBS := $(LIB_PATHS) $(EXTRALIBS) $(LOGCABIN_LIB) $(ZOOKEEPER_LIB) \
     -L$(TOP)/arachne-all/Arachne/lib -lArachne \
     -L$(TOP)/arachne-all/PerfUtils/lib -lPerfUtils \
     -L$(TOP)/arachne-all/CoreArbiter/lib -lCoreArbiter \

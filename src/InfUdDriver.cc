@@ -28,6 +28,7 @@
 #include "CycleCounter.h"
 #include "BitOps.h"
 #include "InfUdDriver.h"
+#include "OptionParser.h"
 #include "NetUtil.h"
 #include "PcapFile.h"
 #include "PerfStats.h"
@@ -98,29 +99,22 @@ namespace {
  *      using the Ethernet port. False means this driver sends and receives
  *      Infiniband unreliable datagrams, using the Infiniband port.
  */
-InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
-        bool ethernet)
+InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl)
     : Driver(context)
     , realInfiniband()
     , infiniband()
-    // FIXME: accept config from service locator
-    , isRoCE(true)
     , loopbackPkts()
     , rxPool()
     , rxBuffersInHca(0)
     , rxBufferLogThreshold(0)
     , txPool()
     , txBuffersInHca()
-    , QKEY(ethernet ? 0 : 0xdeadbeef)
+    , QKEY(0xdeadbeef)
     , rxcq(0)
     , txcq(0)
     , qp()
     // FIXME: how to get the right port num?
     , ibPhysicalPort(1)
-//    , ibPhysicalPort(ethernet ? 2 : 1)
-    // FIXME: on xl170 index 2 of IB device mlx5_3 has RoCE v1; index 3 has v2!
-    , ibGidIndex(2)
-    , gid()
     , lid(0)
     , mtu(0)
     , qpn(0)
@@ -133,35 +127,13 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     , zeroCopyEnd(NULL)
     , zeroCopyRegion(NULL)
 {
-    // FIXME: pass dev=mlx5_3 via serviceLocator? or config/infud.txt
-//    const char *ibDeviceName = NULL;
-    const char* ibDeviceName = "mlx5_3";
-    const char* ethIfName = "ens1f1";
-    bool macAddressProvided = false;
+    ServiceLocator config = readDriverConfigFile();
+    const char* ibDeviceName = config.getOption<const char*>("hca", NULL);
+    const char* ethIfName = config.getOption<const char*>("eth", NULL);
+    ibPhysicalPort = config.getOption<int>("port", 1);
+    LOG(NOTICE, "InfUdDriver config: %s", config.getOriginalString().c_str());
 
-    if (sl != NULL) {
-        locatorString = sl->getDriverLocatorString();
-
-        if (ethernet) {
-            try {
-                localMac.construct(sl->getOption<const char*>("mac"));
-                macAddressProvided = true;
-                mtu = 1514;
-            } catch (ServiceLocator::NoSuchKeyException& e) {}
-        }
-
-        try {
-            ibDeviceName   = sl->getOption<const char *>("dev");
-        } catch (ServiceLocator::NoSuchKeyException& e) {}
-
-        try {
-            ibPhysicalPort = sl->getOption<int>("devport");
-        } catch (ServiceLocator::NoSuchKeyException& e) {}
-
-        try {
-            bandwidthGbps = sl->getOption<uint32_t>("gbs");
-        } catch (ServiceLocator::NoSuchKeyException& e) {}
-    }
+    // Open and initialize the specified device.
     infiniband = realInfiniband.construct(ibDeviceName);
 #if 1
     bandwidthGbps = std::min(bandwidthGbps,
@@ -184,9 +156,10 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
     // throttle the throughput and leave the HCA idle.
     bandwidthGbps = std::min(bandwidthGbps, 26u);
 #endif
-    // FIXME: read eth interface MTU programmatically in case of jumbo frames
-    mtu = ethernet ? 1514 : infiniband->getMtu(ibPhysicalPort);
-    if (ethernet && !macAddressProvided) {
+    bool ethernet = ethIfName;
+    mtu = ethernet ? (1500 + ETH_HEADER_SIZE) :
+            infiniband->getMtu(ibPhysicalPort);
+    if (ethernet) {
         localMac.construct(NetUtil::getLocalMac(ethIfName).c_str());
     }
 
@@ -243,7 +216,6 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
                                      QKEY);
 
     // Cache these for easier access.
-    gid = infiniband->getGid(ibPhysicalPort, ibGidIndex);
     lid = infiniband->getLid(ibPhysicalPort);
     qpn = qp->getLocalQpNumber();
 
@@ -257,8 +229,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl,
         if (localMac) {
             locatorString += "mac=" + localMac->toString();
         } else {
-            locatorString += format("gid=%s,lid=%u,qpn=%u",
-                    infiniband->gidToString(gid).c_str(), lid, qpn);
+            locatorString += format("lid=%u,qpn=%u", lid, qpn);
         }
         LOG(NOTICE, "Locator for InfUdDriver: %s", locatorString.c_str());
     }
@@ -335,6 +306,36 @@ InfUdDriver::getTransmitBuffer()
     BufferDescriptor* bd = txPool->freeBuffers.back();
     txPool->freeBuffers.pop_back();
     return bd;
+}
+
+/**
+ * Read the driver configuration file (if there is one) and parse the infud
+ * config to return a service locator.
+ */
+ServiceLocator
+InfUdDriver::readDriverConfigFile()
+{
+    string configDir = "config";
+    if (context->options) {
+        configDir = context->options->getConfigDir();
+    }
+    std::ifstream configFile(configDir + "/driver.conf");
+    Tub<ServiceLocator> config;
+    if (configFile.is_open()) {
+        std::string sl;
+        try {
+            while (std::getline(configFile, sl)) {
+                if ((sl.find('#') == 0) || (sl.find("infud") == string::npos)) {
+                    // Skip comments and irrelevant lines.
+                    continue;
+                }
+                return ServiceLocator(sl);
+            }
+        } catch (ServiceLocator::BadServiceLocatorException&) {
+            LOG(ERROR, "Ignored bad driver configuration: '%s'", sl.c_str());
+        }
+    }
+    return ServiceLocator("infud:");
 }
 
 /**
@@ -872,19 +873,11 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
                     bd->packetLength - ETH_HEADER_SIZE,
                     bd->buffer + ETH_HEADER_SIZE);
         } else {
-            // Address handle and qpn are all we need to identify the sender.
-            // In RoCE v1, the source GID starts at the 8-th byte of GRH:
-            // https://community.mellanox.com/s/article/lrh-and-grh-infiniband-
-            // headers
             ibv_ah* ah;
-            ibv_gid* sgid = reinterpret_cast<ibv_gid*>(bd->buffer + 8);
-            uint64_t ahKey =
-                    isRoCE ? sgid->global.interface_id : incoming->slid;
-            auto it = infiniband->ahMap.find(ahKey);
+            auto it = infiniband->ahMap.find(incoming->slid);
             if (unlikely(it == infiniband->ahMap.end())) {
-                Infiniband::Address infAddress(*infiniband, isRoCE,
-                        ibPhysicalPort, ibGidIndex, *sgid, incoming->slid,
-                        incoming->src_qp);
+                Infiniband::Address infAddress(*infiniband, ibPhysicalPort,
+                        incoming->slid, incoming->src_qp);
                 ah = infAddress.getHandle();
             } else {
                 ah = it->second;

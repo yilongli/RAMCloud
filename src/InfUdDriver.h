@@ -44,7 +44,7 @@ class InfUdDriver : public Driver {
 
   public:
     explicit InfUdDriver(Context* context,
-            const ServiceLocator* localServiceLocator, bool ethernet);
+            const ServiceLocator* localServiceLocator);
     virtual ~InfUdDriver();
     virtual void dumpStats() { infiniband->dumpStats(); }
     virtual uint32_t getMaxPacketSize();
@@ -69,8 +69,8 @@ class InfUdDriver : public Driver {
             return new MacAddress(
                 serviceLocator->getOption<const char*>("mac"));
         } else {
-            Infiniband::Address ibAddress(*infiniband, isRoCE, ibPhysicalPort,
-                    ibGidIndex, serviceLocator);
+            Infiniband::Address ibAddress(*infiniband, ibPhysicalPort,
+                    serviceLocator);
             return new Address(ibAddress.getHandle(), ibAddress.getQpn());
         }
     }
@@ -192,6 +192,7 @@ class InfUdDriver : public Driver {
     };
 
     BufferDescriptor* getTransmitBuffer();
+    ServiceLocator readDriverConfigFile();
     void reapTransmitBuffers();
     void refillReceiver();
 
@@ -236,9 +237,6 @@ class InfUdDriver : public Driver {
     /// mock object.
     Infiniband* infiniband;
 
-    /// True if this driver is operating over RoCE (as opposed to Infiniband).
-    bool isRoCE;
-
     /// FIFO queue which holds packets addressed to the local host. Only used
     /// in raw ethernet mode.
     std::deque<BufferDescriptor*> loopbackPkts;
@@ -278,13 +276,6 @@ class InfUdDriver : public Driver {
 
     /// Physical port on the HCA used by this transport.
     int ibPhysicalPort;
-
-    /// Index of the global identifier (GID) this driver uses.
-    int ibGidIndex;
-
-    /// Global Identifier (GID) of our HCA; a 128-bit identifier modeled after
-    /// IPv6 addresses. Only intended to be used in RoCE mode for now.
-    ibv_gid gid;
 
     /// Identifies our HCA uniquely among all those in the Infiniband
     /// network; roughly equivalent to a host address.

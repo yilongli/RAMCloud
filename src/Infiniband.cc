@@ -750,6 +750,7 @@ Infiniband::QueuePair::activate(const Tub<MacAddress>& localMac)
     // For raw ethernet QP, register a flow steering rule that accepts all
     // RAMCloud packets (identified by EtherType field).
     if (type == IBV_QPT_RAW_PACKET) {
+        const uint8_t* local_mac = localMac->address;
         struct raw_eth_flow_attr {
             struct ibv_flow_attr attr;
             struct ibv_flow_spec_eth spec_eth;
@@ -767,13 +768,14 @@ Infiniband::QueuePair::activate(const Tub<MacAddress>& localMac)
                 .type = IBV_FLOW_SPEC_ETH,
                 .size = sizeof(struct ibv_flow_spec_eth),
                 .val = {
-                    .dst_mac = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+                    .dst_mac = { local_mac[0], local_mac[1], local_mac[2],
+                                 local_mac[3], local_mac[4], local_mac[5] },
                     .src_mac = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
                     .ether_type = HTONS(NetUtil::EthPayloadType::RAMCLOUD),
                     .vlan_tag = 0,
                 },
                 .mask = {
-                    .dst_mac = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+                    .dst_mac = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF },
                     .src_mac = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
                     .ether_type = 0xFFFF,
                     .vlan_tag = 0,
@@ -925,12 +927,8 @@ Infiniband::QueuePair::getSinName() const
  * Construct an Address from the information in a ServiceLocator.
  * \param infiniband
  *      Infiniband instance under which this address is valid.
- * \param isRoCE
- *      TODO:
  * \param physicalPort
  *      The physical port number on the local device through which to send.
- * \param localGidIndex
- *      TODO:
  * \param serviceLocator
  *      The "lid" and "qpn" options describe the desired address.
  * \throw BadAddress
@@ -938,14 +936,11 @@ Infiniband::QueuePair::getSinName() const
  *      (e.g. a required option was missing, or the host name
  *      couldn't be parsed).
  */
-Infiniband::Address::Address(Infiniband& infiniband, bool isRoCE,
-        int physicalPort, int localGidIndex,
-        const ServiceLocator* serviceLocator)
+Infiniband::Address::Address(Infiniband& infiniband,
+                             int physicalPort,
+                             const ServiceLocator* serviceLocator)
     : infiniband(infiniband)
-    , isRoCE(isRoCE)
     , physicalPort(physicalPort)
-    , localGidIndex(localGidIndex)
-    , gid()
     , lid()
     , qpn()
     , ah(NULL)
@@ -972,29 +967,6 @@ Infiniband::Address::Address(Infiniband& infiniband, bool isRoCE,
         throw BadAddressException(HERE,
             "Could not parse qpn. Invalid or out of range.",
             serviceLocator);
-    }
-
-    if (isRoCE) {
-        try {
-            const char* gidStr = serviceLocator->getOption<const char*>("gid");
-            uint8_t* raw = gid.raw;
-            int r = sscanf(gidStr, "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-                    "%02x%02x:%02x%02x:%02x%02x:%02x%02x", &raw[0], &raw[1],
-                    &raw[2], &raw[3], &raw[4], &raw[5], &raw[6], &raw[7],
-                    &raw[8], &raw[9], &raw[10], &raw[11], &raw[12], &raw[13],
-                    &raw[14], &raw[15]);
-            if (r != 16) {
-                throw 0;
-            }
-        } catch (NoSuchKeyException &e) {
-            throw BadAddressException(HERE,
-                "Mandatory RoCE option ``gid'' missing from infiniband "
-                "ServiceLocator.", serviceLocator);
-        } catch (...) {
-            throw BadAddressException(HERE,
-                "Could not parse gid. Invalid or out of range.",
-                serviceLocator);
-        }
     }
 }
 
@@ -1039,8 +1011,7 @@ Infiniband::Address::getHandle() const
     }
 
     // See if we have a cached value.
-    uint64_t ahKey = isRoCE ? gid.global.interface_id : lid;
-    AddressHandleMap::iterator it = infiniband.ahMap.find(ahKey);
+    AddressHandleMap::iterator it = infiniband.ahMap.find(lid);
     if (it != infiniband.ahMap.end()) {
         ah = it->second;
         return ah;
@@ -1050,14 +1021,7 @@ Infiniband::Address::getHandle() const
     ibv_ah_attr attr;
     attr.dlid = lid;
     attr.src_path_bits = 0;
-    attr.is_global = isRoCE ? 1 : 0;
-    if (isRoCE) {
-        attr.is_global = 1;
-        attr.grh.dgid = gid;
-        attr.grh.sgid_index = localGidIndex;
-        attr.grh.hop_limit = 1;
-        attr.grh.traffic_class = 0;
-    }
+    attr.is_global = 0;
     attr.sl = 0;
     attr.port_num = downCast<uint8_t>(physicalPort);
     infiniband.totalAddressHandleAllocCalls += 1;
@@ -1066,7 +1030,7 @@ Infiniband::Address::getHandle() const
     infiniband.totalAddressHandleAllocTime += Cycles::rdtsc() - start;
     if (ah == NULL)
         throw TransportException(HERE, "failed to create ah", errno);
-    infiniband.ahMap[ahKey] = ah;
+    infiniband.ahMap[lid] = ah;
     return ah;
 }
 
