@@ -386,6 +386,19 @@ def run_test(
         client_args['--fullSamples'] = ''
     if options.seconds:
         client_args['--seconds'] = options.seconds
+
+    # FIXME: hack to workaround the lack of Arachne core arbiter
+    if options.num_cpus_per_server != None:
+        # If there is no core arbiter running, we will use a fixed number of
+        # cores for each master/coordinator and rely on the server to pin its
+        # Arachne kernel threads spawned for the allocated cores.
+        cluster_args['master_args'] = \
+                ' --minNumCores ' + str(options.num_cpus_per_server) + \
+                ' --maxNumCores ' + str(options.num_cpus_per_server) + \
+                ' --enableArbiter 0'
+        cluster_args['coordinator_args'] = ' --enableArbiter 0'
+        cluster_args['num_cpus_per_server'] = options.num_cpus_per_server
+
     test.function(test.name, options, cluster_args, client_args)
 
 #-------------------------------------------------------------------
@@ -1035,6 +1048,9 @@ if __name__ == '__main__':
                  'each master')
     parser.add_option('--dpdkPort', type=int, dest='dpdk_port',
             help='Ethernet port that the DPDK driver should use')
+    parser.add_option('--cpusPerServer', type=int, dest='num_cpus_per_server',
+            help='Fixed # cpus a server (master/backup/coordinator) should use;'
+                 ' this implies that no CoreArbiter is running on the host')
     parser.add_option('-T', '--transport', default='basic+infud',
             help='Transport to use for communication with servers')
     parser.add_option('-v', '--verbose', action='store_true', default=False,

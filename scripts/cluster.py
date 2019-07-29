@@ -246,7 +246,7 @@ class Cluster(object):
             f = open('%s/logs/shm/%s' % (os.getcwd(), self.cluster_name),
                      'w+')
 
-    def start_coordinator(self, host, args=''):
+    def start_coordinator(self, host, args='', prefix=''):
         """Start a coordinator on a node.
         @param host: (hostname, ip, id) tuple describing the node on which
                      to start the RAMCloud coordinator.
@@ -262,7 +262,7 @@ class Cluster(object):
         if not self.enable_logcabin:
             command = (
                 '%s %s -C %s -l %s --logFile %s/coordinator.%s.log %s --neverKill' %
-                (prefix_command,
+                (prefix,
                  coordinator_binary, self.coordinator_locator,
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
@@ -277,7 +277,7 @@ class Cluster(object):
             command = (
                 '%s %s -C %s -z logcabin21:61023 -l %s '
                 '--logFile %s/coordinator.%s.log %s' %
-                (prefix_command,
+                (prefix,
                  coordinator_binary, self.coordinator_locator,
                  self.log_level, self.log_subdir,
                  self.coordinator_host[0], args))
@@ -313,7 +313,8 @@ class Cluster(object):
                      backup=True,
                      disk=None,
                      port=server_port,
-                     kill_on_exit=True
+                     kill_on_exit=True,
+                     prefix=''
                      ):
         """Start a server on a node.
         @param host: (hostname, ip, id) tuple describing the node on which
@@ -340,7 +341,7 @@ class Cluster(object):
 
         command = ('%s %s -C %s -L %s -r %d -l %s --clusterName __unnamed__ '
                    '--logFile %s.log --preferredIndex %d %s' %
-                   (prefix_command,
+                   (prefix,
                     server_binary, self.coordinator_locator,
                     server_locator(self.transport, host, port),
                     self.replicas,
@@ -447,7 +448,7 @@ class Cluster(object):
             self.sandbox.checkFailures()
             raise
 
-    def start_clients(self, hosts, client):
+    def start_clients(self, hosts, client, prefix_commands={}):
         """Start a client binary on a set of nodes.
         @param hosts: List of (hostname, ip, id) tuples describing the
                       nodes on which to start the client binary.
@@ -463,9 +464,10 @@ class Cluster(object):
         client_args = ' '.join(args[1:])
         clients = []
         for i, client_host in enumerate(hosts):
+            prefix = prefix_commands.get(client_host[2], prefix_command)
             command = ('%s %s -C %s --numClients %d --clientIndex %d '
                        '--logFile %s/client%d.%s.log %s' %
-                       (prefix_command,
+                       (prefix,
                         client_bin, self.coordinator_locator, num_clients,
                         i, self.log_subdir, self.next_client_id,
                         client_host[0], client_args))
@@ -588,6 +590,7 @@ def run(
                                    # old master (e.g. total RAM).
         enable_logcabin=False,     # Do not enable logcabin.
         dpdk_port=None,            # Do not enable DpdkDriver.
+        num_cpus_per_server=None,  # Number of CPUs a server/coordinator can use
         superuser=False,           # Do not start cluster as superuser by default.
         valgrind=False,            # Do not run under valgrind
         valgrind_args='',          # Additional arguments for valgrind
@@ -655,9 +658,28 @@ def run(
             if client:
                 client += ' --configDir %s' % config_dir
 
+        numactl_commands = {}
+        if num_cpus_per_server is not None:
+            # Compute the affined cpu list of each server. This is needed to
+            # mutiplex multiple servers on one physical machine while avoiding
+            # interference. Arachne CoreArbiter is a better solution but we
+            # don't have root priv. on the POD cluster.
+            # FIXME: hack to work around the lack of root priv. on POD cluster
+            cpus = {}
+            for hostname, _, server_id in cluster.hosts:
+                if hostname not in cpus:
+                    # Leave cpu 0 to system threads.
+                    cpus[hostname] = 1
+                else:
+                    cpus[hostname] += num_cpus_per_server
+                numactl_commands[server_id] = \
+                    'numactl -m 0 -C ' + str(cpus[hostname]) + '-' + \
+                    str(cpus[hostname] + num_cpus_per_server - 1)
+
         if not coordinator_host:
             coordinator_host = cluster.hosts[-1]
-        cluster.start_coordinator(coordinator_host, coordinator_args)
+        cluster.start_coordinator(coordinator_host, coordinator_args,
+                prefix=numactl_commands.get(coordinator_host[2], prefix_command))
         if disjunct:
             cluster.hosts.remove(coordinator_host)
 
@@ -678,7 +700,8 @@ def run(
                 args += ' %s' % backup_args
                 backups_started += 1
                 disk_args = disk
-            cluster.start_server(host, args, backup=backup, disk=disk_args)
+            cluster.start_server(host, args, backup=backup, disk=disk_args,
+                    prefix=numactl_commands.get(host[2], prefix_command))
             masters_started += 1
 
         if disjunct:
@@ -713,7 +736,8 @@ def run(
                                 for i in range(num_clients)]
             assert(len(client_hosts) == num_clients)
 
-            clients = cluster.start_clients(client_hosts, client)
+            clients = cluster.start_clients(client_hosts, client,
+                    prefix_commands=numactl_commands)
             cluster.wait(clients, timeout)
 
         return cluster.log_subdir

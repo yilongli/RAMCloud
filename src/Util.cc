@@ -71,6 +71,28 @@ getCpuAffinityString(void)
 }
 
 /**
+ * Returns a list of CPUs the current thread is allowed to run on.
+ */
+std::vector<int>
+getAffinedCpus(void)
+{
+    cpu_set_t cpuSet;
+    int numCpus;
+
+    numCpus = downCast<int>(sysconf(_SC_NPROCESSORS_ONLN));
+    if (sched_getaffinity(0, sizeof(cpuSet), &cpuSet) != 0) {
+        RAMCLOUD_LOG(ERROR, "sched_getaffinitity failed: %s", strerror(errno));
+    };
+    std::vector<int> result;
+    for (int cpu = 0; cpu < numCpus; cpu++) {
+        if (CPU_ISSET(cpu, &cpuSet)) {
+            result.push_back(cpu);
+        }
+    }
+    return result;
+}
+
+/**
  * Generate a random string.
  *
  * \param str
@@ -130,6 +152,26 @@ hexDump(const void *buf, uint64_t bytes)
                    hex[12], hex[13], hex[14], hex[15], ascii);
     }
     return output.str();
+}
+
+/**
+ * Sets the priority of the current thread to high.
+ */
+void setThreadPriorityHigh()
+{
+    // Change the thread scheduling policy to the real-time SCHED_FIFO policy
+    // and set the static priority to its maximum value.
+    // Note: in Linux, only threads under real-time scheduling policies can
+    // have a static priority larger than zero. See also:
+    //      http://man7.org/linux/man-pages/man7/sched.7.html
+    struct sched_param params = {
+        .sched_priority = sched_get_priority_max(SCHED_FIFO)
+    };
+    int ret = pthread_setschedparam(pthread_self(), SCHED_FIFO, &params);
+    if (ret != 0) {
+        RAMCLOUD_LOG(ERROR, "failed to set thread priority: %s",
+                strerror(errno));
+    }
 }
 
 /**
