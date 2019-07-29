@@ -186,9 +186,6 @@ class InfUdDriver : public Driver {
 
         /// Scatter-gather list within the work request.
         ibv_sge sges[2];
-
-        /// Packet buffer containing the data to send.
-        BufferDescriptor* bd;
     };
 
     BufferDescriptor* getTransmitBuffer();

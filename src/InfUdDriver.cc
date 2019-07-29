@@ -527,17 +527,18 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
     sges[0].lkey = bd->memoryRegion->lkey;
     int numSges = 1;
     while (payload && !payload->isDone()) {
-        // Use zero copy for the last chunk of the packet, if it's in the
-        // zero copy region and is large enough to justify the overhead
-        // of an addition scatter-gather element.
+        // TODO: why just last?
+        // Use zero copy for the *last* chunk of the packet, if it's in the
+        // zero copy region and is large enough to justify the overhead of
+        // an additional scatter-gather element.
         const char *currentChunk =
                 reinterpret_cast<const char*>(payload->getData());
         // FIXME: this payload >= 500B check doesn't make sense to me;
         // this condition check is way too complicated!
         if ((payload->getLength() >= 500)
                 && (currentChunk >= zeroCopyStart)
-                && ((currentChunk + payload->getLength()) <= zeroCopyEnd)
-                && (payload->getLength() >= payload->size())) {
+                && (currentChunk + payload->getLength() < zeroCopyEnd)
+                && (payload->getLength() == payload->size())) {
             sges[1].addr = reinterpret_cast<uint64_t>(currentChunk);
             sges[1].length = payload->getLength();
             sges[1].lkey = zeroCopyRegion->lkey;
@@ -633,7 +634,14 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
 
     uint32_t maxPayload = getMaxPacketSize() - headerLen;
     uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
+
+    // Reserve enough memory to hold the send requests for all packets; this
+    // prevents dynamic vector resize from happening within this method that
+    // would otherwise invalidate ibv_send_wr::next used to chain send requests.
     sendRequests.clear();
+    if (sendRequests.capacity() < numPackets) {
+        sendRequests.reserve(numPackets);
+    }
 
     // In raw ethernet mode, loopback packets must be handled specially on
     // CloudLab xl170 machines.
@@ -666,7 +674,6 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
         uint32_t payloadSize = std::min(maxPayload, messageIt->size());
         BufferDescriptor* bd = getTransmitBuffer();
         bd->packetLength = headerLen + payloadSize;
-        sendRequests.back().bd = bd;
 
         // Construct the ethernet header when running in raw ethernet mode.
         char* dst = bd->buffer;
@@ -760,8 +767,10 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
         DIE("Error posting transmit packet: %s", strerror(errno));
     } else {
         for (SendRequest& sr : sendRequests) {
-            txBuffersInHca.push_back(sr.bd);
-            bytesSent += sr.bd->packetLength;
+            BufferDescriptor* bd =
+                    reinterpret_cast<BufferDescriptor*>(sr.wr.wr_id);
+            txBuffersInHca.push_back(bd);
+            bytesSent += bd->packetLength;
         }
     }
     timeTrace("sent packets with %u bytes, %u free buffers", bytesSent,
