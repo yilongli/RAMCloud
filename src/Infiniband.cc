@@ -562,7 +562,7 @@ Infiniband::QueuePair::QueuePair(Infiniband& infiniband, ibv_qp_type type,
     qpia.srq = srq;                    // use the same shared receive queue
     qpia.cap.max_send_wr  = maxSendWr; // max outstanding send requests
     qpia.cap.max_recv_wr  = maxRecvWr; // max outstanding recv requests
-    qpia.cap.max_send_sge = 1;         // max send scatter-gather elements
+    qpia.cap.max_send_sge = 2;         // max send scatter-gather elements
     qpia.cap.max_recv_sge = 1;         // max recv scatter-gather elements
     qpia.cap.max_inline_data =         // max bytes of immediate data on send q
         MAX_INLINE_DATA;
@@ -1017,13 +1017,20 @@ Infiniband::Address::getHandle() const
         return ah;
     }
 
-    // Must allocate a new address handle.
-    ibv_ah_attr attr;
-    attr.dlid = lid;
-    attr.src_path_bits = 0;
-    attr.is_global = 0;
-    attr.sl = 0;
-    attr.port_num = downCast<uint8_t>(physicalPort);
+    // Must allocate a new address handle. See also:
+    // https://www.rdmamojo.com/2012/09/22/ibv_create_ah/
+    ibv_ah_attr attr = {
+        .grh = {},
+        .dlid = lid,
+        .sl = 0,
+        .src_path_bits = 0,
+        .static_rate = 0,
+        .is_global = 0,
+        .port_num = downCast<uint8_t>(physicalPort)
+    };
+    LOG(DEBUG, "Creating address handle: lid %u, port_num %u, pd %p",
+            attr.dlid, attr.port_num, infiniband.pd.pd);
+
     infiniband.totalAddressHandleAllocCalls += 1;
     uint64_t start = Cycles::rdtsc();
     ah = ibv_create_ah(infiniband.pd.pd, &attr);

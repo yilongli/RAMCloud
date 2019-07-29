@@ -156,7 +156,10 @@ class Infiniband {
         explicit ProtectionDomain(Device& device)
             : pd(ibv_alloc_pd(device.ctxt))
         {
-            if (pd == NULL) {
+            if (pd) {
+                RAMCLOUD_LOG(NOTICE, "allocated infiniband protection domain: "
+                        "context %p, handle %u", pd->context, pd->handle);
+            } else {
                 throw TransportException(HERE,
                     "failed to allocate infiniband protection domain", errno);
             }
