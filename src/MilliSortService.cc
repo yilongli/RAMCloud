@@ -439,7 +439,7 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
 void
 MilliSortService::copyValue(void* dst, const void* src)
 {
-//    memcpy(dst, src, Value::SIZE);
+#if __AVX2__
     static_assert(Value::SIZE == 96, "Illegal Value::SIZE!");
     __m256i ymm1 = _mm256_stream_load_si256((__m256i*)src + 0);
     __m256i ymm2 = _mm256_stream_load_si256((__m256i*)src + 1);
@@ -447,6 +447,9 @@ MilliSortService::copyValue(void* dst, const void* src)
     _mm256_stream_si256((__m256i*)dst + 0, ymm1);
     _mm256_stream_si256((__m256i*)dst + 1, ymm2);
     _mm256_stream_si256((__m256i*)dst + 2, ymm3);
+#else
+    memcpy(dst, src, Value::SIZE);
+#endif
 }
 
 void

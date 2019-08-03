@@ -137,6 +137,8 @@ class BasicTransport : public Transport {
         string getRpcInfo();
         virtual void sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier);
+        virtual void addRequest(Buffer* request, Buffer* response,
+                RpcNotifier* notifier);
 
       PRIVATE:
         // Transport associated with this session.

@@ -75,6 +75,8 @@ class InfUdDriver : public Driver {
         }
     }
 
+    virtual void uncorkTransmitQueue();
+
   PRIVATE:
     void sendLoopbackPacket(const void* header, uint32_t headerLen,
             Buffer::Iterator* messageIt, uint32_t payloadSize);
@@ -186,6 +188,10 @@ class InfUdDriver : public Driver {
 
         /// Scatter-gather list within the work request.
         ibv_sge sges[2];
+
+        /// Zeros out all member structs.
+        explicit SendRequest()
+            : wr(), sges() {}
     };
 
     BufferDescriptor* getTransmitBuffer();
@@ -233,6 +239,10 @@ class InfUdDriver : public Driver {
     /// production use it points to #realInfiniband; for testing it points to a
     /// mock object.
     Infiniband* infiniband;
+
+    /// Outgoing packets currently queued up in the driver because the transmit
+    /// queue is corked.
+    std::vector<SendRequest> corkedPackets;
 
     /// FIFO queue which holds packets addressed to the local host. Only used
     /// in raw ethernet mode.

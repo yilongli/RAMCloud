@@ -89,13 +89,19 @@ void
 WorkerSession::sendRequest(Buffer* request, Buffer* response,
         Transport::RpcNotifier* notifier)
 {
+    // TODO: only use the new Session::addRequest interface for broadcast RPCs
+    // to avoid too much disruption
+#if 0
+    if (request->getStart<WireFormat::RequestCommon>()->opcode ==
+            WireFormat::BCAST_TREE) {
+        wrapped->addRequest(request, response, notifier);
+        return;
+    }
+#endif
+
     // Enqueue the request for the dispatch thread.
     context->dispatchExec->addRequest<SendRequestWrapper>(
             request, response, notifier, wrapped);
-//    if (request->getStart<WireFormat::RequestCommon>()->opcode ==
-//            WireFormat::BCAST_TREE) {
-//        TimeTrace::record("WorkerSession enqueued new SendRequest");
-//    }
 }
 
 } // namespace RAMCloud

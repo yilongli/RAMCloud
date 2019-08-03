@@ -103,6 +103,7 @@ InfUdDriver::InfUdDriver(Context* context, const ServiceLocator *sl)
     : Driver(context)
     , realInfiniband()
     , infiniband()
+    , corkedPackets()
     , loopbackPkts()
     , rxPool()
     , rxBuffersInHca(0)
@@ -583,6 +584,30 @@ InfUdDriver::sendPacket(const Driver::Address* addr,
 #if COLLECT_LOW_LEVEL_PERFSTATS
     uint64_t prepareWorkRequest = Cycles::rdtscp();
 #endif
+
+    if (corked) {
+        SendRequest* tail =
+                corkedPackets.empty() ? NULL : &corkedPackets.back();
+        corkedPackets.emplace_back();
+        SendRequest* sr = &corkedPackets.back();
+        if (tail) {
+            tail->wr.next = &sr->wr;
+        }
+        sr->wr = workRequest;
+        sr->wr.sg_list = sr->sges;
+        sr->sges[0] = sges[0];
+        sr->sges[1] = sges[1];
+
+        // Dynamic vector resize can invalidate `ibv_send_wr::sg_list`;
+        // uncork the transmit queue if this is about to happen.
+        if (unlikely(corkedPackets.capacity() == corkedPackets.size())) {
+            uncorkTransmitQueue();
+            corked = true;
+            corkedPackets.reserve(corkedPackets.capacity() * 2);
+        }
+        return;
+    }
+
     ibv_send_wr *bad_txWorkRequest;
     lastTransmitTime = Cycles::rdtsc();
     if (ibv_post_send(qp->qp, &workRequest, &bad_txWorkRequest)) {
@@ -629,6 +654,10 @@ InfUdDriver::sendPackets(const Driver::Address* addr,
                          int priority,
                          TransmitQueueState* txQueueState)
 {
+    if (unlikely(corked)) {
+       DIE("corkTransmitQueue + sendPackets not implemented yet!");
+    }
+
     const uint32_t messageBytes = messageIt->size();
     timeTrace("sendPackets invoked, message bytes %u", messageBytes);
 
@@ -988,6 +1017,28 @@ InfUdDriver::refillReceiver()
             rxBufferLogThreshold -= 1000;
         } while (freeBuffers < rxBufferLogThreshold);
     }
+}
+
+void
+InfUdDriver::uncorkTransmitQueue()
+{
+    corked = false;
+    if (corkedPackets.empty()) {
+        return;
+    }
+
+    ibv_send_wr* bad_txWorkRequest;
+    if (ibv_post_send(qp->qp, &corkedPackets.front().wr, &bad_txWorkRequest)) {
+        DIE("Error posting transmit packet: %s", strerror(errno));
+    } else {
+        for (SendRequest& sr : corkedPackets) {
+            BufferDescriptor* bd =
+                    reinterpret_cast<BufferDescriptor*>(sr.wr.wr_id);
+            txBuffersInHca.push_back(bd);
+        }
+        timeTrace("InfUdDriver: uncorked %u packets", corkedPackets.size());
+    }
+    corkedPackets.clear();
 }
 
 /**

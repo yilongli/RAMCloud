@@ -26,7 +26,7 @@ namespace RAMCloud {
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
 #define TIME_TRACE 0
-#define TIME_TRACE_SHUFFLE 1
+#define TIME_TRACE_SHUFFLE 0
 
 #define PERF_STATS 0
 
@@ -263,7 +263,6 @@ BasicTransport::getRoundTripBytes(const ServiceLocator* locator)
     // plus 2 us of grant packet one-way delay). Note: it's hacky to hardwire
     // this number in the code; a proper implementation would need to measure
     // and set the RTT dynamically.
-//    uint32_t roundTripMicros = 8;
     uint32_t roundTripMicros = 12;
 
     if (locator != NULL) {
@@ -430,12 +429,10 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         dataHeadersToSend.clear();
         ADD_COUNTER(basicTransportOutputDataBytes, bytesSent);
         if (txQueueState.outstandingBytes > 0) {
-//            timeTrace("sent data, %u bytes queued ahead",
-            timetrace_shuffle("sent data, %u bytes queued ahead",
+            timeTrace("sent data, %u bytes queued ahead",
                     txQueueState.outstandingBytes);
         } else {
-//            timeTrace("sent data, tx queue idle %u cyc", txQueueState.idleTime);
-            timetrace_shuffle("sent data, tx queue idle %u cyc", txQueueState.idleTime);
+            timeTrace("sent data, tx queue idle %u cyc", txQueueState.idleTime);
         }
     }
 
@@ -835,6 +832,15 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     if (bytesSent > 0) {
         t->timeTrace("sendRequest transmitted %u bytes", bytesSent);
     }
+}
+
+// See Transport::Session::addRequest for docs.
+void
+BasicTransport::Session::addRequest(Buffer* request, Buffer* response,
+                RpcNotifier* notifier)
+{
+    SpinLock::Guard _(t->addRequestLock);
+    t->workerRequests.emplace_back(this, request, response, notifier);
 }
 
 /**
@@ -1887,6 +1893,23 @@ BasicTransport::Poller::poll()
             t->nextTimeoutCheck = now + t->timerInterval;
             t->timeoutCheckDeadline = 0;
         }
+    }
+
+    // TODO: Send queued worker requests?
+    if (t->addRequestLock.try_lock()) {
+        for (const WorkerRequest& wr : t->workerRequests) {
+            t->dequeuedRequests.emplace_back(wr.session, wr.request,
+                    wr.response, wr.notifier);
+        }
+        t->workerRequests.clear();
+        t->addRequestLock.unlock();
+
+        t->driver->corkTransmitQueue();
+        for (const WorkerRequest& wr : t->dequeuedRequests) {
+            wr.session->sendRequest(wr.request, wr.response, wr.notifier);
+        }
+        t->driver->uncorkTransmitQueue();
+        t->dequeuedRequests.clear();
     }
 
     result += totalBytesSent;

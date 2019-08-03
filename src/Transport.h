@@ -24,6 +24,7 @@
 #include "Buffer.h"
 #include "CodeLocation.h"
 #include "Exception.h"
+#include "SpinLock.h"
 #include "WireFormat.h"
 
 namespace RAMCloud {
@@ -266,6 +267,9 @@ class Transport {
         virtual void sendRequest(Buffer* request, Buffer* response,
                 RpcNotifier* notifier) {}
 
+        virtual void addRequest(Buffer* request, Buffer* response,
+                RpcNotifier* notifier) {}
+
         /**
          * Cancel an RPC request that was sent previously.
          * \param notifier
@@ -345,7 +349,11 @@ class Transport {
     /**
      * Constructor for Transport.
      */
-    Transport() {}
+    Transport()
+        : addRequestLock("workerRequests")
+        , workerRequests()
+        , dequeuedRequests()
+    {}
 
     /**
      * Destructor for Transport.
@@ -443,7 +451,34 @@ class Transport {
         DISALLOW_COPY_AND_ASSIGN(ServerPort);
     };
 
-  PRIVATE:
+  PROTECTED:
+    struct WorkerRequest {
+        Session* session;
+        Buffer* request;
+        Buffer* response;
+        RpcNotifier* notifier;
+
+        explicit WorkerRequest(Session* session, Buffer* request,
+                Buffer* response, RpcNotifier* notifier)
+            : session(session)
+            , request(request)
+            , response(response)
+            , notifier(notifier)
+        {}
+    };
+
+    /// Provides mutual exclusion to #workerRequests between worker threads
+    /// and the dispatch thread.
+    SpinLock addRequestLock;
+
+    /// Pending RPC requests enqueued by the worker threads.
+    std::vector<WorkerRequest> workerRequests;
+
+    /// RPC requests dequeued from #workerRequest and ready to be sent by
+    /// the dispatch thread
+    std::vector<WorkerRequest> dequeuedRequests;
+
+    PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(Transport);
 };
 

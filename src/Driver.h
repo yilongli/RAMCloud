@@ -395,6 +395,22 @@ class Driver {
     virtual Address* newAddress(const ServiceLocator* serviceLocator) = 0;
 
     /**
+     * Stops the driver from actually passing the outgoing packets to the NIC's
+     * transmit queue.
+     */
+    void corkTransmitQueue()
+    {
+        corked = true;
+    }
+
+    /**
+     * Flushes all outgoing packets currently queued inside the driver due to
+     * #coreTransmitQueue to the NIC; the packets are sent in one batch to save
+     * cost of ringing the doorbell register.
+     */
+    virtual void uncorkTransmitQueue() {};
+
+    /**
      * Checks to see if any packets have arrived that have not already
      * been returned by this method; if so, it returns some or all of
      * them.
@@ -555,6 +571,9 @@ class Driver {
   PROTECTED:
     /// Shared RAMCloud information.
     Context* context;
+
+    /// True if outgoing packets should be queued and wait to be released.
+    bool corked;
 
     /// The most recent time that the driver polled packets from the NIC,
     /// in rdtsc ticks.
