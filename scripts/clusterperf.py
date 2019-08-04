@@ -837,8 +837,9 @@ def millisort(name, options, cluster_args, client_args):
                 .communicate()[0]) - 1
         cluster_args['master_args'] = '--minNumCores ' + str(ncores)
         cluster_args['master_args'] += ' --maxNumCores ' + str(ncores)
-        # No need to use too much memory on masters; 1GB should be enough.
-        cluster_args['master_args'] += ' --totalMasterMemory 1000'
+
+    # No need to use too much memory on masters; 1GB should be enough.
+    cluster_args['master_args'] += ' --totalMasterMemory 1000'
 
     default(name, options, cluster_args, client_args)
 

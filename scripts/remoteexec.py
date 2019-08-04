@@ -25,6 +25,12 @@ SIGHUP when the ssh client is closed. This script will read on stdin until EOF
 instead.
 """
 
+def sigchld_handler(p):
+    stdoutdata, stderrdata = p.communicate()
+    print("returncode = {}, stdout = {}, stderr = {}".format(p.returncode,
+            stdoutdata, stderrdata))
+    sys.exit(p.returncode)
+
 if __name__ == '__main__':
 
     import os
@@ -47,9 +53,18 @@ if __name__ == '__main__':
     if len(sys.argv) > 2:
         os.chdir(sys.argv[2])
     command = ['bash', '-c', sys.argv[1]]
-    p = subprocess.Popen(command)
-    signal.signal(signal.SIGCHLD, lambda signum, frame: sys.exit(p.wait()))
+    # p = subprocess.Popen(command)
+    # signal.signal(signal.SIGCHLD, lambda signum, frame: sigchld_handler(p))
 
+    try:
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT)
+    except subprocess.CalledProcessError as ex:
+        print("remoteexec.py failed", ex.returncode, ex.output)
+        sys.exit(ex.returncode)
+    else:
+        sys.exit(0)
+
+    # FIXME: what are the following code for? It's completely bypassed now
     r = sys.stdin.read()
     assert r == ''
     # stdin was closed, user aborted

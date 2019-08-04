@@ -123,7 +123,11 @@ class Sandbox(object):
                           self.sudo,
                           '%s/remoteexec.py' % remote_scripts_path,
                           "'%s'" % command, config.hooks.get_remote_wd()]
-            subprocess.check_call(sh_command, **kwargs)
+            try:
+                subprocess.check_output(sh_command, stderr=subprocess.STDOUT)
+            except subprocess.CalledProcessError as exc:
+                print("Status : FAIL", exc.returncode, exc.output)
+                raise exc
             return None
 
     def kill(self, process):

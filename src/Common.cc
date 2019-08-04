@@ -224,8 +224,9 @@ flushCacheInternal(int cpu)
     // For each core, allocate a per-core buffer at least 2x as large as L2.
     // Also, allocate a shared buffer at least 2x as large as L3. Only needs
     // to be done once at startup.
-    static const size_t CORE_BUF_SIZE = 2 * 1000000 * 2;
-    static const size_t SHARED_BUF_SIZE = 32 * 1000000 * 2;
+#define GET_FULL_PAGES(x) ((x + 4095) & ~0xfff)
+    constexpr size_t CORE_BUF_SIZE = GET_FULL_PAGES(2 * 1000000 * 2);
+    constexpr size_t SHARED_BUF_SIZE = GET_FULL_PAGES(32 * 1000000 * 2);
     static char* coreBuf[256] = {};
     static char* sharedBuf = NULL;
 
@@ -234,12 +235,10 @@ flushCacheInternal(int cpu)
 
     if (buffer == NULL) {
         // Allocate memory backed by hugepage's to reduce TLB pollution.
-        buffer = static_cast<char*>(mmap(NULL, bufferSize,
-                PROT_READ | PROT_WRITE,
-                MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0));
-        if (buffer == MAP_FAILED) {
-            perror("mmap");
-            exit(1);
+        buffer = reinterpret_cast<char*>(Memory::xmemalign(HERE, 4096,
+                bufferSize));
+        if (madvise(buffer, bufferSize, MADV_HUGEPAGE)) {
+            LOG(WARNING, "madvise failed: %s", strerror(errno));
         }
 
         // Write to the space to ensure they are not zero-mapped pages.

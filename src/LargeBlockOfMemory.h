@@ -54,8 +54,7 @@ struct LargeBlockOfMemory {
      */
     explicit LargeBlockOfMemory(size_t length)
         : length(length)
-        , block(static_cast<T*>(mmapGigabyteAligned(length,
-                MAP_ANONYMOUS | MAP_HUGETLB)))
+        , block(static_cast<T*>(mmapGigabyteAligned(length, MAP_ANONYMOUS)))
     {
         if (block == MAP_FAILED) {
             if (length == 0)
@@ -195,8 +194,10 @@ struct LargeBlockOfMemory {
                               fd,
                               0);
 
-            if (base == reinterpret_cast<void*>(tryBase))
+            if (base == reinterpret_cast<void*>(tryBase)) {
+                madvise(base, length, MADV_HUGEPAGE);
                 break;
+            }
 
             if (base != MAP_FAILED) {
                 if (munmap(base, length)) {
