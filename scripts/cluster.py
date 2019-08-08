@@ -666,15 +666,29 @@ def run(
             # don't have root priv. on the POD cluster.
             # FIXME: hack to work around the lack of root priv. on POD cluster
             cpus = {}
+            mem_nodes = {}
             for hostname, _, server_id in cluster.hosts:
                 if hostname not in cpus:
                     # Leave cpu 0 to system threads.
                     cpus[hostname] = 1
+                    mem_nodes[hostname] = 0
                 else:
-                    cpus[hostname] += num_cpus_per_server
+                    # cpus[hostname] += num_cpus_per_server
+                    if mem_nodes[hostname] == 0:
+                        mem_nodes[hostname] = 1
+                    else:
+                        cpus[hostname] += num_cpus_per_server
+                        mem_nodes[hostname] = 0
+
+                # FIXME: hardcoding 20 cpus per numa node for POD S30 machines
+                cpu_range_l = mem_nodes[hostname] * 20 + cpus[hostname]
+                cpu_range_r = cpu_range_l + num_cpus_per_server - 1
                 numactl_commands[server_id] = \
-                    'numactl -m 0 -C ' + str(cpus[hostname]) + '-' + \
-                    str(cpus[hostname] + num_cpus_per_server - 1)
+                    'numactl -m ' + str(mem_nodes[hostname]) + \
+                    ' -C ' + str(cpu_range_l) + '-' + str(cpu_range_r)
+                # numactl_commands[server_id] = \
+                #     'numactl -m 0 -C ' + str(cpus[hostname]) + '-' + \
+                #     str(cpus[hostname] + num_cpus_per_server - 1)
 
         if not coordinator_host:
             coordinator_host = cluster.hosts[-1]

@@ -129,6 +129,15 @@ ClockSynchronizer::computeOffset()
                 double(outgoing.serverTsc);
         uint64_t halfRTT = static_cast<uint64_t>(
                 (localElapsed - skew * remoteElapsed) / (1 + skew));
+        double roundTripMicros = Cycles::toSeconds(2*halfRTT)*1e6;
+        if (roundTripMicros > 20.0) {
+            LOG(ERROR, "Suspiciously large RTT %.2f, localElapsed %.2f cyc, "
+                    "remoteElapsed %.2f cyc, skew %.10f, probe 1 %.2f us, "
+                    "probe 2 %.2f us", roundTripMicros, localElapsed,
+                    remoteElapsed, skew,
+                    Cycles::toSeconds(probe1.completionTime)*1e6,
+                    Cycles::toSeconds(probe2.completionTime)*1e6);
+        }
         int64_t offset = int64_t(outgoing.clientTsc + halfRTT) -
                 static_cast<int64_t>(skew * double(outgoing.serverTsc));
         clock->offset = offset;
@@ -138,7 +147,7 @@ ClockSynchronizer::computeOffset()
         }
         LOG(NOTICE, "Synchronized clock with server %u round %d; RTT %.2f us; "
                 "time jump %.0f ns; TSC_%u - %lu = %.8f * (TSC_%u - %lu) + %ld",
-                syncee.indexNumber(), syncCount, Cycles::toSeconds(2*halfRTT)*1e6,
+                syncee.indexNumber(), syncCount, roundTripMicros,
                 newRemoteTime - oldRemoteTime, ourServerId.indexNumber(),
                 clockState[ourServerId].baseTsc, skew, syncee.indexNumber(),
                 clock->baseTsc, offset);
