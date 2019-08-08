@@ -9,7 +9,7 @@ namespace RAMCloud {
 
 // Change the following to 0 to test with k-ary tree, or 1 to test with
 // k-nomial tree.
-#define TREE_TYPE 2
+#define TREE_TYPE 0
 
 // TODO: remove this handcoded constant; can we choose it dynamically?
 // A k1-k2 tree is simple (suppose node 0 is the root):
@@ -54,17 +54,19 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     , numPayloadsToMerge()
     , sendData()
 {
-    timeTrace("TreeGather: constructor invoked, opId %d", opId);
+    if (unlikely(group->size() == 1)) {
+        DIE("Gather of 1 node is currently broken!!!!");
+    }
+
     // The gather tree assumes node 0 to be the root. Therefore, to find the
     // children of this node when node 0 is not the root, we need to use the
     // relative rank of this node to compute the children.
     std::vector<int> children;
     gatherTree.getChildren(relativeRank, &children);
     size_t numChildren = children.size();
-
-    if (group->size() == 1) {
-        DIE("Gather of 1 node is currently broken!!!!");
-    }
+    timeTrace("TreeGather: constructor invoked, opId %d, group size %d, "
+            "rank %d, numChildren %u", opId, group->size(), group->rank,
+            numChildren);
 
     // If this is an interior node, wait until we have received data from
     // all its children before sending to its parent; otherwise, send out
@@ -206,10 +208,8 @@ void
 TreeGather::handleRpc(const WireFormat::TreeGather::Request* reqHdr,
         WireFormat::TreeGather::Response* respHdr, Service::Rpc* rpc)
 {
-    assert(group->rank == 0);
-    uint32_t senderId = reqHdr->senderId;
-
     // Chop off the TreeGather header.
+    uint32_t senderId = reqHdr->senderId;
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
     timeTrace("TreeGather: received new data, sender %u, size %u, opId %d",
             senderId, rpc->requestPayload->size(), opId);

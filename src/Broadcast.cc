@@ -133,7 +133,7 @@ TreeBcast::BroadcastTree::getChildren(int parent, std::vector<int>* children)
 {
     // Change the following to 0 to test with k-ary tree, or 1 to test with
     // k-nomial tree.
-#define TREE_TYPE 2
+#define TREE_TYPE 0
 #if TREE_TYPE == 0
     for (int i = 0; i < k; i++) {
         int child = parent * k + i + 1;

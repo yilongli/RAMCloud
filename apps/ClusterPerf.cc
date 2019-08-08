@@ -7338,12 +7338,17 @@ millisort()
     // Start performance counters.
     cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
 
+    // Change 0 -> 1 to synchronize time between nodes and start millisort
+    // at the same global time.
+#if 0
     uint32_t clockSyncSeconds = 2;
     LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
             clockSyncSeconds);
     cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
             &clockSyncSeconds, sizeof(clockSyncSeconds));
+#endif
 
+    std::string perfStats;
     for (int i = 0; i < count; i++) {
         // Initialize the experiment.
         InitMilliSortRpc initRpc(context, rootServer,
@@ -7351,7 +7356,7 @@ millisort()
                 downCast<uint32_t>(dataTuplesPerNode),
                 downCast<uint32_t>(nodesPerPivotServer));
         auto initResp = initRpc.wait();
-        LOG(DEBUG, "Initialized %d millisort service nodes",
+        LOG(NOTICE, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);
 
         Buffer statsBefore, statsAfter;
@@ -7360,28 +7365,33 @@ millisort()
 
         StartMilliSortRpc startRpc(context, rootServer, i);
         startRpc.wait();
+        LOG(NOTICE, "Finished millisort on %d nodes", initResp->numNodesInited);
 
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsAfter);
-        printf("=====================\n");
-        printf("Experiment ID = %d\n", i);
-        printf("=====================\n");
-        printf("Configuration Parameters:\n");
-        printf("numNodes = %d\n", initResp->numNodes);
+        perfStats += format("=====================\n");
+        perfStats += format("Experiment ID = %d\n", i);
+        perfStats += format("=====================\n");
+        perfStats += format("Configuration Parameters:\n");
+        perfStats += format("numNodes = %d\n", initResp->numNodes);
         int numPivotServers = (initResp->numNodes + nodesPerPivotServer - 1)
                 / nodesPerPivotServer;
-        printf("numPivotServers = %d (reduceFactor = %d)\n", numPivotServers,
-                nodesPerPivotServer);
-        printf("numCoresPerNode = %d\n", initResp->numCoresPerNode);
-        printf("numPivotsPerNode = %d\n", initResp->numPivotsPerNode);
-        printf("maxOutstandingRpcs = %d\n", initResp->maxOutstandingRpcs);
-        printf("numItemsPerNode = %d\n", dataTuplesPerNode);
-        printf("keySize = %d B\n", initResp->keySize);
-        printf("valueSize = %d B\n", initResp->valueSize);
-        printf("\n");
-        printf("%s\n", PerfStats::printClusterStats(&statsBefore, &statsAfter)
-                .c_str());
+        perfStats += format("numPivotServers = %d (reduceFactor = %d)\n",
+                numPivotServers, nodesPerPivotServer);
+        perfStats += format("numCoresPerNode = %d\n",
+                initResp->numCoresPerNode);
+        perfStats += format("numPivotsPerNode = %d\n",
+                initResp->numPivotsPerNode);
+        perfStats += format("maxOutstandingRpcs = %d\n",
+                initResp->maxOutstandingRpcs);
+        perfStats += format("numItemsPerNode = %d\n", dataTuplesPerNode);
+        perfStats += format("keySize = %d B\n", initResp->keySize);
+        perfStats += format("valueSize = %d B\n", initResp->valueSize);
+        perfStats += format("\n");
+        perfStats += format("%s\n", PerfStats::printClusterStats(&statsBefore,
+                &statsAfter).c_str());
     }
+    printf("%s", perfStats.c_str());
 }
 
 void

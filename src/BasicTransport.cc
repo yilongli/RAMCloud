@@ -188,6 +188,11 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
     uint64_t sequence = clientRpc->rpcId.sequence;
 
     if (clientRpc->isShuffleRpc) {
+        if (!clientRpc->shuffleReplyAlmostRx) {
+            // The pull response fits in one packet.
+            clientRpc->shuffleReplyAlmostRx = true;
+            numShuffleRepliesRecv++;
+        }
         uint64_t elapsedNs = Cycles::toNanoseconds(Cycles::rdtsc() -
                 clientRpc->shuffleReplyRxStart);
         uint64_t throughput = clientRpc->response->size() * 8000ul / elapsedNs;

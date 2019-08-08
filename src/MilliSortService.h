@@ -673,8 +673,6 @@ class MilliSortService : public Service {
     /// Outgoing RPCs used to implement the value shuffle stage.
     std::unique_ptr<Tub<ShufflePullRpc>[]> pullValueRpcs;
 
-    std::array<Buffer*, 100> serverRank2ValueBuf;
-
     // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;

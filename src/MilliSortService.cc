@@ -139,7 +139,6 @@ MilliSortService::MilliSortService(Context* context,
     , readyToServiceValueShuffle(false)
     , pullKeyRpcs()
     , pullValueRpcs()
-    , serverRank2ValueBuf()
     , mergeSorter()
     , world()
     , myPivotServerGroup()
@@ -354,7 +353,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     readyToServiceValueShuffle = false;
     pullKeyRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
     pullValueRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
-    serverRank2ValueBuf = {};
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
     gatheredPivots.clear();
     superPivots.clear();
@@ -410,20 +408,24 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
         TreeBcast startBcast(context, world.get());
         startBcast.send<StartMilliSortRpc>(reqHdr->requestId, startTime, false);
         startBcast.wait();
+        timeTrace("MilliSort finished at master node, requestId %d",
+                reqHdr->requestId);
         return;
     }
 
     // Wait until the designated start time set by the root node.
-    startTime = context->clockSynchronizer->getConverter(world->getNode(0))
-            .toLocalTsc(reqHdr->startTime);
-    if (Cycles::rdtsc() > startTime) {
-        LOG(ERROR, "Millisort started late!");
+    TimeConverter converter =
+            context->clockSynchronizer->getConverter(world->getNode(0));
+    startTime = converter.isValid() ?
+            converter.toLocalTsc(reqHdr->startTime) : Cycles::rdtsc();
+    if (Cycles::rdtsc() - startTime > Cycles::fromMicroseconds(1)) {
+        LOG(ERROR, "Millisort started %.2f us late!",
+                Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
     }
     while (Cycles::rdtsc() < startTime) {
         Arachne::yield();
     }
     timeTrace("MilliSort algorithm started, requestId %d", reqHdr->requestId);
-    timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->requestId);
 
     // Kick start the sorting process.
     ADD_COUNTER(millisortIsPivotServer, isPivotServer ? 1 : 0);
@@ -563,11 +565,9 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
             Arachne::yield();
         }
         task->complete(Cycles::rdtsc());
-        const char* fmt = initialData ?
-                "Worker rearranged %d init. values, busy %lu us, cpu %d" :
-                "Worker rearranged %d final values, busy %lu us, cpu %d";
-        timeTrace(fmt, workDone, Cycles::toMicroseconds(busyTime),
-                Arachne::core.id);
+        timeTrace("Worker rearranged %d values, busy %lu us, cpu %d, "
+                "initialData %u", workDone, Cycles::toMicroseconds(busyTime),
+                Arachne::core.id, initialData);
         (*cpuTime) += busyTime;
     };
 
@@ -961,6 +961,7 @@ void
 MilliSortService::shuffleValues()
 {
     timeTrace("=== Stage 7: shuffleValues started");
+    std::vector<Buffer*> receivedValues(world->size());
 
     // TODO: pull-based shuffle is not parallelized by default; shall we try?
 #if OVERLAP_SHUFFLE_AND_COPY
@@ -990,9 +991,9 @@ MilliSortService::shuffleValues()
                 Cycles::toMicroseconds(inactiveTime));
     };
 #else
-    auto valueMerger = [this] (int serverRank, Buffer* valueBuffer) {
+    auto valueMerger = [&receivedValues] (int serverRank, Buffer* valueBuffer) {
         ADD_COUNTER(shuffleValuesInputBytes, valueBuffer->size());
-        serverRank2ValueBuf[serverRank] = valueBuffer;
+        receivedValues[serverRank] = valueBuffer;
     };
 #endif
 
@@ -1044,7 +1045,7 @@ MilliSortService::shuffleValues()
 #else
     timeTrace("about to copy shuffle-value RPC responses");
     std::atomic<int> nextServer(0);
-    auto copyOutValues = [this, &nextServer] () {
+    auto copyOutValues = [this, &nextServer, &receivedValues] () {
         while (true) {
             int rank = nextServer.fetch_add(1);
             if (rank >= world->size()) {
@@ -1055,7 +1056,7 @@ MilliSortService::shuffleValues()
                 std::tie(idx, n) = dataBucketRanges[rank];
                 memcpy(&sortedValues0[0], &localValues[idx], n * Value::SIZE);
             } else {
-                Buffer* valueBuffer = serverRank2ValueBuf[rank];
+                Buffer* valueBuffer = receivedValues[rank];
                 valueBuffer->copy(0, ~0u, &sortedValues0[valueStartIdx[rank]]);
             }
         }
@@ -1241,20 +1242,21 @@ MilliSortService::invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
             ShufflePullRpc* rpc = pullRpcs[i].get();
             if (!completed[i] && rpc->isReady()) {
                 int serverRank = (group->rank + i + 1) % group->size();
-                timeTrace("shuffle-client: pull request %u to rank %u completed",
-                        i, serverRank);
+                Buffer* response = rpc->wait();
+                timeTrace("shuffle-client: pull request %u to rank %u "
+                        "completed, bytes %u", i, serverRank, response->size());
                 switch (dataId) {
 //                    case ALLSHUFFLE_KEY:
 //                    case ALLSHUFFLE_VALUE: {
 //                        int coreId = mergerCores[
 //                                generateRandom() % mergerCores.size()];
 //                        mergerThreads.push_back(Arachne::createThreadOnCore(
-//                                coreId, merger, serverRank, rpc->wait()));
+//                                coreId, merger, serverRank, response));
 //                        break;
 //                    }
                     default:
                         mergerThreads.push_back(Arachne::createThread(merger,
-                                serverRank, rpc->wait()));
+                                serverRank, response));
                 }
                 if (i == firstNotReady) {
                     firstNotReady++;
@@ -1280,7 +1282,8 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
     int senderId = reqHdr->senderId;
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
-//            timeTrace("received ShufflePull for keys");
+            timeTrace("shuffle-key-server: handler received pull request from"
+                    " rank %u", senderId);
             while (!readyToServiceKeyShuffle) {
                 Arachne::yield();
             }
