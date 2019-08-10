@@ -239,6 +239,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
         // On failure, send STATUS_RETRY
         LOG(WARNING, "Incoming RPC with opcode %d failed to find a core, "
             "sending RETRY request", header->opcode);
+        // Millisort debugging hack: produce a stacktrace and dump the timetrace
+        raise(SIGSEGV);
         Service::prepareErrorResponse(&rpc->replyPayload,
                 STATUS_RETRY);
         rpc->sendReply();

@@ -496,6 +496,7 @@ class MilliSortService : public Service {
         explicit PivotMerger(MilliSortService* millisort,
                 std::vector<PivotKey>* pivots)
             : millisort(millisort)
+            , mutex()
             , pivots(pivots)
             , activeCycles(0)
             , bytesReceived(0)
@@ -505,6 +506,7 @@ class MilliSortService : public Service {
         append(Buffer* incomingPivots)
         {
             CycleCounter<> _(&activeCycles);
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
             bytesReceived += incomingPivots->size();
             uint32_t offset = 0;
             while (offset < incomingPivots->size()) {
@@ -525,6 +527,8 @@ class MilliSortService : public Service {
         }
 
         MilliSortService* millisort;
+
+        Arachne::SpinLock mutex;
 
         std::vector<PivotKey>* pivots;
 
@@ -666,6 +670,10 @@ class MilliSortService : public Service {
     /// True means local values (i.e., #localValues) have been rearranged and,
     /// thus, can be safely accessed by #shufflePull handler.
     std::atomic_bool readyToServiceValueShuffle;
+
+    /// Records whether we have processed the shuffle value request from a
+    /// server.
+    std::unique_ptr<std::atomic_bool[]> shuffleValReqProcessed;
 
     /// Outgoing RPCs used to implement the key shuffle stage.
     std::unique_ptr<Tub<ShufflePullRpc>[]> pullKeyRpcs;

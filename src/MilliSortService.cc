@@ -64,6 +64,10 @@ extern volatile int numShuffleRepliesRecv;
 // but not too large that slows down the transport
 #define MAX_OUTSTANDING_RPCS 10
 
+// Apply receiver-side sequencing for shuffle messages larger than the
+// threshold.
+#define RECEIVER_SIDE_SEQ_THRESH 8000
+
 #define SCOPED_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
 #define START_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
 #define STOP_TIMER(metric) _timer_##metric.stop();
@@ -137,6 +141,7 @@ MilliSortService::MilliSortService(Context* context,
     , dataBucketRanges()
     , readyToServiceKeyShuffle(false)
     , readyToServiceValueShuffle(false)
+    , shuffleValReqProcessed()
     , pullKeyRpcs()
     , pullValueRpcs()
     , mergeSorter()
@@ -342,7 +347,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     }
     numSortedItems = 0;
     valueStartIdx.clear();
-    valueStartIdx.insert(valueStartIdx.begin(), world->size(), 0);
+    valueStartIdx.resize(world->size(), 0);
 
     //
     localPivots.clear();
@@ -351,6 +356,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     dataBucketRanges.clear();
     readyToServiceKeyShuffle = false;
     readyToServiceValueShuffle = false;
+    shuffleValReqProcessed.reset(new std::atomic_bool[world->size()]());
     pullKeyRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
     pullValueRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
@@ -941,8 +947,8 @@ MilliSortService::shuffleKeys() {
             sortedKeys[i].index = uint32_t(i);
         }
         mergeSorter->add(&sortedKeys[start], numKeys);
-        timeTrace("merged %u keys, %u bytes, total keys %d", numKeys,
-                keyBuffer->size(), start + int(numKeys));
+        timeTrace("merged %u keys from rank %d, %u bytes, total keys %d",
+                numKeys, serverRank, keyBuffer->size(), start + int(numKeys));
     };
 
     timeTrace("about to shuffle keys");
@@ -1085,10 +1091,9 @@ MilliSortService::shuffleValues()
     uint64_t elapsedTime = rearrangeFinalVals.wait();
     ADD_COUNTER(rearrangeFinalValuesElapsedTime, elapsedTime)
 
-    // FIXME: millisortTime can be measured using CycleCounter; nah, maybe not worth the complexity
     ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
     ADD_COUNTER(millisortFinalItems, numSortedItems);
-    timeTrace("millisort finished");
+    timeTrace("millisort finished, numSortedItems %d", numSortedItems);
 
     // Clean up async. broadcast operations.
     if (bcastPivotBucketBoundaries) {
@@ -1140,11 +1145,16 @@ MilliSortService::debugLogKeys(const char* prefix, vector<PivotKey>* keys)
 {
 #if LOG_INTERMEDIATE_RESULT
     string result;
+    uint64_t checksum = 0;
+    uint64_t index = 0;
     for (PivotKey& sortKey : *keys) {
         result += std::to_string(sortKey.keyAsUint64());
         result += " ";
+        index++;
+        checksum += sortKey.keyAsUint64() * index;
     }
-    LOG(NOTICE, "%s%s", prefix, result.c_str());
+    LOG(NOTICE, "%s (csum = %s) %s", prefix, std::to_string(checksum).c_str(),
+            result.c_str());
 #endif
 }
 
@@ -1282,8 +1292,8 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
     int senderId = reqHdr->senderId;
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
-            timeTrace("shuffle-key-server: handler received pull request from"
-                    " rank %u", senderId);
+            timeTrace("shuffle-key-server: handler received pull request from "
+                    "rank %u", senderId);
             while (!readyToServiceKeyShuffle) {
                 Arachne::yield();
             }
@@ -1293,7 +1303,6 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
                     numKeys * PivotKey::SIZE);
             ADD_COUNTER(shuffleKeysOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleKeysReceivedRpcs);
-//            timeTrace("RPC handler ShufflePull finished");
             break;
         }
         case ALLSHUFFLE_VALUE: {
@@ -1308,7 +1317,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
                 if (success) {
                     ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
                     timeTrace("rearranged init. values completed; ready for "
-                              "value shuffle");
+                            "value shuffle");
                 }
             }
 
@@ -1319,42 +1328,32 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             ADD_COUNTER(shuffleValuesOutputBytes, rpc->replyPayload->size());
             INC_COUNTER(shuffleValuesReceivedRpcs);
 
-            // FIXME: a static variable is very hacky (e.g., make it a class
-            // member var.?)
-            static std::atomic<int> lastRelRank(0);
-            int relRank = world->relativeRank(senderId);
-            // The first pull request we service should come from our left
-            // neighbour X. The second pull request should come from the
-            // left neighbor of X, and so on and so forth.
-            if (relRank <= lastRelRank) {
-                // Corner case: this is a duplicate request; let it through
-            } else {
-                while (lastRelRank + 1 != relRank) {
+            // Unless the reply message is too small, serve incoming requests
+            // based on the followng rule:
+            //     The first pull request we service should come from our left
+            //     neighbour X. The second pull request should come from the
+            //     left neighbor of X, and so on and so forth.
+            if (rpc->replyPayload->size() >= RECEIVER_SIDE_SEQ_THRESH) {
+                int prevRequester = (senderId + 1) % world->size();
+                if (prevRequester != world->rank) {
+                    while (!shuffleValReqProcessed[prevRequester]) {
+                        Arachne::yield();
+                    }
+                }
+
+                // Then wait until the transport has finished transmitting all
+                // previous shuffle replies.
+                while (numOutShuffleReplies > 0) {
                     Arachne::yield();
                 }
             }
-            // Then wait until the transport has finished transmitting all
-            // previous shuffle replies.
-            while (numOutShuffleReplies > 0) {
-                Arachne::yield();
-            }
 
-            uint64_t oldDispatchIter = context->dispatch->iteration;
             rpc->sendReply();
             timeTrace("shuffle-value-server: delayed %lu us, handled pull "
                   "request from rank %u",
                   Cycles::toMicroseconds(Cycles::rdtsc() - receiveTime),
                   senderId);
-            // Hack: wait until the dispatch thread gets a chance to
-            // run ServerRpc::sendReply and increment `numOutShuffleReplies`
-            // before setting lastRelRank.
-            while (context->dispatch->iteration < oldDispatchIter + 2) {
-                Arachne::yield();
-            }
-            // Only update lastRelRank for non-duplicate requests.
-            if (relRank == lastRelRank + 1) {
-                lastRelRank += 1;
-            }
+            shuffleValReqProcessed[senderId] = true;
             break;
         }
         case ALLSHUFFLE_BENCHMARK: {

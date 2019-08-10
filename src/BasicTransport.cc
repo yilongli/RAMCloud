@@ -380,7 +380,10 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
 
     // Case 1: the entire message fits in a single packet.
     if (message->size() <= maxDataPerPacket) {
-        assert((offset == 0) && (maxBytes >= message->size()));
+        assert(offset == 0);
+        if (message->size() > maxBytes) {
+            return 0;
+        }
         AllDataHeader header(rpcId, flags, (uint16_t)message->size());
         Buffer::Iterator iter(message);
         const char* fmt = (flags & FROM_CLIENT) ?
