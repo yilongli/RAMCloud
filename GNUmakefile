@@ -199,6 +199,13 @@ COMFLAGS += -DINFINIBAND
 LIBS += -libverbs
 endif
 
+LIBFABRIC ?= no
+ifeq ($(LIBFABRIC),yes)
+LIBFABRIC_DIR ?= libfabric
+COMFLAGS += -DLIBFABRIC -I${LIBFABRIC_DIR}/build/include
+LIBS += -L${LIBFABRIC_DIR}/build/lib -lfabric
+endif
+
 # DPDK definitions:
 #
 # Uncomment the variable definition below (or specify DPDK=yes on the make

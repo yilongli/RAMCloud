@@ -32,6 +32,10 @@
 #include "DpdkDriver.h"
 #endif
 
+#ifdef LIBFABRIC
+#include "OfiUdDriver.h"
+#endif
+
 #ifdef INFINIBAND
 #include "InfRcTransport.h"
 #include "InfUdDriver.h"
@@ -178,6 +182,30 @@ struct HomaDpdkTransportFactory : public TransportFactory {
 static HomaDpdkTransportFactory homaDpdkTransportFactory;
 #endif
 
+#ifdef LIBFABRIC
+static struct BasicOfiUdTransportFactory : public TransportFactory {
+    BasicOfiUdTransportFactory()
+        : TransportFactory("basic+ofiud") {}
+    Transport* createTransport(Context* context,
+            const ServiceLocator* localServiceLocator) {
+        return new BasicTransport(context, localServiceLocator,
+                new OfiUdDriver(context, localServiceLocator), true,
+                generateRandom());
+    }
+} basicOfiUdTransportFactory;
+
+static struct HomaOfiUdTransportFactory : public TransportFactory {
+    HomaOfiUdTransportFactory()
+        : TransportFactory("homa+ofiud") {}
+    Transport* createTransport(Context* context,
+            const ServiceLocator* localServiceLocator) {
+        return new HomaTransport(context, localServiceLocator,
+                new OfiUdDriver(context, localServiceLocator), true,
+                generateRandom());
+    }
+} homaOfiUdTransportFactory;
+#endif
+
 /**
  * TransportManager constructor.
  * 
@@ -221,6 +249,10 @@ TransportManager::TransportManager(Context* context)
             homaDpdkTransportFactory.setDpdkDriver(dpdkDriver);
         }
     }
+#endif
+#ifdef LIBFABRIC
+    transportFactories.push_back(&basicOfiUdTransportFactory);
+    transportFactories.push_back(&homaOfiUdTransportFactory);
 #endif
     transports.resize(transportFactories.size(), NULL);
     if (context->options != NULL) {

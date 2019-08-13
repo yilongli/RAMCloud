@@ -476,7 +476,7 @@ Logger::logMessage(bool collapse, LogModule module, LogLevel level,
         }
     }
 
-#define MAX_MESSAGE_CHARS 2000
+#define MAX_MESSAGE_CHARS 3500
     // Extra space for a message about truncated characters, if needed.
 #define TRUNC_MESSAGE_SPACE 50
     char buffer[MAX_MESSAGE_CHARS + TRUNC_MESSAGE_SPACE];

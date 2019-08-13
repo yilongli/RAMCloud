@@ -8,6 +8,14 @@ else
 INFINIBAND_SRCFILES :=
 endif
 
+ifeq ($(LIBFABRIC),yes)
+LIBFABRIC_SRCFILES := \
+		src/OfiUdDriver.cc \
+		$(NULL)
+else
+LIBFABRIC_SRCFILES :=
+endif
+
 ifeq ($(ONLOAD),yes)
 SOLARFLARE_SRC := \
 	src/SolarFlareDriver.cc \
@@ -125,6 +133,7 @@ CLIENT_SRCFILES := \
 		   src/WorkerTimer.cc \
 		   src/ZooStorage.cc \
 		   $(INFINIBAND_SRCFILES) \
+		   $(LIBFABRIC_SRCFILES) \
 		   $(SOLARFLARE_SRC) \
 		   $(DPDK_SRC) \
 		   $(OBJDIR)/Histogram.pb.cc \

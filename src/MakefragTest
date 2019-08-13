@@ -10,6 +10,14 @@ else
 INFINIBAND_SRCFILES :=
 endif
 
+ifeq ($(LIBFABRIC),yes)
+LIBFABRIC_SRCFILES := \
+		src/OfiUdDriverTest.cc \
+		$(NULL)
+else
+LIBFABRIC_SRCFILES :=
+endif
+
 ifeq ($(ONLOAD),yes)
 SOLARFLARE_SRCFILES := \
 	src/SolarFlareDriverTest.cc \
@@ -193,6 +201,7 @@ TESTS_SRCFILES := \
 		  src/WorkerTimerTest.cc \
 		  src/RamCloudTest.cc \
 		  $(INFINIBAND_SRCFILES) \
+		  $(LIBFABRIC_SRCFILES) \
 		  $(SOLARFLARE_SRCFILES) \
 		  $(DPDK_SRCFILES) \
 		  $(OBJDIR)/ProtoBufTest.pb.cc

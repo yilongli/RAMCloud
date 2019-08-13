@@ -64,6 +64,8 @@ server_locator_templates = {
     'unreliable+infeth': 'unreliable+infeth:mac=00:11:22:33:44:%(id)02x',
     'basic+dpdk': 'basic+dpdk:',
     'homa+dpdk': 'homa+dpdk:',
+    'basic+ofiud': 'basic+ofiud:',
+    'homa+ofiud': 'homa+ofiud:',
 }
 coord_locator_templates = {
     'tcp': 'tcp:host=%(host)s,port=%(port)d',
@@ -80,6 +82,8 @@ coord_locator_templates = {
     'homa+infud': 'homa+udp:host=%(host)s,port=%(port)d',
     'basic+dpdk': 'basic+udp:host=%(host)s,port=%(port)d',
     'homa+dpdk': 'homa+udp:host=%(host)s,port=%(port)d',
+    'basic+ofiud': 'basic+udp:host=%(host)s,port=%(port)d',
+    'homa+ofiud': 'homa+udp:host=%(host)s,port=%(port)d',
 }
 
 def server_locator(transport, host, port=server_port):

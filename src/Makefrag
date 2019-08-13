@@ -22,6 +22,14 @@ else
 INFINIBAND_SRCFILES :=
 endif
 
+ifeq ($(LIBFABRIC),yes)
+LIBFABRIC_SRCFILES := \
+		src/OfiUdDriver.cc \
+		$(NULL)
+else
+LIBFABRIC_SRCFILES :=
+endif
+
 ifeq ($(ONLOAD),yes)
 SOLARFLARE_SRC := \
 	src/SolarFlareDriver.cc \
@@ -182,6 +190,7 @@ SHARED_SRCFILES := \
 		   src/WorkerTimer.cc \
 		   src/simulator/Merge.cc \
 		   $(INFINIBAND_SRCFILES) \
+		   $(LIBFABRIC_SRCFILES) \
 		   $(SOLARFLARE_SRC) \
 		   $(DPDK_SRC) \
 		   $(OBJDIR)/EnumerationIterator.pb.cc \
