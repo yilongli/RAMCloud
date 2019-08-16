@@ -60,19 +60,7 @@ class OfiUdDriver : public Driver {
                             TransmitQueueState* txQueueState = NULL);
 
     virtual string getServiceLocator();
-
-    virtual Address* newAddress(const ServiceLocator* serviceLocator) {
-        std::stringstream sstream(serviceLocator->getOption("addr"));
-        std::string byteStr;
-        std::vector<uint8_t> rawAddress;
-        while (std::getline(sstream, byteStr, '.')) {
-            rawAddress.push_back(downCast<uint8_t>(stoul(byteStr)));
-        }
-        fi_addr_t fi_addr;
-        fi_av_insert(addressVector, rawAddress.data(), 1, &fi_addr, 0, NULL);
-        return new Address(fi_addr);
-    }
-
+    virtual Address* newAddress(const ServiceLocator* serviceLocator);
     virtual void uncorkTransmitQueue();
 
   PRIVATE:
@@ -144,8 +132,8 @@ class OfiUdDriver : public Driver {
      * that has been registered with the NIC.
      */
     struct BufferPool {
-        BufferPool(fid_domain* domain, fi_domain_attr* attr,
-                uint32_t bufferSize, uint32_t numBuffers);
+        BufferPool(OfiUdDriver* driver, uint32_t bufferSize,
+                uint32_t numBuffers);
         ~BufferPool();
 
         /// Dynamically allocated memory for the buffers (must be freed).
@@ -188,10 +176,6 @@ class OfiUdDriver : public Driver {
     ServiceLocator readDriverConfigFile();
     void reapTransmitBuffers();
     void refillReceiver();
-
-    /// Dummy memory region identifer; used by providers that don't require
-    /// or support memory registration (e.g., psm2).
-    static fid_mr NO_MEMORY_REGION;
 
     /// Maximum number of bytes of datagrams to be sent with fi_inject,
     /// which is optimized for small message latency.
@@ -256,6 +240,11 @@ class OfiUdDriver : public Driver {
     /// for transmitted packets. Not owned by this class.
     fid_cq* txcq;
 
+    // TODO:
+//    using RAW_ADDRESS_TYPE = __uint128_t;
+    using RAW_ADDRESS_TYPE = uint64_t;
+    std::unordered_map<RAW_ADDRESS_TYPE, fi_addr_t> addressMap;
+
     /// Outgoing packets currently queued up in the driver because the transmit
     /// queue is corked.
 //    std::vector<SendRequest> corkedPackets;
@@ -278,8 +267,11 @@ class OfiUdDriver : public Driver {
     /// Packet buffers used to transmit outgoing packets.
     Tub<BufferPool> txPool;
 
-    /// Transmit buffers currently in the possession of the NIC.
-    std::deque<BufferDescriptor*> txBuffersInNic;
+    /// Transmit buffers currently in the possession of the NIC, ordered by the
+    /// time they are posted to the transmit queue. This is used to implement
+    /// the selective completion optimization when sending packets; only valid
+    /// when the underlying provider supports generating CQEs in FIFO order.
+    Tub<std::deque<BufferDescriptor*>> txBuffersInNic;
 
     /// Size of the prefix buffer space in all packet buffers, in bytes,
     /// that are left for use by libfabric (similar to GRH in Infiniband UD).
@@ -289,15 +281,23 @@ class OfiUdDriver : public Driver {
     /// which is optimized for small message latency.
     uint32_t maxInlineData;
 
-    /// Maximum # buffers that can be posted to the transmit queue in a batch.
-    uint32_t maxPostTxBuffers;
+    // TODO: I think I misinterpreted the meaning of {tx,rx}_attr->iov_limit;
+    // I thought they limit # buffers I can post at once but it appears that
+    // they refer to the scatter-list list referenced in *ONE* posted operation!
 
-    /// Maximum # buffers that can be posted to the receive queue in a batch.
-    uint32_t maxPostRxBuffers;
+//    /// Maximum # buffers that can be posted to the transmit queue in a batch.
+//    uint32_t maxPostTxBuffers;
+//
+//    /// Maximum # buffers that can be posted to the receive queue in a batch.
+//    uint32_t maxPostRxBuffers;
 
     /// Active maximum MTU enabled on #ibPhysicalPort to transmit and receive.
     /// This is the maximum message size that an UD QP can transmit.
     uint32_t mtu;
+
+    // TODO: when true, we don't need transmit buffers (i.e., txPool) or
+    // txBuffersInNic because the underlying provider does a copy anyway!
+    bool mustRegisterLocalMemory;
 
     /// Our ServiceLocator, including the dynamic lid and qpn
     string locatorString;
@@ -311,9 +311,9 @@ class OfiUdDriver : public Driver {
     /// allocation once.
 //    std::vector<SendRequest> sendRequests;
 
-    /// True means enabling the selective notification optimization when
+    /// True means enabling the selective completion optimization when
     /// sending packets.
-    bool enableUnsignalSendOpt;
+    bool enableSeletiveCompOpt;
 
     /// Used to post a signaled send request after every Nth packet is sent.
     int sendsSinceLastSignal;

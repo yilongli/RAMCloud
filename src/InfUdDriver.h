@@ -132,10 +132,6 @@ class InfUdDriver : public Driver {
         /// of that packet, in bytes.
         uint32_t packetLength;
 
-        /// Unique Infiniband identifier for the HCA to which the packet will
-        /// be sent (or from which the packet was received).
-        uint16_t remoteLid;
-
         /// Source MAC address of the received packet. Used to identify the
         /// sender when operating in raw Ethernet mode. Not for transmitted
         /// packets.
@@ -143,7 +139,7 @@ class InfUdDriver : public Driver {
 
         BufferDescriptor(char *buffer, uint32_t length, ibv_mr *region)
             : buffer(buffer), length(length), memoryRegion(region),
-              packetLength(0), remoteLid(0), macAddress() {}
+              packetLength(0), macAddress() {}
 
       private:
         DISALLOW_COPY_AND_ASSIGN(BufferDescriptor);

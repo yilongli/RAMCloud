@@ -17,3 +17,8 @@ scripts/clusterperf.py -r 0 --disjunct --transport basic+infud --servers <num-se
 # POD submit millisort job
 # Small scale: 18 millisort nodes on 10 S30 machines
 pod-scripts/submit-clusterperf 10 2 clusterperf.py -r 0 --transport basic+infud millisort --servers 18 --verbose --cpusPerServer 16 --nodesPerPivotServer 10 --dataTuplesPerNode 9550 --count 20
+
+# Scalability test with small # MilliSort nodes (packing 8 millisort nodes per physical machine)
+pod-scripts/submit-clusterperf 5 8 clusterperf.py -r 0 --transport basic+infud millisort --servers 38 --verbose --cpusPerServer 4 --nodesPerPivotServer 10 --dataTuplesPerNode 9550 --count 10
+pod-scripts/submit-clusterperf 20 8 clusterperf.py -r 0 --transport basic+infud millisort --servers 158 --verbose --cpusPerServer 4 --nodesPerPivotServer 10 --dataTuplesPerNode 9550 --count 10
+pod-scripts/submit-clusterperf 45 8 clusterperf.py -r 0 --transport basic+infud millisort --servers 358 --verbose --cpusPerServer 4 --nodesPerPivotServer 10 --dataTuplesPerNode 9550 --count 5

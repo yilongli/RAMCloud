@@ -60,6 +60,12 @@ namespace {
     }
 }
 
+// FIXME: figure out why we can't use the result of fi_av_straddr in
+// ServiceLocator and use fi_av_insertsvc to convert that into fi_addr?
+#define SL_USE_FI_ADDR_STR 0
+
+#define EMBED_LOCAL_ADDR 1
+
 #define STR(token) #token
 
 // Most libfabric APIs return negative values to indicate errors. This macro
@@ -68,7 +74,7 @@ namespace {
 // logs a message and exits upon error.
 #define FI_CHK_CALL(fn, ...)                                        \
         do {                                                        \
-            int ret = fn(__VA_ARGS__);                              \
+            int ret = downCast<int>(fn(__VA_ARGS__));               \
             if (ret) {                                              \
                 DIE("%s failed: %s", STR(fn), fi_strerror(-ret));   \
             }                                                       \
@@ -79,10 +85,6 @@ namespace {
 #define context_to_bd(ctx) reinterpret_cast<BufferDescriptor*>( \
     static_cast<char*>(ctx) - OFFSET_OF(BufferDescriptor, context))
 
-// TODO: hmm, actually, this is not absolutely necessary; we could just pass
-// NULL desc, right?
-fid_mr OfiUdDriver::NO_MEMORY_REGION = {};
-            
 /**
  * Construct an OfiUdDriver.
  *
@@ -113,6 +115,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , addressVector()
     , rxcq()
     , txcq()
+    , addressMap()
 //    , corkedPackets()
     , loopbackPkts()
     , rxPool()
@@ -122,13 +125,14 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , txBuffersInNic()
     , datagramPrefixSize()
     , maxInlineData(MAX_INLINE_DATA)
-    , maxPostTxBuffers()
-    , maxPostRxBuffers()
+//    , maxPostTxBuffers()
+//    , maxPostRxBuffers()
     , mtu(0)
+    , mustRegisterLocalMemory()
     , locatorString("ofiud:")
     , bandwidthGbps(0)
 //    , sendRequests()
-    , enableUnsignalSendOpt(false)
+    , enableSeletiveCompOpt(false)
     , sendsSinceLastSignal(0)
     , zeroCopyStart(NULL)
     , zeroCopyEnd(NULL)
@@ -146,7 +150,9 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // We need an endpoint that 1) supports sending and receiving messages or
     // datagrams and 2) returns source address as part of its completion data.
     // TODO: wtf, provider verbs doesn't support FI_SOURCE? how to get src addr then?
-    hints->caps = FI_MSG | FI_SOURCE;
+    // TODO: FI_LOCAL_COMM, FI_REMOTE_COMM are also relevant; deal with them
+    hints->caps = FI_MSG;
+//    hints->caps = FI_MSG | FI_SOURCE;
     // Make it clear that we need the endpoint for connectionless, unreliable
     // datagram (not a reliable, connection-oriented endpoint like FI_EP_MSG).
     hints->ep_attr->type = FI_EP_DGRAM;
@@ -160,6 +166,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // be used with other bits.
     hints->domain_attr->mode = ~0lu;
     hints->domain_attr->mr_mode = ~(FI_MR_BASIC | FI_MR_SCALABLE);
+    // Generate a CQE for an outgoing packet as soon as it's put on the wire.
+    hints->tx_attr->op_flags = FI_INJECT_COMPLETE;
 
     // Query libfabric to obtain the most performant qualified endpoint.
     fi_info* infoList;
@@ -167,10 +175,10 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     info = fi_dupinfo(infoList);
     fi_freeinfo(hints);
     fi_freeinfo(infoList);
-    LOG(NOTICE, "Fabric interface info:\n%s", fi_tostr(info, FI_TYPE_INFO));
+    LOG(DEBUG, "Fabric interface info:\n%s", fi_tostr(info, FI_TYPE_INFO));
 
-    // Set the runtime parameters of this driver based on the fabric info.
-    info->tx_attr->op_flags = FI_INJECT_COMPLETE;
+    // Set the runtime parameters of this driver based on the fabric info and
+    // further tune up a few attributes.
     if (info->tx_attr->size > MAX_TX_QUEUE_DEPTH) {
         info->tx_attr->size = MAX_TX_QUEUE_DEPTH;
     }
@@ -179,15 +187,31 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     }
     if (info->tx_attr->comp_order & FI_ORDER_STRICT) {
         // Enable the selective notification optimization for sending packets.
-        enableUnsignalSendOpt = true;
+        enableSeletiveCompOpt = true;
+        txBuffersInNic.construct();
         info->tx_attr->comp_order = FI_ORDER_STRICT;
+    } else {
+        info->tx_attr->comp_order = FI_ORDER_NONE;
     }
+    info->tx_attr->iov_limit = 2;
+    info->rx_attr->iov_limit = 1;
     datagramPrefixSize = downCast<uint32_t>(info->ep_attr->msg_prefix_size);
+    bool embedSrcAddr = !(info->caps & FI_SOURCE);
+#if EMBED_LOCAL_ADDR
+    embedSrcAddr = true;
+#endif
+    if (embedSrcAddr) {
+        // If the underlying provider doesn't support retrieving source address
+        // from an incoming datagram, we will have to embed the local address
+        // in every outgoing packet manually.
+        datagramPrefixSize += info->src_addrlen;
+    }
     if (info->tx_attr->inject_size < maxInlineData) {
         maxInlineData = downCast<uint32_t>(info->tx_attr->inject_size);
     }
-    maxPostTxBuffers = downCast<uint32_t>(info->tx_attr->iov_limit);
-    maxPostRxBuffers = downCast<uint32_t>(info->rx_attr->iov_limit);
+//    maxPostTxBuffers = downCast<uint32_t>(info->tx_attr->iov_limit);
+//    maxPostRxBuffers = downCast<uint32_t>(info->rx_attr->iov_limit);
+    mustRegisterLocalMemory = info->domain_attr->mr_mode & FI_MR_LOCAL;
 
     // Compute link speed and MTU to setup the queue estimator.
     // FIXME: hack to workaround info->nic == NULL for psm2
@@ -241,33 +265,51 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
 
     fi_cq_attr rx_cq_attr = {};
     rx_cq_attr.size = MAX_RX_QUEUE_DEPTH;
-    rx_cq_attr.format = FI_CQ_FORMAT_CONTEXT;
+    rx_cq_attr.format = FI_CQ_FORMAT_MSG;
     FI_CHK_CALL(fi_cq_open, domain, &rx_cq_attr, &rxcq, NULL);
     FI_CHK_CALL(fi_ep_bind, endpoint, &rxcq->fid, FI_RECV);
 
     // Activate the endpoint and update locatorString with the dynamic address.
     FI_CHK_CALL(fi_enable, endpoint);
-    uint8_t rawAddress[64];
     size_t addrlen = 64;
-    FI_CHK_CALL(fi_getname, (fid_t)endpoint, rawAddress, &addrlen);
-    locatorString += format("addr=%u", rawAddress[0]);
-    for (size_t i = 1; i < addrlen; i++) {
-        locatorString += format(".%u", rawAddress[i]);
+    std::vector<uint8_t> localAddress;
+    localAddress.resize(addrlen);
+    FI_CHK_CALL(fi_getname, (fid_t)endpoint, localAddress.data(), &addrlen);
+    if (addrlen != info->src_addrlen) {
+        DIE("Unexpected address length %u", addrlen);
     }
+#if SL_USE_FI_ADDR_STR
+    char addrStr[100];
+    size_t addrStrLen = 100;
+    fi_av_straddr(addressVector, localAddress.data(), addrStr, &addrStrLen);
+    addrStr[addrStrLen] = 0;
+    locatorString += format("addr=%s", addrStr);
+#else
+    locatorString += format("addr=%u", localAddress[0]);
+    for (size_t i = 1; i < addrlen; i++) {
+        locatorString += format(".%u", localAddress[i]);
+    }
+#endif
     LOG(NOTICE, "Locator for OfiUdDriver: %s", locatorString.c_str());
 
     // Allocate buffer pools.
     uint32_t bufSize = BitOps::powerOfTwoGreaterOrEqual(mtu);
-    rxPool.construct(domain, info->domain_attr, bufSize, TOTAL_RX_BUFFERS);
+    rxPool.construct(this, bufSize, TOTAL_RX_BUFFERS);
     rxBufferLogThreshold = TOTAL_RX_BUFFERS - 1000;
-    txPool.construct(domain, info->domain_attr, bufSize, MAX_TX_QUEUE_DEPTH);
+    txPool.construct(this, bufSize, MAX_TX_QUEUE_DEPTH);
     LOG(NOTICE, "Initialized OfiUdDriver buffers: %u receive buffers (%u MB), "
             "%u transmit buffers (%u MB)",
             TOTAL_RX_BUFFERS, (TOTAL_RX_BUFFERS*bufSize)/(1024*1024),
             MAX_TX_QUEUE_DEPTH, (MAX_TX_QUEUE_DEPTH*bufSize)/(1024*1024));
-    refillReceiver();
 
-    DIE("Done for now!");
+    // Fill in the src address in every transmit buffer, if necessary.
+    if (embedSrcAddr) {
+        for (BufferDescriptor* bd : txPool->freeBuffers) {
+            char* srcAddr = bd->buffer + datagramPrefixSize - info->src_addrlen;
+            memcpy(srcAddr, localAddress.data(), addrlen);
+        }
+    }
+    refillReceiver();
 }
 
 /**
@@ -275,13 +317,16 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
  */
 OfiUdDriver::~OfiUdDriver()
 {
-    fi_freeinfo(info);
+    if (zeroCopyRegion) {
+        fi_close(&zeroCopyRegion->fid);
+    }
     fi_close(&rxcq->fid);
     fi_close(&txcq->fid);
     fi_close(&addressVector->fid);
     fi_close(&endpoint->fid);
     fi_close(&domain->fid);
     fi_close(&fabric->fid);
+    fi_freeinfo(info);
 
     size_t buffersInUse = TOTAL_RX_BUFFERS - rxPool->freeBuffers.size()
             - rxBuffersInNic;
@@ -301,15 +346,8 @@ OfiUdDriver::getMaxPacketSize()
 }
 
 /**
- * Return a free transmit buffer, wrapped by its corresponding
- * BufferDescriptor. If there are none, block until one is available.
- *
- * Any errors from previous transmissions are basically
- *               thrown on the floor, though we do log them. We need
- *               to think a bit more about how this 'fire-and-forget'
- *               behaviour impacts our Transport API.
- * This code is copied from InfRcTransport. It should probably
- *               move in some form to the Infiniband class.
+ * Return a free transmit buffer, wrapped by its corresponding BufferDescriptor.
+ * If there are none, block until one is available.
  */
 OfiUdDriver::BufferDescriptor*
 OfiUdDriver::getTransmitBuffer()
@@ -382,37 +420,46 @@ OfiUdDriver::readDriverConfigFile()
 void
 OfiUdDriver::reapTransmitBuffers()
 {
-#define MAX_TO_RETRIEVE 4
-    // FIXME: can we use fi_cq_entry instead?
-    fi_cq_tagged_entry retArray[MAX_TO_RETRIEVE];
-    int cqes = fi_cq_read(txcq, retArray, MAX_TO_RETRIEVE);
-    if (cqes < 0) {
-        DIE("fi_cq_read failed: %s", fi_strerror(-cqes));
-    } else if (cqes > 0) {
-        timeTrace("polling TX completion queue returned %d CQEs", cqes);
+#define MAX_TO_RETRIEVE 8
+    fi_cq_entry cqes[MAX_TO_RETRIEVE];
+    int numCqes = downCast<int>(fi_cq_read(txcq, cqes, MAX_TO_RETRIEVE));
+    if (numCqes < 0) {
+        // fi_cq_read will fail if the error queue is not empty (the failed
+        // send requests can be retrieved with fi_cq_readerr); however, we
+        // do not attempt to recover from such error.
+        DIE("fi_cq_read failed: %s", fi_strerror(-numCqes));
+    } else if (numCqes > 0) {
+        timeTrace("polling TX completion queue returned %d CQEs", numCqes);
     }
-    for (int i = 0; i < cqes; i++) {
-        BufferDescriptor* signaledCompletion = context_to_bd(retArray[i].op_context);
-        bool found = false;
-        while (!txBuffersInNic.empty()) {
-            BufferDescriptor* bd = txBuffersInNic.front();
-            txBuffersInNic.pop_front();
-            txPool->freeBuffers.push_back(bd);
-            if (bd == signaledCompletion) {
-                found = true;
-                timeTrace("reaped %d TX buffers", SIGNALED_SEND_PERIOD);
-                break;
+
+    if (enableSeletiveCompOpt) {
+        // Each iteration of the following loop attempts to match a signaled
+        // completion with a transmit buffer posted earlier. Upon the match,
+        // we know that any transmit buffer we check so far can be reused as
+        // the underlying provider guarantees generating CQEs in a FIFO order.
+        for (int i = 0; i < numCqes; i++) {
+            BufferDescriptor* signaledCompletion =
+                    context_to_bd(cqes[i].op_context);
+            bool matchSignal = false;
+            while (!txBuffersInNic->empty()) {
+                BufferDescriptor* bd = txBuffersInNic->front();
+                txBuffersInNic->pop_front();
+                txPool->freeBuffers.push_back(bd);
+                if (bd == signaledCompletion) {
+                    matchSignal = true;
+                    timeTrace("reaped %d TX buffers", SIGNALED_SEND_PERIOD);
+                    break;
+                }
+            }
+            if (!matchSignal) {
+                DIE("Couldn't find the send request (SR) just completed");
             }
         }
-        if (!found) {
-            DIE("Couldn't find the send request (SR) just completed");
+    } else {
+        for (int i = 0; i < numCqes; i++) {
+            BufferDescriptor* bd = context_to_bd(cqes[i].op_context);
+            txPool->freeBuffers.push_back(bd);
         }
-
-        // FIXME: do we need to check error inside fi_cq_err_entry?
-//        if (retArray[i].status != IBV_WC_SUCCESS) {
-//            LOG(WARNING, "Infud transmit failed: %s",
-//                infiniband->wcStatusToString(retArray[i].status));
-//        }
     }
 }
 
@@ -422,7 +469,7 @@ OfiUdDriver::reapTransmitBuffers()
 void
 OfiUdDriver::registerMemory(void* base, size_t bytes)
 {
-    if (info->domain_attr->mr_mode & FI_MR_LOCAL) {
+    if (mustRegisterLocalMemory) {
         // We can only remember one region (the first)
         if (zeroCopyRegion == NULL) {
             int ret = fi_mr_reg(domain, base, bytes,
@@ -481,10 +528,11 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 
     // Grab a free packet buffer.
     BufferDescriptor* bd = getTransmitBuffer();
-    bd->packetLength = totalLength;
+    bd->packetLength = datagramPrefixSize + totalLength;
 
-    // Copy transport header into packet buffer.
-    char *dst = bd->buffer + datagramPrefixSize;
+    // Leave enough buffer headroom for libfabric. Then copy transport header
+    // into packet buffer.
+    char* dst = bd->buffer + datagramPrefixSize;
     memcpy(dst, header, headerLen);
     dst += headerLen;
 
@@ -504,24 +552,23 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 //        sendsSinceLastSignal = 0;
 //    }
 
-    // FIXME: how to use fi_inject for small message?
+    // FIXME: how to use fi_inject for small message? does inject_size include msg_prefix_size?
 //    if (bd->packetLength <= MAX_INLINE_DATA)
 //        workRequest.send_flags |= IBV_SEND_INLINE;
 
-    // FIXME: how to reap transmit buffer? how to identify
-    // Create the IB work request. wr_id is used to locate the BufferDescriptor
-    // from the completion notification.
+    // Post the packet buffer to the transmit queue.
     const Address* address = static_cast<const Address*>(addr);
     lastTransmitTime = Cycles::rdtsc();
-    int ret = fi_send(endpoint, bd->buffer, bd->packetLength,
-            fi_mr_desc(bd->memoryRegion), address->addr, &bd->context);
+    int ret = downCast<int>(fi_send(endpoint, bd->buffer, bd->packetLength,
+            fi_mr_desc(bd->memoryRegion), address->addr, &bd->context));
     if (ret) {
         DIE("Error posting transmit packet: %s", fi_strerror(-ret));
-    } else {
-        txBuffersInNic.push_back(bd);
+    }
+    if (txBuffersInNic) {
+        txBuffersInNic->push_back(bd);
     }
 
-    timeTrace("sent packet with %u bytes, %u free buffers", totalLength,
+    timeTrace("sent packet with %u bytes, %u free buffers", bd->packetLength,
             txPool->freeBuffers.size());
     queueEstimator.packetQueued(bd->packetLength, lastTransmitTime,
             txQueueState);
@@ -536,24 +583,35 @@ void
 OfiUdDriver::receivePackets(uint32_t maxPackets,
         std::vector<Received>* receivedPackets)
 {
-    static const int MAX_COMPLETIONS = 16;
-    fi_cq_tagged_entry wc[MAX_COMPLETIONS];
+    static const uint32_t MAX_COMPLETIONS = 16;
+    fi_cq_msg_entry wc[MAX_COMPLETIONS];
     fi_addr_t srcAddr[MAX_COMPLETIONS];
-    uint32_t maxToReceive = (maxPackets < MAX_COMPLETIONS) ? maxPackets
-            : MAX_COMPLETIONS;
-    int numPackets = fi_cq_readfrom(rxcq, wc, maxToReceive, srcAddr);
+    uint32_t maxToReceive = std::min(maxPackets, MAX_COMPLETIONS);
+#if EMBED_LOCAL_ADDR
+    int numPackets = downCast<int>(fi_cq_read(rxcq, wc, maxToReceive));
+#else
+    int numPackets = downCast<int>(
+            fi_cq_readfrom(rxcq, wc, maxToReceive, srcAddr));
+#endif
     if (numPackets <= 0) {
-        if (unlikely(numPackets < 0)) {
-            LOG(ERROR, "ibv_poll_cq failed with result %d", numPackets);
+        if (unlikely(numPackets != -FI_EAGAIN)) {
+            if (numPackets == -FI_EAVAIL) {
+                fi_cq_err_entry err = {};
+                FI_CHK_CALL(fi_cq_readerr, rxcq, &err, 0);
+                DIE("fi_cq_readfrom failed, fi_cq_readerr: %s", fi_cq_strerror(
+                        rxcq, err.prov_errno, err.err_data, NULL, 0));
+            } else {
+                DIE("fi_cq_readfrom failed: %s", fi_strerror(-numPackets));
+            }
         }
         return;
     }
     lastReceiveTime = Cycles::rdtsc();
-    timeTrace("InfUdDriver received %d packets", numPackets);
+    timeTrace("OfiUdDriver received %d packets", numPackets);
 
-    rxBuffersInNic -= numPackets;
+    rxBuffersInNic -= downCast<uint32_t>(numPackets);
     if (unlikely(rxBuffersInNic == 0)) {
-        RAMCLOUD_CLOG(WARNING, "Infiniband receiver temporarily ran "
+        RAMCLOUD_CLOG(WARNING, "OfiUdDriver: receiver temporarily ran "
                 "out of packet buffers; could result in dropped packets");
     }
 
@@ -562,23 +620,28 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
 
     // Each iteration of the following loop processes one incoming packet.
     for (int i = 0; i < numPackets; i++) {
-        fi_cq_tagged_entry* incoming = &wc[i];
-        BufferDescriptor *bd = context_to_bd(incoming->op_context);
-//        if (unlikely(incoming->status != IBV_WC_SUCCESS)) {
-//            DIE("Infiniband receive error (%d: %s)", incoming->status,
-//                    infiniband->wcStatusToString(incoming->status));
-//        }
+        fi_cq_msg_entry* incoming = &wc[i];
+        BufferDescriptor* bd = context_to_bd(incoming->op_context);
+        bd->packetLength = downCast<uint32_t>(incoming->len);
 
-        bd->packetLength = incoming->len;
+#if EMBED_LOCAL_ADDR
+        char* p = bd->buffer + datagramPrefixSize - info->src_addrlen;
+        RAW_ADDRESS_TYPE key = *((RAW_ADDRESS_TYPE*)p);
+        auto it = addressMap.find(key);
+        if (it == addressMap.end()) {
+            fi_av_insert(addressVector, p, 1, &srcAddr[i], 0, NULL);
+            addressMap[key] = srcAddr[i];
+        } else {
+            srcAddr[i] = addressMap[key];
+        }
+#endif
+
         bd->sourceAddress.construct(srcAddr[i]);
+        receivedPackets->emplace_back(bd->sourceAddress.get(), this,
+                bd->packetLength - datagramPrefixSize,
+                bd->buffer + datagramPrefixSize);
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
-        receivedPackets->emplace_back(bd->sourceAddress.get(), this,
-                bd->packetLength, bd->buffer);
-        continue;
-
-      error:
-        rxPool->freeBuffers.push_back(bd);
     }
     timeTrace("OfiUdDriver::receivePackets done");
 }
@@ -599,30 +662,67 @@ OfiUdDriver::getBandwidth()
     return bandwidthGbps*1000;
 }
 
+// See docs in Driver class.
+Driver::Address*
+OfiUdDriver::newAddress(const ServiceLocator* serviceLocator) {
+    fi_addr_t fi_addr= {};
+#if SL_USE_FI_ADDR_STR
+    const char* addr = serviceLocator->getOption<const char*>("addr");
+//    RAMCLOUD_LOG(NOTICE, "remote addr = %s", addr);
+    fi_av_insertsvc(addressVector, addr, NULL, &fi_addr, 0, NULL);
+#else
+    std::stringstream sstream(serviceLocator->getOption("addr"));
+    std::string byteStr;
+    std::vector<uint8_t> rawAddress;
+    while (std::getline(sstream, byteStr, '.')) {
+        rawAddress.push_back(downCast<uint8_t>(stoul(byteStr)));
+    }
+    fi_av_insert(addressVector, rawAddress.data(), 1, &fi_addr, 0, NULL);
+#endif
+    RAMCLOUD_LOG(NOTICE, "OfiUdDriver AV insert, sl %s, fi_addr %lu",
+            serviceLocator->getOriginalString().c_str(), fi_addr);
+    return new Address(fi_addr);
+}
+
+
 /**
- * Fill up the HCA's queue of pending receive buffers.
+ * Fill up the NIC's receive queue with more packet buffers.
  */
 void
 OfiUdDriver::refillReceiver()
 {
     // Always refill in batch to amortize the cost of posting receive buffers.
-    const uint32_t refillBatch = std::min(maxPostRxBuffers, 16u);
+    static const uint32_t REFILL_BATCH = 16;
     uint32_t maxRefill = std::min(MAX_RX_QUEUE_DEPTH - rxBuffersInNic,
             downCast<uint32_t>(rxPool->freeBuffers.size()));
-    if (maxRefill < refillBatch) {
+    if (maxRefill < REFILL_BATCH) {
         return;
     }
 
-    // Create a list of receive buffers to be posted to the RX queue.
     // FIXME: use batch-oriented recvv instead!!!
-    for (int i = 0; i < refillBatch; i++) {
+#if 0
+    if (maxPostRxBuffers > 1) {
+        // Create a list of receive buffers to be posted to the RX queue.
+        DIE("Not implemented!");
+    } else {
+        // The underlying provider doesn't support posting multiple receive
+        // buffers in batch; submit the receive buffers one by one.
+        for (int i = 0; i < REFILL_BATCH; i++) {
+            BufferDescriptor* bd = rxPool->freeBuffers.back();
+            rxPool->freeBuffers.pop_back();
+            FI_CHK_CALL(fi_recv, endpoint, bd->buffer, bd->length,
+                    fi_mr_desc(bd->memoryRegion), (fi_addr_t)0, &bd->context);
+        }
+    }
+#else
+    for (int i = 0; i < REFILL_BATCH; i++) {
         BufferDescriptor* bd = rxPool->freeBuffers.back();
         rxPool->freeBuffers.pop_back();
-        void* desc = fi_mr_desc(bd->memoryRegion);
-        FI_CHK_CALL(fi_recv, endpoint, bd->buffer, bd->length, desc,
-                (fi_addr_t)0, &bd->context);
+        FI_CHK_CALL(fi_recv, endpoint, bd->buffer, bd->length,
+                fi_mr_desc(bd->memoryRegion), (fi_addr_t)0, &bd->context);
     }
-    rxBuffersInNic += refillBatch;
+#endif
+    rxBuffersInNic += REFILL_BATCH;
     timeTrace("receive queue refilled");
 
     // Generate log messages every time buffer usage reaches a significant new
@@ -649,45 +749,43 @@ OfiUdDriver::uncorkTransmitQueue()
 /**
  * Constructor for BufferPool objects.
  * 
- * \param domain
- *      Libfabric resource domain the buffer pool belongs to.
- * \param attr
- *      Attributes of the domain.
+ * \param driver
+ *      Driver this buffer pool belongs to.
  * \param bufferSize
  *      Size of each packet buffer, in bytes.
  * \param numBuffers
  *      Number of buffers to allocate in the pool.
  */
-OfiUdDriver::BufferPool::BufferPool(fid_domain* domain, fi_domain_attr* attr,
-        uint32_t bufferSize, uint32_t numBuffers)
+OfiUdDriver::BufferPool::BufferPool(OfiUdDriver* driver, uint32_t bufferSize,
+        uint32_t numBuffers)
     : bufferMemory(NULL)
     , memoryRegion(NULL)
     , descriptors()
     , freeBuffers()
     , numBuffers(numBuffers)
 {
+    // Dummy memory region identifer; used by providers that don't require
+    // or support memory registration (e.g., psm2).
+    static fid_mr NO_MEMORY_REGION = {};
+
     // Allocate space for the packet buffers (page aligned, full pages).
-    size_t bytesToAllocate = ((bufferSize * numBuffers) + 4095) & ~0xfff;
+    size_t bytesToAllocate = ((bufferSize * numBuffers) + 4095) & ~0xfffu;
     bufferMemory = reinterpret_cast<char*>(Memory::xmemalign(HERE, 4096,
             bytesToAllocate));
 
-    // FIXME: hack to skip memory registration for psm2 provider; psm2 provider
-    // doesn't need registration because it can't do zero-copy anyway, right?
-    // Steal from: https://github.com/yilongli/libfabric/blob/master/util/pingpong.c#L1324
-    if (attr->mr_mode & FI_MR_LOCAL) {
-        int ret = fi_mr_reg(domain, bufferMemory, bytesToAllocate,
+    if (driver->mustRegisterLocalMemory) {
+        int ret = fi_mr_reg(driver->domain, bufferMemory, bytesToAllocate,
                 FI_SEND | FI_RECV, 0, 0, 0, &memoryRegion, NULL);
         if (ret) {
             DIE("Couldn't register memory region: %s", fi_strerror(-ret));
         }
-    } else {
-        memoryRegion = &NO_MEMORY_REGION;
     }
     descriptors = reinterpret_cast<BufferDescriptor*>(
             malloc(numBuffers*sizeof(BufferDescriptor)));
     char* buffer = bufferMemory;
+    fid_mr* mr = memoryRegion ? memoryRegion : &NO_MEMORY_REGION;
     for (uint32_t i = 0; i < numBuffers; i++) {
-        new(&descriptors[i]) BufferDescriptor(buffer, bufferSize, memoryRegion);
+        new(&descriptors[i]) BufferDescriptor(buffer, bufferSize, mr);
         freeBuffers.push_back(&descriptors[i]);
         buffer += bufferSize;
     }
@@ -698,7 +796,7 @@ OfiUdDriver::BufferPool::BufferPool(fid_domain* domain, fi_domain_attr* attr,
  */
 OfiUdDriver::BufferPool::~BufferPool()
 {
-    if (memoryRegion != NULL) {
+    if (memoryRegion) {
         fi_close(&memoryRegion->fid);
     }
     // `bufferMemory` and `descriptors` are allocated using malloc.
