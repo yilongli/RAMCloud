@@ -224,6 +224,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
         mtu = downCast<uint32_t>(info->nic->link_attr->mtu);
     } else {
         mtu = 4096;
+        LOG(WARNING, "fi_getinfo returns no NIC information: setting MTU to %u",
+                mtu);
     }
     queueEstimator.setBandwidth(1000*bandwidthGbps);
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
@@ -433,10 +435,10 @@ OfiUdDriver::reapTransmitBuffers()
     }
 
     if (enableSeletiveCompOpt) {
-        // Each iteration of the following loop attempts to match a signaled
-        // completion with a transmit buffer posted earlier. Upon the match,
-        // we know that any transmit buffer we check so far can be reused as
-        // the underlying provider guarantees generating CQEs in a FIFO order.
+        // Each iteration of the following loop attempts to match one CQE with
+        // a transmit buffer posted earlier. Upon the match, we know that any
+        // transmit buffer that have been checked so far can be reused as the
+        // underlying provider guarantees generating CQEs in a FIFO order.
         for (int i = 0; i < numCqes; i++) {
             BufferDescriptor* signaledCompletion =
                     context_to_bd(cqes[i].op_context);
@@ -537,9 +539,35 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     dst += headerLen;
 
     // Copy payload into packet buffer or apply zero-copy when approapriate.
+    iovec io_vec[2];
+    io_vec[0]= {
+        .iov_base = bd->buffer,
+        .iov_len = bd->packetLength
+    };
+    size_t iov_count = 1;
+    void* desc[2] = {fi_mr_desc(bd->memoryRegion)};
     while (payload && !payload->isDone()) {
-        memcpy(dst, payload->getData(), payload->getLength());
-        dst += payload->getLength();
+        // Use zero copy for the *last* chunk of the packet, if it's in the
+        // zero copy region and is large enough to justify the overhead of
+        // an additional scatter-gather element.
+        const char* currentChunk =
+                reinterpret_cast<const char*>(payload->getData());
+        bool isLastChunk = payload->getLength() == payload->size();
+        if (isLastChunk && (payload->getLength() >= 500)
+                && (currentChunk >= zeroCopyStart)
+                && (currentChunk + payload->getLength() < zeroCopyEnd)) {
+            io_vec[1].iov_base = const_cast<char*>(currentChunk);
+            io_vec[1].iov_len = payload->getLength();
+            io_vec[0].iov_len -= payload->getLength();
+            desc[1] = fi_mr_desc(zeroCopyRegion);
+            iov_count = 2;
+            break;
+        } else {
+            memcpy(dst, currentChunk, payload->getLength());
+            dst += payload->getLength();
+            timeTrace("0-copy not applicable; copied %u bytes",
+                    payload->getLength());
+        }
         payload->next();
     }
 
@@ -552,20 +580,24 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 //        sendsSinceLastSignal = 0;
 //    }
 
-    // FIXME: how to use fi_inject for small message? does inject_size include msg_prefix_size?
-//    if (bd->packetLength <= MAX_INLINE_DATA)
-//        workRequest.send_flags |= IBV_SEND_INLINE;
-
     // Post the packet buffer to the transmit queue.
     const Address* address = static_cast<const Address*>(addr);
     lastTransmitTime = Cycles::rdtsc();
-    int ret = downCast<int>(fi_send(endpoint, bd->buffer, bd->packetLength,
-            fi_mr_desc(bd->memoryRegion), address->addr, &bd->context));
+
+    int ret;
+    if (bd->packetLength <= info->tx_attr->inject_size) {
+        ret = downCast<int>(fi_inject(endpoint, bd->buffer, bd->packetLength,
+                address->addr));
+        txPool->freeBuffers.push_back(bd);
+    } else {
+        ret = downCast<int>(fi_sendv(endpoint, io_vec, desc, iov_count,
+                address->addr, &bd->context));
+        if (txBuffersInNic) {
+            txBuffersInNic->push_back(bd);
+        }
+    }
     if (ret) {
         DIE("Error posting transmit packet: %s", fi_strerror(-ret));
-    }
-    if (txBuffersInNic) {
-        txBuffersInNic->push_back(bd);
     }
 
     timeTrace("sent packet with %u bytes, %u free buffers", bd->packetLength,
@@ -699,29 +731,30 @@ OfiUdDriver::refillReceiver()
         return;
     }
 
-    // FIXME: use batch-oriented recvv instead!!!
-#if 0
-    if (maxPostRxBuffers > 1) {
-        // Create a list of receive buffers to be posted to the RX queue.
-        DIE("Not implemented!");
-    } else {
-        // The underlying provider doesn't support posting multiple receive
-        // buffers in batch; submit the receive buffers one by one.
-        for (int i = 0; i < REFILL_BATCH; i++) {
-            BufferDescriptor* bd = rxPool->freeBuffers.back();
-            rxPool->freeBuffers.pop_back();
-            FI_CHK_CALL(fi_recv, endpoint, bd->buffer, bd->length,
-                    fi_mr_desc(bd->memoryRegion), (fi_addr_t)0, &bd->context);
-        }
-    }
-#else
+    // Each iteration of the following loop posts one receive buffer to the
+    // receive queue. All post operations except the last one are flagged as
+    // FI_MORE to indicate that additional buffers will be posted immediately
+    // after the current call returns.
     for (int i = 0; i < REFILL_BATCH; i++) {
         BufferDescriptor* bd = rxPool->freeBuffers.back();
         rxPool->freeBuffers.pop_back();
-        FI_CHK_CALL(fi_recv, endpoint, bd->buffer, bd->length,
-                fi_mr_desc(bd->memoryRegion), (fi_addr_t)0, &bd->context);
+
+        iovec msg_iov = {
+            .iov_base = bd->buffer,
+            .iov_len = bd->length,
+        };
+        void* desc = fi_mr_desc(bd->memoryRegion);
+        fi_msg msg = {
+            .msg_iov = &msg_iov,
+            .desc = &desc,
+            .iov_count = 1,
+            .addr = 0,
+            .context = &bd->context,
+            .data = 0
+        };
+        uint64_t flags = (i < REFILL_BATCH) ? FI_MORE : 0;
+        FI_CHK_CALL(fi_recvmsg, endpoint, &msg, flags);
     }
-#endif
     rxBuffersInNic += REFILL_BATCH;
     timeTrace("receive queue refilled");
 
