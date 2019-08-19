@@ -64,8 +64,6 @@ namespace {
 // ServiceLocator and use fi_av_insertsvc to convert that into fi_addr?
 #define SL_USE_FI_ADDR_STR 0
 
-#define EMBED_LOCAL_ADDR 1
-
 #define STR(token) #token
 
 // Most libfabric APIs return negative values to indicate errors. This macro
@@ -75,7 +73,7 @@ namespace {
 #define FI_CHK_CALL(fn, ...)                                        \
         do {                                                        \
             int ret = downCast<int>(fn(__VA_ARGS__));               \
-            if (ret) {                                              \
+            if (ret < 0) {                                          \
                 DIE("%s failed: %s", STR(fn), fi_strerror(-ret));   \
             }                                                       \
         } while (0)
@@ -115,6 +113,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , addressVector()
     , rxcq()
     , txcq()
+    , addressLength()
     , addressMap()
 //    , corkedPackets()
     , loopbackPkts()
@@ -125,9 +124,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , txBuffersInNic()
     , datagramPrefixSize()
     , maxInlineData(MAX_INLINE_DATA)
-//    , maxPostTxBuffers()
-//    , maxPostRxBuffers()
     , mtu(0)
+    , mustIncludeLocalAddress(true)
     , mustRegisterLocalMemory()
     , locatorString("ofiud:")
     , bandwidthGbps(0)
@@ -179,6 +177,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
 
     // Set the runtime parameters of this driver based on the fabric info and
     // further tune up a few attributes.
+    addressLength = downCast<uint32_t>(info->src_addrlen);
     if (info->tx_attr->size > MAX_TX_QUEUE_DEPTH) {
         info->tx_attr->size = MAX_TX_QUEUE_DEPTH;
     }
@@ -196,21 +195,13 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     info->tx_attr->iov_limit = 2;
     info->rx_attr->iov_limit = 1;
     datagramPrefixSize = downCast<uint32_t>(info->ep_attr->msg_prefix_size);
-    bool embedSrcAddr = !(info->caps & FI_SOURCE);
-#if EMBED_LOCAL_ADDR
-    embedSrcAddr = true;
-#endif
-    if (embedSrcAddr) {
-        // If the underlying provider doesn't support retrieving source address
-        // from an incoming datagram, we will have to embed the local address
-        // in every outgoing packet manually.
-        datagramPrefixSize += info->src_addrlen;
+    if (mustIncludeLocalAddress) {
+        // Place the source address info right after the prefix buffer space.
+        datagramPrefixSize += addressLength;
     }
     if (info->tx_attr->inject_size < maxInlineData) {
         maxInlineData = downCast<uint32_t>(info->tx_attr->inject_size);
     }
-//    maxPostTxBuffers = downCast<uint32_t>(info->tx_attr->iov_limit);
-//    maxPostRxBuffers = downCast<uint32_t>(info->rx_attr->iov_limit);
     mustRegisterLocalMemory = info->domain_attr->mr_mode & FI_MR_LOCAL;
 
     // Compute link speed and MTU to setup the queue estimator.
@@ -277,8 +268,9 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     std::vector<uint8_t> localAddress;
     localAddress.resize(addrlen);
     FI_CHK_CALL(fi_getname, (fid_t)endpoint, localAddress.data(), &addrlen);
-    if (addrlen != info->src_addrlen) {
-        DIE("Unexpected address length %u", addrlen);
+    if (addrlen != addressLength) {
+        DIE("Unexpected address length %u (expecting %u)", addrlen,
+                addressLength);
     }
 #if SL_USE_FI_ADDR_STR
     char addrStr[100];
@@ -305,9 +297,9 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
             MAX_TX_QUEUE_DEPTH, (MAX_TX_QUEUE_DEPTH*bufSize)/(1024*1024));
 
     // Fill in the src address in every transmit buffer, if necessary.
-    if (embedSrcAddr) {
+    if (mustIncludeLocalAddress) {
         for (BufferDescriptor* bd : txPool->freeBuffers) {
-            char* srcAddr = bd->buffer + datagramPrefixSize - info->src_addrlen;
+            char* srcAddr = bd->buffer + datagramPrefixSize - addressLength;
             memcpy(srcAddr, localAddress.data(), addrlen);
         }
     }
@@ -368,7 +360,7 @@ OfiUdDriver::getTransmitBuffer()
                 reapTransmitBuffers();
                 count++;
             }
-            timeTrace("TX buffers refilled after polling CQ %u times", count);
+            timeTrace("ofiud: TX buffers refilled after %u polls", count);
             double waitMillis = 1e03 * Cycles::toSeconds(Cycles::rdtsc()
                     - start);
             if (waitMillis > 1.0)  {
@@ -431,7 +423,7 @@ OfiUdDriver::reapTransmitBuffers()
         // do not attempt to recover from such error.
         DIE("fi_cq_read failed: %s", fi_strerror(-numCqes));
     } else if (numCqes > 0) {
-        timeTrace("polling TX completion queue returned %d CQEs", numCqes);
+        timeTrace("ofiud: polling txcq returned %d CQEs", numCqes);
     }
 
     if (enableSeletiveCompOpt) {
@@ -449,7 +441,6 @@ OfiUdDriver::reapTransmitBuffers()
                 txPool->freeBuffers.push_back(bd);
                 if (bd == signaledCompletion) {
                     matchSignal = true;
-                    timeTrace("reaped %d TX buffers", SIGNALED_SEND_PERIOD);
                     break;
                 }
             }
@@ -489,6 +480,8 @@ OfiUdDriver::registerMemory(void* base, size_t bytes)
     } else {
         LOG(NOTICE, "Provider %s requires no memory registration",
                 info->fabric_attr->prov_name);
+        // FIXME: perhaps we should set zeroCopyStart to 0 and zeroCopyEnd to
+        // ~0lu after we figure out why fi_sendv is so damn slow with psm2
     }
 }
 
@@ -565,8 +558,6 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
         } else {
             memcpy(dst, currentChunk, payload->getLength());
             dst += payload->getLength();
-            timeTrace("0-copy not applicable; copied %u bytes",
-                    payload->getLength());
         }
         payload->next();
     }
@@ -600,12 +591,112 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
         DIE("Error posting transmit packet: %s", fi_strerror(-ret));
     }
 
-    timeTrace("sent packet with %u bytes, %u free buffers", bd->packetLength,
-            txPool->freeBuffers.size());
+    timeTrace("ofiud: sent packet with %u bytes, %u free buffers",
+            bd->packetLength, txPool->freeBuffers.size());
     queueEstimator.packetQueued(bd->packetLength, lastTransmitTime,
             txQueueState);
     PerfStats::threadStats.networkOutputBytes += bd->packetLength;
     PerfStats::threadStats.networkOutputPackets++;
+}
+
+/*
+ * See docs in the ``Driver'' class.
+ */
+void
+OfiUdDriver::sendPackets(const Driver::Address* addr,
+                         const void* headers,
+                         uint32_t headerLen,
+                         Buffer::Iterator* messageIt,
+                         int priority,
+                         TransmitQueueState* txQueueState)
+{
+    const uint32_t messageBytes = messageIt->size();
+    timeTrace("ofiud: sendPackets invoked, message bytes %u", messageBytes);
+
+    uint32_t maxPayload = getMaxPacketSize() - headerLen;
+    uint32_t numPackets = (messageIt->size() + maxPayload - 1) / maxPayload;
+
+    // Each iteration of the following loop enqueues one outgoing packet to
+    // the transmit queue. All send operations except the last one are flagged
+    // as FI_MORE to indicate that additional packets will be sent immediately
+    // after the current call returns.
+    uint32_t bytesSent = 0;
+    const char* header = reinterpret_cast<const char*>(headers);
+    for (uint32_t i = 0; i < numPackets; i++) {
+        // Get a packet buffer.
+        uint32_t payloadSize = std::min(maxPayload, messageIt->size());
+        BufferDescriptor* bd = getTransmitBuffer();
+        bd->packetLength = datagramPrefixSize + headerLen + payloadSize;
+
+        // Copy transport header into packet buffer.
+        char* dst = bd->buffer + datagramPrefixSize;
+        memcpy(dst, header, headerLen);
+        header += headerLen;
+        dst += headerLen;
+
+        // Copy payload into packet buffer or apply zero-copy when approapriate.
+        iovec io_vec[2];
+        io_vec[0]= {
+            .iov_base = bd->buffer,
+            .iov_len = bd->packetLength
+        };
+        size_t iov_count = 1;
+        void* desc[2] = {fi_mr_desc(bd->memoryRegion)};
+        const char* payloadStart =
+                reinterpret_cast<const char*>(messageIt->getData());
+        if ((messageIt->getLength() >= payloadSize) &&
+                (zeroCopyStart <= payloadStart) &&
+                (payloadStart + payloadSize <= zeroCopyEnd)) {
+            // Add a new scatter-gather entry that points to the payload.
+            iov_count = 2;
+            io_vec[1].iov_base = const_cast<char*>(payloadStart);
+            io_vec[1].iov_len = payloadSize;
+            io_vec[0].iov_len -= payloadSize;
+            desc[1] = fi_mr_desc(zeroCopyRegion);
+            messageIt->advance(payloadSize);
+        } else {
+            // Copy payload into packet buffer.
+            uint32_t bytesToCopy = payloadSize;
+            while (bytesToCopy > 0) {
+                // The current buffer chunk contains the rest of the packet.
+                if (messageIt->getLength() >= bytesToCopy) {
+                    memcpy(dst, messageIt->getData(), bytesToCopy);
+                    messageIt->advance(bytesToCopy);
+                    break;
+                }
+
+                memcpy(dst, messageIt->getData(), messageIt->getLength());
+                dst += messageIt->getLength();
+                bytesToCopy -= messageIt->getLength();
+                messageIt->next();
+            }
+        }
+
+        // Send the packet.
+        fi_msg msg = {
+            .msg_iov = io_vec,
+            .desc = &desc[0],
+            .iov_count = iov_count,
+            .addr = static_cast<const Address*>(addr)->addr,
+            .context = &bd->context,
+            .data = 0
+        };
+        uint64_t flags = (i < numPackets) ?
+                (FI_MORE | FI_INJECT_COMPLETE) : FI_INJECT_COMPLETE;
+        FI_CHK_CALL(fi_sendmsg, endpoint, &msg, flags);
+        timeTrace("ofiud: enqueued one more packet");
+
+        if (txBuffersInNic) {
+            txBuffersInNic->push_back(bd);
+        }
+        bytesSent += bd->packetLength;
+    }
+    lastTransmitTime = Cycles::rdtsc();
+    timeTrace("ofiud: sent %u packets (%u bytes), %u free buffers", numPackets,
+            bytesSent, txPool->freeBuffers.size());
+    queueEstimator.packetQueued(bytesSent, lastTransmitTime, txQueueState);
+    PerfStats::threadStats.networkOutputBytes += bytesSent;
+    PerfStats::threadStats.networkOutputPackets += numPackets;
 }
 
 /*
@@ -617,14 +708,8 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
 {
     static const uint32_t MAX_COMPLETIONS = 16;
     fi_cq_msg_entry wc[MAX_COMPLETIONS];
-    fi_addr_t srcAddr[MAX_COMPLETIONS];
     uint32_t maxToReceive = std::min(maxPackets, MAX_COMPLETIONS);
-#if EMBED_LOCAL_ADDR
     int numPackets = downCast<int>(fi_cq_read(rxcq, wc, maxToReceive));
-#else
-    int numPackets = downCast<int>(
-            fi_cq_readfrom(rxcq, wc, maxToReceive, srcAddr));
-#endif
     if (numPackets <= 0) {
         if (unlikely(numPackets != -FI_EAGAIN)) {
             if (numPackets == -FI_EAVAIL) {
@@ -639,7 +724,7 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
         return;
     }
     lastReceiveTime = Cycles::rdtsc();
-    timeTrace("OfiUdDriver received %d packets", numPackets);
+    timeTrace("ofiud: received %d packets", numPackets);
 
     rxBuffersInNic -= downCast<uint32_t>(numPackets);
     if (unlikely(rxBuffersInNic == 0)) {
@@ -654,28 +739,30 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
     for (int i = 0; i < numPackets; i++) {
         fi_cq_msg_entry* incoming = &wc[i];
         BufferDescriptor* bd = context_to_bd(incoming->op_context);
-        bd->packetLength = downCast<uint32_t>(incoming->len);
 
-#if EMBED_LOCAL_ADDR
-        char* p = bd->buffer + datagramPrefixSize - info->src_addrlen;
-        RAW_ADDRESS_TYPE key = *((RAW_ADDRESS_TYPE*)p);
-        auto it = addressMap.find(key);
-        if (it == addressMap.end()) {
-            fi_av_insert(addressVector, p, 1, &srcAddr[i], 0, NULL);
-            addressMap[key] = srcAddr[i];
-        } else {
-            srcAddr[i] = addressMap[key];
+        // Convert the raw source address of the packet into fi_addr_t.
+        fi_addr_t srcAddr;
+        if (mustIncludeLocalAddress) {
+            char* srcAddrBuf = bd->buffer + datagramPrefixSize - addressLength;
+            RawAddress key(srcAddrBuf, addressLength);
+            AddressMap::iterator it = addressMap.find(key);
+            if (it == addressMap.end()) {
+                fi_av_insert(addressVector, srcAddrBuf, 1, &srcAddr, 0, NULL);
+                addressMap[key] = srcAddr;
+            } else {
+                srcAddr = it->second;
+            }
         }
-#endif
 
-        bd->sourceAddress.construct(srcAddr[i]);
+        bd->packetLength = downCast<uint32_t>(incoming->len);
+        bd->sourceAddress.construct(srcAddr);
         receivedPackets->emplace_back(bd->sourceAddress.get(), this,
                 bd->packetLength - datagramPrefixSize,
                 bd->buffer + datagramPrefixSize);
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
     }
-    timeTrace("OfiUdDriver::receivePackets done");
+    timeTrace("ofiud: receivePackets done");
 }
 
 /**
@@ -756,7 +843,7 @@ OfiUdDriver::refillReceiver()
         FI_CHK_CALL(fi_recvmsg, endpoint, &msg, flags);
     }
     rxBuffersInNic += REFILL_BATCH;
-    timeTrace("receive queue refilled");
+    timeTrace("ofiud: receive queue refilled");
 
     // Generate log messages every time buffer usage reaches a significant new
     // high. Running out of buffers is a bad thing, so we want warnings in the

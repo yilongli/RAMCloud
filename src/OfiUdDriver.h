@@ -27,6 +27,12 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 
+#pragma GCC diagnostic ignored "-Wconversion"
+#pragma GCC diagnostic ignored "-Weffc++"
+#include "flat_hash_map.h"
+#pragma GCC diagnostic warning "-Wconversion"
+#pragma GCC diagnostic warning "-Weffc++"
+
 #include "Common.h"
 #include "Dispatch.h"
 #include "Driver.h"
@@ -58,6 +64,10 @@ class OfiUdDriver : public Driver {
                             uint32_t headerLen, Buffer::Iterator* payload,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
+    virtual void sendPackets(const Driver::Address* addr, const void* headers,
+                             uint32_t headerLen, Buffer::Iterator* messageIt,
+                             int priority = 0,
+                             TransmitQueueState* txQueueState = NULL);
 
     virtual string getServiceLocator();
     virtual Address* newAddress(const ServiceLocator* serviceLocator);
@@ -156,6 +166,47 @@ class OfiUdDriver : public Driver {
         DISALLOW_COPY_AND_ASSIGN(BufferPool);
     };
 
+    /// A container for the raw address information.
+    struct RawAddress {
+        /// Supports up to 16 bytes of address info.
+        uint8_t raw[16];
+
+        /**
+         * Constructs a .
+         *
+         * \param buf
+         *      Buffer containing the address info.
+         * \param len
+         *      Size of the address info, in bytes.
+         */
+        explicit RawAddress(void* buffer, uint32_t len)
+        {
+            assert(len == 8 || len == 16);
+            char* buf = reinterpret_cast<char*>(buffer);
+            *(uint64_t*)(raw + 0) = *(uint64_t*)(buf + 0);
+            if (len == 8) {
+                *(uint64_t*)(raw + 8) = 0;
+            } else {
+                *(uint64_t*)(raw + 8) = *(uint64_t*)(buf + 8);
+            }
+        }
+
+        /// Equality function, for use in hash map.
+        bool operator==(RawAddress other) const
+        {
+            return (*(uint64_t*)(other.raw + 0) == *(uint64_t*)(other.raw + 0))
+                && (*(uint64_t*)(other.raw + 8) == *(uint64_t*)(other.raw + 8));
+        }
+
+        struct Hasher {
+            std::size_t operator()(const RawAddress& rawAddress) const {
+                uint64_t h1 = *(uint64_t*)(rawAddress.raw + 0);
+                uint64_t h2 = *(uint64_t*)(rawAddress.raw + 8);
+                return h1 ^ h2;
+            }
+        };
+    };
+
     /**
      * Stores information about a work request that will be posted to the TX
      * queue (i.e., a send request).
@@ -240,10 +291,14 @@ class OfiUdDriver : public Driver {
     /// for transmitted packets. Not owned by this class.
     fid_cq* txcq;
 
-    // TODO:
-//    using RAW_ADDRESS_TYPE = __uint128_t;
-    using RAW_ADDRESS_TYPE = uint64_t;
-    std::unordered_map<RAW_ADDRESS_TYPE, fi_addr_t> addressMap;
+    /// # bytes used to represent a raw address in this fabric.
+    uint32_t addressLength;
+
+    /// Map from raw addresses to fi_addr_t addresses, which are used in every
+    /// send operation.
+    using AddressMap = ska::flat_hash_map<RawAddress, fi_addr_t,
+            RawAddress::Hasher>;
+    AddressMap addressMap;
 
     /// Outgoing packets currently queued up in the driver because the transmit
     /// queue is corked.
@@ -281,21 +336,16 @@ class OfiUdDriver : public Driver {
     /// which is optimized for small message latency.
     uint32_t maxInlineData;
 
-    // TODO: I think I misinterpreted the meaning of {tx,rx}_attr->iov_limit;
-    // I thought they limit # buffers I can post at once but it appears that
-    // they refer to the scatter-list list referenced in *ONE* posted operation!
-
-//    /// Maximum # buffers that can be posted to the transmit queue in a batch.
-//    uint32_t maxPostTxBuffers;
-//
-//    /// Maximum # buffers that can be posted to the receive queue in a batch.
-//    uint32_t maxPostRxBuffers;
-
     /// Active maximum MTU enabled on #ibPhysicalPort to transmit and receive.
     /// This is the maximum message size that an UD QP can transmit.
     uint32_t mtu;
 
-    // TODO: when true, we don't need transmit buffers (i.e., txPool) or
+    /// True means we must manually embed the local address in every outgoing
+    /// packet because the underlying provider doesn't have another way for the
+    /// receiver to retrieve the source address.
+    const bool mustIncludeLocalAddress;
+
+    // TODO: when false, we don't need transmit buffers (i.e., txPool) or
     // txBuffersInNic because the underlying provider does a copy anyway!
     bool mustRegisterLocalMemory;
 
