@@ -27,6 +27,7 @@ cd libfabric
 # utility programs) under directory ${LIBFABRIC_DIR}/build.
 #./autogen.sh
 mkdir -p build && cd build
-CFLAGS=${EXTRA_CFLAGS} ../configure --prefix="$(pwd)" --disable-sockets \
-    --disable-tcp --disable-udp --disable-psm
+CFLAGS=${EXTRA_CFLAGS} ../configure --prefix="$(pwd)" \
+    --enable-psm2=../../opa-psm2/build_release/usr \
+    --disable-sockets --disable-tcp --disable-udp --disable-psm
 make clean && make -j && make install

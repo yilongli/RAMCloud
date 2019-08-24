@@ -393,6 +393,8 @@ main(int argc, const char *argv[]) {
         std::vector<int> affinedCpus = Util::getAffinedCpus();
         if (coreIndex < affinedCpus.size()) {
             Util::pinThreadToCore(affinedCpus[coreIndex]);
+            LOG(NOTICE, "Arachne::initCore: new kthread pinned to cpu %d",
+                    affinedCpus[coreIndex]);
         } else {
             RAMCLOUD_DIE("Not enough cores to pin the thread: CPU affinity %s",
                     Util::getCpuAffinityString().c_str());

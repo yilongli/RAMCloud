@@ -25,7 +25,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 #define TIME_TRACE_SHUFFLE 0
 
 #define PERF_STATS 0
@@ -579,10 +579,12 @@ BasicTransport::headerToString(const void* packet, uint32_t packetLength)
  * we will help perform the casting internally.
  */
 template<typename... Args>
-void
+uint64_t
 BasicTransport::timeTrace(const char* format, Args... args) {
 #if TIME_TRACE
-    TimeTrace::record(format, uint32_t(args)...);
+    return TimeTrace::record(format, uint32_t(args)...);
+#else
+    return 0;
 #endif
 }
 
@@ -591,6 +593,15 @@ void
 BasicTransport::timetrace_shuffle(const char* format, Args... args) {
 #if TIME_TRACE_SHUFFLE
     TimeTrace::record(format, uint32_t(args)...);
+#endif
+}
+
+void
+BasicTransport::cancelRecord(uint64_t lastRecordTime) {
+#if TIME_TRACE
+    TimeTrace::cancelRecord(lastRecordTime);
+#else
+    (void*)lastRecordTime;
 #endif
 }
 
@@ -1808,13 +1819,14 @@ BasicTransport::ScheduledMessage::~ScheduledMessage()
 int
 BasicTransport::Poller::poll()
 {
+    // Record the timestamp so that we can use the cancel trick before the
+    // method returns to ensure timetrace entries do not go back in time.
+    uint64_t startTime = t->timeTrace("start of polling iteration %u",
+            uint32_t(owner->iteration));
+
     SCOPED_TIMER(basicTransportActiveCycles);
     int result = 0;
     uint32_t totalBytesSent = 0;
-
-#if TIME_TRACE
-    uint64_t startTime = Cycles::rdtsc();
-#endif
 
     // Try to fill up the transmit queue.
     // TODO: doing TX before RX helps reducing TX queue bubble because we might
@@ -1839,12 +1851,6 @@ BasicTransport::Poller::poll()
     }
 
     if (numPackets > 0) {
-#if TIME_TRACE
-        // Log the beginning of poll() here so that timetrace entries do not
-        // go back in time.
-        TimeTrace::record(startTime, "start of polling iteration %u",
-                uint32_t(owner->iteration));
-#endif
         START_TIMER(basicTransportHandlePacketCycles);
         for (uint i = 0; i < numPackets; i++) {
             t->handlePacket(&t->receivedPackets[i]);
@@ -1931,6 +1937,8 @@ BasicTransport::Poller::poll()
     } else {
         CANCEL_SCOPED_TIMER(basicTransportActiveCycles);
     }
+
+    t->cancelRecord(startTime);
     return result;
 }
 

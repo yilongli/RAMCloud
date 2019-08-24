@@ -2966,6 +2966,12 @@ doMultiReadColocation(
 void
 echo_basic()
 {
+    // FIXME: temp workaround for the fact that CPerf hasn't been arachnified???
+    std::vector<int> affinedCpus = Util::getAffinedCpus();
+    Util::pinThreadToCore(affinedCpus[0]);
+    LOG(WARNING, "Pinned client thread to first available core, affinity %s",
+            Util::getCpuAffinityString().c_str());
+
 #if !HOMA_BENCHMARK
     LOG(WARNING, "To achieve best performance, compile ClusterPerf "
             "and RAMCloud with -DHOMA_BENCHMARK");

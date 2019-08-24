@@ -64,10 +64,13 @@ class OfiUdDriver : public Driver {
                             uint32_t headerLen, Buffer::Iterator* payload,
                             int priority = 0,
                             TransmitQueueState* txQueueState = NULL);
+
+#if 0
     virtual void sendPackets(const Driver::Address* addr, const void* headers,
                              uint32_t headerLen, Buffer::Iterator* messageIt,
                              int priority = 0,
                              TransmitQueueState* txQueueState = NULL);
+#endif
 
     virtual string getServiceLocator();
     virtual Address* newAddress(const ServiceLocator* serviceLocator);
@@ -194,8 +197,8 @@ class OfiUdDriver : public Driver {
         /// Equality function, for use in hash map.
         bool operator==(RawAddress other) const
         {
-            return (*(uint64_t*)(other.raw + 0) == *(uint64_t*)(other.raw + 0))
-                && (*(uint64_t*)(other.raw + 8) == *(uint64_t*)(other.raw + 8));
+            return (*(uint64_t*)(raw + 0) == *(uint64_t*)(other.raw + 0)) &&
+                   (*(uint64_t*)(raw + 8) == *(uint64_t*)(other.raw + 8));
         }
 
         struct Hasher {
@@ -208,25 +211,30 @@ class OfiUdDriver : public Driver {
     };
 
     /**
-     * Stores information about a work request that will be posted to the TX
-     * queue (i.e., a send request).
+     * Convert raw addresses to fi_addr_t addresses that are used in libfabric
+     * send operations.
      */
-//    struct SendRequest {
-//        /// Work request to be posted to the TX queue.
-//        ibv_send_wr wr;
-//
-//        /// Scatter-gather list within the work request.
-//        ibv_sge sges[2];
-//
-//        /// Zeros out all member structs.
-//        explicit SendRequest()
-//            : wr(), sges() {}
-//    };
+    class AddressMap {
+      public:
+        explicit AddressMap(fid_av* addressVector)
+            : addressVector(addressVector), map()
+        {}
+
+        fi_addr_t insertIfAbsent(RawAddress* rawAddress);
+
+      private:
+        /// libfabric address vector for inserting raw addresses.
+        fid_av* addressVector;
+
+        /// Map from raw addresses to fi_addr_t addresses, which are used in
+        /// every send operation.
+        ska::flat_hash_map<RawAddress, fi_addr_t, RawAddress::Hasher> map;
+    };
 
     BufferDescriptor* getTransmitBuffer();
     ServiceLocator readDriverConfigFile();
     void reapTransmitBuffers();
-    void refillReceiver();
+    void refillReceiver(bool refillAll = false);
 
     /// Maximum number of bytes of datagrams to be sent with fi_inject,
     /// which is optimized for small message latency.
@@ -237,14 +245,20 @@ class OfiUdDriver : public Driver {
     /// the possession of higher-level software processing requests, and
     /// some may be idle (in freeRxBuffers). We need a *lot* of these,
     /// if we're going to handle multiple 8-MB incoming RPCs at once.
-    static constexpr uint32_t TOTAL_RX_BUFFERS = 50000;
+//    static constexpr uint32_t TOTAL_RX_BUFFERS = 50000;
+    static constexpr uint32_t TOTAL_RX_BUFFERS = 5000;
+
+    // FIXME: wtf is the performance of psm2 so sensitive to the size of
+    // MAX_{TX,RX}_QUEUE_DEPTH when using zero-copy tx???
 
     /// Maximum number of receive buffers that will be in the possession
     /// of the NIC at once.
-    static constexpr uint32_t MAX_RX_QUEUE_DEPTH = 1000;
+//    static constexpr uint32_t MAX_RX_QUEUE_DEPTH = 1000;
+    static constexpr uint32_t MAX_RX_QUEUE_DEPTH = 16;
 
     /// Maximum number of transmit buffers that may be outstanding at once.
-    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 128;
+//    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 128;
+    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 16;
 
     /// Post a signaled send request, which generates a work completion entry
     /// when it completes, after posting SIGNALED_SEND_PERIOD-1 unsignaled send
@@ -296,9 +310,7 @@ class OfiUdDriver : public Driver {
 
     /// Map from raw addresses to fi_addr_t addresses, which are used in every
     /// send operation.
-    using AddressMap = ska::flat_hash_map<RawAddress, fi_addr_t,
-            RawAddress::Hasher>;
-    AddressMap addressMap;
+    Tub<AddressMap> addressMap;
 
     /// Outgoing packets currently queued up in the driver because the transmit
     /// queue is corked.

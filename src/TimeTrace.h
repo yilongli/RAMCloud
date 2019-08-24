@@ -93,8 +93,25 @@ class TimeTrace {
     }
 
     template<typename... Args>
-    static inline void record(const char* format, Args... args) {
-        record(Cycles::rdtsc(), format, args...);
+    static inline uint64_t record(const char* format, Args... args) {
+        uint64_t timestamp = Cycles::rdtsc();
+        record(timestamp, format, args...);
+        return timestamp;
+    }
+
+    static inline bool cancelRecord(uint64_t lastRecordTime)
+    {
+        Buffer* buffer = getBuffer();
+        int currentIndex = buffer->nextIndex - 1;
+        if (currentIndex < 0) {
+            currentIndex = Buffer::BUFFER_SIZE - 1;
+        }
+        if (buffer->events[currentIndex].timestamp == lastRecordTime) {
+            buffer->nextIndex = currentIndex;
+            buffer->events[buffer->nextIndex].format = 0;
+            return true;
+        }
+        return false;
     }
 
     static void reset();

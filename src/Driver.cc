@@ -37,6 +37,9 @@ Driver::sendPackets(const Address* recipient, const void* headers,
         sendPacket(recipient, header, headerLen, &payload, priority,
                 txQueueState);
         header += headerLen;
+
+        // Clear out the pointer to avoid overwriting the TX queue state.
+        txQueueState = NULL;
     }
 }
 

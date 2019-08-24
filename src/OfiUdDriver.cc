@@ -19,6 +19,7 @@
  * unreliable datagrams
  */
 
+#include <cstdlib>
 #include <fstream>
 #include <sys/types.h>
 
@@ -40,7 +41,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this driver.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -48,14 +49,16 @@ namespace RAMCloud {
 // frequently cast their 64-bit arguments into uint32_t explicitly: we will
 // help perform the casting internally.
 namespace {
-    inline void
+    inline uint64_t
     timeTrace(const char* format,
             uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
             uint64_t arg3 = 0)
     {
 #if TIME_TRACE
-        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+        return TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
                 uint32_t(arg2), uint32_t(arg3));
+#else
+        return 0;
 #endif
     }
 }
@@ -139,7 +142,26 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     ServiceLocator config = readDriverConfigFile();
     const char* provider = config.getOption<const char*>("prov", NULL);
     bandwidthGbps = config.getOption<uint32_t>("gbs", 0);
+    mtu = config.getOption<uint32_t>("mtu", 0);
     LOG(NOTICE, "OfiUdDriver config: %s", config.getOriginalString().c_str());
+
+    // FIXME: print PSM2 related env variables
+    if (strcmp(provider, "psm2") == 0) {
+        // FIXME: instead of setting env vars in ~/.bashrc, set it here?
+        // Example .bashrc:
+        //      export PSM2_MQ_EAGER_SDMA_SZ=16384
+        //      export PSM2_MQ_RNDV_HFI_THRESH=1000000000
+        //      export FI_PSM2_LOCK_LEVEL=0
+        static const char* ENV_VARS[] = {"PSM2_MQ_EAGER_SDMA_SZ",
+                "PSM2_MQ_RNDV_HFI_THRESH", "FI_PSM2_LOCK_LEVEL",
+                "FI_PSM2_PROG_INTERVAL", "FI_PSM2_PROG_AFFINITY"};
+        for (const char* env : ENV_VARS) {
+            char* value = std::getenv(env);
+            if (value) {
+                LOG(NOTICE, "%s = %s", env, value);
+            }
+        }
+    }
 
     // Fill out the hints struct to indicate the capabilities we need and the
     // operation modes we support.
@@ -164,6 +186,14 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // be used with other bits.
     hints->domain_attr->mode = ~0lu;
     hints->domain_attr->mr_mode = ~(FI_MR_BASIC | FI_MR_SCALABLE);
+    // FIXME: use auto-progress for psm2 provider? NO! It's unclear to me what
+    // falls under the responsibility of the background thread (e.g., copying
+    // data in eager receive mode doesn't seem to be covered, which is one of
+    // the reasons why I wanted to try auto-progress mode). Using auto progress
+    // mode is piling even more opaque shit on the (already) fucked-up psm2
+    // provider.
+//    hints->domain_attr->data_progress = FI_PROGRESS_AUTO;
+    hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
     // Generate a CQE for an outgoing packet as soon as it's put on the wire.
     hints->tx_attr->op_flags = FI_INJECT_COMPLETE;
 
@@ -192,8 +222,6 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     } else {
         info->tx_attr->comp_order = FI_ORDER_NONE;
     }
-    info->tx_attr->iov_limit = 2;
-    info->rx_attr->iov_limit = 1;
     datagramPrefixSize = downCast<uint32_t>(info->ep_attr->msg_prefix_size);
     if (mustIncludeLocalAddress) {
         // Place the source address info right after the prefix buffer space.
@@ -213,10 +241,6 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
                     (1024.0*1024.0*1024.0));
         }
         mtu = downCast<uint32_t>(info->nic->link_attr->mtu);
-    } else {
-        mtu = 4096;
-        LOG(WARNING, "fi_getinfo returns no NIC information: setting MTU to %u",
-                mtu);
     }
     queueEstimator.setBandwidth(1000*bandwidthGbps);
     maxTransmitQueueSize = (uint32_t) (static_cast<double>(bandwidthGbps)
@@ -243,6 +267,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     av_attr.type = FI_AV_MAP;
     FI_CHK_CALL(fi_av_open, domain, &av_attr, &addressVector, NULL);
     FI_CHK_CALL(fi_ep_bind, endpoint, &addressVector->fid, 0);
+    addressMap.construct(addressVector);
 
     // Create completion queues for receive and transmit. Note: a completion
     // queue isn't absolutely necessary for the transmit queue; a completion
@@ -303,7 +328,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
             memcpy(srcAddr, localAddress.data(), addrlen);
         }
     }
-    refillReceiver();
+    refillReceiver(true);
 }
 
 /**
@@ -311,7 +336,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
  */
 OfiUdDriver::~OfiUdDriver()
 {
-    if (zeroCopyRegion) {
+    if (fi_mr_desc(zeroCopyRegion)) {
         fi_close(&zeroCopyRegion->fid);
     }
     fi_close(&rxcq->fid);
@@ -417,11 +442,18 @@ OfiUdDriver::reapTransmitBuffers()
 #define MAX_TO_RETRIEVE 8
     fi_cq_entry cqes[MAX_TO_RETRIEVE];
     int numCqes = downCast<int>(fi_cq_read(txcq, cqes, MAX_TO_RETRIEVE));
-    if (numCqes < 0) {
-        // fi_cq_read will fail if the error queue is not empty (the failed
-        // send requests can be retrieved with fi_cq_readerr); however, we
-        // do not attempt to recover from such error.
-        DIE("fi_cq_read failed: %s", fi_strerror(-numCqes));
+    if (numCqes <= 0) {
+        if (unlikely(numCqes != -FI_EAGAIN)) {
+            if (numCqes == -FI_EAVAIL) {
+                fi_cq_err_entry err = {};
+                FI_CHK_CALL(fi_cq_readerr, txcq, &err, 0);
+                DIE("fi_cq_read failed, fi_cq_readerr: %s", fi_cq_strerror(
+                        txcq, err.prov_errno, err.err_data, NULL, 0));
+            } else {
+                DIE("fi_cq_read failed: %s", fi_strerror(-numCqes));
+            }
+        }
+        return;
     } else if (numCqes > 0) {
         timeTrace("ofiud: polling txcq returned %d CQEs", numCqes);
     }
@@ -480,8 +512,10 @@ OfiUdDriver::registerMemory(void* base, size_t bytes)
     } else {
         LOG(NOTICE, "Provider %s requires no memory registration",
                 info->fabric_attr->prov_name);
-        // FIXME: perhaps we should set zeroCopyStart to 0 and zeroCopyEnd to
-        // ~0lu after we figure out why fi_sendv is so damn slow with psm2
+        static fid_mr NO_MEMORY_REGION = {};
+        zeroCopyRegion = &NO_MEMORY_REGION;
+        zeroCopyStart = 0;
+        zeroCopyEnd = reinterpret_cast<char*>(~0lu);
     }
 }
 
@@ -517,6 +551,7 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
                         int priority,
                         TransmitQueueState* txQueueState)
 {
+    timeTrace("ofiud: sendPacket invoked");
     uint32_t payloadSize = payload ? payload->size() : 0;
     uint32_t totalLength = headerLen + payloadSize;
     assert(totalLength <= getMaxPacketSize());
@@ -546,7 +581,7 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
         const char* currentChunk =
                 reinterpret_cast<const char*>(payload->getData());
         bool isLastChunk = payload->getLength() == payload->size();
-        if (isLastChunk && (payload->getLength() >= 500)
+        if (isLastChunk && (payload->getLength() >= 4000)
                 && (currentChunk >= zeroCopyStart)
                 && (currentChunk + payload->getLength() < zeroCopyEnd)) {
             io_vec[1].iov_base = const_cast<char*>(currentChunk);
@@ -558,6 +593,10 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
         } else {
             memcpy(dst, currentChunk, payload->getLength());
             dst += payload->getLength();
+            if (isLastChunk) {
+                timeTrace("ofiud: 0-copy TX for last chunk not applicable; "
+                        "copied %u bytes", payload->getLength());
+            }
         }
         payload->next();
     }
@@ -593,12 +632,19 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 
     timeTrace("ofiud: sent packet with %u bytes, %u free buffers",
             bd->packetLength, txPool->freeBuffers.size());
-    queueEstimator.packetQueued(bd->packetLength, lastTransmitTime,
-            txQueueState);
+    // FIXME: ignore small (how small?) packets so in BasicTransport we can
+    // log more meaningful "tx queue idle XXX cyc" message
+    if (unlikely(bd->packetLength > 128)) {
+        queueEstimator.packetQueued(bd->packetLength, lastTransmitTime,
+                txQueueState);
+    }
     PerfStats::threadStats.networkOutputBytes += bd->packetLength;
     PerfStats::threadStats.networkOutputPackets++;
 }
 
+// FIXME: I think psm2 is such a shitty library that batching with FI_MORE makes
+// no difference.
+#if 0
 /*
  * See docs in the ``Driver'' class.
  */
@@ -698,6 +744,7 @@ OfiUdDriver::sendPackets(const Driver::Address* addr,
     PerfStats::threadStats.networkOutputBytes += bytesSent;
     PerfStats::threadStats.networkOutputPackets += numPackets;
 }
+#endif
 
 /*
  * See docs in the ``Driver'' class.
@@ -709,22 +756,35 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
     static const uint32_t MAX_COMPLETIONS = 16;
     fi_cq_msg_entry wc[MAX_COMPLETIONS];
     uint32_t maxToReceive = std::min(maxPackets, MAX_COMPLETIONS);
+    uint64_t pollCqTime = timeTrace("ofiud: polled rxcq");
     int numPackets = downCast<int>(fi_cq_read(rxcq, wc, maxToReceive));
     if (numPackets <= 0) {
         if (unlikely(numPackets != -FI_EAGAIN)) {
             if (numPackets == -FI_EAVAIL) {
                 fi_cq_err_entry err = {};
                 FI_CHK_CALL(fi_cq_readerr, rxcq, &err, 0);
-                DIE("fi_cq_readfrom failed, fi_cq_readerr: %s", fi_cq_strerror(
+                DIE("fi_cq_read failed, fi_cq_readerr: %s", fi_cq_strerror(
                         rxcq, err.prov_errno, err.err_data, NULL, 0));
             } else {
-                DIE("fi_cq_readfrom failed: %s", fi_strerror(-numPackets));
+                DIE("fi_cq_read failed: %s", fi_strerror(-numPackets));
             }
         }
+#if TIME_TRACE
+        // FIXME: remove the following timetrace?
+        uint64_t now = Cycles::rdtsc();
+        if (now - pollCqTime > Cycles::fromMicroseconds(1)) {
+            timeTrace("ofiud: polling rxcq takes too long; RNDV cost?");
+        }
+#endif
+        TimeTrace::cancelRecord(pollCqTime);
         return;
     }
+#if TIME_TRACE
+    lastReceiveTime = timeTrace("ofiud: received %d packets", numPackets);
+    TimeTrace::cancelRecord(pollCqTime);
+#else
     lastReceiveTime = Cycles::rdtsc();
-    timeTrace("ofiud: received %d packets", numPackets);
+#endif
 
     rxBuffersInNic -= downCast<uint32_t>(numPackets);
     if (unlikely(rxBuffersInNic == 0)) {
@@ -744,14 +804,8 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
         fi_addr_t srcAddr;
         if (mustIncludeLocalAddress) {
             char* srcAddrBuf = bd->buffer + datagramPrefixSize - addressLength;
-            RawAddress key(srcAddrBuf, addressLength);
-            AddressMap::iterator it = addressMap.find(key);
-            if (it == addressMap.end()) {
-                fi_av_insert(addressVector, srcAddrBuf, 1, &srcAddr, 0, NULL);
-                addressMap[key] = srcAddr;
-            } else {
-                srcAddr = it->second;
-            }
+            RawAddress rawAddress(srcAddrBuf, addressLength);
+            srcAddr = addressMap->insertIfAbsent(&rawAddress);
         }
 
         bd->packetLength = downCast<uint32_t>(incoming->len);
@@ -784,34 +838,39 @@ OfiUdDriver::getBandwidth()
 // See docs in Driver class.
 Driver::Address*
 OfiUdDriver::newAddress(const ServiceLocator* serviceLocator) {
-    fi_addr_t fi_addr= {};
+    fi_addr_t fi_addr;
 #if SL_USE_FI_ADDR_STR
     const char* addr = serviceLocator->getOption<const char*>("addr");
-//    RAMCLOUD_LOG(NOTICE, "remote addr = %s", addr);
+//    LOG(NOTICE, "remote addr = %s", addr);
+// TODO: how to avoid duplicate insert?
     fi_av_insertsvc(addressVector, addr, NULL, &fi_addr, 0, NULL);
 #else
     std::stringstream sstream(serviceLocator->getOption("addr"));
     std::string byteStr;
-    std::vector<uint8_t> rawAddress;
+    std::vector<uint8_t> bytes;
     while (std::getline(sstream, byteStr, '.')) {
-        rawAddress.push_back(downCast<uint8_t>(stoul(byteStr)));
+        bytes.push_back(downCast<uint8_t>(stoul(byteStr)));
     }
-    fi_av_insert(addressVector, rawAddress.data(), 1, &fi_addr, 0, NULL);
+    RawAddress rawAddress(bytes.data(), addressLength);
+    fi_addr = addressMap->insertIfAbsent(&rawAddress);
 #endif
-    RAMCLOUD_LOG(NOTICE, "OfiUdDriver AV insert, sl %s, fi_addr %lu",
-            serviceLocator->getOriginalString().c_str(), fi_addr);
     return new Address(fi_addr);
 }
 
 
 /**
  * Fill up the NIC's receive queue with more packet buffers.
+ *
+ * \param refillAll
+ *     Post as many free receive buffers to the NIC as possible when this
+ *     variable is true; otherwise, only post a small batch of buffers at
+ *     a time.
  */
 void
-OfiUdDriver::refillReceiver()
+OfiUdDriver::refillReceiver(bool refillAll)
 {
     // Always refill in batch to amortize the cost of posting receive buffers.
-    static const uint32_t REFILL_BATCH = 16;
+    static const uint32_t REFILL_BATCH = 8;
     uint32_t maxRefill = std::min(MAX_RX_QUEUE_DEPTH - rxBuffersInNic,
             downCast<uint32_t>(rxPool->freeBuffers.size()));
     if (maxRefill < REFILL_BATCH) {
@@ -822,7 +881,8 @@ OfiUdDriver::refillReceiver()
     // receive queue. All post operations except the last one are flagged as
     // FI_MORE to indicate that additional buffers will be posted immediately
     // after the current call returns.
-    for (int i = 0; i < REFILL_BATCH; i++) {
+    uint32_t refillCount = refillAll ? maxRefill : REFILL_BATCH;
+    for (int i = 0; i < refillCount; i++) {
         BufferDescriptor* bd = rxPool->freeBuffers.back();
         rxPool->freeBuffers.pop_back();
 
@@ -839,11 +899,11 @@ OfiUdDriver::refillReceiver()
             .context = &bd->context,
             .data = 0
         };
-        uint64_t flags = (i < REFILL_BATCH) ? FI_MORE : 0;
+        uint64_t flags = (i < refillCount) ? FI_MORE : 0;
         FI_CHK_CALL(fi_recvmsg, endpoint, &msg, flags);
     }
-    rxBuffersInNic += REFILL_BATCH;
-    timeTrace("ofiud: receive queue refilled");
+    rxBuffersInNic += refillCount;
+    timeTrace("ofiud: RX queue refilled, rxBuffersInNic %u", rxBuffersInNic);
 
     // Generate log messages every time buffer usage reaches a significant new
     // high. Running out of buffers is a bad thing, so we want warnings in the
@@ -864,6 +924,29 @@ OfiUdDriver::refillReceiver()
 void
 OfiUdDriver::uncorkTransmitQueue()
 {
+}
+
+/**
+ * Insert a raw address into the libfabric address vector if it hasn't been
+ * inserted before.
+ *
+ * \param rawAddress
+ *      Raw address to insert.
+ * \return
+ *      Address in fi_addr_t format.
+ */
+fi_addr_t
+OfiUdDriver::AddressMap::insertIfAbsent(RawAddress* rawAddress)
+{
+    fi_addr_t result;
+    auto it = map.find(*rawAddress);
+    if (it == map.end()) {
+        fi_av_insert(addressVector, rawAddress->raw, 1, &result, 0, NULL);
+        map[*rawAddress] = result;
+    } else {
+        result = it->second;
+    }
+    return result;
 }
 
 /**

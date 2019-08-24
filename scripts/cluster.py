@@ -664,6 +664,15 @@ def run(
 
         numactl_commands = {}
         if num_cpus_per_server is not None:
+            # Hack: request one more node for libfabric's background
+            # auto-progress thread. For example, when clusterperf.py specifies
+            # "--cpusPerServer 8", we actually use numactl to allocate 9 cpus.
+            # Arachne will only see "--minNumCores 8 --maxNumCores 8" and we
+            # pin the 8 Arachne kernel threads in ServerMain.cc. The one extra
+            # spare core will be used for libfabric progress thread, which is
+            # pinned by environment variable "FI_PSM2_PROG_AFFINITY".
+            # num_cpus_per_server += 1
+
             # Compute the affined cpu list of each server. This is needed to
             # mutiplex multiple servers on one physical machine while avoiding
             # interference. Arachne CoreArbiter is a better solution but we

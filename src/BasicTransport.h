@@ -61,9 +61,10 @@ class BasicTransport : public Transport {
         driver->registerMemory(base, bytes);
     }
     template<typename... Args>
-    inline void timeTrace(const char* format, Args... args);
+    inline uint64_t timeTrace(const char* format, Args... args);
     template<typename... Args>
     inline void timetrace_shuffle(const char* format, Args... args);
+    inline void cancelRecord(uint64_t lastRecordTime);
 
   PRIVATE:
     /// As of 08/17, std::unordered_map is significantly slower than
