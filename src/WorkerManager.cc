@@ -137,8 +137,8 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
             Service::prepareErrorResponse(&rpc->replyPayload,
                     STATUS_MESSAGE_TOO_SHORT);
         } else {
-            LOG(WARNING, "Incoming RPC contained unknown opcode %d",
-                    header->opcode);
+            LOG(WARNING, "Incoming RPC contained unknown opcode %d, request "
+                    "size %u", header->opcode, rpc->requestPayload.size());
             Service::prepareErrorResponse(&rpc->replyPayload,
                     STATUS_UNIMPLEMENTED_REQUEST);
         }

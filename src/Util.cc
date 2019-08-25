@@ -18,6 +18,7 @@
 #include "Util.h"
 #include "Cycles.h"
 #include "Logger.h"
+#include "PerfStats.h"
 
 namespace RAMCloud {
 namespace Util {
@@ -288,6 +289,34 @@ int getHyperTwin(int coreId) {
         return cpu1;
 }
 
+void arachnePinCoreManually() {
+    PerfStats::registerStats(&PerfStats::threadStats);
+
+    // FIXME: this is really a hack that only works when
+    // minNumCores == maxNumCores; a better solution would be to implement
+    // a non-root mode in Arachne?
+    // TODO: expose Arachne::useCoreArbiter like min/maxNumCores and remove
+    // the #if flag.
+#define ENABLE_CORE_ARBITER 0
+#if !ENABLE_CORE_ARBITER
+    // Pin the kernel thread to the CPU it represents. The CPUs allocated
+    // to us is set by numactl from command line, not the core arbiter.
+    static std::atomic<uint32_t> numCoresInited(0);
+    uint32_t coreIndex = numCoresInited.fetch_add(1);
+    std::vector<int> affinedCpus = getAffinedCpus();
+    if (coreIndex < affinedCpus.size()) {
+        pinThreadToCore(affinedCpus[coreIndex]);
+        RAMCLOUD_LOG(NOTICE, "Arachne::initCore: new kthread pinned to cpu %d",
+                affinedCpus[coreIndex]);
+    } else {
+        RAMCLOUD_DIE("Not enough cores to pin the thread: CPU affinity %s",
+                getCpuAffinityString().c_str());
+    }
+
+    // Occupy the core by adjusting our thread priority to high.
+//    setThreadPriorityHigh();
+#endif
+}
 
 } // namespace Util
 } // namespace RAMCloud

@@ -40,6 +40,7 @@ bool timespecLessEqual(const struct timespec& t1, const struct timespec& t2);
 struct timespec timespecAdd(const struct timespec& t1,
         const struct timespec& t2);
 int getHyperTwin(int coreId);
+void arachnePinCoreManually();
 
 extern uint64_t mockPmcValue;
 

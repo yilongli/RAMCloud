@@ -260,7 +260,7 @@ realMain(int argc, char *argv[])
         }
         LOG(NOTICE, "Command line: %s", args.c_str());
         LOG(NOTICE, "Server process id: %u on core %d",
-            getpid(), sched_getcpu());
+            getpid(), Arachne::core.id);
 
         Context context(true, &optionParser.options);
 
@@ -376,34 +376,7 @@ main(int argc, const char *argv[]) {
 
     Arachne::minNumCores = 3;
     Arachne::maxNumCores = 8;
-    Arachne::initCore = [] () {
-        PerfStats::registerStats(&PerfStats::threadStats);
-
-        // FIXME: this is really a hack that only works when
-        // minNumCores == maxNumCores; a better solution would be to implement
-        // a non-root mode in Arachne?
-        // TODO: expose Arachne::useCoreArbiter like min/maxNumCores and remove
-        // the #if flag.
-#define ENABLE_CORE_ARBITER 0
-#if !ENABLE_CORE_ARBITER
-        // Pin the kernel thread to the CPU it represents. The CPUs allocated
-        // to us is set by numactl from command line, not the core arbiter.
-        static std::atomic<uint32_t> numCoresInited(0);
-        uint32_t coreIndex = numCoresInited.fetch_add(1);
-        std::vector<int> affinedCpus = Util::getAffinedCpus();
-        if (coreIndex < affinedCpus.size()) {
-            Util::pinThreadToCore(affinedCpus[coreIndex]);
-            LOG(NOTICE, "Arachne::initCore: new kthread pinned to cpu %d",
-                    affinedCpus[coreIndex]);
-        } else {
-            RAMCLOUD_DIE("Not enough cores to pin the thread: CPU affinity %s",
-                    Util::getCpuAffinityString().c_str());
-        }
-
-        // Occupy the core by adjusting our thread priority to high.
-//        Util::setThreadPriorityHigh();
-#endif
-    };
+    Arachne::initCore = Util::arachnePinCoreManually;
     Arachne::init(&argc, argv);
     Arachne::createThreadWithClass(
             Arachne::DefaultCorePolicy::EXCLUSIVE,

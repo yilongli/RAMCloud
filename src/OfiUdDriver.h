@@ -33,6 +33,7 @@
 #pragma GCC diagnostic warning "-Wconversion"
 #pragma GCC diagnostic warning "-Weffc++"
 
+#include "Arachne/Arachne.h"
 #include "Common.h"
 #include "Dispatch.h"
 #include "Driver.h"
@@ -233,6 +234,7 @@ class OfiUdDriver : public Driver {
 
     BufferDescriptor* getTransmitBuffer();
     ServiceLocator readDriverConfigFile();
+    void receivePacketsImpl();
     void reapTransmitBuffers();
     void refillReceiver(bool refillAll = false);
 
@@ -288,7 +290,15 @@ class OfiUdDriver : public Driver {
     /// Identifier of the connection-less endpoint used to send and receive
     /// data packets. Not owned by this class. See also:
     ///     https://github.com/ofiwg/ofi-guide/blob/master/OFIGuide.md#active
-    fid_ep* endpoint;
+    /// Note: this is actually a scalable endpoint that may have multiple TX
+    /// and/or RX queues. See also:
+    ///     https://github.com/ofiwg/ofi-guide/blob/master/OFIGuide.md#scalable
+    /// TODO: rename back to endpoint?
+    fid_ep* scalableEp;
+//    fid_ep* endpoint;
+
+    fid_ep* transmitContext[2];
+    fid_ep* receiveContext[2];
 
     /// Identifier of the local addressing table that maps provider-specific
     /// addresses (i.e., those returned by fi_getname) to opaque libfabric
@@ -319,6 +329,17 @@ class OfiUdDriver : public Driver {
     /// FIFO queue which holds packets addressed to the local host. Only used
     /// in raw ethernet mode.
     std::deque<BufferDescriptor*> loopbackPkts;
+
+    Arachne::ThreadId receiverThread;
+    std::atomic_bool receiverThreadStop;
+
+    // TODO: mutual exclusive access to resources related to RX code path:
+    // inside receivePacketsImpl: rxPackets, rxcq, lastReceiveTime, rxBuffersInNic, addressMap
+    // inside refillReceiver: rxPool, rxBuffersInNic, rxBufferLogThreshold, receiveContext
+    SpinLock rxPacketsLock;
+
+    // TODO: packets received in receivePacketsImpl
+    std::deque<Received> rxPackets;
 
     /// Packet buffers used for receiving incoming packets.
     Tub<BufferPool> rxPool;

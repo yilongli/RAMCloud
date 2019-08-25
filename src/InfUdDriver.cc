@@ -804,14 +804,16 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
 #endif
 
     // Attempt to receive loopback packets first (only in raw ethernet mode).
+    uint64_t receiveTime;
     if (unlikely(!loopbackPkts.empty())) {
         assert(localMac.get());
+        receiveTime = Cycles::rdtsc();
         do {
             BufferDescriptor* bd = loopbackPkts.front();
             loopbackPkts.pop_front();
             receivedPackets->emplace_back(localMac.get(), this,
                     bd->packetLength - ETH_HEADER_SIZE,
-                    bd->buffer + ETH_HEADER_SIZE);
+                    bd->buffer + ETH_HEADER_SIZE, receiveTime);
             maxPackets--;
         } while (!loopbackPkts.empty() && (maxPackets > 0));
     }
@@ -827,7 +829,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
         }
         return;
     }
-    lastReceiveTime = Cycles::rdtsc();
+    receiveTime = Cycles::rdtsc();
     timeTrace("InfUdDriver received %d packets", numPackets);
 #if COLLECT_LOW_LEVEL_PERFSTATS
     uint64_t ibvPollCq = Cycles::rdtscp();
@@ -892,7 +894,7 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
             bd->macAddress.construct(ethHdr->srcAddress);
             receivedPackets->emplace_back(bd->macAddress.get(), this,
                     bd->packetLength - ETH_HEADER_SIZE,
-                    bd->buffer + ETH_HEADER_SIZE);
+                    bd->buffer + ETH_HEADER_SIZE, receiveTime);
         } else {
             ibv_ah* ah;
             auto it = infiniband->ahMap.find(incoming->slid);
@@ -908,7 +910,8 @@ InfUdDriver::receivePackets(uint32_t maxPackets,
             new(bd->buffer) Address(ah, incoming->src_qp);
             receivedPackets->emplace_back(
                     reinterpret_cast<Address*>(bd->buffer), this,
-                    bd->packetLength - GRH_SIZE, bd->buffer + GRH_SIZE);
+                    bd->packetLength - GRH_SIZE, bd->buffer + GRH_SIZE,
+                    receiveTime);
         }
         continue;
 

@@ -392,12 +392,20 @@ def run_test(
         # If there is no core arbiter running, we will use a fixed number of
         # cores for each master/coordinator and rely on the server to pin its
         # Arachne kernel threads spawned for the allocated cores.
+        cluster_args['num_cpus_per_server'] = options.num_cpus_per_server
         cluster_args['master_args'] = \
                 ' --minNumCores ' + str(options.num_cpus_per_server) + \
                 ' --maxNumCores ' + str(options.num_cpus_per_server) + \
                 ' --enableArbiter 0'
-        cluster_args['coordinator_args'] = ' --enableArbiter 0'
-        cluster_args['num_cpus_per_server'] = options.num_cpus_per_server
+
+        cluster_args['coordinator_args'] = \
+                ' --minNumCores ' + str(options.num_cpus_per_server) + \
+                ' --maxNumCores ' + str(options.num_cpus_per_server) + \
+                ' --enableArbiter 0'
+
+        client_args['--minNumCores'] = str(options.num_cpus_per_server)
+        client_args['--maxNumCores'] = str(options.num_cpus_per_server)
+        client_args['--enableArbiter'] = '0'
 
     test.function(test.name, options, cluster_args, client_args)
 

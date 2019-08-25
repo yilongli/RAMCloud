@@ -26,6 +26,7 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_errno.h>
 
+#include "Arachne/DefaultCorePolicy.h"
 #include "Common.h"
 #include "Cycles.h"
 #include "BitOps.h"
@@ -112,7 +113,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , fabric()
     , info()
     , domain()
-    , endpoint()
+    , scalableEp()
+//    , endpoint()
     , addressVector()
     , rxcq()
     , txcq()
@@ -120,6 +122,13 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , addressMap()
 //    , corkedPackets()
     , loopbackPkts()
+
+    // FIXME: newly added fields for RX-side scaling; not yet properly ordered
+    , receiverThread()
+    , receiverThreadStop()
+    , rxPacketsLock()
+    , rxPackets()
+
     , rxPool()
     , rxBuffersInNic(0)
     , rxBufferLogThreshold(0)
@@ -176,6 +185,11 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // Make it clear that we need the endpoint for connectionless, unreliable
     // datagram (not a reliable, connection-oriented endpoint like FI_EP_MSG).
     hints->ep_attr->type = FI_EP_DGRAM;
+    // TODO: scalable EPs; for now, only uses one Tx queue as SDMA + large MTU
+    // is enough to keep up with 100Gbps outbound BW; uses >= 2 RX queues to
+    // allow parallelizing data copying in eager RX mode.
+    hints->ep_attr->tx_ctx_cnt = 1;
+    hints->ep_attr->rx_ctx_cnt = 2;
     // We can support at least three operation modes: FI_CONTEXT, FI_MSG_PREFIX,
     // and FI_RX_CQ_DATA. The operation modes required by each provider can be
     // found at:
@@ -260,13 +274,13 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // vector and the completion queues must be bound to the endpoint.
     FI_CHK_CALL(fi_fabric, info->fabric_attr, &fabric, NULL);
     FI_CHK_CALL(fi_domain, fabric, info, &domain, NULL);
-    FI_CHK_CALL(fi_endpoint, domain, info, &endpoint, NULL);
+    FI_CHK_CALL(fi_scalable_ep, domain, info, &scalableEp, NULL);
 
     // Create the address vector and bind it to the endpoint.
     fi_av_attr av_attr = {};
     av_attr.type = FI_AV_MAP;
     FI_CHK_CALL(fi_av_open, domain, &av_attr, &addressVector, NULL);
-    FI_CHK_CALL(fi_ep_bind, endpoint, &addressVector->fid, 0);
+    FI_CHK_CALL(fi_scalable_ep_bind, scalableEp, &addressVector->fid, 0);
     addressMap.construct(addressVector);
 
     // Create completion queues for receive and transmit. Note: a completion
@@ -276,7 +290,10 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     tx_cq_attr.size = MAX_TX_QUEUE_DEPTH;
     tx_cq_attr.format = FI_CQ_FORMAT_CONTEXT;
     FI_CHK_CALL(fi_cq_open, domain, &tx_cq_attr, &txcq, NULL);
-    FI_CHK_CALL(fi_ep_bind, endpoint, &txcq->fid, FI_TRANSMIT);
+    for (int i = 0; i < int(info->ep_attr->tx_ctx_cnt); i++) {
+        fi_tx_context(scalableEp, i, info->tx_attr, &transmitContext[i], NULL);
+    }
+    FI_CHK_CALL(fi_ep_bind, transmitContext[0], &txcq->fid, FI_TRANSMIT);
     // FIXME: deal with selective notification later!
 //    FI_CHK_CALL(fi_ep_bind, endpoint, &txcq->fid,
 //            FI_TRANSMIT | FI_SELECTIVE_COMPLETION);
@@ -284,15 +301,28 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     fi_cq_attr rx_cq_attr = {};
     rx_cq_attr.size = MAX_RX_QUEUE_DEPTH;
     rx_cq_attr.format = FI_CQ_FORMAT_MSG;
+    for (int i = 0; i < int(info->ep_attr->rx_ctx_cnt); i++) {
+        fi_rx_context(scalableEp, i, info->rx_attr, &receiveContext[i], NULL);
+    }
     FI_CHK_CALL(fi_cq_open, domain, &rx_cq_attr, &rxcq, NULL);
-    FI_CHK_CALL(fi_ep_bind, endpoint, &rxcq->fid, FI_RECV);
+    FI_CHK_CALL(fi_ep_bind, receiveContext[1], &rxcq->fid, FI_RECV);
 
     // Activate the endpoint and update locatorString with the dynamic address.
-    FI_CHK_CALL(fi_enable, endpoint);
+    FI_CHK_CALL(fi_enable, scalableEp);
     size_t addrlen = 64;
     std::vector<uint8_t> localAddress;
     localAddress.resize(addrlen);
-    FI_CHK_CALL(fi_getname, (fid_t)endpoint, localAddress.data(), &addrlen);
+    // FIXME: which should I use? scalableEp or receiveContext[0]? Or even
+    // pack all rx ctxs in the service locator???
+#if 1
+    FI_CHK_CALL(fi_getname, (fid_t)scalableEp, localAddress.data(), &addrlen);
+    LOG(NOTICE, "scalableEp: %u.%u.%u.%u", localAddress[0], localAddress[1], localAddress[2], localAddress[3]);
+    FI_CHK_CALL(fi_getname, (fid_t)receiveContext[0], localAddress.data(), &addrlen);
+    LOG(NOTICE, "rxCtx[0]: %u.%u.%u.%u", localAddress[0], localAddress[1], localAddress[2], localAddress[3]);
+    FI_CHK_CALL(fi_getname, (fid_t)receiveContext[1], localAddress.data(), &addrlen);
+    LOG(NOTICE, "rxCtx[1]: %u.%u.%u.%u", localAddress[0], localAddress[1], localAddress[2], localAddress[3]);
+#endif
+    FI_CHK_CALL(fi_getname, (fid_t)receiveContext[1], localAddress.data(), &addrlen);
     if (addrlen != addressLength) {
         DIE("Unexpected address length %u (expecting %u)", addrlen,
                 addressLength);
@@ -328,7 +358,20 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
             memcpy(srcAddr, localAddress.data(), addrlen);
         }
     }
-    refillReceiver(true);
+
+    // Spawn receive threads for polling RX queues (and copying data into RX
+    // buffers if 0-copy RX is not supported).
+    // FIXME: spawn multiple RX threads
+    auto receiverThreadMain = [this] () {
+        LOG(NOTICE, "OfiUdDriver: RX thread started on core %d",
+                Arachne::core.id);
+        refillReceiver(true);
+        while (!receiverThreadStop.load(std::memory_order_acquire)) {
+            receivePacketsImpl();
+            Arachne::yield();
+        }
+    };
+    receiverThread = Arachne::createThread(receiverThreadMain);
 }
 
 /**
@@ -336,16 +379,21 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
  */
 OfiUdDriver::~OfiUdDriver()
 {
-    if (fi_mr_desc(zeroCopyRegion)) {
-        fi_close(&zeroCopyRegion->fid);
-    }
-    fi_close(&rxcq->fid);
-    fi_close(&txcq->fid);
-    fi_close(&addressVector->fid);
-    fi_close(&endpoint->fid);
-    fi_close(&domain->fid);
-    fi_close(&fabric->fid);
-    fi_freeinfo(info);
+    // Wait for the receiver thread to stop.
+    receiverThreadStop = true;
+    Arachne::join(receiverThread);
+
+    // FIXME:
+//    if (fi_mr_desc(zeroCopyRegion)) {
+//        fi_close(&zeroCopyRegion->fid);
+//    }
+//    fi_close(&rxcq->fid);
+//    fi_close(&txcq->fid);
+//    fi_close(&addressVector->fid);
+//    fi_close(&endpoint->fid);
+//    fi_close(&domain->fid);
+//    fi_close(&fabric->fid);
+//    fi_freeinfo(info);
 
     size_t buffersInUse = TOTAL_RX_BUFFERS - rxPool->freeBuffers.size()
             - rxBuffersInNic;
@@ -525,18 +573,23 @@ OfiUdDriver::registerMemory(void* base, size_t bytes)
 void
 OfiUdDriver::release()
 {
-    while (!packetsToRelease.empty()) {
-        // Payload points to the first byte of the packet buffer after the
-        // datagram prefix buffer; from that, compute the address of its
-        // corresponding buffer descriptor.
-        char* payload = packetsToRelease.back();
-        packetsToRelease.pop_back();
-        payload -= datagramPrefixSize;
-        int index = downCast<int>((payload - rxPool->bufferMemory)
-                / rxPool->descriptors[0].length);
-        BufferDescriptor* bd = &rxPool->descriptors[index];
-        assert(payload == bd->buffer);
-        rxPool->freeBuffers.push_back(bd);
+    // Test if we can acquire the lock and return the packets to rxPool;
+    // don't block if the lock is currently held by another thread.
+    if (!packetsToRelease.empty() && rxPacketsLock.try_lock()) {
+        while (!packetsToRelease.empty()) {
+            // Payload points to the first byte of the packet buffer after the
+            // datagram prefix buffer; from that, compute the address of its
+            // corresponding buffer descriptor.
+            char* payload = packetsToRelease.back();
+            packetsToRelease.pop_back();
+            payload -= datagramPrefixSize;
+            int index = downCast<int>((payload - rxPool->bufferMemory)
+                    / rxPool->descriptors[0].length);
+            BufferDescriptor* bd = &rxPool->descriptors[index];
+            assert(payload == bd->buffer);
+            rxPool->freeBuffers.push_back(bd);
+        }
+        rxPacketsLock.unlock();
     }
 }
 
@@ -616,12 +669,12 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 
     int ret;
     if (bd->packetLength <= info->tx_attr->inject_size) {
-        ret = downCast<int>(fi_inject(endpoint, bd->buffer, bd->packetLength,
-                address->addr));
+        ret = downCast<int>(fi_inject(transmitContext[0], bd->buffer,
+                bd->packetLength, address->addr));
         txPool->freeBuffers.push_back(bd);
     } else {
-        ret = downCast<int>(fi_sendv(endpoint, io_vec, desc, iov_count,
-                address->addr, &bd->context));
+        ret = downCast<int>(fi_sendv(transmitContext[0], io_vec, desc,
+                iov_count, address->addr, &bd->context));
         if (txBuffersInNic) {
             txBuffersInNic->push_back(bd);
         }
@@ -746,18 +799,13 @@ OfiUdDriver::sendPackets(const Driver::Address* addr,
 }
 #endif
 
-/*
- * See docs in the ``Driver'' class.
- */
 void
-OfiUdDriver::receivePackets(uint32_t maxPackets,
-        std::vector<Received>* receivedPackets)
+OfiUdDriver::receivePacketsImpl()
 {
     static const uint32_t MAX_COMPLETIONS = 16;
     fi_cq_msg_entry wc[MAX_COMPLETIONS];
-    uint32_t maxToReceive = std::min(maxPackets, MAX_COMPLETIONS);
     uint64_t pollCqTime = timeTrace("ofiud: polled rxcq");
-    int numPackets = downCast<int>(fi_cq_read(rxcq, wc, maxToReceive));
+    int numPackets = downCast<int>(fi_cq_read(rxcq, wc, MAX_COMPLETIONS));
     if (numPackets <= 0) {
         if (unlikely(numPackets != -FI_EAGAIN)) {
             if (numPackets == -FI_EAVAIL) {
@@ -769,21 +817,14 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
                 DIE("fi_cq_read failed: %s", fi_strerror(-numPackets));
             }
         }
-#if TIME_TRACE
-        // FIXME: remove the following timetrace?
-        uint64_t now = Cycles::rdtsc();
-        if (now - pollCqTime > Cycles::fromMicroseconds(1)) {
-            timeTrace("ofiud: polling rxcq takes too long; RNDV cost?");
-        }
-#endif
         TimeTrace::cancelRecord(pollCqTime);
         return;
     }
 #if TIME_TRACE
-    lastReceiveTime = timeTrace("ofiud: received %d packets", numPackets);
+    uint64_t receiveTime = timeTrace("ofiud: received %d packets", numPackets);
     TimeTrace::cancelRecord(pollCqTime);
 #else
-    lastReceiveTime = Cycles::rdtsc();
+    uint64_t receiveTime = Cycles::rdtsc();
 #endif
 
     rxBuffersInNic -= downCast<uint32_t>(numPackets);
@@ -791,6 +832,10 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
         RAMCLOUD_CLOG(WARNING, "OfiUdDriver: receiver temporarily ran "
                 "out of packet buffers; could result in dropped packets");
     }
+
+    // TODO: explain why we acquire the lock here: need to cover refillReceiver
+    // which modifies rxPool.
+    SpinLock::Guard _(rxPacketsLock);
 
     // Give the RX queue a chance to replenish.
     refillReceiver();
@@ -810,13 +855,29 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
 
         bd->packetLength = downCast<uint32_t>(incoming->len);
         bd->sourceAddress.construct(srcAddr);
-        receivedPackets->emplace_back(bd->sourceAddress.get(), this,
+        rxPackets.emplace_back(bd->sourceAddress.get(), this,
                 bd->packetLength - datagramPrefixSize,
-                bd->buffer + datagramPrefixSize);
+                bd->buffer + datagramPrefixSize, receiveTime);
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
     }
     timeTrace("ofiud: receivePackets done");
+}
+
+/*
+ * See docs in the ``Driver'' class.
+ */
+void
+OfiUdDriver::receivePackets(uint32_t maxPackets,
+        std::vector<Received>* receivedPackets)
+{
+    if (rxPacketsLock.try_lock()) {
+        while (maxPackets-- && !rxPackets.empty()) {
+            receivedPackets->emplace_back(std::move(rxPackets.front()));
+            rxPackets.pop_front();
+        }
+        rxPacketsLock.unlock();
+    }
 }
 
 /**
@@ -852,11 +913,11 @@ OfiUdDriver::newAddress(const ServiceLocator* serviceLocator) {
         bytes.push_back(downCast<uint8_t>(stoul(byteStr)));
     }
     RawAddress rawAddress(bytes.data(), addressLength);
+    SpinLock::Guard _(rxPacketsLock);
     fi_addr = addressMap->insertIfAbsent(&rawAddress);
 #endif
     return new Address(fi_addr);
 }
-
 
 /**
  * Fill up the NIC's receive queue with more packet buffers.
@@ -900,7 +961,7 @@ OfiUdDriver::refillReceiver(bool refillAll)
             .data = 0
         };
         uint64_t flags = (i < refillCount) ? FI_MORE : 0;
-        FI_CHK_CALL(fi_recvmsg, endpoint, &msg, flags);
+        FI_CHK_CALL(fi_recvmsg, receiveContext[1], &msg, flags);
     }
     rxBuffersInNic += refillCount;
     timeTrace("ofiud: RX queue refilled, rxBuffersInNic %u", rxBuffersInNic);

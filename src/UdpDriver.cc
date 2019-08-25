@@ -183,11 +183,12 @@ UdpDriver::receivePackets(uint32_t maxPackets,
         limit = available;
     }
 
+    uint64_t receiveTime = Cycles::rdtsc();
     for (int i = batch->packetsRemoved; i < limit; i++) {
         struct mmsghdr* header = &batch->messageHeaders[i];
         PacketBuf* buffer = batch->buffers[i];
         receivedPackets->emplace_back(buffer->sender.get(), this,
-                header->msg_len, buffer->payload);
+                header->msg_len, buffer->payload, receiveTime);
         batch->buffers[i] = NULL;
     }
     if (limit < available) {

@@ -48,8 +48,12 @@
 #include <unordered_set>
 namespace po = boost::program_options;
 
+#include "Arachne/Arachne.h"
+#include "Arachne/DefaultCorePolicy.h"
+
 #include "btreeRamCloud/Btree.h"
 #include "ClientLeaseAgent.h"
+#include "FileLogger.h"
 #include "IndexLookup.h"
 #include "MilliSortClient.h"
 #include "ObjectPool.h"
@@ -2966,12 +2970,6 @@ doMultiReadColocation(
 void
 echo_basic()
 {
-    // FIXME: temp workaround for the fact that CPerf hasn't been arachnified???
-    std::vector<int> affinedCpus = Util::getAffinedCpus();
-    Util::pinThreadToCore(affinedCpus[0]);
-    LOG(WARNING, "Pinned client thread to first available core, affinity %s",
-            Util::getCpuAffinityString().c_str());
-
 #if !HOMA_BENCHMARK
     LOG(WARNING, "To achieve best performance, compile ClusterPerf "
             "and RAMCloud with -DHOMA_BENCHMARK");
@@ -7801,7 +7799,7 @@ TestInfo tests[] = {
 };
 
 int
-main(int argc, char *argv[])
+realMain(int argc, char *argv[])
 try
 {
     Logger::installCrashBacktraceHandlers();
@@ -7940,11 +7938,31 @@ try
         cluster->serverControlAll(WireFormat::LOG_CACHE_TRACE);
     }
     TimeTrace::printToLog();
+
+    // Shutdown Arachne so that the main application thread blocking on
+    // Arachne::waitForTermination can return.
+    Arachne::shutDown();
 }
 catch (std::exception& e) {
     RAMCLOUD_LOG(ERROR, "%s", e.what());
     Logger::get().sync();
     exit(1);
+}
+
+int
+main(int argc, const char *argv[]) {
+    FileLogger arachneLogger(NOTICE, "ARACHNE: ");
+    Arachne::Logger::setLogLevel(Arachne::SILENT);
+    Arachne::setErrorStream(arachneLogger.getFile());
+
+    Arachne::minNumCores = 2;
+    Arachne::maxNumCores = 4;
+    Arachne::initCore = Util::arachnePinCoreManually;
+    Arachne::init(&argc, argv);
+    Arachne::createThreadWithClass(
+            Arachne::DefaultCorePolicy::EXCLUSIVE,
+            &realMain, argc, const_cast<char**>(argv));
+    Arachne::waitForTermination();
 }
 
 #if __GNUC__ && (__GNUC__ >= 7)

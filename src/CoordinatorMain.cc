@@ -30,7 +30,7 @@
 #include "Arachne/CorePolicy.h"
 #include "Arachne/DefaultCorePolicy.h"
 #include "FileLogger.h"
-#include "PerfUtils/Util.h"
+#include "Util.h"
 
 /**
  * \file
@@ -174,14 +174,11 @@ main(int argc, const char *argv[]) {
 
     Arachne::minNumCores = 2;
     Arachne::maxNumCores = 4;
-    Arachne::initCore = [] () {
-        PerfStats::registerStats(&PerfStats::threadStats);
-    };
+    Arachne::initCore = Util::arachnePinCoreManually;
     Arachne::init(&argc, argv);
     // Invoke realMain outside of Arachne for now so we can defer handling of
     // the fact that the dispatch thread does not yield or terminate until we
     // are ready to do that experiment.
-    PerfUtils::Util::pinAvailableCore();
     Arachne::createThreadWithClass(
             Arachne::DefaultCorePolicy::EXCLUSIVE,
             &realMain, argc, const_cast<char**>(argv));

@@ -939,7 +939,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                 Driver::PayloadChunk::appendToBuffer(clientRpc->response,
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
-                clientRpc->notifier->receiveTime = driver->getLastReceiveTime();
+                clientRpc->notifier->receiveTime = received->timestamp;
                 clientRpc->notifier->completed();
                 deleteClientRpc(clientRpc);
                 return;
@@ -1226,7 +1226,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                         payload + sizeof32(AllDataHeader),
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
-                serverRpc->receiveTime = driver->getLastReceiveTime();
+                serverRpc->receiveTime = received->timestamp;
 
                 if (serverRpc->getOpcode() == WireFormat::SHUFFLE_PULL) {
                        timetrace_shuffle("shuffle-server: transport received request");

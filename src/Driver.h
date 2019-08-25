@@ -116,11 +116,12 @@ class Driver {
     class Received {
       public:
         Received(const Address* sender, Driver *driver, uint32_t len,
-                char *payload)
+                char *payload, uint64_t timestamp)
             : sender(sender)
             , driver(driver)
             , len(len)
             , payload(payload)
+            , timestamp(timestamp)
         {}
 
         // Move constructor (needed for using in std::vectors)
@@ -129,6 +130,7 @@ class Driver {
             , driver(other.driver)
             , len(other.len)
             , payload(other.payload)
+            , timestamp(other.timestamp)
         {
             other.len = 0;
             other.payload = NULL;
@@ -176,6 +178,9 @@ class Driver {
         /// someone else (e.g. the Transport module) has taken responsibility
         /// for it.
         char *payload;
+
+        /// Time when the packet is received from the NIC, in rdtsc ticks.
+        uint64_t timestamp;
 
         /// Counts the total number of times that steal has been invoked
         /// across all Received objects. Intended for unit testing; only
@@ -229,7 +234,6 @@ class Driver {
      */
     explicit Driver(Context* context)
         : context(context)
-        , lastReceiveTime(0)
         , lastTransmitTime(0)
         , maxTransmitQueueSize(0)
         , packetsToRelease()
@@ -295,18 +299,6 @@ class Driver {
     {
         return static_cast<int>(maxTransmitQueueSize) -
                 queueEstimator.getQueueSize(currentTime);
-    }
-
-    /**
-     * The most recent time that the driver received packets from the NIC.
-     * Mainly used for performance debugging.
-     *
-     * \return
-     *      Last receive time, in Cycles::rdtsc ticks
-     */
-    uint64_t getLastReceiveTime()
-    {
-        return lastReceiveTime;
     }
 
     /**
@@ -574,10 +566,6 @@ class Driver {
 
     /// True if outgoing packets should be queued and wait to be released.
     bool corked;
-
-    /// The most recent time that the driver polled packets from the NIC,
-    /// in rdtsc ticks.
-    uint64_t lastReceiveTime;
 
     /// The most recent time that the driver handed a packet to the NIC,
     /// in rdtsc ticks.
