@@ -78,28 +78,36 @@ class OfiUdDriver : public Driver {
     virtual void uncorkTransmitQueue();
 
   PRIVATE:
+
+    static constexpr uint32_t MAX_RX_QUEUES = 4;
+
+    // FIXME: temp hack
+    static constexpr uint32_t PSM2_MULTI_EP_ADDR_INC = 1;
+
+    using fi_addr_vec = std::array<fi_addr_t, MAX_RX_QUEUES>;
+
     /**
      * Identifies the address of a libfabric endpoint.
      */
     class Address : public Driver::Address {
       public:
-        Address(fi_addr_t addr)
+        Address(fi_addr_vec* addr)
             : Driver::Address()
-            , addr(addr)
+            , addr(*addr)
         {}
 
         virtual ~Address() {}
 
         virtual uint64_t getHash() const {
-            return addr;
+            return addr[0];
         }
 
         virtual string toString() const {
-            return format("%lu", addr);
+            return format("%lu", addr[0]);
         }
 
         /// Opaque libfabric internal address that identifies the endpoint.
-        fi_addr_t addr;
+        fi_addr_vec addr;
     };
 
     /**
@@ -195,6 +203,15 @@ class OfiUdDriver : public Driver {
             }
         }
 
+        string toString() const {
+            string result = "";
+            for (uint8_t byte : raw) {
+                result += std::to_string(byte) + ".";
+            }
+            result.pop_back();
+            return result;
+        }
+
         /// Equality function, for use in hash map.
         bool operator==(RawAddress other) const
         {
@@ -221,7 +238,7 @@ class OfiUdDriver : public Driver {
             : addressVector(addressVector), map()
         {}
 
-        fi_addr_t insertIfAbsent(RawAddress* rawAddress);
+        void insertIfAbsent(RawAddress* rawAddress, fi_addr_vec* out);
 
       private:
         /// libfabric address vector for inserting raw addresses.
@@ -229,14 +246,14 @@ class OfiUdDriver : public Driver {
 
         /// Map from raw addresses to fi_addr_t addresses, which are used in
         /// every send operation.
-        ska::flat_hash_map<RawAddress, fi_addr_t, RawAddress::Hasher> map;
+        ska::flat_hash_map<RawAddress, fi_addr_vec, RawAddress::Hasher> map;
     };
 
     BufferDescriptor* getTransmitBuffer();
     ServiceLocator readDriverConfigFile();
-    void receivePacketsImpl();
+    void receivePacketsImpl(int rxid, uint32_t maxPackets);
     void reapTransmitBuffers();
-    void refillReceiver(bool refillAll = false);
+    void refillReceiver(int rxid, bool refillAll = false);
 
     /// Maximum number of bytes of datagrams to be sent with fi_inject,
     /// which is optimized for small message latency.
@@ -297,8 +314,9 @@ class OfiUdDriver : public Driver {
     fid_ep* scalableEp;
 //    fid_ep* endpoint;
 
-    fid_ep* transmitContext[2];
-    fid_ep* receiveContext[2];
+    fid_ep* transmitContext[MAX_RX_QUEUES];
+
+    fid_ep* receiveContext[MAX_RX_QUEUES];
 
     /// Identifier of the local addressing table that maps provider-specific
     /// addresses (i.e., those returned by fi_getname) to opaque libfabric
@@ -309,7 +327,8 @@ class OfiUdDriver : public Driver {
 
     /// Identifier of the completion queue for receiving incoming packets.
     /// Not owned by this class.
-    fid_cq* rxcq;
+    fid_cq* rxcq[MAX_RX_QUEUES];
+//    fid_cq* rxcq;
 
     /// Identifier of the completion queue used by the NIC to return buffers
     /// for transmitted packets. Not owned by this class.
@@ -330,7 +349,7 @@ class OfiUdDriver : public Driver {
     /// in raw ethernet mode.
     std::deque<BufferDescriptor*> loopbackPkts;
 
-    Arachne::ThreadId receiverThread;
+    std::vector<Arachne::ThreadId> receiverThreads;
     std::atomic_bool receiverThreadStop;
 
     // TODO: mutual exclusive access to resources related to RX code path:
@@ -345,7 +364,8 @@ class OfiUdDriver : public Driver {
     Tub<BufferPool> rxPool;
 
     /// Number of receive buffers currently in the possession of the NIC.
-    uint32_t rxBuffersInNic;
+//    uint32_t rxBuffersInNic;
+    uint32_t rxBuffersInNic[MAX_RX_QUEUES];
 
     /// Used to log messages when receive buffer usage hits a new high.
     /// Log the next message when the number of free receive buffers

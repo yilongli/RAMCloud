@@ -1170,23 +1170,24 @@ echoMessage(string receiver, const char* message, uint32_t length,
             context->transportManager->getSession(receiver);
     uint64_t startTime = Cycles::rdtsc();
     uint64_t deadline = startTime + Cycles::fromSeconds(timeLimit);
-    uint64_t count;
-    for (count = 0; count < iteration; count++) {
+    for (uint32_t run = 0; run < iteration; run++) {
         uint64_t now = Cycles::rdtsc();
         if (now >= deadline) {
-            LOG(WARNING, "time expired after %lu iterations", count);
+            LOG(WARNING, "time expired after %u iterations", run);
             break;
         }
 
+        TimeTrace::record("echoMessage started run %u", run);
         EchoRpc rpc(cluster, session, message, length, echoLength, &buffer);
         rpc.wait();
         times.push_back(rpc.getCompletionTime());
+        TimeTrace::record("echoMessage finished run %u", run);
     }
     uint64_t totalCycles = Cycles::rdtsc() - startTime;
 
     TimeDist result;
     getDist(times, &result);
-    double totalTxBytes = length * static_cast<double>(count);
+    double totalTxBytes = length * static_cast<double>(iteration);
     result.bandwidth = totalTxBytes/Cycles::toSeconds(totalCycles);
     return result;
 }
@@ -7898,6 +7899,9 @@ try
     dataTable = cluster->getTableId("data");
     cluster->createTable("control");
     controlTable = cluster->getTableId("control");
+
+    LOG(NOTICE, "ClusterPerf dispatch thread running, core %d, sched_getcpu %d",
+            Arachne::core.id, sched_getcpu());
 
     if (testNames.size() == 0) {
         // No test names specified; run all tests.
