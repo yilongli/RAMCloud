@@ -79,7 +79,7 @@ class OfiUdDriver : public Driver {
 
   PRIVATE:
 
-    static constexpr uint32_t MAX_RX_QUEUES = 4;
+    static constexpr uint32_t MAX_RX_QUEUES = 5;
 
     // FIXME: temp hack
     static constexpr uint32_t PSM2_MULTI_EP_ADDR_INC = 1;
@@ -249,6 +249,25 @@ class OfiUdDriver : public Driver {
         ska::flat_hash_map<RawAddress, fi_addr_vec, RawAddress::Hasher> map;
     };
 
+    struct RxThreadContext {
+        std::function<void(CopyRequest*)> callback;
+
+        SpinLock lock;
+
+        std::deque<CopyRequest> pendingRequests;
+
+        RxThreadContext()
+            : callback()
+            , lock("RxThreadContext::pendingRequests")
+            , pendingRequests()
+        {
+            callback = [this] (CopyRequest* copyRequest) {
+                SpinLock::Guard _(lock);
+                pendingRequests.push_back(*copyRequest);
+            };
+        }
+    };
+
     BufferDescriptor* getTransmitBuffer();
     ServiceLocator readDriverConfigFile();
     void receivePacketsImpl(int rxid, uint32_t maxPackets);
@@ -317,6 +336,8 @@ class OfiUdDriver : public Driver {
     fid_ep* transmitContext[MAX_RX_QUEUES];
 
     fid_ep* receiveContext[MAX_RX_QUEUES];
+
+    RxThreadContext rxThreadContext[MAX_RX_QUEUES];
 
     /// Identifier of the local addressing table that maps provider-specific
     /// addresses (i.e., those returned by fi_getname) to opaque libfabric

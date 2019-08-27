@@ -968,7 +968,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     }
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
-                        received->len);
+                        received->len, received);
                 if (clientRpc->isShuffleRpc) {
                     if (clientRpc->shuffleReplyRxStart == 0) {
                         clientRpc->shuffleReplyRxStart = Cycles::rdtsc();
@@ -999,6 +999,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                     }
                 }
                 if (clientRpc->response->size() >= header->totalLength) {
+                    // Do not proceed until all pending copy requests are done.
+                    clientRpc->accumulator->syncDriverRxThreads();
+
                     // Response complete.
                     if (clientRpc->response->size() > header->totalLength) {
                         // We have more bytes than we want. This can happen
@@ -1271,7 +1274,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                     goto serverDataDone;
                 }
                 retainPacket = serverRpc->accumulator->addPacket(header,
-                        received->len);
+                        received->len, received);
                 if (header->offset == 0) {
                     timeTrace("server received opcode %u, totalLength %u",
                             serverRpc->requestPayload.getStart<
@@ -1279,6 +1282,9 @@ BasicTransport::handlePacket(Driver::Received* received)
                             header->totalLength);
                 }
                 if (serverRpc->requestPayload.size() >= header->totalLength) {
+                    // Do not proceed until all pending copy requests are done.
+                    serverRpc->accumulator->syncDriverRxThreads();
+
                     // Message complete; start servicing the RPC.
                     if (serverRpc->requestPayload.size()
                             > header->totalLength) {
@@ -1608,6 +1614,8 @@ BasicTransport::MessageAccumulator::MessageAccumulator(BasicTransport* t,
     : t(t)
     , buffer(buffer)
     , fragments()
+    , bytesToCopy(0)
+    , bytesCopied(0)
 {
     assert(buffer->size() == 0);
     buffer->reserve(totalLength);
@@ -1626,6 +1634,9 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
         t->driver->returnPacket(fragment.header);
     }
     fragments.clear();
+
+    // Make sure the driver Rx threads will not write to the buffer anymore.
+    syncDriverRxThreads();
 }
 
 /**
@@ -1647,7 +1658,7 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
  */
 bool
 BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
-        uint32_t length)
+        uint32_t length, Driver::Received* received)
 {
     length -= sizeof32(DataHeader);
 
@@ -1685,8 +1696,26 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                         payload + sizeof32(DataHeader), fragment.length,
                         t->driver, payload);
             } else {
-                buffer->appendCopy(payload + sizeof32(DataHeader),
-                        fragment.length);
+                // Consider delegating the task of copying packet payload into
+                // the buffer to the RX thread in the driver that received this
+                // packet, if the payload is large enough to justify the handoff
+                // cost.
+                bool isLastPacket = (fragment.length < t->maxDataPerPacket);
+                if ((fragment.length > 8000) && !isLastPacket &&
+                        received->delegateCopy) {
+                    Driver::CopyRequest req = {
+                        .dst = buffer->alloc(fragment.length),
+                        .src = payload + sizeof32(DataHeader),
+                        .len = fragment.length,
+                        .bytesCopied = &bytesCopied
+                    };
+                    bytesToCopy += fragment.length;
+                    (*received->delegateCopy)(&req);
+                } else {
+                    buffer->appendCopy(payload + sizeof32(DataHeader),
+                            fragment.length);
+                }
+
                 if (fragment.header != header) {
                     // This packet was retained earlier due to out-of-order
                     // arrival and must be returned to driver now.
@@ -1705,6 +1734,20 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
     } else {
         // This packet is redundant.
         return false;
+    }
+}
+
+void
+BasicTransport::MessageAccumulator::syncDriverRxThreads()
+{
+    if (bytesToCopy) {
+        while (bytesCopied.load() < bytesToCopy) {
+            // Wait 80 ns to avoid thrashing the cache.
+            Arachne::sleep(80);
+        }
+        t->timeTrace("driver Rx threads finished copying %u bytes", bytesToCopy);
+        bytesToCopy = 0;
+        bytesCopied = 0;
     }
 }
 

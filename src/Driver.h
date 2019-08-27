@@ -16,6 +16,7 @@
 #ifndef RAMCLOUD_DRIVER_H
 #define RAMCLOUD_DRIVER_H
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -60,6 +61,14 @@ class Driver {
          * debugging, logging, etc).
          */
         virtual string toString() const = 0;
+    };
+
+    // FIXME: hack to support delegating BasicTransport::addPacket to OfiDriver's Rx threads
+    struct CopyRequest {
+        void* dst;
+        void* src;
+        uint32_t len;
+        std::atomic<uint32_t>* bytesCopied;
     };
 
   PROTECTED:
@@ -122,6 +131,7 @@ class Driver {
             , len(len)
             , payload(payload)
             , timestamp(timestamp)
+            , delegateCopy()
         {}
 
         // Move constructor (needed for using in std::vectors)
@@ -131,6 +141,7 @@ class Driver {
             , len(other.len)
             , payload(other.payload)
             , timestamp(other.timestamp)
+            , delegateCopy(other.delegateCopy)
         {
             other.len = 0;
             other.payload = NULL;
@@ -181,6 +192,10 @@ class Driver {
 
         /// Time when the packet is received from the NIC, in rdtsc ticks.
         uint64_t timestamp;
+
+        /// Callback function to delegate a payload copy request to the RX
+        /// thread of the driver who received the payload in the first place.
+        std::function<void(CopyRequest*)>* delegateCopy;
 
         /// Counts the total number of times that steal has been invoked
         /// across all Received objects. Intended for unit testing; only

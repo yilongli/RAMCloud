@@ -128,6 +128,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , receiverThreadStop()
     , rxPacketsLock()
     , rxPackets()
+    , rxThreadContext()
 
     , rxPool()
     , rxBuffersInNic()
@@ -376,6 +377,31 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
         while (!receiverThreadStop.load(std::memory_order_acquire)) {
             receivePacketsImpl(rxid, 8);
             Arachne::yield();
+
+            // Each iteration of the following loop processes one pending copy
+            // request enqueued by the transport; the loop doesn't return or
+            // yield until it has finished all the pending requests.
+            RxThreadContext* threadCtx = &rxThreadContext[rxid];
+            CopyRequest copyRequest;
+            while (true) {
+                // Critical section: check if there is any pending copy request;
+                // if so, fetch the first one.
+                {
+                    SpinLock::Guard _(threadCtx->lock);
+                    if (threadCtx->pendingRequests.empty()) {
+                        break;
+                    }
+                    copyRequest = threadCtx->pendingRequests.front();
+                    threadCtx->pendingRequests.pop_front();
+                }
+
+                uint32_t nbytes = copyRequest.len;
+                timeTrace("ofiud: rxid %d to copy %u bytes", rxid, nbytes);
+                memcpy(copyRequest.dst, copyRequest.src, nbytes);
+                copyRequest.bytesCopied->fetch_add(nbytes);
+                timeTrace("ofiud: rxid %d copied %u bytes, coreId %d",
+                        rxid, nbytes, Arachne::core.id);
+            }
         }
     };
 
@@ -895,6 +921,7 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
         rxPackets.emplace_back(bd->sourceAddress.get(), this,
                 bd->packetLength - datagramPrefixSize,
                 bd->buffer + datagramPrefixSize, receiveTime);
+        rxPackets.back().delegateCopy = &rxThreadContext[rxid].callback;
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
     }

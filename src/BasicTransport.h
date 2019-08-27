@@ -171,7 +171,9 @@ class BasicTransport : public Transport {
         MessageAccumulator(BasicTransport* t, Buffer* buffer,
                 uint32_t totalLength);
         ~MessageAccumulator();
-        bool addPacket(DataHeader *header, uint32_t length);
+        bool addPacket(DataHeader *header, uint32_t length,
+                Driver::Received* received);
+        void syncDriverRxThreads();
         uint32_t requestRetransmission(BasicTransport *t,
                 const Driver::Address* address, RpcId rpcId,
                 uint32_t grantOffset, uint8_t whoFrom);
@@ -208,6 +210,13 @@ class BasicTransport : public Transport {
         /// corresponding fragment, which is a stolen Driver::Received.
         typedef HashMap<uint32_t, MessageFragment> FragmentMap;
         FragmentMap fragments;
+
+        /// # bytes of the payload delegated to be copied by the driver's RX
+        /// threads.
+        uint32_t bytesToCopy;
+
+        /// # bytes of payload that have been copied by driver's RX threads.
+        std::atomic<uint32_t> bytesCopied;
 
       PRIVATE:
         DISALLOW_COPY_AND_ASSIGN(MessageAccumulator);
