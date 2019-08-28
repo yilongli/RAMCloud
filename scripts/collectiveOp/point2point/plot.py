@@ -6,8 +6,8 @@ import pickle
 plt.xlabel("Message Size (B)")
 plt.ylabel("Latency (us)")
 
-for data_source in ['xl170_RC', 'm510_RC', 'rccluster_RC',
-        'millisort_p2p_benchmark']:
+for data_source in ['millisort_p2p_benchmark_rccluster',
+                    'millisort_p2p_benchmark_pod']:
     with open(data_source + '.txt') as file:
         message_size = []
         message_cost = []
@@ -18,11 +18,9 @@ for data_source in ['xl170_RC', 'm510_RC', 'rccluster_RC',
         for line in file:
             # Plot with the median latency.
             words = line.split()
-            if data_source == 'millisort_p2p_benchmark':
-                size = int(words[1])
-            else:
-                size = int(words[0])
-            cost = float(words[4])
+            size = int(words[1])
+            # cost = float(words[3]) # use min
+            cost = float(words[4]) # use p50
             message_size.append(size)
             message_cost.append(cost)
 

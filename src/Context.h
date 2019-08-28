@@ -154,6 +154,11 @@ class Context {
     // not freed by this class.
     ClockSynchronizer* clockSynchronizer;
 
+    /// Responsible for running all non-latency-sensitive RAMCloud std::thread's
+    /// that are outside the control of Arachne (e.g., UdpDriver::readerThread,
+    /// Logger::printThread, etc.).
+    int garbageCore;
+
     /**
      * Returns whether the context belongs to a client.
      */

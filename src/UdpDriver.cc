@@ -26,6 +26,7 @@
 #include "UdpDriver.h"
 #include "ServiceLocator.h"
 #include "TimeTrace.h"
+#include "Util.h"
 
 namespace RAMCloud {
 
@@ -304,6 +305,10 @@ UdpDriver::getServiceLocator()
 void
 UdpDriver::readerThreadMain(UdpDriver* driver)
 {
+    if (driver->context->garbageCore >= 0) {
+        Util::pinThreadToCore(driver->context->garbageCore);
+    }
+
     // Index within driver->packetBatches where we will read the next
     // batch of packets.
     int currentBatch = 0;

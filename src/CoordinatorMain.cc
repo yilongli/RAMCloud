@@ -39,6 +39,10 @@
 
 using namespace RAMCloud;
 
+// TODO: hack
+/// Use this core for all std::thread's that are not under control of Arachne.
+static const int garbageCore = Util::takeOneCore();
+
 /**
  * Main program for the RAMCloud cluster coordinator.
  *
@@ -102,6 +106,7 @@ realMain(int argc, char *argv[])
         LOG(NOTICE, "Coordinator process id: %u", getpid());
 
         Context context(true, &optionParser.options);
+        context.garbageCore = garbageCore;
 
         context.workerManager = new WorkerManager(&context);
 

@@ -42,7 +42,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this driver.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
@@ -723,6 +723,8 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 
     int ret;
     if (bd->packetLength <= info->tx_attr->inject_size) {
+        // TODO: use different tx contexts for inject and sendv to reduce HOL
+        // blocking at sender-side? How to verify that this is indeed useful?
         ret = downCast<int>(fi_inject(transmitContext[0], bd->buffer,
                 bd->packetLength, dstAddr));
         txPool->freeBuffers.push_back(bd);

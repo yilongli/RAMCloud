@@ -29,6 +29,7 @@ namespace RAMCloud {
 namespace Util {
 
 void clearCpuAffinity(void);
+int takeOneCore(void);
 void genRandomString(char* str, const int length);
 string getCpuAffinityString(void);
 vector<int> getAffinedCpus(void);
@@ -103,7 +104,8 @@ void pinThreadToCore(int id) {
     CPU_SET(id, &cpuset);
     int r = sched_setaffinity(0, sizeof(cpuset), &cpuset);
     if (r != 0) {
-        RAMCLOUD_DIE("sched_setaffinity failed: %s", strerror(errno));
+        RAMCLOUD_DIE("sched_setaffinity failed: %s, id %d, affinity mask %s",
+                strerror(errno), id, getCpuAffinityString().c_str());
     }
 }
 

@@ -7500,7 +7500,7 @@ treeBcast()
 }
 
 void
-benchmarkCollectiveOp(WireFormat::Opcode opcode)
+benchmarkCollectiveOp(WireFormat::Opcode opcode, std::vector<int> sizes)
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7528,61 +7528,68 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode)
 
     // Sweep machineCount from 1 to numMasters.
     uint32_t clockSyncSeconds = 2;
-//    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
-        // (Re)synchronize the cluster clock before each experiment.
-        LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
-                clockSyncSeconds);
-        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-                &clockSyncSeconds, sizeof(clockSyncSeconds));
+    for (int size : sizes) {
+//        for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
+        for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
+            // (Re)synchronize the cluster clock before each experiment.
+            LOG(NOTICE, "Run clock sync. protocol for %u seconds before "
+                    "experiment, machineCount %d, size %d", clockSyncSeconds,
+                    machineCount, size);
+            cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
+                    &clockSyncSeconds, sizeof(clockSyncSeconds));
 
-        // Initialize the millisort service.
-        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
-        auto initResp = initRpc.wait();
-        LOG(NOTICE, "Initialized %d millisort service nodes",
-                initResp->numNodesInited);
+            // Initialize the millisort service.
+            InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+            auto initResp = initRpc.wait();
+            LOG(NOTICE, "Initialized %d millisort service nodes",
+                    initResp->numNodesInited);
 
-        // Start the experiment.
-        BenchmarkCollectiveOpRpc rpc(context, count, opcode, objectSize);
-        Buffer* result = rpc.wait();
-        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
-                result->size());
+            // Start the experiment.
+            BenchmarkCollectiveOpRpc rpc(context, count, opcode, size);
+            Buffer* result = rpc.wait();
+            LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
+                    result->size());
 
-        // Retrieve the broadcast latency of each node from the RPC response
-        // buffer.
-        std::vector<uint64_t> completionTimes;
-        uint32_t offset = 0;
-        while (offset < result->size()) {
-            completionTimes.push_back(*result->read<uint64_t>(&offset));
+            // Retrieve the broadcast latency of each node from the RPC response
+            // buffer.
+            std::vector<uint64_t> completionTimes;
+            uint32_t offset = 0;
+            while (offset < result->size()) {
+                completionTimes.push_back(*result->read<uint64_t>(&offset));
+            }
+            std::sort(completionTimes.begin(), completionTimes.end());
+
+            double numSamples = double(completionTimes.size());
+            double min = double(completionTimes.front()) * 1e-3;
+            double p50 = double(completionTimes[int(numSamples * 0.5)]) * 1e-3;
+            double p90 = double(completionTimes[int(numSamples * 0.9)]) * 1e-3;
+            double p99 = double(completionTimes[int(numSamples * 0.99)]) * 1e-3;
+            printf(" %10d%10d%10.0f%10.2f%10.2f%10.2f%10.2f\n", machineCount,
+                    size, numSamples, min, p50, p90, p99);
         }
-        std::sort(completionTimes.begin(), completionTimes.end());
-
-        double numSamples = double(completionTimes.size());
-        double min = double(completionTimes.front()) * 1e-3;
-        double p50 = double(completionTimes[int(numSamples * 0.5)]) * 1e-3;
-        double p90 = double(completionTimes[int(numSamples * 0.9)]) * 1e-3;
-        double p99 = double(completionTimes[int(numSamples * 0.99)]) * 1e-3;
-        printf(" %10d%10d%10.0f%10.2f%10.2f%10.2f%10.2f\n", machineCount,
-                objectSize, numSamples, min, p50, p90, p99);
     }
 }
 
 void
 treeGather()
 {
-    benchmarkCollectiveOp(WireFormat::GATHER_TREE);
+    benchmarkCollectiveOp(WireFormat::GATHER_TREE, {objectSize});
 }
 
 void
 allGather()
 {
-    benchmarkCollectiveOp(WireFormat::ALL_GATHER);
+    benchmarkCollectiveOp(WireFormat::ALL_GATHER, {objectSize});
 }
 
 void
 point2point()
 {
-    benchmarkCollectiveOp(WireFormat::SEND_DATA);
+    std::vector<int> sizes = {};
+    for (int size = 0; size <= objectSize; size += 100) {
+        sizes.push_back(size);
+    }
+    benchmarkCollectiveOp(WireFormat::SEND_DATA, sizes);
 }
 
 // TODO: let allShuffle and treeBcast call benchmarkCollectiveOp too?

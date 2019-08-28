@@ -49,6 +49,17 @@ clearCpuAffinity(void)
     };
 }
 
+int
+takeOneCore(void)
+{
+    int cpu = getAffinedCpus().back();
+    cpu_set_t cpuSet;
+    sched_getaffinity(0, sizeof(cpuSet), &cpuSet);
+    CPU_CLR(cpu, &cpuSet);
+    sched_setaffinity(0, sizeof(cpuSet), &cpuSet);
+    return cpu;
+}
+
 /**
  * Returns a string describing the CPU affinity of the current thread.
  * Each character in the string corresponds to a core; "X" means the

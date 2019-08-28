@@ -95,6 +95,7 @@ Context::Context(bool hasDedicatedDispatchThread,
     , masterZeroCopyRegion(Memory::xmalloc(HERE, Transport::MAX_RPC_LEN))
 #endif
     , clockSynchronizer(NULL)
+    , garbageCore(-1)
 {
     LOG(NOTICE, "Zero-copy memory region set to %p", masterZeroCopyRegion);
     try {

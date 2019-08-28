@@ -39,6 +39,10 @@
 
 using namespace RAMCloud;
 
+// TODO: hack
+/// Use this core for all std::thread's that are not under control of Arachne.
+static const int garbageCore = Util::takeOneCore();
+
 // The following class is used for performance debugging: it logs
 // performance information at regular intervals.
 
@@ -263,6 +267,7 @@ realMain(int argc, char *argv[])
             getpid(), Arachne::core.id);
 
         Context context(true, &optionParser.options);
+        context.garbageCore = garbageCore;
 
         if (masterOnly && backupOnly)
             DIE("Can't specify both -B and -M options");
