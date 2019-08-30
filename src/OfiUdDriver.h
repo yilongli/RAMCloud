@@ -268,6 +268,16 @@ class OfiUdDriver : public Driver {
         }
     };
 
+    // FIXME: do we really need 2 io_vec's? think about how to make this struct
+    // minimal?
+    struct SendRequest {
+        iovec io_vec[2];
+        void* desc[2];
+        size_t iov_count;
+        fi_addr_t dstAddr;
+        BufferDescriptor* bd;
+    };
+
     BufferDescriptor* getTransmitBuffer();
     ServiceLocator readDriverConfigFile();
     void receivePacketsImpl(int rxid, uint32_t maxPackets);
@@ -364,7 +374,7 @@ class OfiUdDriver : public Driver {
 
     /// Outgoing packets currently queued up in the driver because the transmit
     /// queue is corked.
-//    std::vector<SendRequest> corkedPackets;
+    std::vector<SendRequest> corkedPackets;
 
     /// FIFO queue which holds packets addressed to the local host. Only used
     /// in raw ethernet mode.

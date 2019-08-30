@@ -91,7 +91,7 @@ WorkerSession::sendRequest(Buffer* request, Buffer* response,
 {
     // TODO: only use the new Session::addRequest interface for broadcast RPCs
     // to avoid too much disruption
-#if 0
+#if 1
     if (request->getStart<WireFormat::RequestCommon>()->opcode ==
             WireFormat::BCAST_TREE) {
         wrapped->addRequest(request, response, notifier);

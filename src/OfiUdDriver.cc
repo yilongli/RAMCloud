@@ -120,7 +120,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , txcq()
     , addressLength()
     , addressMap()
-//    , corkedPackets()
+    , corkedPackets()
     , loopbackPkts()
 
     // FIXME: newly added fields for RX-side scaling; not yet properly ordered
@@ -721,6 +721,30 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
             1 + context->dispatch->iteration % (MAX_RX_QUEUES - 1);
     fi_addr_t dstAddr = address->addr[remoteRxid];
 
+    // Change the following from 0 to 1 to enable message TX batching (note:
+    // it has no effect for providers ignoring FI_MORE flag like psm2).
+#if 0
+    if (corked) {
+        corkedPackets.emplace_back();
+        corkedPackets.back() = {
+            .io_vec = {io_vec[0], io_vec[1]},
+            .desc = {desc[0], desc[1]},
+            .iov_count = iov_count,
+            .dstAddr = dstAddr,
+            .bd = bd
+        };
+
+        // Dynamic vector resize can invalidate `ibv_send_wr::sg_list`;
+        // uncork the transmit queue if this is about to happen.
+        if (unlikely(corkedPackets.capacity() == corkedPackets.size())) {
+            uncorkTransmitQueue();
+            corked = true;
+            corkedPackets.reserve(corkedPackets.capacity() * 2);
+        }
+        return;
+    }
+#endif
+
     int ret;
     if (bd->packetLength <= info->tx_attr->inject_size) {
         // TODO: use different tx contexts for inject and sendv to reduce HOL
@@ -1057,6 +1081,27 @@ OfiUdDriver::refillReceiver(int rxid, bool refillAll)
 void
 OfiUdDriver::uncorkTransmitQueue()
 {
+    corked = false;
+    if (corkedPackets.empty()) {
+        return;
+    }
+
+    // FIXME: the correct way is to use fi_sendmsg with FI_MORE; psm2 ignores
+    // FI_MORE so I will too for now.
+    timeTrace("ofiud: about to uncork the transmit queue");
+    int ret;
+    for (SendRequest& sr : corkedPackets) {
+        ret = downCast<int>(fi_sendv(transmitContext[0], sr.io_vec, sr.desc,
+                sr.iov_count, sr.dstAddr, &sr.bd->context));
+        if (txBuffersInNic) {
+            txBuffersInNic->push_back(sr.bd);
+        }
+        if (ret) {
+            DIE("Error posting transmit packet: %s", fi_strerror(-ret));
+        }
+    }
+    timeTrace("ofiud: enqueued %u packets", corkedPackets.size());
+    corkedPackets.clear();
 }
 
 /**
