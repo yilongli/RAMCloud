@@ -252,6 +252,8 @@ class Driver {
         , lastTransmitTime(0)
         , maxTransmitQueueSize(0)
         , packetsToRelease()
+        , releaseLock("Driver::workerReturnedPackets")
+        , workerReturnedPackets()
         , queueEstimator(0)
     {
         // Default: no throttling of transmissions (probably not a good idea).
@@ -377,11 +379,15 @@ class Driver {
         if (isDispatchThread) {
             assert(context->dispatch->isDispatchThread());
             packetsToRelease.push_back(static_cast<char*>(payload));
+
+            SpinLock::Guard _(releaseLock);
+            while (!workerReturnedPackets.empty()) {
+                packetsToRelease.push_back(workerReturnedPackets.back());
+                workerReturnedPackets.pop_back();
+            }
         } else {
-            // Must sync with the dispatch thread, since this method could
-            // be invoked from a worker thread (e.g. in ~PayloadChunk).
-            Dispatch::Lock _(context->dispatch);
-            packetsToRelease.push_back(static_cast<char*>(payload));
+            SpinLock::Guard _(releaseLock);
+            workerReturnedPackets.push_back(static_cast<char*>(payload));
         }
     }
 
@@ -591,8 +597,16 @@ class Driver {
     uint32_t maxTransmitQueueSize;
 
     /// Holds incoming packets that have been processed by the transport and
-    /// can be safely released by the driver.
+    /// can be safely released by the driver. Note: this field must only be
+    /// accessed from the dispatch thread (or, when holding the dispatch lock).
     std::vector<char*> packetsToRelease;
+
+    /// Provides thread-safe accesses to #workerReturnedPackets.
+    SpinLock releaseLock;
+
+    /// Holds incoming packets returned by the worker threads for release;
+    /// enqueued by worker threads and dequeued by the dispatch thread.
+    std::vector<char*> workerReturnedPackets;
 
     /// Used to estimate # bytes outstanding in the NIC's transmit queue.
     QueueEstimator queueEstimator;
