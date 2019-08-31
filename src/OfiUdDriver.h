@@ -79,10 +79,9 @@ class OfiUdDriver : public Driver {
 
   PRIVATE:
 
-    static constexpr uint32_t MAX_RX_QUEUES = 5;
+    static constexpr uint32_t MAX_RX_QUEUES = 4;
 
-    // FIXME: temp hack
-    static constexpr uint32_t PSM2_MULTI_EP_ADDR_INC = 1;
+    static constexpr uint32_t POD_PSM2_REAL_ADDR_LEN = 4;
 
     using fi_addr_vec = std::array<fi_addr_t, MAX_RX_QUEUES>;
 
@@ -234,13 +233,18 @@ class OfiUdDriver : public Driver {
      */
     class AddressMap {
       public:
-        explicit AddressMap(fid_av* addressVector)
-            : addressVector(addressVector), map()
+        explicit AddressMap(uint32_t addressLength, fid_av* addressVector)
+            : addressLength(addressLength)
+            , addressVector(addressVector)
+            , map()
         {}
 
         void insertIfAbsent(RawAddress* rawAddress, fi_addr_vec* out);
 
       private:
+        /// # bytes used to represent a raw address.
+        uint32_t addressLength;
+
         /// libfabric address vector for inserting raw addresses.
         fid_av* addressVector;
 

@@ -62,6 +62,16 @@ namespace {
         return 0;
 #endif
     }
+
+    inline void
+    cancelRecord(uint64_t timestamp)
+    {
+#if TIME_TRACE
+        TimeTrace::cancelRecord(timestamp);
+#else
+        _unused(timestamp);
+#endif
+    }
 }
 
 // FIXME: figure out why we can't use the result of fi_av_straddr in
@@ -282,7 +292,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     av_attr.type = FI_AV_MAP;
     FI_CHK_CALL(fi_av_open, domain, &av_attr, &addressVector, NULL);
     FI_CHK_CALL(fi_scalable_ep_bind, scalableEp, &addressVector->fid, 0);
-    addressMap.construct(addressVector);
+    addressMap.construct(addressLength, addressVector);
 
     // Create completion queues for receive and transmit. Note: a completion
     // queue isn't absolutely necessary for the transmit queue; a completion
@@ -315,7 +325,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     size_t addrlen = 64;
     std::vector<uint8_t> localAddress;
     localAddress.resize(addrlen);
-#if 0
+#if 1
     // Print raw addresses of all receive contexts.
     FI_CHK_CALL(fi_getname, (fid_t)scalableEp, localAddress.data(), &addrlen);
     LOG(NOTICE, "scalableEp: %s",
@@ -327,8 +337,23 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
         LOG(NOTICE, "rxCtx[%u]: %s", i, rawAddress.toString().c_str());
     }
 #endif
-    FI_CHK_CALL(fi_getname, (fid_t)receiveContext[0], localAddress.data(),
-            &addrlen);
+    if (strcmp(provider, "psm2") == 0) {
+        if (MAX_RX_QUEUES * POD_PSM2_REAL_ADDR_LEN > addrlen) {
+            DIE("Not enough space to pack %u addresses into sl", MAX_RX_QUEUES);
+        }
+        // Each iteration of the following loop packs one raw address into the
+        // service locator; on POD cluster, only the first 4 bytes of the result
+        // of fi_getname are non-zero.
+        for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
+            uint8_t addr[addrlen];
+            FI_CHK_CALL(fi_getname, (fid_t)receiveContext[i], addr, &addrlen);
+            memcpy(localAddress.data() + i * POD_PSM2_REAL_ADDR_LEN, addr,
+                    POD_PSM2_REAL_ADDR_LEN);
+        }
+    } else {
+        DIE("Only psm2 provider is supported due to the raw address packing "
+                "feature.");
+    }
     if (addrlen != addressLength) {
         DIE("Unexpected address length %lu (expecting %u)", addrlen,
                 addressLength);
@@ -762,9 +787,9 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     if (ret) {
         DIE("Error posting transmit packet: %s", fi_strerror(-ret));
     }
-
-    timeTrace("ofiud: sent packet with %u bytes, %u free buffers",
-            bd->packetLength, txPool->freeBuffers.size());
+    timeTrace("ofiud: sent packet with %u bytes, %u free buffers, "
+            "remoteRxid %u", bd->packetLength, txPool->freeBuffers.size(),
+            remoteRxid);
     // FIXME: ignore small (how small?) packets so in BasicTransport we can
     // log more meaningful "tx queue idle XXX cyc" message
     if (unlikely(bd->packetLength > 128)) {
@@ -905,18 +930,17 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
                     rxid);
         }
 #endif
-        TimeTrace::cancelRecord(pollCqTime);
+        cancelRecord(pollCqTime);
         return;
     }
+    rxBuffersInNic[rxid] -= downCast<uint32_t>(numPackets);
 #if TIME_TRACE
-    uint64_t receiveTime = timeTrace("ofiud: received %d packets from rxcq %d",
-            numPackets, rxid);
-    TimeTrace::cancelRecord(pollCqTime);
+    uint64_t receiveTime = timeTrace("ofiud: received %d packets from rxcq %d,"
+            " rxBuffersInNic %u", numPackets, rxid, rxBuffersInNic[rxid]);
 #else
     uint64_t receiveTime = Cycles::rdtsc();
 #endif
 
-    rxBuffersInNic[rxid] -= downCast<uint32_t>(numPackets);
     if (unlikely(rxBuffersInNic[rxid] == 0)) {
         RAMCLOUD_CLOG(WARNING, "OfiUdDriver: receiver temporarily ran "
                 "out of packet buffers; could result in dropped packets");
@@ -1120,12 +1144,17 @@ OfiUdDriver::AddressMap::insertIfAbsent(RawAddress* rawAddress,
     auto it = map.find(*rawAddress);
     if (it == map.end()) {
         fi_addr_vec& addr_vec = map[*rawAddress];
-        fi_addr_t addr;
+        fi_addr_t fi_addr;
+        uint8_t realAddr[addressLength];
+        bzero(realAddr, addressLength);
         for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
-            fi_av_insert(addressVector, rawAddress->raw, 1, &addr, 0, NULL);
-            addr_vec[i] = addr;
-            // FIXME: this is not very nice; we are modifying the input rawAddr
-            rawAddress->raw[1] += PSM2_MULTI_EP_ADDR_INC;
+            memcpy(realAddr, rawAddress->raw + i * POD_PSM2_REAL_ADDR_LEN,
+                    POD_PSM2_REAL_ADDR_LEN);
+            fi_av_insert(addressVector, realAddr, 1, &fi_addr, 0, NULL);
+            addr_vec[i] = fi_addr;
+            LOG(NOTICE, "OfiUdDriver: inserts new raw addr %s, fi_addr_t %lu",
+                    RawAddress(realAddr, addressLength).toString().c_str(),
+                    fi_addr);
         }
         *out = addr_vec;
     } else {

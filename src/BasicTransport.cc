@@ -601,7 +601,7 @@ BasicTransport::cancelRecord(uint64_t lastRecordTime) {
 #if TIME_TRACE
     TimeTrace::cancelRecord(lastRecordTime);
 #else
-    (void*)lastRecordTime;
+    _unused(lastRecordTime);
 #endif
 }
 

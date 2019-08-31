@@ -1364,9 +1364,7 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             uint64_t receiveTime = Cycles::rdtsc();
             timeTrace("shuffle-server: handler received pull request from rank %u",
                     senderId);
-/// Apply receiver-side sequencing for shuffle messages larger than the threshold.
-#define SMALL_SHUFFLE_MESSAGE 8000
-            bool orderRequests = (reqHdr->dataSize >= SMALL_SHUFFLE_MESSAGE);
+            bool orderRequests = (reqHdr->dataSize >= RECEIVER_SIDE_SEQ_THRESH);
             if (orderRequests) {
                 // The first pull request we service should come from our left
                 // neighbour X. The second pull request should come from the
