@@ -21,7 +21,8 @@ ax.yaxis.set_minor_locator(ticker.MultipleLocator(1))
 
 def get_packet_time_us(bytes):
     # A full packet is 4096B and the bandwidth is 24Gbps, or 3B/ns.
-    return bytes * 8.0 / 24.0 / 1000
+    # return bytes * 8.0 / 24.0 / 1000
+    return bytes * 8.0 / 50.0 / 1000
 
 num_nodes = len(glob.glob(logs_dir + '/server*.tt'))
 for node_id in range(num_nodes):
@@ -49,9 +50,9 @@ for node_id in range(num_nodes):
             # rank 0
             elif words[-6] == 'handled' and words[-2] == "rank":
                 handle_pull_rpc.append((time, int(words[-1])))
-            # Example: shuffle-client: pull request 22 to rank 7 completed
-            elif words[-1] == 'completed' and words[-3] == "rank":
-                rpc_complete.append((time, int(words[-5])))
+            # Example: shuffle-client: pull request 22 to rank 7 completed, bytes XXX
+            elif words[-3] == 'completed,' and words[-5] == "rank":
+                rpc_complete.append((time, int(words[-7])))
 
         offset = .0
 
@@ -85,7 +86,7 @@ for node_id in range(num_nodes):
             y = node_id - offset
             busy_start, packet_size = transmit_packets[0]
             busy_end = busy_start + get_packet_time_us(packet_size)
-            for time in transmit_packets[1:]:
+            for time, packet_size in transmit_packets[1:]:
                 if time < busy_end:
                     busy_end += get_packet_time_us(packet_size)
                 else:

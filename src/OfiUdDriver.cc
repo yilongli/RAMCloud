@@ -74,6 +74,8 @@ namespace {
     }
 }
 
+#define DEBUG_ALL_SHUFFLE 0
+
 // FIXME: figure out why we can't use the result of fi_av_straddr in
 // ServiceLocator and use fi_av_insertsvc to convert that into fi_addr?
 #define SL_USE_FI_ADDR_STR 0
@@ -742,8 +744,9 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     // that we reserve the first rx queue for relatively small messages in order
     // to improve their latency since the first rxcq will be polled inside the
     // dispatch thread.
+    static uint64_t sprayPacketCount;
     uint32_t remoteRxid = (bd->packetLength < 8192) ? 0 :
-            1 + context->dispatch->iteration % (MAX_RX_QUEUES - 1);
+            1 + (sprayPacketCount++) % (MAX_RX_QUEUES - 1);
     fi_addr_t dstAddr = address->addr[remoteRxid];
 
     // Change the following from 0 to 1 to enable message TX batching (note:
@@ -790,6 +793,10 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     timeTrace("ofiud: sent packet with %u bytes, %u free buffers, "
             "remoteRxid %u", bd->packetLength, txPool->freeBuffers.size(),
             remoteRxid);
+#if DEBUG_ALL_SHUFFLE
+    TimeTrace::record("ofiud: transmit buffer of size %u enqueued",
+            bd->packetLength);
+#endif
     // FIXME: ignore small (how small?) packets so in BasicTransport we can
     // log more meaningful "tx queue idle XXX cyc" message
     if (unlikely(bd->packetLength > 128)) {
@@ -974,6 +981,11 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
         rxPackets.back().delegateCopy = &rxThreadContext[rxid].callback;
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
+
+#if DEBUG_ALL_SHUFFLE
+        TimeTrace::record(receiveTime, "ofiud received packet, size %u, "
+                "batch size %d", bd->packetLength, numPackets);
+#endif
     }
     timeTrace("ofiud: receivePackets done");
 }
