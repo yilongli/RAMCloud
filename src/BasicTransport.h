@@ -195,11 +195,12 @@ class BasicTransport : public Transport {
             /// # bytes of message data available at payload.
             uint32_t length;
 
-            MessageFragment()
-                    : header(NULL), length(0)
-            {}
-            MessageFragment(DataHeader *header, uint32_t length)
-                    : header(header), length(length)
+            /// See docs for Driver::Received::delegateCopy
+            void* delegateCopy;
+
+            MessageFragment(DataHeader *header, uint32_t length,
+                    void* delegateCopy)
+                : header(header), length(length), delegateCopy(delegateCopy)
             {}
         };
 

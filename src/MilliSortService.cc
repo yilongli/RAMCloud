@@ -1422,6 +1422,16 @@ MilliSortService::benchmarkCollectiveOp(
         WireFormat::BenchmarkCollectiveOp::Response* respHdr,
         Rpc* rpc)
 {
+    static std::atomic<bool> ongoingBenchmark;
+    if (reqHdr->masterId == 0) {
+        if (ongoingBenchmark) {
+            LOG(ERROR, "Already servicing another BenchmarkCollectiveOp RPC!");
+            respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
+            return;
+        }
+        ongoingBenchmark = true;
+    }
+
 #define WARMUP_COUNT 20
     std::unique_ptr<char[]> data(new char[std::max(1u, reqHdr->dataSize)]);
     if (reqHdr->opcode == WireFormat::SEND_DATA) {
@@ -1751,6 +1761,8 @@ MilliSortService::benchmarkCollectiveOp(
     } else {
         respHdr->common.status = STATUS_INVALID_PARAMETER;
     }
+
+    ongoingBenchmark = true;
 }
 
 void

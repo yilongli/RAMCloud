@@ -690,6 +690,9 @@ BasicTransport::tryToTransmitData()
                             serverRpc->rpcId.sequence,
                             message->buffer->size() * 8000ul / elapsedNs);
                 }
+                // FIXME: I think there is actually a bug here: returning from
+                // Driver::sendPacket doesn't guarantee the bytes have actually
+                // been transmitted (e.g., DMA engine hasn't read the bytes yet)
                 deleteServerRpc(serverRpc);
             }
         } else if (message->transmitOffset == message->transmitLimit) {
@@ -1673,7 +1676,8 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
         // data is missing. Save the packet for later, if it's not redundant.
         FragmentMap::iterator iter;
         std::tie(iter, retainPacket) = fragments.emplace(
-                uint32_t(header->offset), MessageFragment(header, length));
+                uint32_t(header->offset),
+                MessageFragment(header, length, received->delegateCopy));
         return retainPacket;
     }
 
@@ -1682,7 +1686,7 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
     if (header->offset == buffer->size()) {
         // Each iteration of the following loop appends one fragment to
         // the buffer.
-        MessageFragment fragment(header, length);
+        MessageFragment fragment(header, length, received->delegateCopy);
         do {
             char* payload = reinterpret_cast<char*>(fragment.header);
             // Currently, the first packet of a multi-packet message must
@@ -1702,7 +1706,7 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                 // cost.
                 bool isLastPacket = (fragment.length < t->maxDataPerPacket);
                 if ((fragment.length > 8000) && !isLastPacket &&
-                        received->delegateCopy) {
+                        fragment.delegateCopy) {
                     Driver::CopyRequest req = {
                         .dst = buffer->alloc(fragment.length),
                         .src = payload + sizeof32(DataHeader),
@@ -1710,7 +1714,8 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                         .bytesCopied = &bytesCopied
                     };
                     bytesToCopy += fragment.length;
-                    (*received->delegateCopy)(&req);
+                    (*reinterpret_cast<decltype(received->delegateCopy)>(
+                            fragment.delegateCopy))(&req);
                 } else {
                     buffer->appendCopy(payload + sizeof32(DataHeader),
                             fragment.length);
@@ -1994,8 +1999,8 @@ BasicTransport::Poller::poll()
 void
 BasicTransport::checkTimeouts()
 {
-    timeTrace("checkTimeouts invoked, %u client RPCs, %u server RPCs",
-            outgoingRpcs.size(), serverTimerList.size());
+    uint64_t checkTime = timeTrace("checkTimeouts invoked, %u client RPCs, "
+            "%u server RPCs", outgoingRpcs.size(), serverTimerList.size());
 
     // Scan all of the ClientRpc objects.
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
@@ -2020,11 +2025,11 @@ BasicTransport::checkTimeouts()
         if (clientRpc->silentIntervals >= timeoutIntervals) {
             // A long time has elapsed with no communication whatsoever
             // from the server, so abort the RPC.
-            RAMCLOUD_LOG(WARNING, "aborting %s RPC to server %s, "
+            RAMCLOUD_LOG(WARNING, "aborting %s RPC to server %s, clientId %lu, "
                     "sequence %lu: timeout",
                     WireFormat::opcodeSymbol(clientRpc->request.buffer),
                     clientRpc->session->serverAddress->toString().c_str(),
-                    sequence);
+                    clientId, sequence);
             clientRpc->notifier->failed();
             deleteClientRpc(clientRpc);
             continue;
@@ -2113,7 +2118,12 @@ BasicTransport::checkTimeouts()
         //     could process the RPC before the retransmitted data arrived.
         assert(serverRpc->sendingResponse || !serverRpc->requestComplete);
         if (serverRpc->silentIntervals >= timeoutIntervals) {
-            timeTrace("aborting %s RPC from client, clientId %u, sequence %u",
+            LOG(WARNING, "aborting %s RPC from client %s, clientId %lu, "
+                    "sequence %lu: timeout",
+                    WireFormat::opcodeSymbol(&serverRpc->requestPayload),
+                    serverRpc->clientAddress->toString().c_str(),
+                    serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
+            timeTrace("aborting RPC from client, clientId %u, sequence %u",
                     serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
             deleteServerRpc(serverRpc);
             continue;
@@ -2142,6 +2152,8 @@ BasicTransport::checkTimeouts()
                     FROM_SERVER);
         }
     }
+
+    cancelRecord(checkTime);
 }
 
 }  // namespace RAMCloud
