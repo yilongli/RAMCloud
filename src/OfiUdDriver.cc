@@ -136,11 +136,11 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , loopbackPkts()
 
     // FIXME: newly added fields for RX-side scaling; not yet properly ordered
-    , receiverThreads()
-    , receiverThreadStop()
+    , workerThreads()
+    , workerThreadStop()
     , rxPacketsLock()
     , rxPackets()
-    , rxThreadContext()
+    , workerThreadContext()
 
     , rxPool()
     , rxBuffersInNic()
@@ -201,8 +201,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // TODO: scalable EPs; for now, only uses one Tx queue as SDMA + large MTU
     // is enough to keep up with 100Gbps outbound BW; uses >= 2 RX queues to
     // allow parallelizing data copying in eager RX mode.
-    hints->ep_attr->tx_ctx_cnt = 1;
-    hints->ep_attr->rx_ctx_cnt = MAX_RX_QUEUES;
+    hints->ep_attr->tx_ctx_cnt = MAX_HW_QUEUES;
+    hints->ep_attr->rx_ctx_cnt = MAX_HW_QUEUES;
     // We can support at least three operation modes: FI_CONTEXT, FI_MSG_PREFIX,
     // and FI_RX_CQ_DATA. The operation modes required by each provider can be
     // found at:
@@ -302,11 +302,13 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     fi_cq_attr tx_cq_attr = {};
     tx_cq_attr.size = MAX_TX_QUEUE_DEPTH;
     tx_cq_attr.format = FI_CQ_FORMAT_CONTEXT;
-    FI_CHK_CALL(fi_cq_open, domain, &tx_cq_attr, &txcq, NULL);
-    for (int i = 0; i < int(info->ep_attr->tx_ctx_cnt); i++) {
+    for (int i = 0; i < int(MAX_HW_QUEUES); i++) {
         fi_tx_context(scalableEp, i, info->tx_attr, &transmitContext[i], NULL);
     }
-    FI_CHK_CALL(fi_ep_bind, transmitContext[0], &txcq->fid, FI_TRANSMIT);
+    for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
+        FI_CHK_CALL(fi_cq_open, domain, &tx_cq_attr, &txcq[i], NULL);
+        FI_CHK_CALL(fi_ep_bind, transmitContext[i], &txcq[i]->fid, FI_TRANSMIT);
+    }
     // FIXME: deal with selective notification later!
 //    FI_CHK_CALL(fi_ep_bind, endpoint, &txcq->fid,
 //            FI_TRANSMIT | FI_SELECTIVE_COMPLETION);
@@ -314,10 +316,10 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     fi_cq_attr rx_cq_attr = {};
     rx_cq_attr.size = MAX_RX_QUEUE_DEPTH;
     rx_cq_attr.format = FI_CQ_FORMAT_MSG;
-    for (int i = 0; i < int(MAX_RX_QUEUES); i++) {
+    for (int i = 0; i < int(MAX_HW_QUEUES); i++) {
         fi_rx_context(scalableEp, i, info->rx_attr, &receiveContext[i], NULL);
     }
-    for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
+    for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
         FI_CHK_CALL(fi_cq_open, domain, &rx_cq_attr, &rxcq[i], NULL);
         FI_CHK_CALL(fi_ep_bind, receiveContext[i], &rxcq[i]->fid, FI_RECV);
     }
@@ -332,7 +334,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     FI_CHK_CALL(fi_getname, (fid_t)scalableEp, localAddress.data(), &addrlen);
     LOG(NOTICE, "scalableEp: %s",
             RawAddress(localAddress.data(), addrlen).toString().c_str());
-    for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
+    for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
         FI_CHK_CALL(fi_getname, (fid_t)receiveContext[i], localAddress.data(),
                 &addrlen);
         RawAddress rawAddress(localAddress.data(), addrlen);
@@ -340,13 +342,13 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     }
 #endif
     if (strcmp(provider, "psm2") == 0) {
-        if (MAX_RX_QUEUES * POD_PSM2_REAL_ADDR_LEN > addrlen) {
-            DIE("Not enough space to pack %u addresses into sl", MAX_RX_QUEUES);
+        if (MAX_HW_QUEUES * POD_PSM2_REAL_ADDR_LEN > addrlen) {
+            DIE("Not enough space to pack %u addresses into sl", MAX_HW_QUEUES);
         }
         // Each iteration of the following loop packs one raw address into the
         // service locator; on POD cluster, only the first 4 bytes of the result
         // of fi_getname are non-zero.
-        for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
+        for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
             uint8_t addr[addrlen];
             FI_CHK_CALL(fi_getname, (fid_t)receiveContext[i], addr, &addrlen);
             memcpy(localAddress.data() + i * POD_PSM2_REAL_ADDR_LEN, addr,
@@ -376,67 +378,104 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     uint32_t bufSize = BitOps::powerOfTwoGreaterOrEqual(mtu);
     rxPool.construct(this, bufSize, TOTAL_RX_BUFFERS);
     rxBufferLogThreshold = TOTAL_RX_BUFFERS - 1000;
-    txPool.construct(this, bufSize, MAX_TX_QUEUE_DEPTH);
+    for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
+        txPool[i].construct(this, bufSize, MAX_TX_QUEUE_DEPTH);
+    }
     LOG(NOTICE, "Initialized OfiUdDriver buffers: %u receive buffers (%u MB), "
             "%u transmit buffers (%u MB)",
             TOTAL_RX_BUFFERS, (TOTAL_RX_BUFFERS*bufSize)/(1024*1024),
-            MAX_TX_QUEUE_DEPTH, (MAX_TX_QUEUE_DEPTH*bufSize)/(1024*1024));
+            MAX_TX_QUEUE_DEPTH*MAX_HW_QUEUES,
+            (MAX_TX_QUEUE_DEPTH*MAX_HW_QUEUES*bufSize)/(1024*1024));
 
     // Fill in the src address in every transmit buffer, if necessary.
     if (mustIncludeLocalAddress) {
-        for (BufferDescriptor* bd : txPool->freeBuffers) {
-            char* srcAddr = bd->buffer + datagramPrefixSize - addressLength;
-            memcpy(srcAddr, localAddress.data(), addrlen);
+        for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
+            for (BufferDescriptor* bd : txPool[i]->freeBuffers) {
+                char* srcAddr = bd->buffer + datagramPrefixSize - addressLength;
+                memcpy(srcAddr, localAddress.data(), addrlen);
+            }
         }
     }
 
     // Pre-post some receive buffers in each RX queue.
-    for (int rxid = 0; rxid < int(MAX_RX_QUEUES); rxid++) {
+    for (int rxid = 0; rxid < int(MAX_HW_QUEUES); rxid++) {
         refillReceiver(rxid, true);
     }
 
     // Spawn receive threads for polling RX queues (and copying data into RX
     // buffers if 0-copy RX is not supported); spread out the threads on
     // available cores evenly.
-    auto receiverThreadMain = [this] (int rxid) {
-        LOG(NOTICE, "OfiUdDriver: RX thread %d started on core %d", rxid,
-                Arachne::core.id);
-        while (!receiverThreadStop.load(std::memory_order_acquire)) {
-            receivePacketsImpl(rxid, 8);
+    auto workerThreadMain = [this] (int workerId) {
+        LOG(NOTICE, "OfiUdDriver: worker thread %d started on core %d",
+                workerId, Arachne::core.id);
+        WorkerThreadContext* threadCtx = &workerThreadContext[workerId];
+        using OutPacket = WorkerThreadContext::OutPacket;
+        std::vector<OutPacket*> outPackets;
+
+        // Polling loop of the worker thread.
+        while (!workerThreadStop.load(std::memory_order_acquire)) {
+            // Fetch all pending send requests enqueued by the dispatch thread
+            // with one lock operation.
+            {
+                SpinLock::Guard _(threadCtx->txLock);
+                for (OutPacket& outPacket : threadCtx->pendingSendReqs) {
+                    outPackets.push_back(&outPacket);
+                }
+            }
+            if (!outPackets.empty()) {
+                // Each iteration of the following loop sends out one packet.
+                for (OutPacket* outPacket : outPackets) {
+                    sendPacketImpl(workerId, outPacket->addr, outPacket->header,
+                            outPacket->headerLen, &outPacket->payload);
+                }
+
+                // Remove all completed send requests.
+                {
+                    SpinLock::Guard _(threadCtx->txLock);
+                    for (uint32_t i = 0; i < outPackets.size(); i++) {
+                        threadCtx->pendingSendReqs.pop_front();
+                    }
+                }
+                outPackets.clear();
+                Arachne::yield();
+            }
+
+            // Try to receive packets from RX queue.
+            receivePacketsImpl(workerId, 8);
             Arachne::yield();
 
             // Each iteration of the following loop processes one pending copy
             // request enqueued by the transport; the loop doesn't return or
             // yield until it has finished all the pending requests.
-            RxThreadContext* threadCtx = &rxThreadContext[rxid];
             CopyRequest copyRequest;
             while (true) {
-                // Critical section: check if there is any pending copy request;
-                // if so, fetch the first one.
+                // Critical section: fetch the first pending copy request, if
+                // any
                 {
-                    SpinLock::Guard _(threadCtx->lock);
-                    if (threadCtx->pendingRequests.empty()) {
+                    SpinLock::Guard _(threadCtx->rxLock);
+                    if (threadCtx->pendingCopyReqs.empty()) {
                         break;
                     }
-                    copyRequest = threadCtx->pendingRequests.front();
-                    threadCtx->pendingRequests.pop_front();
+                    copyRequest = threadCtx->pendingCopyReqs.front();
+                    threadCtx->pendingCopyReqs.pop_front();
                 }
 
                 uint32_t nbytes = copyRequest.len;
-                timeTrace("ofiud: rxid %d to copy %u bytes", rxid, nbytes);
+                timeTrace("ofiud: rxid %d to copy %u bytes", workerId, nbytes);
                 memcpy(copyRequest.dst, copyRequest.src, nbytes);
                 copyRequest.bytesCopied->fetch_add(nbytes);
                 timeTrace("ofiud: rxid %d copied %u bytes, coreId %d",
-                        rxid, nbytes, Arachne::core.id);
+                        workerId, nbytes, Arachne::core.id);
             }
+            Arachne::yield();
         }
     };
 
     Arachne::CorePolicy::CoreList cores = Arachne::getCorePolicy()->getCores(0);
-    for (int rxid = 1; rxid < int(MAX_RX_QUEUES); rxid++) {
-        int coreId = cores[(rxid - 1) % cores.size()];
-        receiverThreads.push_back(
-                Arachne::createThreadOnCore(coreId, receiverThreadMain, rxid));
+    for (int workerId = 1; workerId < int(MAX_HW_QUEUES); workerId++) {
+        int coreId = cores[(workerId - 1) % cores.size()];
+        workerThreads.push_back(Arachne::createThreadOnCore(
+                coreId, workerThreadMain, workerId));
     }
 }
 
@@ -446,8 +485,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
 OfiUdDriver::~OfiUdDriver()
 {
     // Wait for the receiver thread to stop.
-    receiverThreadStop = true;
-    for (Arachne::ThreadId& tid : receiverThreads) {
+    workerThreadStop = true;
+    for (Arachne::ThreadId& tid : workerThreads) {
         Arachne::join(tid);
     }
 
@@ -464,7 +503,7 @@ OfiUdDriver::~OfiUdDriver()
 //    fi_freeinfo(info);
 
     uint32_t totalRxBuffersInNic = 0;
-    for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
+    for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
         totalRxBuffersInNic += rxBuffersInNic[i];
     }
     size_t buffersInUse = TOTAL_RX_BUFFERS - rxPool->freeBuffers.size()
@@ -489,20 +528,20 @@ OfiUdDriver::getMaxPacketSize()
  * If there are none, block until one is available.
  */
 OfiUdDriver::BufferDescriptor*
-OfiUdDriver::getTransmitBuffer()
+OfiUdDriver::getTransmitBuffer(int txid)
 {
     // if we've drained our free tx buffer pool, we must wait.
-    if (unlikely(txPool->freeBuffers.empty())) {
-        reapTransmitBuffers();
-        if (txPool->freeBuffers.empty()) {
+    if (unlikely(txPool[txid]->freeBuffers.empty())) {
+        reapTransmitBuffers(txid);
+        if (txPool[txid]->freeBuffers.empty()) {
             // We are temporarily out of buffers. Time how long it takes
             // before a transmit buffer becomes available again (a long
             // time is a bad sign); in the normal case this code should
             // not be invoked.
             uint64_t start = Cycles::rdtsc();
             uint32_t count = 1;
-            while (txPool->freeBuffers.empty()) {
-                reapTransmitBuffers();
+            while (txPool[txid]->freeBuffers.empty()) {
+                reapTransmitBuffers(txid);
                 count++;
             }
             timeTrace("ofiud: TX buffers refilled after %u polls", count);
@@ -511,13 +550,13 @@ OfiUdDriver::getTransmitBuffer()
             if (waitMillis > 1.0)  {
                 LOG(WARNING, "Long delay waiting for transmit buffers "
                         "(%.1f ms elapsed, %lu buffers now free)",
-                        waitMillis, txPool->freeBuffers.size());
+                        waitMillis, txPool[txid]->freeBuffers.size());
             }
         }
     }
 
-    BufferDescriptor* bd = txPool->freeBuffers.back();
-    txPool->freeBuffers.pop_back();
+    BufferDescriptor* bd = txPool[txid]->freeBuffers.back();
+    txPool[txid]->freeBuffers.pop_back();
     return bd;
 }
 
@@ -557,18 +596,18 @@ OfiUdDriver::readDriverConfigFile()
  * reclaim them. This method also detects and logs transmission errors.
  */
 void
-OfiUdDriver::reapTransmitBuffers()
+OfiUdDriver::reapTransmitBuffers(int txid)
 {
 #define MAX_TO_RETRIEVE 8
     fi_cq_entry cqes[MAX_TO_RETRIEVE];
-    int numCqes = downCast<int>(fi_cq_read(txcq, cqes, MAX_TO_RETRIEVE));
+    int numCqes = downCast<int>(fi_cq_read(txcq[txid], cqes, MAX_TO_RETRIEVE));
     if (numCqes <= 0) {
         if (unlikely(numCqes != -FI_EAGAIN)) {
             if (numCqes == -FI_EAVAIL) {
                 fi_cq_err_entry err = {};
-                FI_CHK_CALL(fi_cq_readerr, txcq, &err, 0);
+                FI_CHK_CALL(fi_cq_readerr, txcq[txid], &err, 0);
                 DIE("fi_cq_read failed, fi_cq_readerr: %s", fi_cq_strerror(
-                        txcq, err.prov_errno, err.err_data, NULL, 0));
+                        txcq[txid], err.prov_errno, err.err_data, NULL, 0));
             } else {
                 DIE("fi_cq_read failed: %s", fi_strerror(-numCqes));
             }
@@ -587,10 +626,11 @@ OfiUdDriver::reapTransmitBuffers()
             BufferDescriptor* signaledCompletion =
                     context_to_bd(cqes[i].op_context);
             bool matchSignal = false;
-            while (!txBuffersInNic->empty()) {
-                BufferDescriptor* bd = txBuffersInNic->front();
-                txBuffersInNic->pop_front();
-                txPool->freeBuffers.push_back(bd);
+            BufferDescriptorQueue* txBuffersInUse = &(*txBuffersInNic)[txid];
+            while (!txBuffersInUse->empty()) {
+                BufferDescriptor* bd = txBuffersInUse->front();
+                txBuffersInUse->pop_front();
+                txPool[txid]->freeBuffers.push_back(bd);
                 if (bd == signaledCompletion) {
                     matchSignal = true;
                     break;
@@ -603,7 +643,7 @@ OfiUdDriver::reapTransmitBuffers()
     } else {
         for (int i = 0; i < numCqes; i++) {
             BufferDescriptor* bd = context_to_bd(cqes[i].op_context);
-            txPool->freeBuffers.push_back(bd);
+            txPool[txid]->freeBuffers.push_back(bd);
         }
     }
 }
@@ -665,25 +705,13 @@ OfiUdDriver::release()
     }
 }
 
-/*
- * See docs in the ``Driver'' class.
- */
 void
-OfiUdDriver::sendPacket(const Driver::Address* addr,
-                        const void* header,
-                        uint32_t headerLen,
-                        Buffer::Iterator* payload,
-                        int priority,
-                        TransmitQueueState* txQueueState)
+OfiUdDriver::sendPacketImpl(int txid, const Driver::Address* addr,
+        const void* header, uint32_t headerLen, Buffer::Iterator* payload)
 {
-    timeTrace("ofiud: sendPacket invoked");
-    uint32_t payloadSize = payload ? payload->size() : 0;
-    uint32_t totalLength = headerLen + payloadSize;
-    assert(totalLength <= getMaxPacketSize());
-
-    // Grab a free packet buffer.
-    BufferDescriptor* bd = getTransmitBuffer();
-    bd->packetLength = datagramPrefixSize + totalLength;
+    BufferDescriptor* bd = getTransmitBuffer(txid);
+    bd->packetLength = datagramPrefixSize + headerLen +
+            (payload ? payload->size() : 0);
 
     // Leave enough buffer headroom for libfabric. Then copy transport header
     // into packet buffer.
@@ -736,8 +764,47 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 //    }
 
     // Post the packet buffer to the transmit queue.
-    const Address* address = static_cast<const Address*>(addr);
-    lastTransmitTime = Cycles::rdtsc();
+    fid_ep* ep = transmitContext[txid];
+    fi_addr_t dstAddr = static_cast<const Address*>(addr)->addr[txid];
+
+    int ret;
+    if (bd->packetLength <= info->tx_attr->inject_size) {
+        ret = downCast<int>(fi_inject(ep, bd->buffer, bd->packetLength,
+                dstAddr));
+        txPool[txid]->freeBuffers.push_back(bd);
+    } else {
+        ret = downCast<int>(fi_sendv(ep, io_vec, desc, iov_count, dstAddr,
+                &bd->context));
+        if (txBuffersInNic) {
+            (*txBuffersInNic)[txid].push_back(bd);
+        }
+    }
+    if (ret) {
+        DIE("Error posting transmit packet: %s", fi_strerror(-ret));
+    }
+    timeTrace("ofiud: sent packet with %u bytes, %u free buffers, txid %u",
+            bd->packetLength, txPool[txid]->freeBuffers.size(), txid);
+#if DEBUG_ALL_SHUFFLE
+    TimeTrace::record("ofiud: transmit buffer of size %u enqueued",
+            bd->packetLength);
+#endif
+}
+
+/*
+ * See docs in the ``Driver'' class.
+ */
+void
+OfiUdDriver::sendPacket(const Driver::Address* addr,
+                        const void* header,
+                        uint32_t headerLen,
+                        Buffer::Iterator* payload,
+                        int priority,
+                        TransmitQueueState* txQueueState)
+{
+    timeTrace("ofiud: sendPacket invoked");
+    uint32_t totalLength = headerLen + (payload ? payload->size() : 0);
+    uint32_t packetLength = datagramPrefixSize + totalLength;
+    assert(totalLength <= getMaxPacketSize());
 
     // FIXME: hack to do packet balancing on the sender-side; this relies on
     // the FI_NAMED_RX_CTX cap of psm2 when using scalable endpoints. Note
@@ -745,65 +812,25 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     // to improve their latency since the first rxcq will be polled inside the
     // dispatch thread.
     static uint64_t sprayPacketCount;
-    uint32_t remoteRxid = (bd->packetLength < 8192) ? 0 :
-            1 + (sprayPacketCount++) % (MAX_RX_QUEUES - 1);
-    fi_addr_t dstAddr = address->addr[remoteRxid];
+    int txid = (packetLength < 8192) ?
+            0 : (1 + (sprayPacketCount++) % (MAX_HW_QUEUES - 1));
 
-    // Change the following from 0 to 1 to enable message TX batching (note:
-    // it has no effect for providers ignoring FI_MORE flag like psm2).
-#if 0
-    if (corked) {
-        corkedPackets.emplace_back();
-        corkedPackets.back() = {
-            .io_vec = {io_vec[0], io_vec[1]},
-            .desc = {desc[0], desc[1]},
-            .iov_count = iov_count,
-            .dstAddr = dstAddr,
-            .bd = bd
-        };
+    lastTransmitTime = Cycles::rdtsc();
 
-        // Dynamic vector resize can invalidate `ibv_send_wr::sg_list`;
-        // uncork the transmit queue if this is about to happen.
-        if (unlikely(corkedPackets.capacity() == corkedPackets.size())) {
-            uncorkTransmitQueue();
-            corked = true;
-            corkedPackets.reserve(corkedPackets.capacity() * 2);
-        }
-        return;
-    }
-#endif
-
-    int ret;
-    if (bd->packetLength <= info->tx_attr->inject_size) {
-        // TODO: use different tx contexts for inject and sendv to reduce HOL
-        // blocking at sender-side? How to verify that this is indeed useful?
-        ret = downCast<int>(fi_inject(transmitContext[0], bd->buffer,
-                bd->packetLength, dstAddr));
-        txPool->freeBuffers.push_back(bd);
+    if (txid == 0) {
+        sendPacketImpl(0, addr, header, headerLen, payload);
     } else {
-        ret = downCast<int>(fi_sendv(transmitContext[0], io_vec, desc,
-                iov_count, dstAddr, &bd->context));
-        if (txBuffersInNic) {
-            txBuffersInNic->push_back(bd);
-        }
+        workerThreadContext[txid].sendPacket(addr, header, headerLen, payload);
+        timeTrace("ofiud: handoff send request to txid %u", txid);
     }
-    if (ret) {
-        DIE("Error posting transmit packet: %s", fi_strerror(-ret));
-    }
-    timeTrace("ofiud: sent packet with %u bytes, %u free buffers, "
-            "remoteRxid %u", bd->packetLength, txPool->freeBuffers.size(),
-            remoteRxid);
-#if DEBUG_ALL_SHUFFLE
-    TimeTrace::record("ofiud: transmit buffer of size %u enqueued",
-            bd->packetLength);
-#endif
+
     // FIXME: ignore small (how small?) packets so in BasicTransport we can
     // log more meaningful "tx queue idle XXX cyc" message
-    if (unlikely(bd->packetLength > 128)) {
-        queueEstimator.packetQueued(bd->packetLength, lastTransmitTime,
+    if (unlikely(packetLength > 128)) {
+        queueEstimator.packetQueued(packetLength, lastTransmitTime,
                 txQueueState);
     }
-    PerfStats::threadStats.networkOutputBytes += bd->packetLength;
+    PerfStats::threadStats.networkOutputBytes += packetLength;
     PerfStats::threadStats.networkOutputPackets++;
 }
 
@@ -932,7 +959,7 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
         }
 #if TIME_TRACE
         uint64_t now = Cycles::rdtsc();
-        if (now - pollCqTime >= Cycles::fromMicroseconds(2)) {
+        if (now - pollCqTime >= Cycles::fromMicroseconds(5)) {
             TimeTrace::record(now, "ofiud: polling rxcq %d took too long!",
                     rxid);
         }
@@ -978,7 +1005,7 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
         rxPackets.emplace_back(bd->sourceAddress.get(), this,
                 bd->packetLength - datagramPrefixSize,
                 bd->buffer + datagramPrefixSize, receiveTime);
-        rxPackets.back().delegateCopy = &rxThreadContext[rxid].callback;
+        rxPackets.back().delegateCopy = &workerThreadContext[rxid].callback;
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
 
@@ -1114,32 +1141,6 @@ OfiUdDriver::refillReceiver(int rxid, bool refillAll)
     }
 }
 
-void
-OfiUdDriver::uncorkTransmitQueue()
-{
-    corked = false;
-    if (corkedPackets.empty()) {
-        return;
-    }
-
-    // FIXME: the correct way is to use fi_sendmsg with FI_MORE; psm2 ignores
-    // FI_MORE so I will too for now.
-    timeTrace("ofiud: about to uncork the transmit queue");
-    int ret;
-    for (SendRequest& sr : corkedPackets) {
-        ret = downCast<int>(fi_sendv(transmitContext[0], sr.io_vec, sr.desc,
-                sr.iov_count, sr.dstAddr, &sr.bd->context));
-        if (txBuffersInNic) {
-            txBuffersInNic->push_back(sr.bd);
-        }
-        if (ret) {
-            DIE("Error posting transmit packet: %s", fi_strerror(-ret));
-        }
-    }
-    timeTrace("ofiud: enqueued %u packets", corkedPackets.size());
-    corkedPackets.clear();
-}
-
 /**
  * Insert a raw address into the libfabric address vector if it hasn't been
  * inserted before.
@@ -1159,7 +1160,7 @@ OfiUdDriver::AddressMap::insertIfAbsent(RawAddress* rawAddress,
         fi_addr_t fi_addr;
         uint8_t realAddr[addressLength];
         bzero(realAddr, addressLength);
-        for (uint32_t i = 0; i < MAX_RX_QUEUES; i++) {
+        for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
             memcpy(realAddr, rawAddress->raw + i * POD_PSM2_REAL_ADDR_LEN,
                     POD_PSM2_REAL_ADDR_LEN);
             fi_av_insert(addressVector, realAddr, 1, &fi_addr, 0, NULL);

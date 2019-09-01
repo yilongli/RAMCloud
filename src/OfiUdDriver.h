@@ -75,15 +75,14 @@ class OfiUdDriver : public Driver {
 
     virtual string getServiceLocator();
     virtual Address* newAddress(const ServiceLocator* serviceLocator);
-    virtual void uncorkTransmitQueue();
 
   PRIVATE:
 
-    static constexpr uint32_t MAX_RX_QUEUES = 4;
+    static constexpr uint32_t MAX_HW_QUEUES = 4;
 
     static constexpr uint32_t POD_PSM2_REAL_ADDR_LEN = 4;
 
-    using fi_addr_vec = std::array<fi_addr_t, MAX_RX_QUEUES>;
+    using fi_addr_vec = std::array<fi_addr_t, MAX_HW_QUEUES>;
 
     /**
      * Identifies the address of a libfabric endpoint.
@@ -253,22 +252,57 @@ class OfiUdDriver : public Driver {
         ska::flat_hash_map<RawAddress, fi_addr_vec, RawAddress::Hasher> map;
     };
 
-    struct RxThreadContext {
+    /**
+     * Holds state of the driver's worker thread.
+     */
+    struct WorkerThreadContext {
+        struct OutPacket {
+            const Driver::Address* addr;
+            char header[32];
+            uint32_t headerLen;
+            Buffer::Iterator payload;
+
+            OutPacket(const Driver::Address* addr, const void* header,
+                    uint32_t headerLen, Buffer::Iterator* payload)
+                : addr(addr)
+                , header()
+                , headerLen(headerLen)
+                , payload(*payload)
+            {
+                assert(arrayLength(this->header) >= headerLen);
+                memcpy(this->header, header, headerLen);
+            }
+        };
+
         std::function<void(CopyRequest*)> callback;
 
-        SpinLock lock;
+        SpinLock rxLock;
 
-        std::deque<CopyRequest> pendingRequests;
+        SpinLock txLock;
 
-        RxThreadContext()
+        std::deque<CopyRequest> pendingCopyReqs;
+
+        std::deque<OutPacket> pendingSendReqs;
+
+        WorkerThreadContext()
             : callback()
-            , lock("RxThreadContext::pendingRequests")
-            , pendingRequests()
+            , rxLock("WorkerThreadContext::pendingCopyReqs")
+            , txLock("WorkerThreadContext::pendingSendReqs")
+            , pendingCopyReqs()
+            , pendingSendReqs()
         {
             callback = [this] (CopyRequest* copyRequest) {
-                SpinLock::Guard _(lock);
-                pendingRequests.push_back(*copyRequest);
+                SpinLock::Guard _(rxLock);
+                pendingCopyReqs.push_back(*copyRequest);
             };
+        }
+
+        void
+        sendPacket(const Driver::Address* addr, const void* header,
+                uint32_t headerLen, Buffer::Iterator* payload)
+        {
+            SpinLock::Guard _(txLock);
+            pendingSendReqs.emplace_back(addr, header, headerLen, payload);
         }
     };
 
@@ -282,10 +316,12 @@ class OfiUdDriver : public Driver {
         BufferDescriptor* bd;
     };
 
-    BufferDescriptor* getTransmitBuffer();
+    BufferDescriptor* getTransmitBuffer(int txid);
     ServiceLocator readDriverConfigFile();
     void receivePacketsImpl(int rxid, uint32_t maxPackets);
-    void reapTransmitBuffers();
+    void sendPacketImpl(int txid, const Driver::Address* addr,
+            const void* header, uint32_t headerLen, Buffer::Iterator* payload);
+    void reapTransmitBuffers(int txid);
     void refillReceiver(int rxid, bool refillAll = false);
 
     /// Maximum number of bytes of datagrams to be sent with fi_inject,
@@ -347,11 +383,11 @@ class OfiUdDriver : public Driver {
     fid_ep* scalableEp;
 //    fid_ep* endpoint;
 
-    fid_ep* transmitContext[MAX_RX_QUEUES];
+    fid_ep* transmitContext[MAX_HW_QUEUES];
 
-    fid_ep* receiveContext[MAX_RX_QUEUES];
+    fid_ep* receiveContext[MAX_HW_QUEUES];
 
-    RxThreadContext rxThreadContext[MAX_RX_QUEUES];
+    WorkerThreadContext workerThreadContext[MAX_HW_QUEUES];
 
     /// Identifier of the local addressing table that maps provider-specific
     /// addresses (i.e., those returned by fi_getname) to opaque libfabric
@@ -362,12 +398,12 @@ class OfiUdDriver : public Driver {
 
     /// Identifier of the completion queue for receiving incoming packets.
     /// Not owned by this class.
-    fid_cq* rxcq[MAX_RX_QUEUES];
+    fid_cq* rxcq[MAX_HW_QUEUES];
 //    fid_cq* rxcq;
 
     /// Identifier of the completion queue used by the NIC to return buffers
     /// for transmitted packets. Not owned by this class.
-    fid_cq* txcq;
+    fid_cq* txcq[MAX_HW_QUEUES];
 
     /// # bytes used to represent a raw address in this fabric.
     uint32_t addressLength;
@@ -384,8 +420,8 @@ class OfiUdDriver : public Driver {
     /// in raw ethernet mode.
     std::deque<BufferDescriptor*> loopbackPkts;
 
-    std::vector<Arachne::ThreadId> receiverThreads;
-    std::atomic_bool receiverThreadStop;
+    std::vector<Arachne::ThreadId> workerThreads;
+    std::atomic_bool workerThreadStop;
 
     // TODO: mutual exclusive access to resources related to RX code path:
     // inside receivePacketsImpl: rxPackets, rxcq, lastReceiveTime, rxBuffersInNic, addressMap
@@ -400,7 +436,7 @@ class OfiUdDriver : public Driver {
 
     /// Number of receive buffers currently in the possession of the NIC.
 //    uint32_t rxBuffersInNic;
-    uint32_t rxBuffersInNic[MAX_RX_QUEUES];
+    uint32_t rxBuffersInNic[MAX_HW_QUEUES];
 
     /// Used to log messages when receive buffer usage hits a new high.
     /// Log the next message when the number of free receive buffers
@@ -408,13 +444,14 @@ class OfiUdDriver : public Driver {
     uint32_t rxBufferLogThreshold;
 
     /// Packet buffers used to transmit outgoing packets.
-    Tub<BufferPool> txPool;
+    std::array<Tub<BufferPool>, MAX_HW_QUEUES> txPool;
 
     /// Transmit buffers currently in the possession of the NIC, ordered by the
     /// time they are posted to the transmit queue. This is used to implement
     /// the selective completion optimization when sending packets; only valid
     /// when the underlying provider supports generating CQEs in FIFO order.
-    Tub<std::deque<BufferDescriptor*>> txBuffersInNic;
+    using BufferDescriptorQueue = std::deque<BufferDescriptor*>;
+    Tub<std::array<BufferDescriptorQueue, MAX_HW_QUEUES>> txBuffersInNic;
 
     /// Size of the prefix buffer space in all packet buffers, in bytes,
     /// that are left for use by libfabric (similar to GRH in Infiniband UD).
