@@ -195,7 +195,7 @@ class Driver {
 
         /// Callback function to delegate a payload copy request to the RX
         /// thread of the driver who received the payload in the first place.
-        std::function<void(CopyRequest*)>* delegateCopy;
+        std::function<bool(CopyRequest*)>* delegateCopy;
 
         /// Counts the total number of times that steal has been invoked
         /// across all Received objects. Intended for unit testing; only

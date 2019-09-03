@@ -156,6 +156,7 @@ class DispatchExec : public Dispatch::Poller {
         }
 
         void sync(uint64_t id);
+        bool isDone(uint64_t id);
 
         /**
          * Worker threads invoke this method to schedule work for execution in

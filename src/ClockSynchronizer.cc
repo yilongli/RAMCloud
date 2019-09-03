@@ -78,21 +78,23 @@ ClockSynchronizer::ClockSynchronizer(Context* context)
 
 /**
  * Compute the clock skew factors and offsets between this node and other nodes
- * in the cluster. This method is called from a worker thread and must be
- * carefully synchronized with #handleRequest and #poll that both run in the
- * dispatch thread.
+ * in the cluster. This method is run inside the dispatch thread (so does #poll
+ * and #handleRequest), via the DispatchExec mechanism, to simplify the
+ * synchronization.
  */
 void
 ClockSynchronizer::computeOffset()
 {
-    {
-        // Wait till the current poll(), if any, to finish. The next poll()
-        // will realize that it has passed the stop time and return immediately.
-        Dispatch::Lock _(context->dispatch);
-        phase = -1;
-        syncCount++;
+    if (!context->dispatch->isDispatchThread()) {
+        DIE("ClockSynchronizer::computeOffset must run in the dispatch thread");
     }
-    timeTrace("computeOffset released dispatch lock");
+
+    LOG(NOTICE, "ClockSynchronizer::ComputeOffsetWrapper: start to compute "
+            "clock skew factors and offsets");
+
+    phase = -1;
+    syncCount++;
+
     SpinLock::Guard _(mutex);
     outstandingRpc.destroy();
 
@@ -317,10 +319,18 @@ ClockSynchronizer::poll()
     if (outstandingRpc && outstandingRpc->isReady()) {
         ClockSyncRpc* rpc = outstandingRpc.get();
         ServerId targetId = rpc->targetId;
-        uint64_t serverTsc = rpc->wait();
+        uint64_t completionTime = ~0lu;
+        uint64_t serverTsc = 0;
+        try {
+            serverTsc = rpc->wait();
+            completionTime = rpc->getCompletionTime();
+        } catch (const std::exception& e) {
+            LOG(ERROR, "ClockSync RPC to server %s failed: %s",
+                    targetId.toString().c_str(), e.what());
+        }
 
-        codedProbes[probeId % 2] =
-                {rpc->getClientTsc(), serverTsc, rpc->getCompletionTime()};
+        codedProbes[probeId % 2] = {rpc->getClientTsc(), serverTsc,
+                completionTime};
         if (probeId % 2) {
             // Test probe pair's purity
             uint64_t clientDelta =
@@ -333,15 +343,19 @@ ClockSynchronizer::poll()
                     (codedProbes[1].serverTsc == 0)) {
                 error = 99999;
             }
+            if ((codedProbes[0].completionTime > 99999999) ||
+                    (codedProbes[1].completionTime > 99999999)) {
+                error = 99999;
+            }
             if (error < 50) {
                 int index = phase.load(std::memory_order_relaxed);
                 Probe* fastestProbe = &outgoingProbes[index][targetId];
-                if (rpc->getCompletionTime() < fastestProbe->completionTime) {
+                if (completionTime < fastestProbe->completionTime) {
                     fastestProbe->clientTsc = rpc->getClientTsc();
                     fastestProbe->serverTsc = serverTsc;
-                    fastestProbe->completionTime = rpc->getCompletionTime();
+                    fastestProbe->completionTime = completionTime;
                     timeTrace("update fastest probe, completion time %u ns",
-                            Cycles::toNanoseconds(rpc->getCompletionTime()));
+                            Cycles::toNanoseconds(completionTime));
                 }
 
                 // FIXME: Huygens-related experiment
@@ -349,7 +363,6 @@ ClockSynchronizer::poll()
                         rpc->getCompletionTime());
             }
         }
-
         outstandingRpc.destroy();
         probeId++;
     }
@@ -385,6 +398,14 @@ ClockSynchronizer::poll()
 void
 ClockSynchronizer::run(uint32_t seconds)
 {
+    if (phase >= 0) {
+        LOG(WARNING, "Clock sync. protocol in progress; duplicate request?");
+        while (phase >= 0) {
+            Arachne::sleep(100 * 1000);
+        }
+        return;
+    }
+
     LOG(NOTICE, "Start running clock sync. for %u seconds", seconds);
     timeTrace("ClockSynchronizer started");
     uint64_t totalTimeNs = seconds * 1000000000UL;
@@ -416,7 +437,14 @@ ClockSynchronizer::run(uint32_t seconds)
             break;
         }
     }
-    computeOffset();
+
+    // Pass the final task of computing clock skew/offset to the dispatch thread
+    // and wait until it's done.
+    uint64_t id = context->dispatchExec->addRequest<ComputeOffsetWrapper>(this);
+    while (!context->dispatchExec->isDone(id)) {
+        Arachne::sleep(100 * 1000);
+    }
+
     LOG(NOTICE, "ClockSynchronizer stopped");
 }
 

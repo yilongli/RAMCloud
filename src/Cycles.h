@@ -87,6 +87,7 @@ class Cycles {
     static uint64_t fromNanoseconds(uint64_t ns, double cyclesPerSec = 0);
     // TODO: the following should be replaced by Arachne::sleep in most cases.
     static void sleep(uint64_t us);
+    static void sleepNanos(uint64_t ns);
 
   PRIVATE:
     Cycles();

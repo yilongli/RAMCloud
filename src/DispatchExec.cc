@@ -82,4 +82,23 @@ DispatchExec::sync(uint64_t id)
             owner->poll();
     }
 }
+
+/**
+ * Check if a previously-scheduled piece of work has been executed.
+ *
+ * \param id
+ *      The return value from a previous indication of addRequest:
+ *      identifies the work we want to check for completion.
+ */
+bool
+DispatchExec::isDone(uint64_t id)
+{
+    if (totalRemoves >= id) {
+        return true;
+    }
+
+    if (owner->isDispatchThread())
+        owner->poll();
+    return false;
+}
 }

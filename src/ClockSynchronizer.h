@@ -18,6 +18,7 @@
 
 #include "AdminClient.h"
 #include "Dispatch.h"
+#include "DispatchExec.h"
 #include "ServerTracker.h"
 #include "Tub.h"
 
@@ -79,6 +80,21 @@ class ClockSynchronizer : Dispatch::Poller {
             : baseTsc(), newBaseTsc(), offset(), skew()
         {}
     };
+
+    class ComputeOffsetWrapper : public DispatchExec::Lambda {
+      PRIVATE:
+        ClockSynchronizer* clockSync;
+
+      public:
+        ComputeOffsetWrapper(ClockSynchronizer* clockSync)
+            : clockSync(clockSync) {}
+
+        /// @copydoc DispatchExec::Lambda::invoke()
+        void invoke() { clockSync->computeOffset(); };
+      PRIVATE:
+        DISALLOW_COPY_AND_ASSIGN(ComputeOffsetWrapper);
+    };
+
 
     /// Stores the states of clocks on all nodes in the cluster when the
     /// synchronization completes.

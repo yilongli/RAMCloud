@@ -138,7 +138,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // FIXME: newly added fields for RX-side scaling; not yet properly ordered
     , workerThreads()
     , workerThreadStop()
-    , rxPacketsLock()
+    , rxPacketsLock("OfiUdDriver::rxPackets")
     , rxPackets()
     , workerThreadContext()
 
@@ -399,7 +399,8 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
 
     // Pre-post some receive buffers in each RX queue.
     for (int rxid = 0; rxid < int(MAX_HW_QUEUES); rxid++) {
-        refillReceiver(rxid, true);
+        // Refill until the RX queue is full.
+        while (refillReceiver(rxid)) {}
     }
 
     // Spawn receive threads for polling RX queues (and copying data into RX
@@ -411,6 +412,7 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
         WorkerThreadContext* threadCtx = &workerThreadContext[workerId];
         using OutPacket = WorkerThreadContext::OutPacket;
         std::vector<OutPacket*> outPackets;
+        std::vector<Received> receivedPackets;
 
         // Polling loop of the worker thread.
         while (!workerThreadStop.load(std::memory_order_acquire)) {
@@ -425,8 +427,9 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
             if (!outPackets.empty()) {
                 // Each iteration of the following loop sends out one packet.
                 for (OutPacket* outPacket : outPackets) {
-                    sendPacketImpl(workerId, outPacket->addr, outPacket->header,
-                            outPacket->headerLen, &outPacket->payload);
+                    sendPacketImpl(workerId, workerId, outPacket->addr,
+                            outPacket->header, outPacket->headerLen,
+                            &outPacket->payload);
                 }
 
                 // Remove all completed send requests.
@@ -441,8 +444,19 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
             }
 
             // Try to receive packets from RX queue.
-            receivePacketsImpl(workerId, 8);
-            Arachne::yield();
+            receivePacketsImpl(workerId, 8, &receivedPackets);
+            // FIXME: do we really need try_lock here? guard should be ok?
+            while (!receivedPackets.empty()) {
+                if (rxPacketsLock.try_lock()) {
+                    for (auto& received : receivedPackets) {
+                        rxPackets.emplace_back(std::move(received));
+                    }
+                    rxPacketsLock.unlock();
+                    receivedPackets.clear();
+                } else {
+                    Arachne::yield();
+                }
+            }
 
             // Each iteration of the following loop processes one pending copy
             // request enqueued by the transport; the loop doesn't return or
@@ -706,8 +720,9 @@ OfiUdDriver::release()
 }
 
 void
-OfiUdDriver::sendPacketImpl(int txid, const Driver::Address* addr,
-        const void* header, uint32_t headerLen, Buffer::Iterator* payload)
+OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
+        const Driver::Address* addr, const void* header, uint32_t headerLen,
+        Buffer::Iterator* payload)
 {
     BufferDescriptor* bd = getTransmitBuffer(txid);
     bd->packetLength = datagramPrefixSize + headerLen +
@@ -765,7 +780,7 @@ OfiUdDriver::sendPacketImpl(int txid, const Driver::Address* addr,
 
     // Post the packet buffer to the transmit queue.
     fid_ep* ep = transmitContext[txid];
-    fi_addr_t dstAddr = static_cast<const Address*>(addr)->addr[txid];
+    fi_addr_t dstAddr = static_cast<const Address*>(addr)->addr[remoteRxid];
 
     int ret;
     if (bd->packetLength <= info->tx_attr->inject_size) {
@@ -782,8 +797,9 @@ OfiUdDriver::sendPacketImpl(int txid, const Driver::Address* addr,
     if (ret) {
         DIE("Error posting transmit packet: %s", fi_strerror(-ret));
     }
-    timeTrace("ofiud: sent packet with %u bytes, %u free buffers, txid %u",
-            bd->packetLength, txPool[txid]->freeBuffers.size(), txid);
+    timeTrace("ofiud: sent packet with %u bytes, %u free buffers, txid %u, "
+            "remoteRxid %d", bd->packetLength, txPool[txid]->freeBuffers.size(),
+            txid, remoteRxid);
 #if DEBUG_ALL_SHUFFLE
     TimeTrace::record("ofiud: transmit buffer of size %u enqueued",
             bd->packetLength);
@@ -818,10 +834,16 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     lastTransmitTime = Cycles::rdtsc();
 
     if (txid == 0) {
-        sendPacketImpl(0, addr, header, headerLen, payload);
+        sendPacketImpl(0, 0, addr, header, headerLen, payload);
     } else {
-        workerThreadContext[txid].sendPacket(addr, header, headerLen, payload);
-        timeTrace("ofiud: handoff send request to txid %u", txid);
+        bool success = workerThreadContext[txid].sendPacket(addr, header,
+                headerLen, payload);
+        if (success) {
+            timeTrace("ofiud: handoff send request to txid %u", txid);
+        } else {
+            timeTrace("ofiud: failed to offload send request to txid %u", txid);
+            sendPacketImpl(0, txid, addr, header, headerLen, payload);
+        }
     }
 
     // FIXME: ignore small (how small?) packets so in BasicTransport we can
@@ -939,7 +961,8 @@ OfiUdDriver::sendPackets(const Driver::Address* addr,
 #endif
 
 void
-OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
+OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets,
+        std::vector<Received>* receivedPackets)
 {
     static const uint32_t MAX_COMPLETIONS = 16;
     fi_cq_msg_entry wc[MAX_COMPLETIONS];
@@ -975,17 +998,12 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
     uint64_t receiveTime = Cycles::rdtsc();
 #endif
 
+    // Give the RX queue a chance to replenish.
+    refillReceiver(rxid);
     if (unlikely(rxBuffersInNic[rxid] == 0)) {
         RAMCLOUD_CLOG(WARNING, "OfiUdDriver: receiver temporarily ran "
                 "out of packet buffers; could result in dropped packets");
     }
-
-    // TODO: explain why we acquire the lock here: need to cover refillReceiver
-    // which modifies rxPool.
-    SpinLock::Guard _(rxPacketsLock);
-
-    // Give the RX queue a chance to replenish.
-    refillReceiver(rxid);
 
     // Each iteration of the following loop processes one incoming packet.
     for (int i = 0; i < numPackets; i++) {
@@ -997,15 +1015,15 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets)
         if (mustIncludeLocalAddress) {
             char* srcAddrBuf = bd->buffer + datagramPrefixSize - addressLength;
             RawAddress rawAddress(srcAddrBuf, addressLength);
-            addressMap->insertIfAbsent(&rawAddress, &srcAddr);
+            addressMap->insertIfAbsent(rxid, &rawAddress, &srcAddr);
         }
 
         bd->packetLength = downCast<uint32_t>(incoming->len);
         bd->sourceAddress.construct(&srcAddr);
-        rxPackets.emplace_back(bd->sourceAddress.get(), this,
+        receivedPackets->emplace_back(bd->sourceAddress.get(), this,
                 bd->packetLength - datagramPrefixSize,
                 bd->buffer + datagramPrefixSize, receiveTime);
-        rxPackets.back().delegateCopy = &workerThreadContext[rxid].callback;
+        receivedPackets->back().delegateCopy = &workerThreadContext[rxid].callback;
         PerfStats::threadStats.networkInputBytes += bd->packetLength;
         PerfStats::threadStats.networkInputPackets++;
 
@@ -1026,10 +1044,13 @@ OfiUdDriver::receivePackets(uint32_t maxPackets,
 {
     // Receive "small" packets that are addressed to rxcq[0] in the dispatch
     // thread to improve latency.
-    receivePacketsImpl(0, maxPackets);
+    receivePacketsImpl(0, maxPackets, receivedPackets);
 
-    if (rxPacketsLock.try_lock()) {
-        while (maxPackets-- && !rxPackets.empty()) {
+    // Check if the worker threads have any incoming packets for us.
+    uint32_t morePackets =
+            downCast<uint32_t>(maxPackets - receivedPackets->size());
+    if (morePackets && rxPacketsLock.try_lock()) {
+        while (morePackets-- && !rxPackets.empty()) {
             receivedPackets->emplace_back(std::move(rxPackets.front()));
             rxPackets.pop_front();
         }
@@ -1070,9 +1091,8 @@ OfiUdDriver::newAddress(const ServiceLocator* serviceLocator) {
         bytes.push_back(downCast<uint8_t>(stoul(byteStr)));
     }
     RawAddress rawAddress(bytes.data(), addressLength);
-    SpinLock::Guard _(rxPacketsLock);
     fi_addr_vec fi_addr;
-    addressMap->insertIfAbsent(&rawAddress, &fi_addr);
+    addressMap->insertIfAbsent(-1, &rawAddress, &fi_addr);
     return new Address(&fi_addr);
 #endif
 }
@@ -1080,31 +1100,48 @@ OfiUdDriver::newAddress(const ServiceLocator* serviceLocator) {
 /**
  * Fill up the NIC's receive queue with more packet buffers.
  *
- * \param refillAll
- *     Post as many free receive buffers to the NIC as possible when this
- *     variable is true; otherwise, only post a small batch of buffers at
- *     a time.
+ * \return
+ *      True if we have successfully posted some receive buffers;
+ *      false, otherwise.
  */
-void
-OfiUdDriver::refillReceiver(int rxid, bool refillAll)
+bool
+OfiUdDriver::refillReceiver(int rxid)
 {
-    // Always refill in batch to amortize the cost of posting receive buffers.
+    // Refill in batch to amortize the cost of posting receive buffers and the
+    // times to acquire the locks.
     static const uint32_t REFILL_BATCH = 8;
-    uint32_t maxRefill = std::min(MAX_RX_QUEUE_DEPTH - rxBuffersInNic[rxid],
-            downCast<uint32_t>(rxPool->freeBuffers.size()));
-    if (maxRefill < REFILL_BATCH) {
-        return;
+    BufferDescriptor* rxBuffersToRefill[REFILL_BATCH];
+    uint32_t freeBuffers;
+
+    // Check if the RX queue can accept at least REFILL_BATCH more buffers to
+    // be posted. If not, don't attempt to acquire the lock.
+    if (MAX_RX_QUEUE_DEPTH - rxBuffersInNic[rxid] >= REFILL_BATCH) {
+        // This critical section accesses the shared rxPool to obtain the free
+        // RX buffers that will be used for refill. Therefore, the code that
+        // follows can perform the refill operation without holding the lock.
+        timeTrace("ofiud: time to refill rx buffers");
+        SpinLock::Guard _(rxPacketsLock);
+        freeBuffers = downCast<uint32_t>(rxPool->freeBuffers.size());
+        if (freeBuffers < REFILL_BATCH) {
+            return false;
+        }
+
+        for (int i = 0; i < REFILL_BATCH; i++) {
+            BufferDescriptor* bd = rxPool->freeBuffers.back();
+            rxPool->freeBuffers.pop_back();
+            rxBuffersToRefill[i] = bd;
+        }
+        freeBuffers += REFILL_BATCH;
+    } else {
+        return false;
     }
 
     // Each iteration of the following loop posts one receive buffer to the
     // receive queue. All post operations except the last one are flagged as
     // FI_MORE to indicate that additional buffers will be posted immediately
     // after the current call returns.
-    uint32_t refillCount = refillAll ? maxRefill : REFILL_BATCH;
-    for (int i = 0; i < refillCount; i++) {
-        BufferDescriptor* bd = rxPool->freeBuffers.back();
-        rxPool->freeBuffers.pop_back();
-
+    for (int i = 0; i < REFILL_BATCH; i++) {
+        BufferDescriptor* bd = rxBuffersToRefill[i];
         iovec msg_iov = {
             .iov_base = bd->buffer,
             .iov_len = bd->length,
@@ -1118,17 +1155,19 @@ OfiUdDriver::refillReceiver(int rxid, bool refillAll)
             .context = &bd->context,
             .data = 0
         };
-        uint64_t flags = (i < refillCount) ? FI_MORE : 0;
+        uint64_t flags = (i < REFILL_BATCH) ? FI_MORE : 0;
         FI_CHK_CALL(fi_recvmsg, receiveContext[rxid], &msg, flags);
     }
-    rxBuffersInNic[rxid] += refillCount;
+    rxBuffersInNic[rxid] += REFILL_BATCH;
     timeTrace("ofiud: RX queue %d refilled, rxBuffersInNic %u", rxid,
             rxBuffersInNic[rxid]);
 
+    // FIXME: comment out cause I don't have an easy solution to prevent data
+    // race on rxBufferLogThreshold.
+#if 0
     // Generate log messages every time buffer usage reaches a significant new
     // high. Running out of buffers is a bad thing, so we want warnings in the
     // log long before that happens.
-    uint32_t freeBuffers = downCast<uint32_t>(rxPool->freeBuffers.size());
     if (unlikely(freeBuffers <= rxBufferLogThreshold)) {
         double percentUsed = 100.0*static_cast<double>(
                 TOTAL_RX_BUFFERS - freeBuffers)/TOTAL_RX_BUFFERS;
@@ -1139,39 +1178,69 @@ OfiUdDriver::refillReceiver(int rxid, bool refillAll)
             rxBufferLogThreshold -= 1000;
         } while (freeBuffers < rxBufferLogThreshold);
     }
+#endif
+    return true;
 }
 
 /**
  * Insert a raw address into the libfabric address vector if it hasn't been
  * inserted before.
  *
+ * \param rxid
+ *      Identifier of the calling thread. -1 means the caller is not the
+ *      dispatch or worker threads.
  * \param rawAddress
  *      Raw address to insert.
- * \return
- *      Address in fi_addr_t format.
+ * \param[out] out
+ *      Filled with translated fi_addr_t addresses upon return.
  */
 void
-OfiUdDriver::AddressMap::insertIfAbsent(RawAddress* rawAddress,
+OfiUdDriver::AddressMap::insertIfAbsent(int rxid, RawAddress* rawAddress,
         fi_addr_vec* out)
 {
-    auto it = map.find(*rawAddress);
+    // Lookup the address in our thread-local cache first; no need to acquire
+    // the lock if the address already exists in the cache.
+    AddressHashMap::iterator it;
+    if (likely(rxid >= 0)) {
+        it = cache[rxid].find(*rawAddress);
+        if (likely(it != cache[rxid].end())) {
+            *out = it->second;
+            return;
+        }
+    }
+
+    // Acquire the lock to access the shared address map.
+    SpinLock::Guard _(lock);
+    it = map.find(*rawAddress);
     if (it == map.end()) {
         fi_addr_vec& addr_vec = map[*rawAddress];
-        fi_addr_t fi_addr;
-        uint8_t realAddr[addressLength];
-        bzero(realAddr, addressLength);
+        uint8_t realAddr[addressLength * MAX_HW_QUEUES];
+        bzero(realAddr, addressLength * MAX_HW_QUEUES);
+
+        // For psm2, each raw address contains actually MAX_HW_QUEUES real
+        // addresses; unpack them into realAddr.
+        uint8_t* dst = realAddr;
+        uint8_t* src = rawAddress->raw;
         for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
-            memcpy(realAddr, rawAddress->raw + i * POD_PSM2_REAL_ADDR_LEN,
-                    POD_PSM2_REAL_ADDR_LEN);
-            fi_av_insert(addressVector, realAddr, 1, &fi_addr, 0, NULL);
-            addr_vec[i] = fi_addr;
-            LOG(NOTICE, "OfiUdDriver: inserts new raw addr %s, fi_addr_t %lu",
-                    RawAddress(realAddr, addressLength).toString().c_str(),
-                    fi_addr);
+            memcpy(dst, src, POD_PSM2_REAL_ADDR_LEN);
+            dst += addressLength;
+            src += POD_PSM2_REAL_ADDR_LEN;
+        }
+        fi_av_insert(addressVector, realAddr, MAX_HW_QUEUES, addr_vec.data(),
+                0, NULL);
+        for (uint32_t i = 0; i < MAX_HW_QUEUES; i++) {
+            RawAddress raw(realAddr + i * addressLength, addressLength);
+            LOG(DEBUG, "OfiUdDriver: inserts new raw addr %s, fi_addr_t %lu",
+                    raw.toString().c_str(), addr_vec[i]);
         }
         *out = addr_vec;
     } else {
         *out = it->second;
+    }
+
+    // Update our thread-local cache about the missing record.
+    if (rxid >= 0) {
+        cache[rxid][*rawAddress] = *out;
     }
 }
 

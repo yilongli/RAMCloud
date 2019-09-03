@@ -233,4 +233,11 @@ Cycles::sleep(uint64_t us)
     uint64_t stop = Cycles::rdtsc() + Cycles::fromNanoseconds(1000*us);
     while (Cycles::rdtsc() < stop);
 }
+
+void
+Cycles::sleepNanos(uint64_t ns)
+{
+    uint64_t stop = Cycles::rdtsc() + Cycles::fromNanoseconds(ns);
+    while (Cycles::rdtsc() < stop);
+}
 } // end RAMCloud

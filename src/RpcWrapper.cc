@@ -155,10 +155,6 @@ RpcWrapper::handleTransportError()
 {
     // Default version that does not handle errors; probably only useful
     // for testing.
-#if !TESTING
-    LOG(WARNING, "RpcWrapper::handleTransportError() invoked; "
-            "forgot to override?");
-#endif
     return true;
 }
 

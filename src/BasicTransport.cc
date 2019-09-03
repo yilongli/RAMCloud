@@ -1705,6 +1705,7 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                 // packet, if the payload is large enough to justify the handoff
                 // cost.
                 bool isLastPacket = (fragment.length < t->maxDataPerPacket);
+                bool copyOffload = false;
                 if ((fragment.length > 8000) && !isLastPacket &&
                         fragment.delegateCopy) {
                     Driver::CopyRequest req = {
@@ -1713,10 +1714,14 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                         .len = fragment.length,
                         .bytesCopied = &bytesCopied
                     };
-                    bytesToCopy += fragment.length;
-                    (*reinterpret_cast<decltype(received->delegateCopy)>(
-                            fragment.delegateCopy))(&req);
-                } else {
+                    if ((*reinterpret_cast<decltype(received->delegateCopy)>(
+                            fragment.delegateCopy))(&req)) {
+                        bytesToCopy += fragment.length;
+                        copyOffload = true;
+                    }
+                }
+
+                if (!copyOffload) {
                     buffer->appendCopy(payload + sizeof32(DataHeader),
                             fragment.length);
                 }
@@ -1746,9 +1751,19 @@ void
 BasicTransport::MessageAccumulator::syncDriverRxThreads()
 {
     if (bytesToCopy) {
+        // TODO: this method is really a quick hack and has the risk of blocking
+        // the dispatch thread; add excessive log messages to detect such case.
+        double ms = 50.0;
+        uint64_t warningDeadline =
+                Cycles::rdtsc() + Cycles::fromSeconds(ms*1e-3);
         while (bytesCopied.load() < bytesToCopy) {
             // Wait 80 ns to avoid thrashing the cache.
             Arachne::sleep(80);
+
+            if (Cycles::rdtsc() > warningDeadline) {
+                LOG(WARNING, "Dispatch thread got stuck for %.2f ms", ms);
+                warningDeadline += Cycles::fromSeconds(ms*1e-3);
+            }
         }
         t->timeTrace("driver Rx threads finished copying %u bytes", bytesToCopy);
         bytesToCopy = 0;

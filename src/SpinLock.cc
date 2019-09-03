@@ -91,6 +91,7 @@ SpinLock::lock()
                 RAMCLOUD_LOG(WARNING,
                         "%s SpinLock locked for one second; deadlock?",
                         name.c_str());
+                RAMCLOUD_BACKTRACE(WARNING);
                 contendedTicks += now - startOfContention;
                 startOfContention = now;
             }

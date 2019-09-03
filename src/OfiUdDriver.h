@@ -101,7 +101,7 @@ class OfiUdDriver : public Driver {
         }
 
         virtual string toString() const {
-            return format("%lu", addr[0]);
+            return format("ofiud:fi_addr_t=%lu", addr[0]);
         }
 
         /// Opaque libfabric internal address that identifies the endpoint.
@@ -171,7 +171,7 @@ class OfiUdDriver : public Driver {
         vector<BufferDescriptor*> freeBuffers;
 
         /// Total number of buffers (and descriptors) allocated.
-        uint32_t numBuffers;
+        const uint32_t numBuffers;
 
         DISALLOW_COPY_AND_ASSIGN(BufferPool);
     };
@@ -235,10 +235,12 @@ class OfiUdDriver : public Driver {
         explicit AddressMap(uint32_t addressLength, fid_av* addressVector)
             : addressLength(addressLength)
             , addressVector(addressVector)
+            , lock("AddressMap::map")
             , map()
+            , cache()
         {}
 
-        void insertIfAbsent(RawAddress* rawAddress, fi_addr_vec* out);
+        void insertIfAbsent(int rxid, RawAddress* rawAddress, fi_addr_vec* out);
 
       private:
         /// # bytes used to represent a raw address.
@@ -247,9 +249,24 @@ class OfiUdDriver : public Driver {
         /// libfabric address vector for inserting raw addresses.
         fid_av* addressVector;
 
+        /// Protects the shared address map structure.
+        SpinLock lock;
+
+        using AddressHashMap =
+                std::unordered_map<RawAddress, fi_addr_vec, RawAddress::Hasher>;
+
+        // FIXME: OMG, flat_hash_map operations can take 100s milliseconds to
+        // seconds in insertIfAbsent?! (this bug causes RAMCloud pings and clock
+        // sync. to fail and cost me at least 2 days of time!) How come?
+//        using AddressHashMap =
+//                ska::flat_hash_map<RawAddress, fi_addr_vec, RawAddress::Hasher>;
+
         /// Map from raw addresses to fi_addr_t addresses, which are used in
         /// every send operation.
-        ska::flat_hash_map<RawAddress, fi_addr_vec, RawAddress::Hasher> map;
+        AddressHashMap map;
+
+        /// Thread-local cache of #map.
+        AddressHashMap cache[OfiUdDriver::MAX_HW_QUEUES];
     };
 
     /**
@@ -274,7 +291,9 @@ class OfiUdDriver : public Driver {
             }
         };
 
-        std::function<void(CopyRequest*)> callback;
+        /// Callback function invoked by the dispatch thread to delegate
+        /// payload copy requests. Return true on success; otherwise, false.
+        std::function<bool(CopyRequest*)> callback;
 
         SpinLock rxLock;
 
@@ -284,6 +303,8 @@ class OfiUdDriver : public Driver {
 
         std::deque<OutPacket> pendingSendReqs;
 
+        const static int MAX_LOCK_RETRIES = 2;
+
         WorkerThreadContext()
             : callback()
             , rxLock("WorkerThreadContext::pendingCopyReqs")
@@ -292,17 +313,33 @@ class OfiUdDriver : public Driver {
             , pendingSendReqs()
         {
             callback = [this] (CopyRequest* copyRequest) {
-                SpinLock::Guard _(rxLock);
-                pendingCopyReqs.push_back(*copyRequest);
+                for (int i = 0; i < MAX_LOCK_RETRIES; i++) {
+                    if (rxLock.try_lock()) {
+                        pendingCopyReqs.push_back(*copyRequest);
+                        rxLock.unlock();
+                        return true;
+                    }
+//                    RAMCLOUD_LOG(DEBUG, "ofud: failed to lock; delegation failed");
+                    Cycles::sleepNanos(100);
+                }
+                return false;
             };
         }
 
-        void
+        bool
         sendPacket(const Driver::Address* addr, const void* header,
                 uint32_t headerLen, Buffer::Iterator* payload)
         {
-            SpinLock::Guard _(txLock);
-            pendingSendReqs.emplace_back(addr, header, headerLen, payload);
+            for (int i = 0; i < MAX_LOCK_RETRIES; i++) {
+                if (txLock.try_lock()) {
+                    pendingSendReqs.emplace_back(addr, header, headerLen,
+                            payload);
+                    txLock.unlock();
+                    return true;
+                }
+                Cycles::sleepNanos(100);
+            }
+            return false;
         }
     };
 
@@ -318,11 +355,12 @@ class OfiUdDriver : public Driver {
 
     BufferDescriptor* getTransmitBuffer(int txid);
     ServiceLocator readDriverConfigFile();
-    void receivePacketsImpl(int rxid, uint32_t maxPackets);
-    void sendPacketImpl(int txid, const Driver::Address* addr,
+    void receivePacketsImpl(int rxid, uint32_t maxPackets,
+            std::vector<Received>* receivedPackets);
+    void sendPacketImpl(int txid, int remoteRxid, const Driver::Address* addr,
             const void* header, uint32_t headerLen, Buffer::Iterator* payload);
     void reapTransmitBuffers(int txid);
-    void refillReceiver(int rxid, bool refillAll = false);
+    bool refillReceiver(int rxid);
 
     /// Maximum number of bytes of datagrams to be sent with fi_inject,
     /// which is optimized for small message latency.
@@ -424,8 +462,10 @@ class OfiUdDriver : public Driver {
     std::atomic_bool workerThreadStop;
 
     // TODO: mutual exclusive access to resources related to RX code path:
-    // inside receivePacketsImpl: rxPackets, rxcq, lastReceiveTime, rxBuffersInNic, addressMap
-    // inside refillReceiver: rxPool, rxBuffersInNic, rxBufferLogThreshold, receiveContext
+    // thread-local (no lock needed): rxcq[], rxBuffersInNic[], receiveContext[]
+    // not responsible: addressMap has its own lock
+    // inside receivePacketsImpl: rxPackets
+    // inside refillReceiver: rxPool, rxBufferLogThreshold
     SpinLock rxPacketsLock;
 
     // TODO: packets received in receivePacketsImpl
