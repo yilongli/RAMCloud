@@ -1235,7 +1235,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                 serverRpc->receiveTime = received->timestamp;
 
                 if (serverRpc->getOpcode() == WireFormat::SHUFFLE_PULL) {
-                       timetrace_shuffle("shuffle-server: transport received request");
+                    timetrace_shuffle("shuffle-server: transport received request");
                 }
 
                 context->workerManager->handleRpc(serverRpc);
@@ -1718,6 +1718,8 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                             fragment.delegateCopy))(&req)) {
                         bytesToCopy += fragment.length;
                         copyOffload = true;
+                    } else {
+                        buffer->truncate(buffer->size() - fragment.length);
                     }
                 }
 
@@ -1822,15 +1824,17 @@ BasicTransport::MessageAccumulator::requestRetransmission(BasicTransport *t,
         // the normal grant mechanism should kick in if it's still needed.
         endOffset = t->roundTripBytes;
     }
-    if (endOffset <= buffer->size()) {
-        DIE("Bad endOffset %u, offset %u", endOffset, buffer->size());
-    }
     const char* fmt = (whoFrom == FROM_SERVER) ?
             "server requesting retransmission of bytes %u-%u, clientId %u, "
             "sequence %u" :
             "client requesting retransmission of bytes %u-%u, clientId %u, "
             "sequence %u";
     t->timeTrace(fmt, buffer->size(), endOffset, rpcId.clientId, rpcId.sequence);
+
+    if (endOffset <= buffer->size()) {
+        DIE("Bad endOffset %u, offset %u, clientId %lu, sequence %lu",
+                endOffset, buffer->size(), rpcId.clientId, rpcId.sequence);
+    }
     ResendHeader resend(rpcId, buffer->size(), endOffset - buffer->size(),
             whoFrom);
     t->sendControlPacket(address, &resend);

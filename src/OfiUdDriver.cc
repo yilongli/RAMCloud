@@ -154,7 +154,6 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     , mustRegisterLocalMemory()
     , locatorString("ofiud:")
     , bandwidthGbps(0)
-//    , sendRequests()
     , enableSeletiveCompOpt(false)
     , sendsSinceLastSignal(0)
     , zeroCopyStart(NULL)
@@ -833,6 +832,14 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
 
     lastTransmitTime = Cycles::rdtsc();
 
+    // FIXME: stick to single-thread TX for now; since the transport currently
+    // assumes a sync. sendPacket model and delete serverRpc response buffer
+    // immediately after sendPacket for the last packet returns.
+    // BTW, I don't see any perf. improvement on 2-server allShuffle test?
+    // In fact, even some degradation when the 2 servers are on the same node.
+#if 1
+    sendPacketImpl(0, txid, addr, header, headerLen, payload);
+#else
     if (txid == 0) {
         sendPacketImpl(0, 0, addr, header, headerLen, payload);
     } else {
@@ -845,6 +852,7 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
             sendPacketImpl(0, txid, addr, header, headerLen, payload);
         }
     }
+#endif
 
     // FIXME: ignore small (how small?) packets so in BasicTransport we can
     // log more meaningful "tx queue idle XXX cyc" message
@@ -1001,8 +1009,8 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets,
     // Give the RX queue a chance to replenish.
     refillReceiver(rxid);
     if (unlikely(rxBuffersInNic[rxid] == 0)) {
-        RAMCLOUD_CLOG(WARNING, "OfiUdDriver: receiver temporarily ran "
-                "out of packet buffers; could result in dropped packets");
+        DIE("OfiUdDriver: receiver %d ran out of packet buffers; all incoming "
+                "packets will be dropped", rxid);
     }
 
     // Each iteration of the following loop processes one incoming packet.

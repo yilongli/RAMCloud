@@ -131,6 +131,8 @@ class ClockSynchronizer : Dispatch::Poller {
             , serverTsc(serverTsc)
             , completionTime(completionTime)
         {}
+
+        bool invalid() { return completionTime == ~0lu; }
     };
 
     /// Records the fastest incoming ClockSync RPCs received from each server.

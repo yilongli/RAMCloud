@@ -1762,7 +1762,7 @@ MilliSortService::benchmarkCollectiveOp(
         respHdr->common.status = STATUS_INVALID_PARAMETER;
     }
 
-    ongoingBenchmark = true;
+    ongoingBenchmark = false;
 }
 
 void

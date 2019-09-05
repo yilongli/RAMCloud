@@ -23,6 +23,7 @@
 #include "Common.h"
 #include "Buffer.h"
 #include "Dispatch.h"
+#include "DispatchExec.h"
 #include "QueueEstimator.h"
 
 #undef CURRENT_LOG_MODULE
@@ -379,15 +380,35 @@ class Driver {
         if (isDispatchThread) {
             assert(context->dispatch->isDispatchThread());
             packetsToRelease.push_back(static_cast<char*>(payload));
-
-            SpinLock::Guard _(releaseLock);
-            while (!workerReturnedPackets.empty()) {
-                packetsToRelease.push_back(workerReturnedPackets.back());
-                workerReturnedPackets.pop_back();
-            }
         } else {
-            SpinLock::Guard _(releaseLock);
+            // Passing packets back to Driver::packetsToRelease is done via
+            // the DispatchExec mechanism so that packetsToRelease can always
+            // be accessed without locks from the dispatch thread.
+            struct ReturnPacketToDispatch : public DispatchExec::Lambda {
+                Driver* driver;
+
+                ReturnPacketToDispatch(Driver* driver) : driver(driver) {}
+
+                void invoke()
+                {
+                    SpinLock::Guard _(driver->releaseLock);
+                    for (char* payload : driver->workerReturnedPackets) {
+                        driver->packetsToRelease.push_back(payload);
+                    }
+                    driver->workerReturnedPackets.clear();
+                }
+            };
+
+            releaseLock.lock();
             workerReturnedPackets.push_back(static_cast<char*>(payload));
+            // DispatchExec is a pretty heavyweight mechanism: return packets in
+            // large batch to amortize the cost.
+            if (workerReturnedPackets.size() > 100) {
+                releaseLock.unlock();
+                context->dispatchExec->addRequest<ReturnPacketToDispatch>(this);
+            } else {
+                releaseLock.unlock();
+            }
         }
     }
 

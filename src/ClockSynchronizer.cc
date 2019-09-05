@@ -120,6 +120,11 @@ ClockSynchronizer::computeOffset()
         double skew = double(probe2.clientTsc - probe1.clientTsc) /
                 double(probe2.serverTsc - probe1.serverTsc);
         clock->skew = skew;
+        if (probe1.invalid() || probe2.invalid()) {
+            DIE("Failed to sync. clock with server %u: no qualified "
+                    "clean probe found in phase %u", syncee.indexNumber(),
+                    probe1.invalid() ? 0 : 2);
+        }
 
         // Then use the fastest outgoing probe and incoming probe to compute
         // the clock offset.
@@ -132,7 +137,7 @@ ClockSynchronizer::computeOffset()
         uint64_t halfRTT = static_cast<uint64_t>(
                 (localElapsed - skew * remoteElapsed) / (1 + skew));
         double roundTripMicros = Cycles::toSeconds(2*halfRTT)*1e6;
-        if (roundTripMicros > 20.0) {
+        if (roundTripMicros > 5.0) {
             LOG(ERROR, "Suspiciously large RTT %.2f, localElapsed %.2f cyc, "
                     "remoteElapsed %.2f cyc, skew %.10f, probe 1 %.2f us, "
                     "probe 2 %.2f us", roundTripMicros, localElapsed,
