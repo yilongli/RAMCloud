@@ -7326,6 +7326,24 @@ workloadThroughput()
     }
 }
 
+/**
+ * (Re)synchronize the cluster clock if a significant time has passed since
+ * the last synchronization point.
+ */
+void
+syncClusterClock(int numServers)
+{
+    static uint64_t nextClockSyncTime = 0;
+    if (Cycles::rdtsc() > nextClockSyncTime) {
+        uint32_t secs = uint32_t((numServers + 19) / 20 * 2 + 0.99);
+        LOG(NOTICE, "Running clock sync. for %u seconds, numServers %d", secs,
+                numServers);
+        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC, &secs,
+                sizeof(secs));
+        nextClockSyncTime = Cycles::rdtsc() + Cycles::fromSeconds(secs);
+    }
+}
+
 /// This benchmark runs a prototype implementation of the MilliSort application
 /// inside RAMCloud and measures its end-to-end latency.
 void
@@ -7346,11 +7364,7 @@ millisort()
     // Change 0 -> 1 to synchronize time between nodes and start millisort
     // at the same global time.
 #if 0
-    uint32_t clockSyncSeconds = 2;
-    LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
-            clockSyncSeconds);
-    cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-            &clockSyncSeconds, sizeof(clockSyncSeconds));
+    syncClusterClock(numMasters);
 #endif
 
     std::string perfStats;
@@ -7427,15 +7441,11 @@ treeBcast()
     string rawdata;
 
     // Sweep machineCount from 1 to numMasters.
-    uint32_t clockSyncSeconds = 2;
 //    for (int i = 0; i < 20; i++) { int machineCount = numMasters;
 //    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
     for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
-        LOG(NOTICE, "Run clock sync. protocol for %u seconds before experiment",
-                clockSyncSeconds);
-        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-                &clockSyncSeconds, sizeof(clockSyncSeconds));
+        syncClusterClock(numMasters);
 
         // Initialize the millisort service.
         InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
@@ -7527,16 +7537,11 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode, std::vector<int> sizes)
            "----------\n");
 
     // Sweep machineCount from 1 to numMasters.
-    uint32_t clockSyncSeconds = 2;
     for (int size : sizes) {
 //        for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
         for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
             // (Re)synchronize the cluster clock before each experiment.
-            LOG(NOTICE, "Run clock sync. protocol for %u seconds before "
-                    "experiment, machineCount %d, size %d", clockSyncSeconds,
-                    machineCount, size);
-            cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-                    &clockSyncSeconds, sizeof(clockSyncSeconds));
+            syncClusterClock(numMasters);
 
             // Initialize the millisort service.
             InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
@@ -7628,12 +7633,16 @@ allShuffle()
     string perfstats;
     // Each iteration of the following loop performs a all-to-all shuffle
     // operation between a specific number of servers.
-    uint32_t clockSyncSeconds = 2;
     for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-//    for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
-        // (Re)synchronize the cluster clock before each experiment.
-        cluster->serverControlAll(WireFormat::START_CLOCK_SYNC,
-                &clockSyncSeconds, sizeof(clockSyncSeconds));
+//    for (int machineCount = 33; machineCount <= numMasters; machineCount++) {
+    for (int startOffset = 0; startOffset < 1; startOffset++) {
+//    for (int startOffset = 0; startOffset < machineCount; startOffset++) {
+        // Let the cluster idle for a while (e.g., 100 ms) to reduce influence
+        // from previous experiment.
+        Cycles::sleep(100*1000);
+
+        // Synchronize the cluster clock before the experiment, if necessary.
+        syncClusterClock(numMasters);
 
         // Initialize the millisort service.
         ServerId rootServer(1, 0);
@@ -7663,6 +7672,19 @@ allShuffle()
             // By default, fix message size.
             messageSize = objectSize;
         }
+
+        // FIXME: hack to run only a few lock steps of the shuffle
+        bool shuffleBreakdown = false;
+#if 0
+        if (messageSize == 1000000) {
+            shuffleBreakdown = true;
+            int numMessages = 1;
+            messageSize = messageSize + numMessages*100 + startOffset;
+            LOG(NOTICE, "numMessages = %d, startOffset = %d", numMessages,
+                    startOffset);
+        }
+#endif
+
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
                 messageSize);
         Buffer* result = rpc.wait();
@@ -7729,6 +7751,14 @@ allShuffle()
         double p99 = double(completionNs[int(count * 0.99)]) * 1e-3;
         double throughputGbps = double(messageSize) * (machineCount - 1) * 8 /
                 (p50 * 1e3);
+
+        // FIXME: hack to run only a few lock steps of the shuffle
+        if (shuffleBreakdown) {
+            uint32_t args = messageSize - 1000000;
+            uint32_t numMessages = args / 100;
+            throughputGbps = 1000000.0 * numMessages * 8 / (p50 * 1e3);
+        }
+
         printf(" %12d%12d%8d%12.2f%12.2f%12.2f%12.2f%12.2f%20.2f\n",
                 machineCount, messageSize, count, min, avg, p50, p90, p99,
                 throughputGbps);
@@ -7743,6 +7773,7 @@ allShuffle()
         perfstats += "\n\n";
 #endif
 #undef COLLECT_PERFSTATS
+    }
     }
     printf("%s", perfstats.c_str());
 }
@@ -7957,6 +7988,7 @@ try
 catch (std::exception& e) {
     RAMCLOUD_LOG(ERROR, "%s", e.what());
     Logger::get().sync();
+    fflush(stdout);
     exit(1);
 }
 
