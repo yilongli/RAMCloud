@@ -93,6 +93,8 @@ DispatchExec::sync(uint64_t id)
 bool
 DispatchExec::isDone(uint64_t id)
 {
+    // TODO: seems like a data race on totalRemoves: write in poll() from
+    // dispatch but read in sync/isDone from workers
     if (totalRemoves >= id) {
         return true;
     }

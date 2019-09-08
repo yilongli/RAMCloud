@@ -161,6 +161,26 @@ PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(ShufflePullRpc);
 };
 
+class ShufflePushRpc : public ServerIdRpcWrapper {
+  public:
+    ShufflePushRpc(Context* context, ServerId serverId, int32_t senderId,
+            uint32_t dataId, uint32_t totalLength, uint32_t offset,
+            Buffer::Iterator* payload);
+    ~ShufflePushRpc() {}
+
+    static void appendRequest(Buffer* request, int32_t senderId,
+            uint32_t dataId, uint32_t totalLength, uint32_t offset,
+            Buffer::Iterator* payload);
+
+    void wait() { waitAndCheckErrors(); }
+
+    static const uint32_t responseHeaderLength =
+            sizeof(WireFormat::ShufflePush::Response);
+
+PRIVATE:
+    DISALLOW_COPY_AND_ASSIGN(ShufflePushRpc);
+};
+
 
 
 } // namespace RAMCloud

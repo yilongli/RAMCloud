@@ -223,6 +223,10 @@ MilliSortService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             callHandler<WireFormat::ShufflePull, MilliSortService,
                         &MilliSortService::shufflePull>(rpc);
             break;
+        case WireFormat::ShufflePush::opcode:
+            callHandler<WireFormat::ShufflePush, MilliSortService,
+                        &MilliSortService::shufflePush>(rpc);
+            break;
         case WireFormat::BenchmarkCollectiveOp::opcode:
             callHandler<WireFormat::BenchmarkCollectiveOp, MilliSortService,
                         &MilliSortService::benchmarkCollectiveOp>(rpc);
@@ -1285,6 +1289,126 @@ MilliSortService::invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
     }
 }
 
+/**
+ *
+ * \param group
+ * \param dataId
+ * \param outMessages
+ *      Shuffle messages to be sent to all the other nodes in the communication
+ *      group, in clockwise order starting from the right neighbor of the local
+ *      node.
+ */
+void
+MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
+        std::vector<Buffer::Iterator>* outMessages)
+{
+    assert(group->size() == outMessages->size() + 1);
+
+    struct ShuffleMessageTracker {
+        /// Contains the ongoing RPC used to send a chunk of this message.
+        Tub<ShufflePushRpc> outstandingRpc;
+
+        /// Server ID of the message receiver.
+        ServerId serverId;
+
+        /// Size of the complete message, in bytes.
+        uint32_t totalLength;
+
+        /// Offset of the first byte yet to be transmitted.
+        uint32_t offset;
+
+        /// Range of the message yet to be transmitted.
+        Buffer::Iterator* message;
+
+        ShuffleMessageTracker(ServerId serverId, Buffer::Iterator* message)
+            : outstandingRpc()
+            , serverId(serverId)
+            , totalLength(message->size())
+            , offset(0)
+            , message(message)
+        {}
+
+        ~ShuffleMessageTracker() {}
+
+        void
+        sendMessageChunk(Context* context, int senderId, uint32_t dataId,
+                uint32_t size)
+        {
+            timeTrace("shuffle-push: sending message chunk to server %u, "
+                    "offset %u, len %u", serverId.indexNumber(), offset, size);
+            assert(!outstandingRpc);
+            size = std::min(size, message->size());
+            Buffer::Iterator payload(*message);
+            payload.truncate(size);
+            outstandingRpc.construct(context, serverId, senderId, dataId,
+                    totalLength, offset, &payload);
+            offset += size;
+            message->advance(size);
+        }
+    };
+
+    int totalMessages = group->size() - 1;
+    std::unique_ptr<Tub<ShuffleMessageTracker>[]> messageTrackers(
+            new Tub<ShuffleMessageTracker>[totalMessages]);
+    for (int i = 0; i < totalMessages; i++) {
+        messageTrackers[i].construct(group->getNode(group->rank + i + 1),
+                &outMessages->at(i));
+    }
+
+    int messagesUnfinished = totalMessages;
+    while (messagesUnfinished > 0) {
+        // TODO: we might want to relax the "no outstanding RPC" restrict to
+        // allow multiple chunks from the same message in flight; otherwise,
+        // we might be limited by the network latency when we have only a few
+        // messages left?
+
+        // Find the outgoing message with the largest remaining size and no
+        // outstanding RPC.
+        uint32_t maxBytesLeft = 0;
+        int index = -1;
+
+        // Each iteration of the following loop does one of the two things for
+        // each message: (1) if there is no outstanding chunk being sent, check
+        // for RPC completion; (2) otherwise, find the message with maximum
+        // remaining bytes.
+        for (int i = 0; i < totalMessages; i++) {
+            // Check RPC completion.
+            ShufflePushRpc* rpc = messageTrackers[i]->outstandingRpc.get();
+            if (rpc) {
+                if (rpc->isReady()) {
+                    messageTrackers[i]->outstandingRpc.destroy();
+                    if (messageTrackers[i]->message->isDone()) {
+                        messagesUnfinished--;
+                        timeTrace("shuffle-push: message to server %u done",
+                                messageTrackers[i]->serverId.indexNumber());
+                    }
+                } else {
+                    // This message has an outstanding chunk being sent;
+                    // do not consider it for transmission again until that
+                    // chunk is completed.
+                    continue;
+                }
+            }
+
+            // Find next message chunk to send.
+            uint32_t bytesLeft = messageTrackers[i]->message->size();
+            if (bytesLeft > maxBytesLeft) {
+                index = downCast<int>(i);
+                maxBytesLeft = bytesLeft;
+            }
+        }
+
+        // Send out one more chunk of data, if appropriate.
+        if (index >= 0) {
+#define MAX_PUSH_CHUNK_SIZE 40000
+            messageTrackers[index]->sendMessageChunk(context, group->rank,
+                    dataId, MAX_PUSH_CHUNK_SIZE);
+        }
+
+        Arachne::yield();
+    }
+}
+
 void
 MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
             WireFormat::ShufflePull::Response* respHdr, Rpc* rpc)
@@ -1408,6 +1532,35 @@ MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
                 if (relRank == lastRelRank + 1) {
                     lastRelRank += 1;
                 }
+            }
+            break;
+        }
+        default:
+            assert(false);
+    }
+}
+
+void
+MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
+            WireFormat::ShufflePush::Response* respHdr, Rpc* rpc)
+{
+    int senderId = reqHdr->senderId;
+    switch (reqHdr->dataId) {
+        case ALLSHUFFLE_KEY: {
+            DIE("Not implemented!");
+            break;
+        }
+        case ALLSHUFFLE_VALUE: {
+            DIE("Not implemented!");
+            break;
+        }
+        case ALLSHUFFLE_BENCHMARK: {
+            // Do nothing; we are benchmarking the transport layer.
+            timeTrace("shuffle-push: received message chunk, senderId %d, "
+                    "offset %u, len %u", senderId, reqHdr->offset, reqHdr->len);
+            if (reqHdr->offset + reqHdr->len == reqHdr->totalLength) {
+                timeTrace("shuffle-push: received entire message, senderId %d",
+                        senderId);
             }
             break;
         }
@@ -1714,6 +1867,14 @@ MilliSortService::benchmarkCollectiveOp(
 //                dataBuffer->getRange(0, dataBuffer->size());
             };
 
+            std::vector<Buffer::Iterator> outMessages;
+            std::unique_ptr<char[]> space(new char[8000000]);
+            Buffer outMessage;
+            outMessage.appendExternal(space.get(), reqHdr->dataSize);
+            for (int i = 1; i < world->size(); i++) {
+                outMessages.emplace_back(&outMessage);
+            }
+
             std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(
                     new Tub<ShufflePullRpc>[world->size()]);
             uint64_t startTime = context->clockSynchronizer->getConverter(
@@ -1744,8 +1905,9 @@ MilliSortService::benchmarkCollectiveOp(
                 // Large message: enforce sender-side sequencing
                 maxRpcs = -1;
             }
-            invokeShufflePull(pullRpcs.get(), world.get(), maxRpcs,
-                    ALLSHUFFLE_BENCHMARK, merger, reqHdr->dataSize);
+//            invokeShufflePull(pullRpcs.get(), world.get(), maxRpcs,
+//                    ALLSHUFFLE_BENCHMARK, merger, reqHdr->dataSize);
+            invokeShufflePush(world.get(), ALLSHUFFLE_BENCHMARK, &outMessages);
             uint32_t shuffleNs = downCast<uint32_t>(
                     Cycles::toNanoseconds(Cycles::rdtsc() - startTime));
             timeTrace("ALL_SHUFFLE benchmark run %d completed in %u us, "

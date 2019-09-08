@@ -197,6 +197,8 @@ class DispatchExec : public Dispatch::Poller {
             DispatchExec::LambdaBox* request = &requests[addIndex];
             while (request->data.full.load(std::memory_order_acquire)) {
                 if (owner->isDispatchThread()) {
+                    // FIXME: it's weird; why would anyone want to addRequest
+                    // from the dispatch thread?
                     DIE("Invoked DispatchExec::addRequest from dispatch thread,"
                             " deadlocked due to full request queue");
                 }

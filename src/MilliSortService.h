@@ -145,6 +145,8 @@ class MilliSortService : public Service {
     void invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
             CommunicationGroup* group, int maxRpcs, uint32_t dataId,
             Merger &merger, uint32_t pullSize = 0);
+    void invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
+            std::vector<Buffer::Iterator>* outMessages);
 
     /**
      * Helper function for use in handling RPCs used by collective operations.
@@ -369,6 +371,9 @@ class MilliSortService : public Service {
                 Rpc* rpc);
     void shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
                 WireFormat::ShufflePull::Response* respHdr,
+                Rpc* rpc);
+    void shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
+                WireFormat::ShufflePush::Response* respHdr,
                 Rpc* rpc);
     void benchmarkCollectiveOp(
                 const WireFormat::BenchmarkCollectiveOp::Request* reqHdr,

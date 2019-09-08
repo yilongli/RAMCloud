@@ -254,6 +254,7 @@ class Driver {
         , maxTransmitQueueSize(0)
         , packetsToRelease()
         , releaseLock("Driver::workerReturnedPackets")
+        , returnPacketsJobId(0)
         , workerReturnedPackets()
         , queueEstimator(0)
     {
@@ -377,7 +378,7 @@ class Driver {
     VIRTUAL_FOR_TESTING void
     returnPacket(void* payload, bool isDispatchThread = true)
     {
-        if (isDispatchThread) {
+        if (isDispatchThread || context->dispatch->isDispatchThread()) {
             assert(context->dispatch->isDispatchThread());
             packetsToRelease.push_back(static_cast<char*>(payload));
         } else {
@@ -405,7 +406,10 @@ class Driver {
             // large batch to amortize the cost.
             if (workerReturnedPackets.size() > 100) {
                 releaseLock.unlock();
-                context->dispatchExec->addRequest<ReturnPacketToDispatch>(this);
+                if (context->dispatchExec->isDone(returnPacketsJobId)) {
+                    returnPacketsJobId = context->dispatchExec->
+                            addRequest<ReturnPacketToDispatch>(this);
+                }
             } else {
                 releaseLock.unlock();
             }
@@ -624,6 +628,9 @@ class Driver {
 
     /// Provides thread-safe accesses to #workerReturnedPackets.
     SpinLock releaseLock;
+
+    // TODO: returned by DispatchExec::addRequest<ReturnPacketToDispatch>
+    uint64_t returnPacketsJobId;
 
     /// Holds incoming packets returned by the worker threads for release;
     /// enqueued by worker threads and dequeued by the dispatch thread.

@@ -140,8 +140,9 @@ enum Opcode {
     ALL_SHUFFLE                 = 87,
     SEND_DATA                   = 88,
     SHUFFLE_PULL                = 89,
-    BENCHMARK_COLLECTIVE_OP     = 90,
-    ILLEGAL_RPC_TYPE            = 91, // 1 + the highest legitimate Opcode
+    SHUFFLE_PUSH                = 90,
+    BENCHMARK_COLLECTIVE_OP     = 91,
+    ILLEGAL_RPC_TYPE            = 92, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -434,6 +435,23 @@ struct ShufflePull {
         uint32_t dataId;
         /// # bytes to pull. Only used in benchmarking.
         uint32_t dataSize;
+    } __attribute__((packed));
+    struct Response {
+        ResponseCommon common;
+    } __attribute__((packed));
+};
+
+struct ShufflePush {
+    static const Opcode opcode = SHUFFLE_PUSH;
+    static const ServiceType service = MILLISORT_SERVICE;
+    struct Request {
+        RequestCommon common;
+        /// Rank of the message sender within the communication group.
+        int32_t senderId;
+        uint32_t dataId;
+        uint32_t totalLength;
+        uint32_t offset;
+        uint32_t len;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
