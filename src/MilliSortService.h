@@ -141,12 +141,8 @@ class MilliSortService : public Service {
 //        removeCollectiveOp(opId);
     }
 
-    template <typename Merger>
-    void invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
-            CommunicationGroup* group, int maxRpcs, uint32_t dataId,
-            Merger &merger, uint32_t pullSize = 0);
     void invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
-            std::vector<Buffer::Iterator>* outMessages);
+            std::vector<Buffer>* outMessages);
 
     /**
      * Helper function for use in handling RPCs used by collective operations.
@@ -369,9 +365,6 @@ class MilliSortService : public Service {
     void sendData(const WireFormat::SendData::Request* reqHdr,
                 WireFormat::SendData::Response* respHdr,
                 Rpc* rpc);
-    void shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
-                WireFormat::ShufflePull::Response* respHdr,
-                Rpc* rpc);
     void shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 WireFormat::ShufflePush::Response* respHdr,
                 Rpc* rpc);
@@ -442,6 +435,7 @@ class MilliSortService : public Service {
          */
         uint64_t wait() {
             for (auto& tid : workers) { Arachne::join(tid); }
+            workers.clear();
             return stopTime - startTime;
         }
     };
@@ -645,7 +639,7 @@ class MilliSortService : public Service {
     std::atomic_bool printingResult;
 
     // FIXME: this is a bad name; besides, does it have to be class member?
-    std::vector<int> valueStartIdx;
+    std::vector<uint32_t> valueStartIdx;
 
     /// Selected keys that evenly divide #localKeys on this node into # nodes
     /// partitions.
@@ -667,24 +661,21 @@ class MilliSortService : public Service {
     /// bucket.
     std::vector<std::pair<int,int>> dataBucketRanges;
 
-    /// True means #dataBucketRanges has been filled out and, thus, can be
-    /// safely accessed by #shufflePull handler. Used to prevent data race on
-    /// #dataBucketRanges.
-    std::atomic_bool readyToServiceKeyShuffle;
+    /// # complete key shuffle messages received so far. Note: each shuffle
+    /// message is broken down into multiple chunks for transmission, where
+    /// each chunk is sent with one ShufflePushRpc.
+    std::atomic<int> shuffleKeysRxCount;
 
-    /// True means local values (i.e., #localValues) have been rearranged and,
-    /// thus, can be safely accessed by #shufflePull handler.
-    std::atomic_bool readyToServiceValueShuffle;
+    /// # complete value shuffle messages received so far.
+    std::atomic<int> shuffleValsRxCount;
 
-    /// Records whether we have processed the shuffle value request from a
-    /// server.
-    std::unique_ptr<std::atomic_bool[]> shuffleValReqProcessed;
+    /// Records whether we have received the complete key shuffle message from
+    /// a server. There is one element for each server, ordered by their ranks.
+    Tub<std::vector<std::atomic_bool>> shuffleKeysRxFrom;
 
-    /// Outgoing RPCs used to implement the key shuffle stage.
-    std::unique_ptr<Tub<ShufflePullRpc>[]> pullKeyRpcs;
-
-    /// Outgoing RPCs used to implement the value shuffle stage.
-    std::unique_ptr<Tub<ShufflePullRpc>[]> pullValueRpcs;
+    /// Records whether we have received the complete value shuffle message from
+    /// a server. There is one element for each server, ordered by their ranks.
+    Tub<std::vector<std::atomic_bool>> shuffleValsRxFrom;
 
     // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.

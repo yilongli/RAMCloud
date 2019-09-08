@@ -54,20 +54,6 @@ namespace {
 
 #endif
 
-/// Hack to get # outgoing shuffle replies present in BasicTransport.
-extern volatile int numOutShuffleReplies;
-
-/// Hack to get # incoming shuffle replies (almost) received in BasicTransport.
-extern volatile int numShuffleRepliesRecv;
-
-// TODO: justify this number; need to be large enough to saturate the bw
-// but not too large that slows down the transport
-#define MAX_OUTSTANDING_RPCS 10
-
-// Apply receiver-side sequencing for shuffle messages larger than the
-// threshold.
-#define RECEIVER_SIDE_SEQ_THRESH 8000
-
 #define SCOPED_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
 #define START_TIMER(metric) CycleCounter<> _timer_##metric(&PerfStats::threadStats.metric);
 #define STOP_TIMER(metric) _timer_##metric.stop();
@@ -91,8 +77,6 @@ extern volatile int numShuffleRepliesRecv;
 // Change 0 -> 1 in the following line to overlap init. value rearrangement
 // with subsequent partition steps.
 #define OVERLAP_INIT_VAL_REARRANGE 0
-
-#define OVERLAP_SHUFFLE_AND_COPY 0
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
 // each stage of the algorithm. Note: must be turned off during benchmarking.
@@ -139,11 +123,10 @@ MilliSortService::MilliSortService(Context* context,
     , rearrangeLocalVals()
     , dataBucketBoundaries()
     , dataBucketRanges()
-    , readyToServiceKeyShuffle(false)
-    , readyToServiceValueShuffle(false)
-    , shuffleValReqProcessed()
-    , pullKeyRpcs()
-    , pullValueRpcs()
+    , shuffleKeysRxCount()
+    , shuffleValsRxCount()
+    , shuffleKeysRxFrom()
+    , shuffleValsRxFrom()
     , mergeSorter()
     , world()
     , myPivotServerGroup()
@@ -219,10 +202,6 @@ MilliSortService::dispatch(WireFormat::Opcode opcode, Rpc* rpc)
             callHandler<WireFormat::SendData, MilliSortService,
                         &MilliSortService::sendData>(rpc);
             break;
-        case WireFormat::ShufflePull::opcode:
-            callHandler<WireFormat::ShufflePull, MilliSortService,
-                        &MilliSortService::shufflePull>(rpc);
-            break;
         case WireFormat::ShufflePush::opcode:
             callHandler<WireFormat::ShufflePush, MilliSortService,
                         &MilliSortService::shufflePush>(rpc);
@@ -289,7 +268,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         respHdr->numCoresPerNode = static_cast<int>(
                 Arachne::numActiveCores.load());
         respHdr->numPivotsPerNode = respHdr->numNodes;
-        respHdr->maxOutstandingRpcs = MAX_OUTSTANDING_RPCS;
         respHdr->keySize = PivotKey::KEY_SIZE;
         respHdr->valueSize = Value::SIZE;
         return;
@@ -358,11 +336,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     rearrangeLocalVals.construct(localKeys, localValues0, localValues);
     dataBucketBoundaries.clear();
     dataBucketRanges.clear();
-    readyToServiceKeyShuffle = false;
-    readyToServiceValueShuffle = false;
-    shuffleValReqProcessed.reset(new std::atomic_bool[world->size()]());
-    pullKeyRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
-    pullValueRpcs.reset(new Tub<ShufflePullRpc>[world->size()]);
+    shuffleKeysRxCount = 0;
+    shuffleValsRxCount = 0;
+    shuffleKeysRxFrom.construct(world->size());
+    shuffleValsRxFrom.construct(world->size());
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
     gatheredPivots.clear();
     superPivots.clear();
@@ -635,7 +612,6 @@ MilliSortService::localSortAndPickPivots()
     // FIXME: to avoid interfering with the partition phase, block till finish.
 #if !OVERLAP_INIT_VAL_REARRANGE
     uint64_t elapsedTime = rearrangeLocalVals->wait();
-    readyToServiceValueShuffle = true;
     timeTrace("rearranging init. values completed");
     ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
 #endif
@@ -920,49 +896,35 @@ MilliSortService::shuffleKeys() {
         }
         dataBucketRanges.emplace_back(rangeStart, rangeEnd - rangeStart);
     }
-    readyToServiceKeyShuffle.store(true);
     timeTrace("partitioned keys to be ready for key shuffle");
 
     // TODO: move this into startMillisort? not sure it's a good idea to have
     // idle A-threads when it's not necessary.
     mergeSorter->prepareThreads();
 
-    // Merge keys from other nodes into a sorted array as they arrive.
-    // TODO: pull-based shuffle is not parallelized by default; shall we try?
-    int keyIdx, numKeys;
-    std::tie(keyIdx, numKeys) = dataBucketRanges[world->rank];
-    std::atomic<int> sortedItemCnt(numKeys);
-    valueStartIdx[world->rank] = 0;
-    std::memcpy(&sortedKeys[0], &localKeys[keyIdx], numKeys * PivotKey::SIZE);
-    for (int i = 0; i < numKeys; i++) {
-        sortedKeys[i].index = uint32_t(i);
+    // Push keys to the right node they belong to (keys that should remain in
+    // the local node are also sent in the same way to simplify code).
+    timeTrace("about to shuffle keys");
+    std::vector<Buffer> keysToSend(world->size());
+    for (int i = 0; i < world->size(); i++) {
+        int rank = (world->rank + i) % world->size();
+        int keyIdx, numKeys;
+        std::tie(keyIdx, numKeys) = dataBucketRanges[rank];
+        keysToSend[i].append(&localKeys[keyIdx], numKeys * PivotKey::SIZE);
+        ADD_COUNTER(shuffleKeysOutputBytes, keysToSend[i].size());
+    }
+    invokeShufflePush(world.get(), ALLSHUFFLE_KEY, &keysToSend);
+
+    // Wait until we have received all keys that belong to us.
+    while (shuffleKeysRxCount.load() < world->size()) {
+        Arachne::yield();
     }
 
-    mergeSorter->add(&sortedKeys[0], numKeys);
-    auto keyMerger = [this, &sortedItemCnt] (int serverRank, Buffer* keyBuffer)
-    {
-        SCOPED_TIMER(shuffleKeysCopyResponseCycles);
-        ADD_COUNTER(shuffleKeysInputBytes, keyBuffer->size());
-        uint32_t numKeys = keyBuffer->size() / PivotKey::SIZE;
-        int start = sortedItemCnt.fetch_add(numKeys);
-        valueStartIdx[serverRank] = start;
-        keyBuffer->copy(0, keyBuffer->size(), &sortedKeys[start]);
-        for (int i = start; i < start + int(numKeys); i++) {
-            sortedKeys[i].index = uint32_t(i);
-        }
-        mergeSorter->add(&sortedKeys[start], numKeys);
-        timeTrace("merged %u keys from rank %d, %u bytes, total keys %d",
-                numKeys, serverRank, keyBuffer->size(), start + int(numKeys));
-    };
-
-    timeTrace("about to shuffle keys");
-    invokeShufflePull(pullKeyRpcs.get(), world.get(), MAX_OUTSTANDING_RPCS,
-            ALLSHUFFLE_KEY, keyMerger);
-    numSortedItems = sortedItemCnt.load();
     STOP_TIMER(shuffleKeysElapsedTime);
-    ADD_COUNTER(shuffleKeysSentRpcs, world->size() - 1);
+    ADD_COUNTER(shuffleKeysSentRpcs, world->size());
+    ADD_COUNTER(shuffleKeysReceivedRpcs, world->size());
     ADD_COUNTER(millisortFinalPivotKeyBytes, numSortedItems * PivotKey::SIZE);
-    timeTrace("shuffle keys completed");
+    timeTrace("shuffle keys completed, received %d keys", numSortedItems);
 
     shuffleValues();
 }
@@ -971,41 +933,6 @@ void
 MilliSortService::shuffleValues()
 {
     timeTrace("=== Stage 7: shuffleValues started");
-    std::vector<Buffer*> receivedValues(world->size());
-
-    // TODO: pull-based shuffle is not parallelized by default; shall we try?
-#if OVERLAP_SHUFFLE_AND_COPY
-    auto valueMerger = [this] (int serverRank, Buffer* valueBuffer) {
-        timeTrace("value merger invoked, data from rank %d", serverRank);
-        SCOPED_TIMER(shuffleValuesCopyResponseCycles);
-        ADD_COUNTER(shuffleValuesInputBytes, valueBuffer->size());
-        uint32_t numValues = valueBuffer->size() / Value::SIZE;
-        uint32_t offset = 0;
-        Value* dst = &sortedValues0[valueStartIdx[serverRank]];
-        uint64_t inactiveTime = 0;
-        for (uint32_t i = 0; i < numValues; i++) {
-            // TODO: yield more often; eliminate this copy; eliminate final
-            // value rearrangement?
-            copyValue(dst + i, valueBuffer->read<Value>(&offset));
-            // TODO: how to choose this value? what if we don't yield at all?
-            // i.e., we rely on #invokeShufflePull to spawn us on a exclusive
-            // core?
-//            if (i % 128 == 0) {
-//                CycleCounter<> _(&inactiveTime);
-//                Arachne::yield();
-//            }
-        }
-        PerfStats::threadStats.shuffleValuesCopyResponseCycles -= inactiveTime;
-        timeTrace("merged %u values from rank %d, %u bytes, inactive %u us",
-                numValues, serverRank, valueBuffer->size(),
-                Cycles::toMicroseconds(inactiveTime));
-    };
-#else
-    auto valueMerger = [&receivedValues] (int serverRank, Buffer* valueBuffer) {
-        ADD_COUNTER(shuffleValuesInputBytes, valueBuffer->size());
-        receivedValues[serverRank] = valueBuffer;
-    };
-#endif
 
     Arachne::ThreadId mergeSortPoller = Arachne::createThread([this] () {
         while (mergeSorter->poll()) {
@@ -1031,13 +958,34 @@ MilliSortService::shuffleValues()
     // (TODO: figure out why? e.g., memory/cache interference)
     Arachne::join(mergeSortPoller);
 
+    // Local value rearrangement must be completed before shuffling values.
+#if OVERLAP_INIT_VAL_REARRANGE
+    uint64_t elapsedTime = rearrangeLocalVals->wait();
+    timeTrace("check if rearranging init. values completes");
+    ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
+#endif
+
     ADD_COUNTER(shuffleValuesStartTime, Cycles::rdtsc() - startTime);
     START_TIMER(shuffleValuesElapsedTime);
     timeTrace("about to shuffle values");
-    invokeShufflePull(pullValueRpcs.get(), world.get(), -1,
-            ALLSHUFFLE_VALUE, valueMerger);
+    std::vector<Buffer> valuesToSend(world->size());
+    for (int i = 0; i < world->size(); i++) {
+        int rank = (world->rank + i) % world->size();
+        int valueIdx, numValues;
+        std::tie(valueIdx, numValues) = dataBucketRanges[rank];
+        valuesToSend[i].append(&localValues[valueIdx], numValues * Value::SIZE);
+        ADD_COUNTER(shuffleValuesOutputBytes, valuesToSend[i].size());
+    }
+    invokeShufflePush(world.get(), ALLSHUFFLE_VALUE, &valuesToSend);
+
+    // Wait until we have received all final values that belong to us.
+    while (shuffleValsRxCount.load() < world->size()) {
+        Arachne::yield();
+    }
+
     STOP_TIMER(shuffleValuesElapsedTime);
-    ADD_COUNTER(shuffleValuesSentRpcs, world->size() - 1);
+    ADD_COUNTER(shuffleValuesSentRpcs, world->size());
+    ADD_COUNTER(shuffleValuesReceivedRpcs, world->size());
     ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
     timeTrace("shuffle values completed");
 
@@ -1045,48 +993,6 @@ MilliSortService::shuffleValues()
     // final values. Normally, the online merge to be hidden completely within
     // value shuffle.
 //    Arachne::join(mergeSortPoller);
-
-    // TODO: eventually, I believe we still want to overlap shuffle and copy-out resp buffer.
-#if OVERLAP_SHUFFLE_AND_COPY
-    int valueIdx, numValues;
-    std::tie(valueIdx, numValues) = dataBucketRanges[world->rank];
-    memcpy(&sortedValues0[0], &localValues[valueIdx], numValues * Value::SIZE);
-    timeTrace("copied local values");
-#else
-    timeTrace("about to copy shuffle-value RPC responses");
-    std::atomic<int> nextServer(0);
-    auto copyOutValues = [this, &nextServer, &receivedValues] () {
-        while (true) {
-            int rank = nextServer.fetch_add(1);
-            if (rank >= world->size()) {
-                break;
-            }
-            if (rank == world->rank) {
-                int idx, n;
-                std::tie(idx, n) = dataBucketRanges[rank];
-                memcpy(&sortedValues0[0], &localValues[idx], n * Value::SIZE);
-            } else {
-                Buffer* valueBuffer = receivedValues[rank];
-                valueBuffer->copy(0, ~0u, &sortedValues0[valueStartIdx[rank]]);
-            }
-        }
-    };
-    {
-        SCOPED_TIMER(shuffleValuesCopyResponseElapsedTime);
-        std::vector<Arachne::ThreadId> workers;
-        Arachne::CorePolicy::CoreList coreList =
-                Arachne::getCorePolicy()->getCores(0);
-        for (uint i = 0; i < coreList.size(); i++) {
-            int coreId = coreList[i];
-            workers.push_back(
-                    Arachne::createThreadOnCore(coreId, copyOutValues));
-        }
-        for (auto& threadId : workers) {
-            Arachne::join(threadId);
-        }
-    }
-    timeTrace("copied shuffled values out of RPC responses");
-#endif
 
     timeTrace("about to rearrange final values");
     RearrangeValueTask rearrangeFinalVals(sortedKeys, sortedValues0,
@@ -1117,10 +1023,11 @@ MilliSortService::shuffleValues()
         // TODO: how to check if keys are globally sorted?
         uint64_t key = sortedKeys[i].keyAsUint64();
         if (prevKey > key) {
-            LOG(ERROR, "Validation failed: unordered keys");
+            LOG(ERROR, "Validation failed: unordered keys, index %d", i);
+            break;
         }
         if (key != sortedValues[i].asUint64()) {
-            LOG(ERROR, "Validation failed: unmatched key and value");
+            LOG(ERROR, "Validation failed: unequal key and value, index %d", i);
             break;
         }
         prevKey = key;
@@ -1191,118 +1098,21 @@ MilliSortService::allShuffle(const WireFormat::AllShuffle::Request* reqHdr,
 }
 
 /**
- * Pull-based implementation of the all-to-all shuffle operation.
- *
- * \param pullRpcs
- * \param dataId
- * \param merger
- * \param pullSize
- *      # bytes to pull. Only used in benchmarking.
- */
-template <typename Merger>
-void
-MilliSortService::invokeShufflePull(Tub<ShufflePullRpc>* pullRpcs,
-        CommunicationGroup* group, int maxRpcs, uint32_t dataId, Merger &merger,
-        uint32_t pullSize)
-{
-    int totalRpcs = group->size() - 1;
-    int outstandingRpcs = 0;
-    int completedRpcs = 0;
-    int sentRpcs = 0;
-    numShuffleRepliesRecv = 0;
-    int firstNotReady = 0;
-    std::vector<bool> completed(totalRpcs);
-    std::vector<Arachne::ThreadId> mergerThreads;
-
-    // Compute all cores that the merger can use.
-    // FIXME: this is actually not enough; besides the current core that is used
-    // to instrument shuffle, we have to also make sure the cores used by
-    // shuffle-value handler do not clash with the merger cores; otherwise, we
-    // may delay the start of sending responses... Geeez! So tricky. Is there
-    // a cleaner way to implement shuffle?
-    Arachne::CorePolicy::CoreList coreList =
-            Arachne::getCorePolicy()->getCores(0);
-    std::vector<int> mergerCores;
-    int currentCore = Arachne::core.id;
-    for (uint i = 0; i < coreList.size(); i++) {
-        if (coreList[i] != currentCore) {
-            mergerCores.push_back(coreList[i]);
-        }
-    }
-    // FIXME: remove this?
-    mergerCores.resize(1);
-
-    // The following loop is responsible for sending RPCs, checking for their
-    // completion, and spawning u-threads to execute the merger tasks.
-    while (completedRpcs < totalRpcs) {
-        // Note: there are two different mechanisms to control when to send the
-        // next RPC. For large message (e.g., > 100KB), we only send the next
-        // pull request when the current response is almost done; for small
-        // messages, we simply enforce a maximum number of outgoing pull RPCs.
-        // This is kind of a dirty hack, unfortunately.
-        bool timeToSendRpc = maxRpcs > 0 ? (outstandingRpcs < maxRpcs) :
-                (numShuffleRepliesRecv == sentRpcs);
-        if ((sentRpcs < totalRpcs) && timeToSendRpc) {
-            timeTrace("shuffle-client: issue pull request %u to rank %u",
-                    sentRpcs, (group->rank + sentRpcs + 1) % group->size());
-            ServerId target = group->getNode(group->rank + sentRpcs + 1);
-            pullRpcs[sentRpcs].construct(context, target, group->rank,
-                    dataId, pullSize);
-            sentRpcs++;
-            outstandingRpcs++;
-        }
-
-        for (int i = firstNotReady; i < sentRpcs; i++) {
-            ShufflePullRpc* rpc = pullRpcs[i].get();
-            if (!completed[i] && rpc->isReady()) {
-                int serverRank = (group->rank + i + 1) % group->size();
-                Buffer* response = rpc->wait();
-                timeTrace("shuffle-client: pull request %u to rank %u "
-                        "completed, bytes %u", i, serverRank, response->size());
-                switch (dataId) {
-//                    case ALLSHUFFLE_KEY:
-//                    case ALLSHUFFLE_VALUE: {
-//                        int coreId = mergerCores[
-//                                generateRandom() % mergerCores.size()];
-//                        mergerThreads.push_back(Arachne::createThreadOnCore(
-//                                coreId, merger, serverRank, response));
-//                        break;
-//                    }
-                    default:
-                        mergerThreads.push_back(Arachne::createThread(merger,
-                                serverRank, response));
-                }
-                if (i == firstNotReady) {
-                    firstNotReady++;
-                }
-                completedRpcs++;
-                completed[i] = true;
-                outstandingRpcs--;
-            }
-        }
-        Arachne::yield();
-    }
-
-    // fixme: make sure this is hidden inside shuffle completed?
-    for (auto& tid : mergerThreads) {
-        Arachne::join(tid);
-    }
-}
-
-/**
  *
  * \param group
  * \param dataId
  * \param outMessages
  *      Shuffle messages to be sent to all the other nodes in the communication
- *      group, in clockwise order starting from the right neighbor of the local
- *      node.
+ *      group, in clockwise order starting from the local node.
  */
 void
 MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
-        std::vector<Buffer::Iterator>* outMessages)
+        std::vector<Buffer>* outMessages)
 {
-    assert(group->size() == outMessages->size() + 1);
+    assert(group->size() == outMessages->size());
+    if (group->size() != outMessages->size()) {
+        DIE("wtf??? not enought messages to send?");
+    }
 
     struct ShuffleMessageTracker {
         /// Contains the ongoing RPC used to send a chunk of this message.
@@ -1318,14 +1128,14 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         uint32_t offset;
 
         /// Range of the message yet to be transmitted.
-        Buffer::Iterator* message;
+        Buffer::Iterator messageIt;
 
-        ShuffleMessageTracker(ServerId serverId, Buffer::Iterator* message)
+        ShuffleMessageTracker(ServerId serverId, Buffer* message)
             : outstandingRpc()
             , serverId(serverId)
             , totalLength(message->size())
             , offset(0)
-            , message(message)
+            , messageIt(message)
         {}
 
         ~ShuffleMessageTracker() {}
@@ -1337,22 +1147,22 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             timeTrace("shuffle-push: sending message chunk to server %u, "
                     "offset %u, len %u", serverId.indexNumber(), offset, size);
             assert(!outstandingRpc);
-            size = std::min(size, message->size());
-            Buffer::Iterator payload(*message);
+            size = std::min(size, messageIt.size());
+            Buffer::Iterator payload(messageIt);
             payload.truncate(size);
             outstandingRpc.construct(context, serverId, senderId, dataId,
                     totalLength, offset, &payload);
             offset += size;
-            message->advance(size);
+            messageIt.advance(size);
         }
     };
 
-    int totalMessages = group->size() - 1;
+    int totalMessages = group->size();
     std::unique_ptr<Tub<ShuffleMessageTracker>[]> messageTrackers(
             new Tub<ShuffleMessageTracker>[totalMessages]);
     for (int i = 0; i < totalMessages; i++) {
-        messageTrackers[i].construct(group->getNode(group->rank + i + 1),
-                &outMessages->at(i));
+        messageTrackers[i].construct(group->getNode(group->rank + i),
+                &(*outMessages)[i]);
     }
 
     int messagesUnfinished = totalMessages;
@@ -1377,7 +1187,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             if (rpc) {
                 if (rpc->isReady()) {
                     messageTrackers[i]->outstandingRpc.destroy();
-                    if (messageTrackers[i]->message->isDone()) {
+                    if (messageTrackers[i]->messageIt.isDone()) {
                         messagesUnfinished--;
                         timeTrace("shuffle-push: message to server %u done",
                                 messageTrackers[i]->serverId.indexNumber());
@@ -1391,7 +1201,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             }
 
             // Find next message chunk to send.
-            uint32_t bytesLeft = messageTrackers[i]->message->size();
+            uint32_t bytesLeft = messageTrackers[i]->messageIt.size();
             if (bytesLeft > maxBytesLeft) {
                 index = downCast<int>(i);
                 maxBytesLeft = bytesLeft;
@@ -1410,148 +1220,99 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
 }
 
 void
-MilliSortService::shufflePull(const WireFormat::ShufflePull::Request* reqHdr,
-            WireFormat::ShufflePull::Response* respHdr, Rpc* rpc)
-{
-    int senderId = reqHdr->senderId;
-    switch (reqHdr->dataId) {
-        case ALLSHUFFLE_KEY: {
-            timeTrace("shuffle-key-server: handler received pull request from "
-                    "rank %u", senderId);
-            while (!readyToServiceKeyShuffle) {
-                Arachne::yield();
-            }
-            int keyIdx, numKeys;
-            std::tie(keyIdx, numKeys) = dataBucketRanges[senderId];
-            rpc->replyPayload->appendExternal(&localKeys[keyIdx],
-                    numKeys * PivotKey::SIZE);
-            ADD_COUNTER(shuffleKeysOutputBytes, rpc->replyPayload->size());
-            INC_COUNTER(shuffleKeysReceivedRpcs);
-            break;
-        }
-        case ALLSHUFFLE_VALUE: {
-            uint64_t receiveTime = Cycles::rdtsc();
-            timeTrace("shuffle-value-server: handler received pull request from"
-                    " rank %u", senderId);
-            if (!readyToServiceValueShuffle) {
-                uint64_t elapsedTime = rearrangeLocalVals->wait();
-                bool expected = false;
-                bool success = readyToServiceValueShuffle
-                        .compare_exchange_strong(expected, true);
-                if (success) {
-                    ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
-                    timeTrace("rearranged init. values completed; ready for "
-                            "value shuffle");
-                }
-            }
-
-            int valueIdx, numValues;
-            std::tie(valueIdx, numValues) = dataBucketRanges[senderId];
-            rpc->replyPayload->appendExternal(&localValues[valueIdx],
-                    numValues * Value::SIZE);
-            ADD_COUNTER(shuffleValuesOutputBytes, rpc->replyPayload->size());
-            INC_COUNTER(shuffleValuesReceivedRpcs);
-
-            // Unless the reply message is too small, serve incoming requests
-            // based on the followng rule:
-            //     The first pull request we service should come from our left
-            //     neighbour X. The second pull request should come from the
-            //     left neighbor of X, and so on and so forth.
-            if (rpc->replyPayload->size() >= RECEIVER_SIDE_SEQ_THRESH) {
-                int prevRequester = (senderId + 1) % world->size();
-                if (prevRequester != world->rank) {
-                    while (!shuffleValReqProcessed[prevRequester]) {
-                        Arachne::yield();
-                    }
-                }
-
-                // Then wait until the transport has finished transmitting all
-                // previous shuffle replies.
-                while (numOutShuffleReplies > 0) {
-                    Arachne::yield();
-                }
-            }
-
-            rpc->sendReply();
-            timeTrace("shuffle-value-server: delayed %lu us, handled pull "
-                  "request from rank %u",
-                  Cycles::toMicroseconds(Cycles::rdtsc() - receiveTime),
-                  senderId);
-            shuffleValReqProcessed[senderId] = true;
-            break;
-        }
-        case ALLSHUFFLE_BENCHMARK: {
-            // FIXME: need a better way to implement this w/o static var.
-            static std::atomic<int> lastRelRank(0);
-            int relRank = world->relativeRank(senderId);
-
-            uint64_t receiveTime = Cycles::rdtsc();
-            timeTrace("shuffle-server: handler received pull request from rank %u",
-                    senderId);
-            bool orderRequests = (reqHdr->dataSize >= RECEIVER_SIDE_SEQ_THRESH);
-            if (orderRequests) {
-                // The first pull request we service should come from our left
-                // neighbour X. The second pull request should come from the
-                // left neighbor of X, and so on and so forth.
-                if (relRank <= lastRelRank) {
-                    // Corner case: this is a duplicate request; let it through
-                } else {
-                    while (lastRelRank + 1 != relRank) {
-                        Arachne::yield();
-                    }
-                }
-                // Then wait until the transport has finished transmitting all
-                // previous shuffle replies.
-                while (numOutShuffleReplies > 0) {
-                    Arachne::yield();
-                }
-            } else {
-                // Bypass the shuffle request sequencing process when dealing
-                // small messages.
-            }
-
-            if (reqHdr->dataSize <= Transport::MAX_RPC_LEN) {
-                rpc->replyPayload->appendExternal(
-                        context->masterZeroCopyRegion, reqHdr->dataSize);
-            } else {
-                respHdr->common.status = STATUS_INVALID_PARAMETER;
-            }
-            uint64_t oldDispatchIter = context->dispatch->iteration;
-            rpc->sendReply();
-            timeTrace("shuffle-server: delayed %lu us, handled pull request from "
-                  "rank %u", Cycles::toMicroseconds(Cycles::rdtsc() - receiveTime),
-                  senderId);
-            if (orderRequests) {
-                // Hack: wait until the dispatch thread gets a chance to
-                // run ServerRpc::sendReply and increment `numOutShuffleReplies`
-                // before setting lastRelRank.
-                while (context->dispatch->iteration < oldDispatchIter + 2) {
-                    Arachne::yield();
-                }
-                // Only update lastRelRank for non-duplicate requests.
-                if (relRank == lastRelRank + 1) {
-                    lastRelRank += 1;
-                }
-            }
-            break;
-        }
-        default:
-            assert(false);
-    }
-}
-
-void
 MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             WireFormat::ShufflePush::Response* respHdr, Rpc* rpc)
 {
-    int senderId = reqHdr->senderId;
+    uint32_t senderId = downCast<uint32_t>(reqHdr->senderId);
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
-            DIE("Not implemented!");
+            // Prevent duplicate RPCs from messing up our memory.
+            if (shuffleKeysRxCount == world->size()) {
+                LOG(WARNING, "Ignore duplicate message chunk from senderId %u",
+                        senderId);
+                return;
+            }
+
+            // Lock protecting MillisortService::{valueStartIdx, numSortedItems}
+            static SpinLock lock("shufflePush::ALLSHUFFLE_KEY");
+            uint32_t numKeys = reqHdr->totalLength / PivotKey::SIZE;
+
+            // If this is the first chunk of a shuffle message, reserve space
+            // for the entire message.
+            if (reqHdr->offset == 0) {
+                SpinLock::Guard _(lock);
+                if (valueStartIdx[senderId] == 0) {
+                    valueStartIdx[senderId] =
+                            downCast<uint32_t>(numSortedItems);
+                    numSortedItems += numKeys;
+                } else {
+                    // Duplicate RPC; we've seen this message before.
+                    return;
+                }
+            }
+
+            // Copy the message chunk to its destination.
+            const uint32_t startIdx = valueStartIdx[senderId];
+            Buffer::Iterator payload(rpc->requestPayload, sizeof(*reqHdr), ~0u);
+            char* dst = reinterpret_cast<char*>(&sortedKeys[startIdx]);
+            dst += reqHdr->offset;
+            while (!payload.isDone()) {
+                SCOPED_TIMER(shuffleKeysCopyResponseCycles);
+                memcpy(dst, payload.getData(), payload.getLength());
+                dst += payload.getLength();
+                payload.next();
+            }
+
+            // This is the last chunk of the message, which implies that we
+            // have received the entire message because our push-based shuffle
+            // implementation doesn't send out the next data chunk before the
+            // preceding one is finished.
+            if (reqHdr->offset + reqHdr->len == reqHdr->totalLength) {
+                // Make sure the message is only added to the merge sorter once.
+                if (!shuffleKeysRxFrom->at(senderId).exchange(true)) {
+                    // Fix the value indices of incoming keys.
+                    for (uint32_t i = startIdx; i < startIdx + numKeys; i++) {
+                        sortedKeys[i].index = i;
+                    }
+
+                    shuffleKeysRxCount.fetch_add(1);
+                    mergeSorter->add(&sortedKeys[startIdx], numKeys);
+                    ADD_COUNTER(shuffleKeysInputBytes, reqHdr->totalLength);
+                }
+            }
             break;
         }
         case ALLSHUFFLE_VALUE: {
-            DIE("Not implemented!");
+            // Prevent duplicate RPCs from messing up our memory.
+            if (shuffleValsRxCount == world->size()) {
+                LOG(WARNING, "Ignore duplicate message chunk from senderId %u",
+                        senderId);
+                return;
+            }
+
+            // Copy the message chunk to its destination.
+            uint32_t startIdx = valueStartIdx[senderId];
+            Buffer::Iterator payload(rpc->requestPayload, sizeof(*reqHdr), ~0u);
+            char* dst = reinterpret_cast<char*>(&sortedValues0[startIdx]);
+            dst += reqHdr->offset;
+            while (!payload.isDone()) {
+                SCOPED_TIMER(shuffleValuesCopyResponseCycles);
+                memcpy(dst, payload.getData(), payload.getLength());
+                dst += payload.getLength();
+                payload.next();
+            }
+
+            // This is the last chunk of the message, which implies that we
+            // have received the entire message because our push-based shuffle
+            // implementation doesn't send out the next data chunk before the
+            // preceding one is finished.
+            if (reqHdr->offset + reqHdr->len == reqHdr->totalLength) {
+                // Make sure the message is only added to the merge sorter once.
+                if (!shuffleValsRxFrom->at(senderId).exchange(true)) {
+                    shuffleValsRxCount++;
+                    ADD_COUNTER(shuffleValuesInputBytes, reqHdr->totalLength);
+                }
+            }
             break;
         }
         case ALLSHUFFLE_BENCHMARK: {
@@ -1860,23 +1621,13 @@ MilliSortService::benchmarkCollectiveOp(
                 }
             }
         } else {
-            std::atomic<int> bytesReceived(0);
-            auto merger = [&bytesReceived] (int _, Buffer* dataBuffer) {
-                bytesReceived.fetch_add(dataBuffer->size());
-                // Copy the pulled data into contiguous space.
-//                dataBuffer->getRange(0, dataBuffer->size());
-            };
-
-            std::vector<Buffer::Iterator> outMessages;
+            std::vector<Buffer> messages(world->size());
             std::unique_ptr<char[]> space(new char[8000000]);
             Buffer outMessage;
-            outMessage.appendExternal(space.get(), reqHdr->dataSize);
-            for (int i = 1; i < world->size(); i++) {
-                outMessages.emplace_back(&outMessage);
+            for (int i = 0; i < world->size(); i++) {
+                messages[i].appendExternal(space.get(), reqHdr->dataSize);
             }
 
-            std::unique_ptr<Tub<ShufflePullRpc>[]> pullRpcs(
-                    new Tub<ShufflePullRpc>[world->size()]);
             uint64_t startTime = context->clockSynchronizer->getConverter(
                     ServerId(reqHdr->masterId)).toLocalTsc(reqHdr->startTime);
             if (Cycles::rdtsc() > startTime) {
@@ -1886,39 +1637,15 @@ MilliSortService::benchmarkCollectiveOp(
             }
             while (Cycles::rdtsc() < startTime) {}
             timeTrace("ALL_SHUFFLE benchmark started, run %d", reqHdr->count);
-            // FIXME: quick hack to get better perf. numbers for small & large
-            // messages; for small msgs, we need to send more concurrent rpcs to
-            // avoid bottlenecked on network latency; for large msgs, having
-            // more than 2 message at a time make the distributed matching
-            // appears to deviate from the optimal behavior.
-            int maxRpcs;
-            if (reqHdr->dataSize < 5000) {
-                // Small message: use more concurrent RPCs to avoid being
-                // bottlenecked by network latency.
-                maxRpcs = 10;
-            } else if (reqHdr->dataSize < 25000) {
-                // Medium message: message too small to have pipelining effect
-                // when doing sender-side sequencing; use 2 concurrent messages
-                // to avoid bubbles.
-                maxRpcs = 10;
-            } else {
-                // Large message: enforce sender-side sequencing
-                maxRpcs = -1;
-            }
-//            invokeShufflePull(pullRpcs.get(), world.get(), maxRpcs,
-//                    ALLSHUFFLE_BENCHMARK, merger, reqHdr->dataSize);
-            invokeShufflePush(world.get(), ALLSHUFFLE_BENCHMARK, &outMessages);
+            invokeShufflePush(world.get(), ALLSHUFFLE_BENCHMARK, &messages);
             uint32_t shuffleNs = downCast<uint32_t>(
                     Cycles::toNanoseconds(Cycles::rdtsc() - startTime));
             timeTrace("ALL_SHUFFLE benchmark run %d completed in %u us, "
-                    "received %u bytes", reqHdr->count, shuffleNs / 1000,
-                    bytesReceived.load());
-            pullRpcs.reset();
-            timeTrace("ALL_SHUFFLE benchmark: destroyed ShufflePullRpc's");
+                    "sent %u bytes", reqHdr->count, shuffleNs / 1000,
+                    reqHdr->dataSize * uint32_t(world->size()));
 
             rpc->replyPayload->emplaceAppend<uint32_t>(world->rank);
             rpc->replyPayload->emplaceAppend<uint32_t>(shuffleNs);
-            rpc->sendReply();
         }
     } else {
         respHdr->common.status = STATUS_INVALID_PARAMETER;

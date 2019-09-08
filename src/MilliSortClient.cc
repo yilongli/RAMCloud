@@ -135,35 +135,6 @@ SendDataRpc::wait()
     return response;
 }
 
-ShufflePullRpc::ShufflePullRpc(Context* context, ServerId serverId,
-        int32_t senderId, uint32_t dataId, uint32_t dataSize, Buffer* response)
-    : ServerIdRpcWrapper(context, serverId,
-            sizeof(WireFormat::ShufflePull::Response), response)
-{
-    appendRequest(&request, senderId, dataId, dataSize);
-    send();
-}
-
-void
-ShufflePullRpc::appendRequest(Buffer* request, int32_t senderId,
-        uint32_t dataId, uint32_t dataSize)
-{
-    WireFormat::ShufflePull::Request* reqHdr(
-            allocHeader<WireFormat::ShufflePull>(request));
-    reqHdr->senderId = senderId;
-    reqHdr->dataId = dataId;
-    reqHdr->dataSize = dataSize;
-}
-
-/// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
-Buffer*
-ShufflePullRpc::wait()
-{
-    waitAndCheckErrors();
-    response->truncateFront(responseHeaderLength);
-    return response;
-}
-
 ShufflePushRpc::ShufflePushRpc(Context* context, ServerId serverId,
         int32_t senderId, uint32_t dataId, uint32_t totalLength,
         uint32_t offset, Buffer::Iterator* payload)

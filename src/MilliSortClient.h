@@ -143,24 +143,6 @@ PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(SendDataRpc);
 };
 
-class ShufflePullRpc : public ServerIdRpcWrapper {
-  public:
-    ShufflePullRpc(Context* context, ServerId serverId, int32_t senderId,
-            uint32_t dataId, uint32_t dataSize = 0, Buffer* response = NULL);
-    ~ShufflePullRpc() {}
-
-    static void appendRequest(Buffer* request, int32_t senderId,
-            uint32_t dataId, uint32_t dataSize);
-
-    Buffer* wait();
-
-    static const uint32_t responseHeaderLength =
-            sizeof(WireFormat::ShufflePull::Response);
-
-PRIVATE:
-    DISALLOW_COPY_AND_ASSIGN(ShufflePullRpc);
-};
-
 class ShufflePushRpc : public ServerIdRpcWrapper {
   public:
     ShufflePushRpc(Context* context, ServerId serverId, int32_t senderId,

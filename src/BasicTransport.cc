@@ -26,7 +26,6 @@ namespace RAMCloud {
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
 #define TIME_TRACE 0
-#define TIME_TRACE_SHUFFLE 0
 
 #define PERF_STATS 0
 
@@ -50,11 +49,6 @@ namespace RAMCloud {
 #define INC_COUNTER(metric)
 #define ADD_COUNTER(metric, delta)
 #endif
-
-/// # SHUFFLE_PULL RPC responses being transmitted in the transport.
-volatile int numOutShuffleReplies = 0;
-
-volatile int numShuffleRepliesRecv = 0;
 
 /**
  * Construct a new BasicTransport.
@@ -186,20 +180,6 @@ void
 BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
 {
     uint64_t sequence = clientRpc->rpcId.sequence;
-
-    if (clientRpc->isShuffleRpc) {
-        if (!clientRpc->shuffleReplyAlmostRx) {
-            // The pull response fits in one packet.
-            clientRpc->shuffleReplyAlmostRx = true;
-            numShuffleRepliesRecv++;
-        }
-        uint64_t elapsedNs = Cycles::toNanoseconds(Cycles::rdtsc() -
-                clientRpc->shuffleReplyRxStart);
-        uint64_t throughput = clientRpc->response->size() * 8000ul / elapsedNs;
-        timetrace_shuffle("shuffle-client: clientId %u, seq %u, RX throughput "
-                "%u Mbps", clientId, sequence, throughput);
-    }
-
     TEST_LOG("RpcId %lu", sequence);
     outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
@@ -225,9 +205,6 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
 void
 BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
 {
-    if (serverRpc->response.isShuffleReply) {
-        numOutShuffleReplies--;
-    }
     uint64_t sequence = serverRpc->rpcId.sequence;
     TEST_LOG("RpcId (%lu, %lu)", serverRpc->rpcId.clientId,
             sequence);
@@ -588,14 +565,6 @@ BasicTransport::timeTrace(const char* format, Args... args) {
 #endif
 }
 
-template<typename... Args>
-void
-BasicTransport::timetrace_shuffle(const char* format, Args... args) {
-#if TIME_TRACE_SHUFFLE
-    TimeTrace::record(format, uint32_t(args)...);
-#endif
-}
-
 void
 BasicTransport::cancelRecord(uint64_t lastRecordTime) {
 #if TIME_TRACE
@@ -650,17 +619,6 @@ BasicTransport::tryToTransmitData()
         if (bytesSent > 0) {
             message->transmitOffset += bytesSent;
             message->lastTransmitTime = driver->getLastTransmitTime();
-
-            if (serverRpc) {
-                timetrace_shuffle("shuffle-server: dispatch iter. %u, "
-                        "transmitted %u bytes of reply, clientId %u, seq %u",
-                        context->dispatch->iteration, message->transmitOffset,
-                        serverRpc->rpcId.clientId, serverRpc->rpcId.sequence);
-                timetrace_shuffle("sent %u packets, left %u more packets granted",
-                        bytesSent / maxDataPerPacket,
-                        (bytesGranted - bytesSent) / maxDataPerPacket);
-            }
-
             transmitQueueSpace -= bytesSent;
             totalBytesSent += bytesSent;
             timeTrace("left %u more packets granted",
@@ -681,15 +639,7 @@ BasicTransport::tryToTransmitData()
                 // retransmit it (the whole RPC will be retried). However,
                 // this approach is simpler and faster in the common case
                 // where data isn't lost.
-                if (message->isShuffleReply) {
-                    uint64_t elapsedNs = Cycles::toNanoseconds(
-                            Cycles::rdtsc() - message->shuffleReplyTxStart);
-                    timetrace_shuffle("shuffle-server: transmitted reply, "
-                            "clientId %u, seq %u, TX throughput %u Mbps",
-                            serverRpc->rpcId.clientId,
-                            serverRpc->rpcId.sequence,
-                            message->buffer->size() * 8000ul / elapsedNs);
-                }
+
                 // FIXME: I think there is actually a bug here: returning from
                 // Driver::sendPacket doesn't guarantee the bytes have actually
                 // been transmitted (e.g., DMA engine hasn't read the bytes yet)
@@ -840,12 +790,6 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
         bytesSent = length;
-
-        if (request->getStart<WireFormat::RequestCommon>()->opcode ==
-                WireFormat::SHUFFLE_PULL) {
-            clientRpc->isShuffleRpc = true;
-            t->timetrace_shuffle("shuffle-client: transport sent request");
-        }
     } else {
         t->outgoingRequests.push_back(*clientRpc);
         clientRpc->request.activate(t);
@@ -972,35 +916,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                 }
                 bool retainPacket = clientRpc->accumulator->addPacket(header,
                         received->len, received);
-                if (clientRpc->isShuffleRpc) {
-                    if (clientRpc->shuffleReplyRxStart == 0) {
-                        clientRpc->shuffleReplyRxStart = Cycles::rdtsc();
-                        timetrace_shuffle(
-                                "shuffle-client: received 1st packet of reply, "
-                                "clientId %u, seq %u",
-                                clientRpc->rpcId.clientId,
-                                clientRpc->rpcId.sequence);
-                    } else {
-                        timetrace_shuffle("shuffle-client: dispatch iter. %u, "
-                                "received %u bytes of reply, clientId %u, seq %u",
-                                context->dispatch->iteration,
-                                clientRpc->response->size(),
-                                clientRpc->rpcId.clientId,
-                                clientRpc->rpcId.sequence);
-                    }
-                    // Shuffle client should send out the next pull once the
-                    // current pull is almost done: i.e., less than ~RTTbytes
-                    // left in the response. Another way to say this is that,
-                    // if we send out the request of next pull now, we hope to
-                    // receive the 1st packet of the reply immediately after we
-                    // receive the last packet of the current pull reply.
-                    if (!clientRpc->shuffleReplyAlmostRx &&
-                            (clientRpc->response->size() + roundTripBytes +
-                            4*maxDataPerPacket > header->totalLength)) {
-                        clientRpc->shuffleReplyAlmostRx = true;
-                        numShuffleRepliesRecv++;
-                    }
-                }
                 if (clientRpc->response->size() >= header->totalLength) {
                     // Do not proceed until all pending copy requests are done.
                     clientRpc->accumulator->syncDriverRxThreads();
@@ -1233,11 +1148,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
                 serverRpc->receiveTime = received->timestamp;
-
-                if (serverRpc->getOpcode() == WireFormat::SHUFFLE_PULL) {
-                    timetrace_shuffle("shuffle-server: transport received request");
-                }
-
                 context->workerManager->handleRpc(serverRpc);
                 return;
             }
@@ -1361,13 +1271,6 @@ BasicTransport::handlePacket(Driver::Received* received)
                     response->transmitLimit = grantOffset;
                     if (!response->active) {
                         response->activate(this);
-                    }
-                    if (response->isShuffleReply) {
-                        timetrace_shuffle("shuffle-server: received grant up to "
-                                "%u bytes, clientId %u, seq %u",
-                                response->transmitLimit,
-                                serverRpc->rpcId.clientId,
-                                serverRpc->rpcId.sequence);
                     }
                 }
                 return;
@@ -1551,19 +1454,6 @@ BasicTransport::ServerRpc::sendReply()
 {
     SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = replyPayload.size();
-
-    if (getOpcode() == WireFormat::SHUFFLE_PULL) {
-        numOutShuffleReplies++;
-        response.isShuffleReply = true;
-        response.shuffleReplyTxStart = Cycles::rdtsc();
-        // FIXME: Hack to make shuffle reply msg entirely unscheduled!
-        // This is really problematic because lost packets will not be detected
-        // until the very end of the message...
-//        response.unscheduledBytes = length;
-        t->timetrace_shuffle("shuffle-server: start sending pull response, "
-                "clientId %u, seq %u", rpcId.clientId, rpcId.sequence);
-    }
-
     t->timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
             "%u outgoing responses", rpcId.clientId, rpcId.sequence,
             length, t->outgoingResponses.size());
@@ -1634,6 +1524,11 @@ BasicTransport::MessageAccumulator::~MessageAccumulator()
     for (FragmentMap::iterator it = fragments.begin();
             it != fragments.end(); it++) {
         MessageFragment fragment = it->second;
+        if (fragment.header->offset < buffer->size()) {
+            // TODO: the following is used to debug "Bad endOffset" crash
+            // in requestRetransmission; however, the bug is hard to reproduce
+            DIE("Unexpected fragment left in fragments map?");
+        }
         t->driver->returnPacket(fragment.header);
     }
     fragments.clear();
@@ -1705,7 +1600,6 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                 // packet, if the payload is large enough to justify the handoff
                 // cost.
                 bool isLastPacket = (fragment.length < t->maxDataPerPacket);
-                bool copyOffload = false;
                 if ((fragment.length > 8000) && !isLastPacket &&
                         fragment.delegateCopy) {
                     Driver::CopyRequest req = {
@@ -1714,16 +1608,17 @@ BasicTransport::MessageAccumulator::addPacket(DataHeader *header,
                         .len = fragment.length,
                         .bytesCopied = &bytesCopied
                     };
-                    if ((*reinterpret_cast<decltype(received->delegateCopy)>(
-                            fragment.delegateCopy))(&req)) {
-                        bytesToCopy += fragment.length;
-                        copyOffload = true;
-                    } else {
-                        buffer->truncate(buffer->size() - fragment.length);
+                    // Offload the copy if possible; otherwise, perform the copy
+                    // ourselves.
+                    bytesToCopy += fragment.length;
+                    auto& copyOffloadFunc =
+                            *reinterpret_cast<decltype(received->delegateCopy)>(
+                            fragment.delegateCopy);
+                    if (unlikely(!copyOffloadFunc(&req))) {
+                        bytesToCopy -= fragment.length;
+                        memcpy(req.dst, req.src, req.len);
                     }
-                }
-
-                if (!copyOffload) {
+                } else {
                     buffer->appendCopy(payload + sizeof32(DataHeader),
                             fragment.length);
                 }

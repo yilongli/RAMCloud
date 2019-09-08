@@ -7401,8 +7401,6 @@ millisort()
                 initResp->numCoresPerNode);
         perfStats += format("numPivotsPerNode = %d\n",
                 initResp->numPivotsPerNode);
-        perfStats += format("maxOutstandingRpcs = %d\n",
-                initResp->maxOutstandingRpcs);
         perfStats += format("numItemsPerNode = %d\n", dataTuplesPerNode);
         perfStats += format("keySize = %d B\n", initResp->keySize);
         perfStats += format("valueSize = %d B\n", initResp->valueSize);
@@ -7749,7 +7747,7 @@ allShuffle()
         double p50 = double(completionNs[int(count * 0.5)]) * 1e-3;
         double p90 = double(completionNs[int(count * 0.9)]) * 1e-3;
         double p99 = double(completionNs[int(count * 0.99)]) * 1e-3;
-        double throughputGbps = double(messageSize) * (machineCount - 1) * 8 /
+        double throughputGbps = double(messageSize) * machineCount * 8 /
                 (p50 * 1e3);
 
         // FIXME: hack to run only a few lock steps of the shuffle

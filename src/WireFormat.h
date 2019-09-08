@@ -139,10 +139,9 @@ enum Opcode {
     ALL_GATHER                  = 86,
     ALL_SHUFFLE                 = 87,
     SEND_DATA                   = 88,
-    SHUFFLE_PULL                = 89,
-    SHUFFLE_PUSH                = 90,
-    BENCHMARK_COLLECTIVE_OP     = 91,
-    ILLEGAL_RPC_TYPE            = 92, // 1 + the highest legitimate Opcode
+    SHUFFLE_PUSH                = 89,
+    BENCHMARK_COLLECTIVE_OP     = 90,
+    ILLEGAL_RPC_TYPE            = 91, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -293,9 +292,6 @@ struct InitMilliSort {
         /// # pivots each node selects initially.
         int32_t numPivotsPerNode;
 
-        /// Max # outstanding RPCs
-        int32_t maxOutstandingRpcs;
-
         /// Size of the key, in bytes.
         int32_t keySize;
 
@@ -420,21 +416,6 @@ struct SendData {
     struct Request {
         RequestCommon common;
         uint32_t dataId;
-    } __attribute__((packed));
-    struct Response {
-        ResponseCommon common;
-    } __attribute__((packed));
-};
-
-struct ShufflePull {
-    static const Opcode opcode = SHUFFLE_PULL;
-    static const ServiceType service = MILLISORT_SERVICE;
-    struct Request {
-        RequestCommon common;
-        int32_t senderId;
-        uint32_t dataId;
-        /// # bytes to pull. Only used in benchmarking.
-        uint32_t dataSize;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;

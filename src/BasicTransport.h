@@ -62,8 +62,6 @@ class BasicTransport : public Transport {
     }
     template<typename... Args>
     inline uint64_t timeTrace(const char* format, Args... args);
-    template<typename... Args>
-    inline void timetrace_shuffle(const char* format, Args... args);
     inline void cancelRecord(uint64_t lastRecordTime);
 
   PRIVATE:
@@ -302,12 +300,6 @@ class BasicTransport : public Transport {
         /// # bytes that can be sent unilaterally.
         uint32_t unscheduledBytes;
 
-        // Hack
-        bool isShuffleReply;
-
-        // Hack to compute msg tx bandwidth.
-        uint64_t shuffleReplyTxStart;
-
         OutgoingMessage(ClientRpc* clientRpc, ServerRpc* serverRpc,
                 BasicTransport* t, Buffer* buffer)
             : active(false)
@@ -319,8 +311,6 @@ class BasicTransport : public Transport {
             , lastTransmitTime(0)
             , outgoingMessageLinks()
             , unscheduledBytes(t->roundTripBytes)
-            , isShuffleReply(false)
-            , shuffleReplyTxStart(0)
         {}
 
         virtual ~OutgoingMessage() {}
@@ -370,13 +360,6 @@ class BasicTransport : public Transport {
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
-        // Hack to treat SHUFFLE_PULL RPC specially.
-        bool isShuffleRpc;
-
-        bool shuffleReplyAlmostRx;
-
-        uint64_t shuffleReplyRxStart;
-
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
             : session(session)
@@ -389,9 +372,6 @@ class BasicTransport : public Transport {
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
-            , isShuffleRpc(false)
-            , shuffleReplyAlmostRx(false)
-            , shuffleReplyRxStart(0)
         {}
 
       PRIVATE:
