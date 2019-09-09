@@ -75,8 +75,12 @@ namespace {
 #define BYPASS_LOCAL_SORT 1
 
 // Change 0 -> 1 in the following line to overlap init. value rearrangement
-// with subsequent partition steps.
-#define OVERLAP_INIT_VAL_REARRANGE 0
+// with the subsequent partition steps and key shuffle.
+#define OVERLAP_INIT_VAL_REARRANGE 1
+
+// Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
+// with value shuffle.
+#define OVERLAP_MERGE_SORT 1
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
 // each stage of the algorithm. Note: must be turned off during benchmarking.
@@ -128,6 +132,9 @@ MilliSortService::MilliSortService(Context* context,
     , shuffleKeysRxFrom()
     , shuffleValsRxFrom()
     , mergeSorter()
+    , mergeSorterIsReady()
+    , mergeSorterLock("MilliSortService::mergeSorter")
+    , pendingMergeReqs()
     , world()
     , myPivotServerGroup()
     , gatheredPivots()
@@ -340,7 +347,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     shuffleValsRxCount = 0;
     shuffleKeysRxFrom.construct(world->size());
     shuffleValsRxFrom.construct(world->size());
-    mergeSorter.construct(world->size(), numDataTuples * world->size() * 2);
+    mergeSorter.construct(world->size(), numDataTuples * world->size() * 2,
+            int(Arachne::getCorePolicy()->getCores(0).size()));
+    mergeSorterIsReady = false;
+    pendingMergeReqs.clear();
     gatheredPivots.clear();
     superPivots.clear();
     pivotBucketBoundaries.clear();
@@ -551,7 +561,7 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
             busyTime += (Cycles::rdtsc() - now);
             Arachne::yield();
         }
-        task->complete(Cycles::rdtsc());
+        task->workerDone(Cycles::rdtsc());
         timeTrace("Worker rearranged %d values, busy %lu us, cpu %d, "
                 "initialData %u", workDone, Cycles::toMicroseconds(busyTime),
                 Arachne::core.id, initialData);
@@ -607,6 +617,18 @@ MilliSortService::localSortAndPickPivots()
 
     // Overlap rearranging initial values with subsequent stages. This only
     // needs to be done before key (actually, value) shuffle.
+    rearrangeLocalVals->callback = [this] () {
+        timeTrace("rearrangeLocalVals completed;");
+        std::lock_guard<Arachne::SpinLock> _(mergeSorterLock);
+        mergeSorter->prepareThreads();
+        mergeSorterIsReady = true;
+        timeTrace("mergeSorter ready to run, %u pending requests",
+                pendingMergeReqs.size());
+        for (auto& request : pendingMergeReqs) {
+            mergeSorter->poll(request.first, request.second);
+        }
+        pendingMergeReqs.clear();
+    };
     rearrangeValues(rearrangeLocalVals.get(), numDataTuples, true);
 
     // FIXME: to avoid interfering with the partition phase, block till finish.
@@ -898,10 +920,6 @@ MilliSortService::shuffleKeys() {
     }
     timeTrace("partitioned keys to be ready for key shuffle");
 
-    // TODO: move this into startMillisort? not sure it's a good idea to have
-    // idle A-threads when it's not necessary.
-    mergeSorter->prepareThreads();
-
     // Push keys to the right node they belong to (keys that should remain in
     // the local node are also sent in the same way to simplify code).
     timeTrace("about to shuffle keys");
@@ -920,9 +938,25 @@ MilliSortService::shuffleKeys() {
         Arachne::yield();
     }
 
+    // Local value rearrangement must be completed before shuffling values.
+#if OVERLAP_INIT_VAL_REARRANGE
+    uint64_t now = Cycles::rdtsc();
+    uint64_t elapsedTime = rearrangeLocalVals->wait();
+    if (rearrangeLocalVals->stopTime < now) {
+        uint64_t slackTime = Cycles::rdtsc() - rearrangeLocalVals->stopTime;
+        timeTrace("rearrangeLocalVals completed %u us ago, elapsed %u us",
+                Cycles::toMicroseconds(slackTime),
+                Cycles::toMicroseconds(elapsedTime));
+    } else {
+        uint64_t delayTime = Cycles::rdtsc() - now;
+        timeTrace("rearrangeLocalVals completed %u us late, elapsed %u us",
+                Cycles::toMicroseconds(delayTime),
+                Cycles::toMicroseconds(elapsedTime));
+    }
+    ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
+#endif
+
     STOP_TIMER(shuffleKeysElapsedTime);
-    ADD_COUNTER(shuffleKeysSentRpcs, world->size());
-    ADD_COUNTER(shuffleKeysReceivedRpcs, world->size());
     ADD_COUNTER(millisortFinalPivotKeyBytes, numSortedItems * PivotKey::SIZE);
     timeTrace("shuffle keys completed, received %d keys", numSortedItems);
 
@@ -935,7 +969,11 @@ MilliSortService::shuffleValues()
     timeTrace("=== Stage 7: shuffleValues started");
 
     Arachne::ThreadId mergeSortPoller = Arachne::createThread([this] () {
-        while (mergeSorter->poll()) {
+        bool done = false;
+        while (!done) {
+            mergeSorterLock.lock();
+            done = !mergeSorter->poll();
+            mergeSorterLock.unlock();
             Arachne::yield();
         }
         assert(int(mergeSorter->getSortedArray().size) == numSortedItems);
@@ -955,14 +993,8 @@ MilliSortService::shuffleValues()
     // Ideally, online merge of final keys only need to complete before
     // rearranging final values. However, on rc machines, we don't have many
     // cores and sorting will introduce too much noise for value shuffling
-    // (TODO: figure out why? e.g., memory/cache interference)
+#if !OVERLAP_MERGE_SORT
     Arachne::join(mergeSortPoller);
-
-    // Local value rearrangement must be completed before shuffling values.
-#if OVERLAP_INIT_VAL_REARRANGE
-    uint64_t elapsedTime = rearrangeLocalVals->wait();
-    timeTrace("check if rearranging init. values completes");
-    ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
 #endif
 
     ADD_COUNTER(shuffleValuesStartTime, Cycles::rdtsc() - startTime);
@@ -984,22 +1016,21 @@ MilliSortService::shuffleValues()
     }
 
     STOP_TIMER(shuffleValuesElapsedTime);
-    ADD_COUNTER(shuffleValuesSentRpcs, world->size());
-    ADD_COUNTER(shuffleValuesReceivedRpcs, world->size());
     ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
     timeTrace("shuffle values completed");
 
     // Make sure the online merge of final keys completes before rearranging
-    // final values. Normally, the online merge to be hidden completely within
+    // final values. Normally, the online merge can be hidden completely within
     // value shuffle.
-//    Arachne::join(mergeSortPoller);
+#if OVERLAP_MERGE_SORT
+    Arachne::join(mergeSortPoller);
+#endif
 
     timeTrace("about to rearrange final values");
     RearrangeValueTask rearrangeFinalVals(sortedKeys, sortedValues0,
             sortedValues);
     rearrangeValues(&rearrangeFinalVals, numSortedItems, false);
-    uint64_t elapsedTime = rearrangeFinalVals.wait();
-    ADD_COUNTER(rearrangeFinalValuesElapsedTime, elapsedTime)
+    ADD_COUNTER(rearrangeFinalValuesElapsedTime, rearrangeFinalVals.wait())
 
     ADD_COUNTER(millisortTime, Cycles::rdtsc() - startTime);
     ADD_COUNTER(millisortFinalItems, numSortedItems);
@@ -1213,6 +1244,12 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
 #define MAX_PUSH_CHUNK_SIZE 40000
             messageTrackers[index]->sendMessageChunk(context, group->rank,
                     dataId, MAX_PUSH_CHUNK_SIZE);
+
+            if (dataId == ALLSHUFFLE_KEY) {
+                INC_COUNTER(shuffleKeysSentRpcs);
+            } else if (dataId == ALLSHUFFLE_VALUE) {
+                INC_COUNTER(shuffleValuesSentRpcs);
+            }
         }
 
         Arachne::yield();
@@ -1224,8 +1261,15 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             WireFormat::ShufflePush::Response* respHdr, Rpc* rpc)
 {
     uint32_t senderId = downCast<uint32_t>(reqHdr->senderId);
+
+    // Reply to acknowledge the incoming data immediately; no need to wait
+    // after processing the request.
+    rpc->sendReply();
+
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
+            INC_COUNTER(shuffleKeysReceivedRpcs);
+
             // Prevent duplicate RPCs from messing up our memory.
             if (shuffleKeysRxCount == world->size()) {
                 LOG(WARNING, "Ignore duplicate message chunk from senderId %u",
@@ -1275,14 +1319,25 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                         sortedKeys[i].index = i;
                     }
 
+                    // Notify the merge sorter about the incoming keys.
+                    mergeSorterLock.lock();
+                    if (mergeSorterIsReady) {
+                        mergeSorter->poll(&sortedKeys[startIdx], numKeys);
+                    } else {
+                        pendingMergeReqs.emplace_back(&sortedKeys[startIdx],
+                                numKeys);
+                    }
+                    mergeSorterLock.unlock();
+
                     shuffleKeysRxCount.fetch_add(1);
-                    mergeSorter->add(&sortedKeys[startIdx], numKeys);
                     ADD_COUNTER(shuffleKeysInputBytes, reqHdr->totalLength);
                 }
             }
             break;
         }
         case ALLSHUFFLE_VALUE: {
+            INC_COUNTER(shuffleValuesReceivedRpcs);
+
             // Prevent duplicate RPCs from messing up our memory.
             if (shuffleValsRxCount == world->size()) {
                 LOG(WARNING, "Ignore duplicate message chunk from senderId %u",

@@ -610,9 +610,6 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Shuffle values (us)",
             formatMetricRatio(&diff, "shuffleValuesElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
-    result.append(format("%-40s %s\n", "  Copy-out shuffle values (us)",
-            formatMetricRatio(&diff, "shuffleValuesCopyResponseElapsedTime", "cyclesPerMicros",
-            " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Rearrange final values (us)",
             formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
@@ -626,7 +623,6 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             {"localSortElapsedTime",
              "partitionElapsedTime",
              "shuffleKeysElapsedTime",
-             "shuffleValuesCopyResponseElapsedTime",
              "shuffleValuesElapsedTime",
              "rearrangeFinalValuesElapsedTime",
              "cyclesPerMicros"},
@@ -847,7 +843,6 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Avg. RPC size (KB)",
             formatMetricRatio(&diff, "shuffleValuesOutputBytes",
             "shuffleValuesReceivedRpcs", " %8.2f", 1e-3).c_str()));
-    // TODO: # parallel pullers
     result.append(format("%-40s %s\n", "  Copy RPC response (us)",
             formatMetricRatio(&diff, "shuffleValuesCopyResponseCycles",
             "cyclesPerMicros", " %8.0f").c_str()));

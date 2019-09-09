@@ -31,7 +31,7 @@
 
 #define MERGE_WORKER mergeWorker
 #define MAX_LEVELS 20
-#define MAX_WORKERS 7
+#define MAX_WORKERS 32
 
 #define USE_ARACHNE 1
 
@@ -104,8 +104,8 @@ public:
     Merge(int numArraysTotal, int maxNumAllItems, int numWorkers = 4);
     ~Merge();
     void prepareThreads();
-    bool poll(bool needLock = true);
-    bool add(T* newData, size_t size);
+    bool poll();
+    bool poll(T* newData, size_t size);
     ArrayPtr getSortedArray();
     MergeStats* getPerfStats();
 
@@ -221,9 +221,6 @@ private:
     // Level 1: merges 4 arrays into 2 arrays.
     // Level 2: merges 2 arrays into 1 arrays.
     int level;
-
-    // Serialize calls to the poll method.
-    Arachne::SpinLock dispatchLock;
 
     // Time
     bool isStarted = false;

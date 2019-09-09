@@ -410,7 +410,6 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     , numAllItems(maxNumAllItems)
     , numWorkers(numWorkers)
     , numArraysCompleted()
-    , dispatchLock()
     , startTime(0)
 {
     int nextPowerOfTwo = pow(2, ceil(log(numArraysTotal)/log(2)));
@@ -469,6 +468,10 @@ void Merge<T>::prepareThreads()
 {
 #if USE_ARACHNE
     Arachne::CorePolicy::CoreList list = Arachne::getCorePolicy()->getCores(0);
+    if (numWorkers > list.size()) {
+        LOG(WARNING, "Spawning %d worker threads on %u cores only?", numWorkers,
+                list.size());
+    }
 #endif
     for (int i = 0; i < numWorkers; i++) {
         contexts[i].state = 0;
@@ -534,18 +537,12 @@ Merge<T>::scheduleSplitted(SplittedMergeJob job, int tid)
  */
 template<class T>
 bool
-Merge<T>::poll(bool needLock)
+Merge<T>::poll()
 {
-#if USE_ARACHNE
-    Tub<std::lock_guard<Arachne::SpinLock>> lock;
-    if (needLock) {
-        lock.construct(dispatchLock);
+    if (!preparedThreads) {
+        DIE("Merge::prepareThreads() not called yet!");
     }
-#else
-    DIE("not implemented");
-#endif
 
-    assert(preparedThreads);
     if (!isStarted) {
         isStarted = true;
         startTick = Cycles::rdtscp();
@@ -611,7 +608,7 @@ Merge<T>::poll(bool needLock)
         printf("\n");
 #endif
         // go to begining?
-        return poll(false);
+        return poll();
     }
     
 continuePolling:
@@ -791,24 +788,16 @@ continuePolling:
  */
 template<class T>
 bool
-Merge<T>::add(T* newData, size_t size)
+Merge<T>::poll(T* newData, size_t size)
 {
-#if USE_ARACHNE
-    std::lock_guard<Arachne::SpinLock> _(dispatchLock);
-#else
-    DIE("not implemented!");
-#endif
-
-    assert(preparedThreads);
     if (startTime == 0) {
         startTime = Cycles::rdtsc();
     }
-    
     ArrayPtr ptr;
     ptr.data = newData;
     ptr.size = size;
     arraysToMerge[0].push(ptr);
-    return poll(false);
+    return poll();
 }
 
 template<class T>

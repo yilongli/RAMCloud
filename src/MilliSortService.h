@@ -402,6 +402,8 @@ class MilliSortService : public Service {
         /// Worker threads that rearrange the values.
         std::list<Arachne::ThreadId> workers;
 
+        uint32_t workersDone;
+
         PivotKey* keys;
         Value* src;
         Value* dst;
@@ -409,22 +411,32 @@ class MilliSortService : public Service {
         /// TODO: explain why it must live beyond method #rearrangeValues
         Tub<std::atomic_int> numSortedValues;
 
+        std::function<void(void)> callback;
+
         explicit RearrangeValueTask(PivotKey* keys, Value* src, Value* dst)
             : startTime()
             , stopTime()
             , mutex()
             , workers()
+            , workersDone(0)
             , keys(keys)
             , src(src)
             , dst(dst)
             , numSortedValues()
+            , callback()
         {
             numSortedValues.construct(0);
         }
 
-        void complete(uint64_t time) {
+        void workerDone(uint64_t time) {
             SpinLock::Guard _(mutex);
-            stopTime = std::max(stopTime, time);
+            workersDone++;
+            if (workersDone == workers.size()) {
+                stopTime = time;
+                if (callback) {
+                    callback();
+                }
+            }
         }
 
         /**
@@ -435,7 +447,6 @@ class MilliSortService : public Service {
          */
         uint64_t wait() {
             for (auto& tid : workers) { Arachne::join(tid); }
-            workers.clear();
             return stopTime - startTime;
         }
     };
@@ -677,9 +688,20 @@ class MilliSortService : public Service {
     /// a server. There is one element for each server, ordered by their ranks.
     Tub<std::vector<std::atomic_bool>> shuffleValsRxFrom;
 
-    // TODO: doesn't have to be a class member?
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
+
+    /// True if the merge sorter is ready to accept incoming data via the poll
+    /// method (i.e., Merge::prepareThreads() has been called).
+    bool mergeSorterIsReady;
+
+    /// Serializes all calls to the merge sorter's poll method and protects
+    /// #pendingMergeReqs.
+    Arachne::SpinLock mergeSorterLock;
+
+    /// Holds incoming shuffled keys temporarily before the merge sorter starts.
+    /// Always empty after #mergeSorter is constructed.
+    std::vector<std::pair<PivotKey*, uint32_t>> pendingMergeReqs;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
