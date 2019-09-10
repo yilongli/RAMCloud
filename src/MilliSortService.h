@@ -621,8 +621,13 @@ class MilliSortService : public Service {
     /// to support zero-copy TX.
     PivotKey* const localKeys;
 
-    /// Sorted keys on this node when the sorting completes.
-    PivotKey* const sortedKeys;
+    /// Holds incoming keys that arrive during the key shuffle step and will be
+    /// sorted by the online merge sorter.
+    PivotKey* const incomingKeys;
+
+    /// Sorted keys on this node when the sorting completes. Not owned by this
+    /// class.
+    PivotKey* sortedKeys;
 
     /// Values of the data tuples that are sorted locally. The backing memory
     /// must be pinned to support zero-copy TX. Note: the content of the array

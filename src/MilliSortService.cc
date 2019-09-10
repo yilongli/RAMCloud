@@ -115,8 +115,9 @@ MilliSortService::MilliSortService(Context* context,
     , numDataTuples(-1)
     , numPivotServers(-1)
     , localKeys((PivotKey*) zeroCopyMemoryRegion)
-    , sortedKeys(localKeys + MAX_RECORDS_PER_NODE)
-    , localValues((Value*) sortedKeys + MAX_RECORDS_PER_NODE)
+    , incomingKeys(localKeys + MAX_RECORDS_PER_NODE)
+    , sortedKeys()
+    , localValues((Value*) incomingKeys + MAX_RECORDS_PER_NODE)
     , localValues0(localValues + MAX_RECORDS_PER_NODE)
     , sortedValues(localValues0 + MAX_RECORDS_PER_NODE)
     , sortedValues0(sortedValues + MAX_RECORDS_PER_NODE)
@@ -158,8 +159,8 @@ MilliSortService::MilliSortService(Context* context,
     if (uint64_t(localValues0) % 64) {
         DIE("localValues0 not aligned to cache line!");
     }
-    if (uint64_t(sortedKeys) % 64) {
-        DIE("sortedKeys not aligned to cache line!");
+    if (uint64_t(incomingKeys) % 64) {
+        DIE("incomingKeys not aligned to cache line!");
     }
     if (uint64_t(sortedValues) % 64) {
         DIE("sortedalues not aligned to cache line!");
@@ -330,6 +331,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 #if BYPASS_LOCAL_SORT
     std::sort(localKeys, localKeys + numDataTuples);
 #endif
+    sortedKeys = NULL;
 
     while (printingResult) {
         Arachne::yield();
@@ -976,18 +978,15 @@ MilliSortService::shuffleValues()
             mergeSorterLock.unlock();
             Arachne::yield();
         }
-        assert(int(mergeSorter->getSortedArray().size) == numSortedItems);
+        auto sortedArray = mergeSorter->getSortedArray();
+        assert(int(sortedArray.size) == numSortedItems);
+        sortedKeys = sortedArray.data;
         ADD_COUNTER(onlineMergeSortStartTime,
                 mergeSorter->startTime - startTime);
         ADD_COUNTER(onlineMergeSortElapsedTime,
                 mergeSorter->stopTick - mergeSorter->startTime);
         ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
         timeTrace("sorted %d final keys", numSortedItems);
-        // FIXME: the following copy is not necessary and should be removed!
-        auto sortedArray = mergeSorter->getSortedArray();
-        memcpy(sortedKeys, sortedArray.data, sortedArray.size * PivotKey::SIZE);
-        assert(int(sortedArray.size) == numSortedItems);
-        timeTrace("copied %d final keys", numSortedItems);
     });
 
     // Ideally, online merge of final keys only need to complete before
@@ -1298,7 +1297,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             // Copy the message chunk to its destination.
             const uint32_t startIdx = valueStartIdx[senderId];
             Buffer::Iterator payload(rpc->requestPayload, sizeof(*reqHdr), ~0u);
-            char* dst = reinterpret_cast<char*>(&sortedKeys[startIdx]);
+            char* dst = reinterpret_cast<char*>(&incomingKeys[startIdx]);
             dst += reqHdr->offset;
             while (!payload.isDone()) {
                 SCOPED_TIMER(shuffleKeysCopyResponseCycles);
@@ -1316,15 +1315,15 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 if (!shuffleKeysRxFrom->at(senderId).exchange(true)) {
                     // Fix the value indices of incoming keys.
                     for (uint32_t i = startIdx; i < startIdx + numKeys; i++) {
-                        sortedKeys[i].index = i;
+                        incomingKeys[i].index = i;
                     }
 
                     // Notify the merge sorter about the incoming keys.
                     mergeSorterLock.lock();
                     if (mergeSorterIsReady) {
-                        mergeSorter->poll(&sortedKeys[startIdx], numKeys);
+                        mergeSorter->poll(&incomingKeys[startIdx], numKeys);
                     } else {
-                        pendingMergeReqs.emplace_back(&sortedKeys[startIdx],
+                        pendingMergeReqs.emplace_back(&incomingKeys[startIdx],
                                 numKeys);
                     }
                     mergeSorterLock.unlock();
