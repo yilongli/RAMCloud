@@ -650,6 +650,10 @@ class MilliSortService : public Service {
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;
 
+    /// # values received by this node during final value shuffle. Should be
+    /// equal to numSortedItems; only used for debugging.
+    std::atomic<int> numValuesReceived;
+
     /// True if we haven't finished printing the result of the previous request.
     /// Used to prevent concurrent write from a new InitMilliSort request.
     std::atomic_bool printingResult;

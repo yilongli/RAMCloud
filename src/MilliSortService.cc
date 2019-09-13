@@ -29,9 +29,12 @@ namespace RAMCloud {
 // this transport.
 #define TIME_TRACE 1
 
+#define TIME_TRACE_SP 1
+
 #if 0
 /// Hack: redefine timeTrace to log so that we can use it even when server crashes.
 #define timeTrace(format, ...) RAMCLOUD_LOG(NOTICE, format, ##__VA_ARGS__)
+#define timeTraceSp(format, ...) RAMCLOUD_LOG(NOTICE, format, ##__VA_ARGS__)
 #else
 
 // Provides a cleaner way of invoking TimeTrace::record, with the code
@@ -46,6 +49,17 @@ namespace {
             uint64_t arg3 = 0)
     {
 #if TIME_TRACE
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
+#endif
+    }
+
+    inline void
+    timeTraceSp(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE_SP
         TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
                 uint32_t(arg2), uint32_t(arg3));
 #endif
@@ -122,6 +136,7 @@ MilliSortService::MilliSortService(Context* context,
     , sortedValues(localValues0 + MAX_RECORDS_PER_NODE)
     , sortedValues0(sortedValues + MAX_RECORDS_PER_NODE)
     , numSortedItems(0)
+    , numValuesReceived()
     , printingResult()
     , valueStartIdx()
     , localPivots()
@@ -234,53 +249,67 @@ void
 MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr,
         WireFormat::InitMilliSort::Response* respHdr, Rpc* rpc)
 {
-    timeTrace("initMilliSort invoked, dataTuplesPerServer %u, "
-              "nodesPerPivotServer %u, fromClient %u",
-              reqHdr->dataTuplesPerServer, reqHdr->nodesPerPivotServer,
-              reqHdr->fromClient);
+    timeTrace("initMilliSort invoked, id %u, dataTuplesPerServer %u, "
+              "nodesPerPivotServer %u", reqHdr->id, reqHdr->dataTuplesPerServer,
+              reqHdr->nodesPerPivotServer);
+
+    // Mutex used to serialize calls of this method.
+    static Arachne::SpinLock mutex("MilliSortService::initMilliSort");
+    static uint32_t lastInitRpcId;
+    static WireFormat::InitMilliSort::Response lastInitRpcResp;
+
+    std::lock_guard<Arachne::SpinLock> _(mutex);
+
+    // Check if we have just finished processing the same init. RPC; if so,
+    // just return the same response stored earlier.
+    bool duplicateInitReq = (reqHdr->id == lastInitRpcId);
+    if (duplicateInitReq) {
+        LOG(WARNING, "Skipped duplicate InitMilliSort RPC (id = %u)",
+                reqHdr->id);
+        *respHdr = lastInitRpcResp;
+        return;
+    } else {
+        lastInitRpcId = reqHdr->id;
+        lastInitRpcResp = {};
+    }
 
     // We are busy serving another sorting request.
     if (ongoingMilliSort) {
+        LOG(WARNING, "Sorting already in progress!");
         respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
         return;
     }
 
-    if (reqHdr->fromClient || (serverId.indexNumber() > 1)) {
-        initWorld(reqHdr->numNodes);
-    }
+    // Initialize the world communication group so we know the rank of this
+    // server.
+    initWorld(reqHdr->numNodes);
 
     // Initialization request from an external client should only be processed
-    // by the root node, which would then broadcast the request to all nodes.
+    // by the root node, which also performs error checking.
     if (reqHdr->fromClient) {
         if ((world->rank > 0) ||
                 (numDataTuples * MAX_IMBALANCE_RATIO > MAX_RECORDS_PER_NODE)) {
             respHdr->common.status = STATUS_MILLISORT_ERROR;
             return;
         }
-
-        // TODO: can't do broadcast before communication group has been setup
-        std::list<InitMilliSortRpc> outgoingRpcs;
-        for (int i = 0; i < world->size(); i++) {
-            outgoingRpcs.emplace_back(context, world->getNode(i),
-                    reqHdr->numNodes, reqHdr->dataTuplesPerServer,
-                    reqHdr->nodesPerPivotServer, false);
-        }
-        while (!outgoingRpcs.empty()) {
-            InitMilliSortRpc* initRpc = &outgoingRpcs.front();
-            auto initResult = initRpc->wait();
-            respHdr->numNodesInited += initResult->numNodesInited;
-            outgoingRpcs.pop_front();
-        }
-
-        respHdr->numNodes = respHdr->numNodesInited;
-        respHdr->numCoresPerNode = static_cast<int>(
-                Arachne::numActiveCores.load());
-        respHdr->numPivotsPerNode = respHdr->numNodes;
-        respHdr->keySize = PivotKey::KEY_SIZE;
-        respHdr->valueSize = Value::SIZE;
-        return;
     }
 
+    // Initiate the init. RPCs to its children nodes in the world group;
+    // unfortunately, we can't (re-)use the broadcast mechanism because the
+    // world group has not been setup on the target nodes.
+    std::list<InitMilliSortRpc> outgoingRpcs;
+    const int fanout = 4;
+    for (int i = 0; i < fanout; i++) {
+        int rank = world->rank * fanout + i + 1;
+        if (rank >= world->size()) {
+            break;
+        }
+        outgoingRpcs.emplace_back(context, world->getNode(rank),
+                reqHdr->numNodes, reqHdr->dataTuplesPerServer,
+                reqHdr->nodesPerPivotServer, false);
+    }
+
+    // Initialize member fields.
     startTime = 0;
     numDataTuples = reqHdr->dataTuplesPerServer;
     int nodesPerPivotServer = (int) reqHdr->nodesPerPivotServer;
@@ -337,6 +366,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         Arachne::yield();
     }
     numSortedItems = 0;
+    numValuesReceived = 0;
     valueStartIdx.clear();
     valueStartIdx.resize(world->size(), 0);
 
@@ -367,12 +397,35 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         bcastPivotBucketBoundaries.construct(context, allPivotServers.get());
     }
 
-    //
-    respHdr->numNodesInited = 1;
-
     // Flush LLC to avoid generating unrealistic numbers; we are doing
     // memory-to-memory sorting (not cache-to-cache sorting)!
     flushSharedCache();
+    timeTrace("initMilliSort: flushed shared cache; ready for benchmark");
+
+    // Wait for its children nodes to finish initialization.
+    while (!outgoingRpcs.empty()) {
+        InitMilliSortRpc* initRpc = &outgoingRpcs.front();
+        if (initRpc->isReady()) {
+            auto initResult = initRpc->wait();
+            respHdr->numNodesInited += initResult->numNodesInited;
+            outgoingRpcs.pop_front();
+        }
+        Arachne::yield();
+    }
+
+    // Fill out the RPC response.
+    respHdr->numNodesInited += 1;
+    if (reqHdr->fromClient) {
+        respHdr->numNodes = respHdr->numNodesInited;
+        respHdr->numCoresPerNode = static_cast<int>(
+                Arachne::numActiveCores.load());
+        respHdr->numPivotsPerNode = respHdr->numNodes;
+        respHdr->keySize = PivotKey::KEY_SIZE;
+        respHdr->valueSize = Value::SIZE;
+    }
+    lastInitRpcResp = *respHdr;
+    timeTrace("initMilliSort: rank %d initialized %d millisort nodes",
+            world->rank, respHdr->numNodesInited);
 }
 
 /**
@@ -387,16 +440,29 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     timeTrace("startMilliSort invoked, requestId %u, fromClient %u",
             uint(reqHdr->requestId), reqHdr->fromClient);
 
-    if (ongoingMilliSort) {
-        respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
-        return;
-    }
+    // Mutex used to serialize calls of this method.
+    static Arachne::SpinLock mutex("MilliSortService::startMilliSort");
+    static int32_t lastMilliSortId = -1;
 
     // Start request from external client should only be processed by the root
     // node, which would then broadcast the start request to all nodes.
     if (reqHdr->fromClient) {
         if (world->rank > 0) {
             respHdr->common.status = STATUS_MILLISORT_ERROR;
+            return;
+        }
+
+        if (mutex.try_lock()) {
+            if (reqHdr->requestId == lastMilliSortId) {
+                LOG(WARNING, "Skipped duplicate StartMilliSort RPC from client,"
+                        " requestId = %d", reqHdr->requestId);
+                return;
+            }
+            mutex.unlock();
+        } else {
+            // Can't acquire the lock: there must another millisort in progress;
+            // retry later.
+            respHdr->common.status = STATUS_RETRY;
             return;
         }
 
@@ -410,6 +476,18 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
         timeTrace("MilliSort finished at master node, requestId %d",
                 reqHdr->requestId);
         return;
+    }
+
+    // Acquire the lock to make sure no ongoing millisort is running on this
+    // server. Skip millisort if we have received a duplicate RPC request.
+    std::lock_guard<Arachne::SpinLock> _(mutex);
+    bool duplicateRequest = (reqHdr->requestId == lastMilliSortId);
+    if (duplicateRequest) {
+        LOG(WARNING, "Skipped duplicate StartMilliSort RPC (requestId = %d)",
+                reqHdr->requestId);
+        return;
+    } else {
+        lastMilliSortId = reqHdr->requestId;
     }
 
     // Wait until the designated start time set by the root node.
@@ -986,7 +1064,7 @@ MilliSortService::shuffleValues()
         ADD_COUNTER(onlineMergeSortElapsedTime,
                 mergeSorter->stopTick - mergeSorter->startTime);
         ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
-        timeTrace("sorted %d final keys", numSortedItems);
+        timeTrace("sorted %u final keys", sortedArray.size);
     });
 
     // Ideally, online merge of final keys only need to complete before
@@ -1049,18 +1127,35 @@ MilliSortService::shuffleValues()
 
 #if VALIDATE_RESULT
     uint64_t prevKey = 0;
+    bool success = true;
+    if (int(mergeSorter->getSortedArray().size) != numSortedItems) {
+        LOG(ERROR, "Validation failed: sortedArray.size != numSortedItems "
+                "(%lu vs %u)", mergeSorter->getSortedArray().size,
+                numSortedItems);
+        success = false;
+    }
+    if (numValuesReceived.load() != numSortedItems) {
+        LOG(ERROR, "Validation failed: #keys (%d) not equal to #values (%d)",
+                numSortedItems, numValuesReceived.load());
+        success = false;
+    }
     for (int i = 0; i < numSortedItems; i++) {
         // TODO: how to check if keys are globally sorted?
         uint64_t key = sortedKeys[i].keyAsUint64();
         if (prevKey > key) {
             LOG(ERROR, "Validation failed: unordered keys, index %d", i);
+            success = false;
             break;
         }
         if (key != sortedValues[i].asUint64()) {
             LOG(ERROR, "Validation failed: unequal key and value, index %d", i);
+            success = false;
             break;
         }
         prevKey = key;
+    }
+    if (success) {
+        LOG(NOTICE, "Validation passed");
     }
 #endif
 
@@ -1160,12 +1255,16 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         /// Range of the message yet to be transmitted.
         Buffer::Iterator messageIt;
 
+        /// Time, in rdtsc ticks, when we send out #outstandingRpc.
+        uint64_t lastTransmitTime;
+
         ShuffleMessageTracker(ServerId serverId, Buffer* message)
             : outstandingRpc()
             , serverId(serverId)
             , totalLength(message->size())
             , offset(0)
             , messageIt(message)
+            , lastTransmitTime()
         {}
 
         ~ShuffleMessageTracker() {}
@@ -1174,38 +1273,69 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         sendMessageChunk(Context* context, int senderId, uint32_t dataId,
                 uint32_t size)
         {
-            timeTrace("shuffle-push: sending message chunk to server %u, "
-                    "offset %u, len %u", serverId.indexNumber(), offset, size);
+            timeTraceSp("shuffle-push: sending message chunk to server %u, "
+                    "offset %u, len %u, left %u", serverId.indexNumber(),
+                    offset, size, totalLength - offset);
             assert(!outstandingRpc);
             size = std::min(size, messageIt.size());
             Buffer::Iterator payload(messageIt);
             payload.truncate(size);
             outstandingRpc.construct(context, serverId, senderId, dataId,
                     totalLength, offset, &payload);
+            timeTraceSp("shuffle-push: push rpc constructed, rpcId %u",
+                    outstandingRpc->rpcId);
             offset += size;
             messageIt.advance(size);
         }
     };
 
+    uint64_t activeCycles = context->dispatch->dispatchActiveCycles;
+    uint64_t totalBytesSent = 0;
+
     int totalMessages = group->size();
     std::unique_ptr<Tub<ShuffleMessageTracker>[]> messageTrackers(
             new Tub<ShuffleMessageTracker>[totalMessages]);
     for (int i = 0; i < totalMessages; i++) {
-        messageTrackers[i].construct(group->getNode(group->rank + i),
-                &(*outMessages)[i]);
+        Buffer* message = &(*outMessages)[i];
+        messageTrackers[i].construct(group->getNode(group->rank + i), message);
+        totalBytesSent += message->size();
     }
 
+    // Performance stats.
+    uint64_t shuffleStart = Cycles::rdtsc();
+    uint32_t outstandingChunks = 0;
+
+#define MAX_PUSH_CHUNK_SIZE 40000
+
+    std::vector<int> candidates;
     int messagesUnfinished = totalMessages;
+
+    // TODO: handle corner case first, send out all empty messages
+    for (int i = 0; i < totalMessages; i++) {
+        ShuffleMessageTracker* messageTracker = messageTrackers[i].get();
+        if (messageTracker->totalLength == 0) {
+            messageTracker->sendMessageChunk(context, group->rank, dataId, 0);
+            outstandingChunks++;
+            if (dataId == ALLSHUFFLE_KEY) {
+                INC_COUNTER(shuffleKeysSentRpcs);
+            } else if (dataId == ALLSHUFFLE_VALUE) {
+                INC_COUNTER(shuffleValuesSentRpcs);
+            }
+        }
+    }
+
     while (messagesUnfinished > 0) {
         // TODO: we might want to relax the "no outstanding RPC" restrict to
         // allow multiple chunks from the same message in flight; otherwise,
         // we might be limited by the network latency when we have only a few
         // messages left?
 
-        // Find the outgoing message with the largest remaining size and no
-        // outstanding RPC.
         uint32_t maxBytesLeft = 0;
         int index = -1;
+        candidates.clear();
+
+        // FIXME: hack? perform our own app-level rate control
+        int transmitPendingRpcs = 0;
 
         // Each iteration of the following loop does one of the two things for
         // each message: (1) if there is no outstanding chunk being sent, check
@@ -1215,12 +1345,30 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             // Check RPC completion.
             ShufflePushRpc* rpc = messageTrackers[i]->outstandingRpc.get();
             if (rpc) {
+                transmitPendingRpcs += rpc->transmitDone ? 0 : 1;
                 if (rpc->isReady()) {
+                    // FIXME: RTT seems ridiculously high (e.g. 500 us); how is it
+                    // possible? 40KB amounts to only 3.2 us in 100Gbps network,
+                    // so 500 us is 156 packets! But we only have 38 servers!
+                    // It's impossible for the network queue at the core/ToR
+                    // switch to have that much data?!
+                    // Perhaps the rx_queue_size = 16 in ofiud? PSM2 becomes
+                    // extremely slow when running out of rx buffers?
+                    outstandingChunks--;
+                    timeTraceSp("shuffle-push: message chunk to server %u acked,"
+                            " offset %u, RTT %u us, outstanding chunks %u",
+                            messageTrackers[i]->serverId.indexNumber(),
+                            messageTrackers[i]->offset,
+                            Cycles::toMicroseconds(Cycles::rdtsc() -
+                            messageTrackers[i]->lastTransmitTime),
+                            outstandingChunks);
                     messageTrackers[i]->outstandingRpc.destroy();
                     if (messageTrackers[i]->messageIt.isDone()) {
                         messagesUnfinished--;
-                        timeTrace("shuffle-push: message to server %u done",
-                                messageTrackers[i]->serverId.indexNumber());
+                        timeTraceSp("shuffle-push: message to server %u done, "
+                                "%d messages left",
+                                messageTrackers[i]->serverId.indexNumber(),
+                                messagesUnfinished);
                     }
                 } else {
                     // This message has an outstanding chunk being sent;
@@ -1229,6 +1377,11 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                     continue;
                 }
             }
+            candidates.push_back(i);
+
+            // TODO: is there any benefit to use strict LRPT policy over
+            // random power-of-two policy? Vice versa?
+            // TODO: should I try a random strategy ASAP?
 
             // Find next message chunk to send.
             uint32_t bytesLeft = messageTrackers[i]->messageIt.size();
@@ -1238,11 +1391,47 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             }
         }
 
+#define MAX_TX_PENDING_RPCS 2
+
+        // Change 1 -> 0 to turn off power-of-two policy (and use deterministic
+        // LRPT policy)
+#if 0
+        const int MAX_CHOICES = 2;
+        maxBytesLeft = 0;
+        if (transmitPendingRpcs < MAX_TX_PENDING_RPCS) {
+            for (int choice = 0; choice < MAX_CHOICES; choice++) {
+                int idx = candidates[Util::wyhash64() % candidates.size()];
+                uint32_t bytesLeft = messageTrackers[idx]->messageIt.size();
+                if (bytesLeft > maxBytesLeft) {
+                    maxBytesLeft = bytesLeft;
+                    index = idx;
+                }
+            }
+        }
+        // TODO: the following buggy version gives better performance???
+        // it was power-of-two SRPT by mistake...
+//        if (transmitPendingRpcs < MAX_TX_PENDING_RPCS) {
+//            uint64_t x0 = Util::wyhash64() % candidates.size();
+//            uint64_t x1 = Util::wyhash64() % candidates.size();
+////            uint64_t x2 = Util::wyhash64() % candidates.size();
+//            uint32_t bytesLeft0 = messageTrackers[candidates[x0]]->messageIt.size();
+//            uint32_t bytesLeft1 = messageTrackers[candidates[x1]]->messageIt.size();
+////            uint32_t bytesLeft2 = messageTrackers[candidates[x2]]->messageIt.size();
+//            if (bytesLeft0 < bytesLeft1) {
+//                index = candidates[x0];
+//            } else {
+//                index = candidates[x1];
+//            }
+//        }
+#endif
+
         // Send out one more chunk of data, if appropriate.
-        if (index >= 0) {
-#define MAX_PUSH_CHUNK_SIZE 40000
+        if ((transmitPendingRpcs < MAX_TX_PENDING_RPCS) && (index >= 0)) {
+            uint64_t now = Cycles::rdtsc();
+            messageTrackers[index]->lastTransmitTime = now;
             messageTrackers[index]->sendMessageChunk(context, group->rank,
                     dataId, MAX_PUSH_CHUNK_SIZE);
+            outstandingChunks++;
 
             if (dataId == ALLSHUFFLE_KEY) {
                 INC_COUNTER(shuffleKeysSentRpcs);
@@ -1253,6 +1442,15 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
 
         Arachne::yield();
     }
+
+    activeCycles = context->dispatch->dispatchActiveCycles - activeCycles;
+    uint64_t elapsed = Cycles::rdtsc() - shuffleStart;
+    timeTraceSp("shuffle-push: operation completed, idle %u us, active %u us, "
+            "active BW %u Gbps, actual BW %u Gbps",
+            Cycles::toMicroseconds(elapsed - activeCycles),
+            Cycles::toMicroseconds(activeCycles),
+            uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(activeCycles)),
+            uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(elapsed)));
 }
 
 void
@@ -1313,6 +1511,9 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             if (reqHdr->offset + reqHdr->len == reqHdr->totalLength) {
                 // Make sure the message is only added to the merge sorter once.
                 if (!shuffleKeysRxFrom->at(senderId).exchange(true)) {
+                    timeTrace("received %u keys from server %u", numKeys,
+                            senderId);
+
                     // Fix the value indices of incoming keys.
                     for (uint32_t i = startIdx; i < startIdx + numKeys; i++) {
                         incomingKeys[i].index = i;
@@ -1361,8 +1562,11 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             // implementation doesn't send out the next data chunk before the
             // preceding one is finished.
             if (reqHdr->offset + reqHdr->len == reqHdr->totalLength) {
-                // Make sure the message is only added to the merge sorter once.
                 if (!shuffleValsRxFrom->at(senderId).exchange(true)) {
+                    uint32_t numValues = reqHdr->totalLength / Value::SIZE;
+                    timeTrace("received %u values from server %u", numValues,
+                            senderId);
+                    numValuesReceived.fetch_add(numValues);
                     shuffleValsRxCount++;
                     ADD_COUNTER(shuffleValuesInputBytes, reqHdr->totalLength);
                 }
@@ -1371,10 +1575,10 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
         }
         case ALLSHUFFLE_BENCHMARK: {
             // Do nothing; we are benchmarking the transport layer.
-            timeTrace("shuffle-push: received message chunk, senderId %d, "
+            timeTraceSp("shuffle-push: received message chunk, senderId %d, "
                     "offset %u, len %u", senderId, reqHdr->offset, reqHdr->len);
             if (reqHdr->offset + reqHdr->len == reqHdr->totalLength) {
-                timeTrace("shuffle-push: received entire message, senderId %d",
+                timeTraceSp("shuffle-push: received entire message, senderId %d",
                         senderId);
             }
             break;

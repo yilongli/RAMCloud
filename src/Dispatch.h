@@ -83,6 +83,8 @@ class Dispatch {
     /// waiting for RPCs to complete.
     volatile uint64_t currentTime;
 
+    volatile uint64_t dispatchActiveCycles;
+
     /// How many times the poll method has been invoked. Only used for
     /// debugging purpose in the dispatch thread; not thread-safe.
     uint64_t iteration;

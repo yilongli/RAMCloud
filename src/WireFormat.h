@@ -264,6 +264,8 @@ struct InitMilliSort {
     static const ServiceType service = MILLISORT_SERVICE;
     struct Request {
         RequestCommon common;
+        /// Unique identifier of this request.
+        uint32_t id;
         /// # nodes participating in the millisort.
         uint32_t numNodes;
         /// # tuples on each server.
@@ -277,8 +279,7 @@ struct InitMilliSort {
     struct Response {
         ResponseCommon common;
 
-        /// # nodes initialized in response to this RPC. Should always be 1
-        /// if #fromClient is false.
+        /// # nodes initialized in response to this RPC.
         int32_t numNodesInited;
 
         /// Configuration parameters (only defined when #fromClient is true).
@@ -433,6 +434,8 @@ struct ShufflePush {
         uint32_t totalLength;
         uint32_t offset;
         uint32_t len;
+        // debug logging only
+        uint32_t rpcId;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;

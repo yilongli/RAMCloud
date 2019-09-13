@@ -68,14 +68,19 @@ DispatchExec::sync(uint64_t id)
 {
     // The only nontrivial thing here is that we want to print log messages
     // if the sync takes an unreasonable amount of time. Print the first
-    // message after 10ms, then another message ever second after that.
+    // message after 10ms, then another message every second after that.
     uint64_t start = Cycles::rdtsc();
     uint64_t nextLogTime = start + ((uint64_t) Cycles::perSecond())/100;
+    bool logBacktrace = false;
     while (totalRemoves < id) {
         uint64_t now = Cycles::rdtsc();
         if (now >= nextLogTime) {
             RAMCLOUD_LOG(WARNING, "DispatchExec::sync has been stalled for "
                     "%.2f seconds", Cycles::toSeconds(now - start));
+            if (logBacktrace) {
+                RAMCLOUD_BACKTRACE(WARNING);
+            }
+            logBacktrace = true;
             nextLogTime = now + (uint64_t) Cycles::perSecond();
         }
         if (owner->isDispatchThread())

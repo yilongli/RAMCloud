@@ -51,7 +51,7 @@ class InitMilliSortRpc : public ServerIdRpcWrapper {
             bool fromClient = true);
     ~InitMilliSortRpc() {}
 
-    static void appendRequest(Buffer* request, uint32_t numNodes,
+    static void appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
             uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
             bool fromClient);
 
@@ -152,12 +152,15 @@ class ShufflePushRpc : public ServerIdRpcWrapper {
 
     static void appendRequest(Buffer* request, int32_t senderId,
             uint32_t dataId, uint32_t totalLength, uint32_t offset,
-            Buffer::Iterator* payload);
+            Buffer::Iterator* payload, uint32_t rpcId);
 
     void wait() { waitAndCheckErrors(); }
 
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::ShufflePush::Response);
+
+    // FIXME: Debug only; remove?
+    uint32_t rpcId;
 
 PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(ShufflePushRpc);

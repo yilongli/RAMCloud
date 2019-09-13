@@ -71,10 +71,6 @@ class SendRequestWrapper : public DispatchExec::Lambda {
 
     /// @copydoc DispatchExec::Lambda::invoke()
     void invoke() {
-//        if (request->getStart<WireFormat::RequestCommon>()->opcode ==
-//                WireFormat::BCAST_TREE) {
-//            TimeTrace::record("SendRequestWrapper invoked");
-//        }
         session->sendRequest(request, response, notifier);
         session = NULL;
     }

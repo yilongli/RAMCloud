@@ -329,7 +329,8 @@ class Transport {
      */
     class RpcNotifier {
       public:
-        explicit RpcNotifier() {}
+        explicit RpcNotifier()
+            : receiveTime(), transmitTime(), transmitDone() {}
         virtual ~RpcNotifier() {}
         virtual void completed();
         virtual void failed();
@@ -342,6 +343,10 @@ class Transport {
         /// (both ClockSyncRpc's request & response are single-packet).
         uint64_t receiveTime;
         uint64_t transmitTime;
+
+        // FIXME: indicate whether we have finished transmitted an RPC request;
+        // only used for ShufflePushRpc to perform app-level rate control.
+        volatile bool transmitDone;
 
         DISALLOW_COPY_AND_ASSIGN(RpcNotifier);
     };

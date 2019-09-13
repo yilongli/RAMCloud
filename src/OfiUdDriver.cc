@@ -558,8 +558,10 @@ OfiUdDriver::getTransmitBuffer(int txid)
                 count++;
             }
             timeTrace("ofiud: TX buffers refilled after %u polls", count);
-            double waitMillis = 1e03 * Cycles::toSeconds(Cycles::rdtsc()
-                    - start);
+            uint64_t elapsed = Cycles::rdtsc() - start;
+            TimeTrace::record("ofiud: TX buffers refilled after %u polls, "
+                    "wasted %u cyc", count, elapsed);
+            double waitMillis = 1e03 * Cycles::toSeconds(elapsed);
             if (waitMillis > 1.0)  {
                 LOG(WARNING, "Long delay waiting for transmit buffers "
                         "(%.1f ms elapsed, %lu buffers now free)",

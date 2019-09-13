@@ -16,7 +16,6 @@
 
 #include "BasicTransport.h"
 #include "CycleCounter.h"
-#include "CycleCounter.h"
 #include "Service.h"
 #include "TimeTrace.h"
 #include "WorkerManager.h"
@@ -108,8 +107,12 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // Atom cluster) where threads can get descheduled by the kernel for
     // 10-30ms. This can result in delays in handling network packets, and
     // we don't want those delays to result in RPC timeouts.
-    , timeoutIntervals(40)
-    , pingIntervals(3)
+//    , timeoutIntervals(40)
+//    , pingIntervals(3)
+    // As of 09/2019, the POD cluster seems to be more noisey than cloudlab
+    // or rccluster; relax the timeout critieria.
+    , timeoutIntervals(150) // 300 ms
+    , pingIntervals(6)
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -184,6 +187,7 @@ BasicTransport::deleteClientRpc(ClientRpc* clientRpc)
     outgoingRpcs.erase(sequence);
     if (clientRpc->transmitPending) {
         erase(outgoingRequests, *clientRpc);
+        clientRpc->notifier->transmitDone = true;
     }
     if (clientRpc->request.active) {
         erase(activeOutgoingMessages, clientRpc->request);
@@ -364,9 +368,9 @@ BasicTransport::sendBytes(const Driver::Address* address, RpcId rpcId,
         AllDataHeader header(rpcId, flags, (uint16_t)message->size());
         Buffer::Iterator iter(message);
         const char* fmt = (flags & FROM_CLIENT) ?
-                "client sending ALL_DATA, clientId %u, sequence %u" :
-                "server sending ALL_DATA, clientId %u, sequence %u";
-        timeTrace(fmt, rpcId.clientId, rpcId.sequence);
+                "client sending ALL_DATA, clientId %u, sequence %u, bytes %u" :
+                "server sending ALL_DATA, clientId %u, sequence %u, bytes %u";
+        timeTrace(fmt, rpcId.clientId, rpcId.sequence, header.messageLength);
         driver->sendPacket(address, &header, &iter, 0, &txQueueState);
         ADD_COUNTER(basicTransportOutputDataBytes, sizeof(AllDataHeader));
         ADD_COUNTER(basicTransportOutputDataBytes, message->size());
@@ -632,6 +636,7 @@ BasicTransport::tryToTransmitData()
                 erase(outgoingRequests, *clientRpc);
                 message->active = false;
                 erase(activeOutgoingMessages, *message);
+                clientRpc->notifier->transmitDone = true;
             } else {
                 // Delete the ServerRpc object as soon as we have
                 // transmitted the last byte. This has the disadvantage
@@ -777,6 +782,11 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     t->outgoingRpcs[t->nextClientSequenceNumber] = clientRpc;
     t->nextClientSequenceNumber++;
 
+    if (clientRpc->isShufflePush) {
+        t->timeTrace("sending shuffle push req, rpcId %u",
+                request->getStart<WireFormat::ShufflePush::Request>()->rpcId);
+    }
+
     uint32_t bytesSent;
     if (length < t->smallMessageThreshold) {
         RpcId rpcId = clientRpc->rpcId;
@@ -784,11 +794,12 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
         Buffer::Iterator iter(request, 0, length);
         t->timeTrace("client sending ALL_DATA, clientId %u, sequence %u, "
-                "priority %u", rpcId.clientId, rpcId.sequence, 0);
+                "bytes %u", rpcId.clientId, rpcId.sequence, length);
         t->driver->sendPacket(serverAddress, &header, &iter, 0);
         notifier->transmitTime = t->driver->getLastTransmitTime();
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
+        clientRpc->notifier->transmitDone = true;
         bytesSent = length;
     } else {
         t->outgoingRequests.push_back(*clientRpc);
@@ -855,6 +866,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 TimeTrace::printToLogBackground(context->dispatch);
             }
             TEST_LOG("Discarding unknown packet, sequence %lu",
+                    common->rpcId.sequence);
+            timeTrace("client received packet from unknown RPC, "
+                    "packet opcode %u, clientId %u, sequence %u",
+                    common->opcode, common->rpcId.clientId,
                     common->rpcId.sequence);
             return;
         }
@@ -1474,7 +1489,7 @@ BasicTransport::ServerRpc::sendReply()
         AllDataHeader header(rpcId, FROM_SERVER, uint16_t(length));
         Buffer::Iterator iter(&replyPayload, 0, length);
         t->timeTrace("server sending ALL_DATA, clientId %u, sequence %u, "
-                "priority %u", rpcId.clientId, rpcId.sequence, 0);
+                "bytes %u", rpcId.clientId, rpcId.sequence, length);
         t->driver->sendPacket(clientAddress, &header, &iter, 0);
         t->deleteServerRpc(this);
         bytesSent = length;
@@ -1802,7 +1817,9 @@ BasicTransport::Poller::poll()
     // best value).
 #define MAX_PACKETS 8
     uint32_t numPackets;
+    uint64_t rxCycles = 0;
     {
+        CycleCounter<> _(&rxCycles);
         SCOPED_TIMER(basicTransportReceiveCycles);
         t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
         numPackets = static_cast<uint32_t>(t->receivedPackets.size());
@@ -1812,7 +1829,14 @@ BasicTransport::Poller::poll()
         ADD_COUNTER(basicTransportInputPackets, numPackets);
     }
 
+    // TODO: remove this debug message
+    static const uint64_t SLOW_RX_THRESH = Cycles::fromMicroseconds(20);
+    if (rxCycles > SLOW_RX_THRESH) {
+        t->timeTrace("WARNING! receivePackets took %u cyc", rxCycles);
+    }
+
     if (numPackets > 0) {
+        t->timeTrace("received %u packets", numPackets);
         START_TIMER(basicTransportHandlePacketCycles);
         for (uint i = 0; i < numPackets; i++) {
             t->handlePacket(&t->receivedPackets[i]);

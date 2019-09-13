@@ -360,6 +360,10 @@ class BasicTransport : public Transport {
         /// Used to link this object into t->outgoingRequests.
         IntrusiveListHook outgoingRequestLinks;
 
+        // FIXME: remove
+        /// Hack to treat shuffle push RPC differently.
+        bool isShufflePush;
+
         ClientRpc(Session* session, uint64_t sequence, Buffer* request,
                 Buffer* response, RpcNotifier* notifier)
             : session(session)
@@ -372,6 +376,8 @@ class BasicTransport : public Transport {
             , accumulator()
             , scheduledMessage()
             , outgoingRequestLinks()
+            , isShufflePush(WireFormat::SHUFFLE_PUSH ==
+                    request->getStart<WireFormat::RequestCommon>()->opcode)
         {}
 
       PRIVATE:

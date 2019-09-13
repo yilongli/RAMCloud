@@ -65,6 +65,7 @@ Syscall* Dispatch::sys = &defaultSyscall;
 Dispatch::Dispatch(bool hasDedicatedThread)
     : coreId(-1)
     , currentTime(0)
+    , dispatchActiveCycles(0)
     , iteration(0)
     , pollers()
     , files()
@@ -163,6 +164,8 @@ Dispatch::poll()
             && hasDedicatedThread) {
         LOG(WARNING, "Long gap in dispatcher: %.2f ms",
                 Cycles::toSeconds(pollingTime)*1e03);
+        TimeTrace::record("dispatch: previous polling iteration was slow; "
+                "took %u us", Cycles::toMicroseconds(pollingTime));
     }
 
     for (uint32_t i = 0; i < pollers.size(); i++) {
@@ -177,6 +180,8 @@ Dispatch::poll()
             double ms = Cycles::toSeconds(ticks) * 1000;
             LOG(NOTICE, "Poller %s (%u) took awhile: %.2f ms",
                 pollers[i]->pollerName.c_str(), i, ms);
+            TimeTrace::record("dispatch: poller %u took %u us", i,
+                    uint32_t(ms*1e3));
         }
 #endif
     }
@@ -323,6 +328,7 @@ Dispatch::run()
         uint64_t elapsed = currentTime - prevPollTime;
         if (prevResult > 0) {
             PerfStats::threadStats.dispatchActiveCycles += elapsed;
+            dispatchActiveCycles += elapsed;
         } else {
             idleTime += elapsed;
         }

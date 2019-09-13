@@ -14,6 +14,7 @@
  */
 
 #include "MilliSortClient.h"
+#include "Util.h"
 
 namespace RAMCloud {
 
@@ -33,18 +34,20 @@ InitMilliSortRpc::InitMilliSortRpc(Context* context, ServerId serverId,
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::InitMilliSort::Response))
 {
-    appendRequest(&request, numNodes, dataTuplesPerServer, nodesPerPivotServer,
-            fromClient);
+    uint32_t id = Util::wyhash64();
+    appendRequest(&request, id, numNodes, dataTuplesPerServer,
+            nodesPerPivotServer, fromClient);
     send();
 }
 
 void
-InitMilliSortRpc::appendRequest(Buffer* request, uint32_t numNodes,
+InitMilliSortRpc::appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
         uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
         bool fromClient)
 {
     WireFormat::InitMilliSort::Request* reqHdr(
             RpcWrapper::allocHeader<WireFormat::InitMilliSort>(request));
+    reqHdr->id = id;
     reqHdr->numNodes = numNodes;
     reqHdr->dataTuplesPerServer = dataTuplesPerServer;
     reqHdr->nodesPerPivotServer = nodesPerPivotServer;
@@ -140,15 +143,17 @@ ShufflePushRpc::ShufflePushRpc(Context* context, ServerId serverId,
         uint32_t offset, Buffer::Iterator* payload)
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::ShufflePush::Response))
+    , rpcId(Util::wyhash64())
 {
-    appendRequest(&request, senderId, dataId, totalLength, offset, payload);
+    appendRequest(&request, senderId, dataId, totalLength, offset, payload,
+            rpcId);
     send();
 }
 
 void
 ShufflePushRpc::appendRequest(Buffer* request, int32_t senderId,
         uint32_t dataId, uint32_t totalLength, uint32_t offset,
-        Buffer::Iterator* payload)
+        Buffer::Iterator* payload, uint32_t rpcId)
 {
     WireFormat::ShufflePush::Request* reqHdr(
             allocHeader<WireFormat::ShufflePush>(request));
@@ -157,6 +162,7 @@ ShufflePushRpc::appendRequest(Buffer* request, int32_t senderId,
     reqHdr->totalLength = totalLength;
     reqHdr->offset = offset;
     reqHdr->len = payload->size();
+    reqHdr->rpcId = rpcId;
     while (!payload->isDone()) {
         request->appendExternal(payload->getData(), payload->getLength());
         payload->next();
