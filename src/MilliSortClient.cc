@@ -30,20 +30,20 @@ MilliSortClient::initMilliSort(Context* context, ServerId serverId,
 
 InitMilliSortRpc::InitMilliSortRpc(Context* context, ServerId serverId,
         uint32_t numNodes, uint32_t dataTuplesPerServer,
-        uint32_t nodesPerPivotServer, bool fromClient)
+        uint32_t nodesPerPivotServer, bool flushCache, bool fromClient)
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::InitMilliSort::Response))
 {
     uint32_t id = Util::wyhash64();
     appendRequest(&request, id, numNodes, dataTuplesPerServer,
-            nodesPerPivotServer, fromClient);
+            nodesPerPivotServer, flushCache, fromClient);
     send();
 }
 
 void
 InitMilliSortRpc::appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
         uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-        bool fromClient)
+        bool flushCache, bool fromClient)
 {
     WireFormat::InitMilliSort::Request* reqHdr(
             RpcWrapper::allocHeader<WireFormat::InitMilliSort>(request));
@@ -51,6 +51,7 @@ InitMilliSortRpc::appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
     reqHdr->numNodes = numNodes;
     reqHdr->dataTuplesPerServer = dataTuplesPerServer;
     reqHdr->nodesPerPivotServer = nodesPerPivotServer;
+    reqHdr->flushCache = flushCache;
     reqHdr->fromClient = fromClient;
 }
 

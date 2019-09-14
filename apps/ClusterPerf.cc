@@ -7367,9 +7367,9 @@ millisort()
     syncClusterClock(numMasters);
 #endif
 
-    std::string perfStats;
     for (int i = 0; i < count; i++) {
         // Initialize the experiment.
+        LOG(NOTICE, "Initializing millisort service");
         InitMilliSortRpc initRpc(context, rootServer,
                 downCast<uint32_t>(serverList.size() - 1),
                 downCast<uint32_t>(dataTuplesPerNode),
@@ -7388,6 +7388,7 @@ millisort()
 
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsAfter);
+        std::string perfStats;
         perfStats += format("=====================\n");
         perfStats += format("Experiment ID = %d\n", i);
         perfStats += format("=====================\n");
@@ -7407,12 +7408,13 @@ millisort()
         perfStats += format("\n");
         perfStats += format("%s\n", PerfStats::printClusterStats(&statsBefore,
                 &statsAfter).c_str());
+        printf("%s", perfStats.c_str());
+        fflush(stdout);
     }
-    printf("%s", perfStats.c_str());
 }
 
 void
-treeBcast()
+treeBcastImpl(std::vector<int> sizes)
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7439,21 +7441,22 @@ treeBcast()
     string rawdata;
 
     // Sweep machineCount from 1 to numMasters.
-//    for (int i = 0; i < 20; i++) { int machineCount = numMasters;
-//    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
+    for (int size : sizes) {
+    //    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
     for (int machineCount = 2; machineCount <= numMasters; machineCount++) {
         // (Re)synchronize the cluster clock before each experiment.
         syncClusterClock(numMasters);
 
         // Initialize the millisort service.
-        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1,
+                false);
         auto initResp = initRpc.wait();
-        LOG(NOTICE, "Initialized %d millisort service nodes",
-                initResp->numNodesInited);
+        LOG(NOTICE, "Initialized %d millisort service nodes, size %d",
+                initResp->numNodesInited, size);
 
         // Start the experiment.
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::BCAST_TREE,
-                objectSize);
+                size);
         Buffer* result = rpc.wait();
         LOG(NOTICE, "BenchmarkCollectiveOpRpc returned");
 
@@ -7481,8 +7484,9 @@ treeBcast()
         double p90 = double(completionTimes[int(numSamples * 0.9)]) * 1e-3;
         double p99 = double(completionTimes[int(numSamples * 0.99)]) * 1e-3;
         printf(" %10d%10d%10.0f%10.2f%10.2f%10.2f%10.2f\n", machineCount,
-                objectSize, numSamples, min, p50, p90, p99);
+                size, numSamples, min, p50, p90, p99);
 
+#if 0
         // Output the broadcast latencies of each node from all runs (several
         // comma-separated values on each line).
         rawdata.append(std::to_string(machineCount));
@@ -7503,6 +7507,8 @@ treeBcast()
             }
             rawdata.append("\n");
         }
+#endif
+    }
     }
 //    printf("%s", rawdata.c_str());
 }
@@ -7542,10 +7548,11 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode, std::vector<int> sizes)
             syncClusterClock(numMasters);
 
             // Initialize the millisort service.
-            InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+            InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1,
+                    false);
             auto initResp = initRpc.wait();
-            LOG(NOTICE, "Initialized %d millisort service nodes",
-                    initResp->numNodesInited);
+            LOG(NOTICE, "Initialized %d millisort service nodes, size %d",
+                    initResp->numNodesInited, size);
 
             // Start the experiment.
             BenchmarkCollectiveOpRpc rpc(context, count, opcode, size);
@@ -7571,6 +7578,12 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode, std::vector<int> sizes)
                     size, numSamples, min, p50, p90, p99);
         }
     }
+}
+
+void
+treeBcast()
+{
+    treeBcastImpl({objectSize});
 }
 
 void
@@ -7644,7 +7657,8 @@ allShuffle()
 
         // Initialize the millisort service.
         ServerId rootServer(1, 0);
-        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1);
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1,
+                false);
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);

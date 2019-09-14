@@ -48,12 +48,12 @@ class InitMilliSortRpc : public ServerIdRpcWrapper {
   public:
     InitMilliSortRpc(Context* context, ServerId serverId, uint32_t numNodes,
             uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-            bool fromClient = true);
+            bool flushCache = true, bool fromClient = true);
     ~InitMilliSortRpc() {}
 
     static void appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
             uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-            bool fromClient);
+            bool flushCache, bool fromClient);
 
     /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
     WireFormat::InitMilliSort::Response*

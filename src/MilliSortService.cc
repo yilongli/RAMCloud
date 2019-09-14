@@ -289,6 +289,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     if (reqHdr->fromClient) {
         if ((world->rank > 0) ||
                 (numDataTuples * MAX_IMBALANCE_RATIO > MAX_RECORDS_PER_NODE)) {
+            LOG(ERROR, "Illegal arguments: rank %d, numDataTuples %d",
+                    world->rank, numDataTuples);
             respHdr->common.status = STATUS_MILLISORT_ERROR;
             return;
         }
@@ -306,7 +308,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         }
         outgoingRpcs.emplace_back(context, world->getNode(rank),
                 reqHdr->numNodes, reqHdr->dataTuplesPerServer,
-                reqHdr->nodesPerPivotServer, false);
+                reqHdr->nodesPerPivotServer, reqHdr->flushCache, false);
     }
 
     // Initialize member fields.
@@ -399,8 +401,11 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 
     // Flush LLC to avoid generating unrealistic numbers; we are doing
     // memory-to-memory sorting (not cache-to-cache sorting)!
-    flushSharedCache();
-    timeTrace("initMilliSort: flushed shared cache; ready for benchmark");
+    if (reqHdr->flushCache) {
+        flushSharedCache();
+        timeTrace("initMilliSort: flushed shared cache; ready for end-to-end "
+                "benchmark");
+    }
 
     // Wait for its children nodes to finish initialization.
     while (!outgoingRpcs.empty()) {
@@ -448,6 +453,7 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     // node, which would then broadcast the start request to all nodes.
     if (reqHdr->fromClient) {
         if (world->rank > 0) {
+            LOG(ERROR, "Illegal arguments: rank %d", world->rank);
             respHdr->common.status = STATUS_MILLISORT_ERROR;
             return;
         }

@@ -272,6 +272,10 @@ struct InitMilliSort {
         uint32_t dataTuplesPerServer;
         /// # nodes assigned to each pivot server (including itself).
         uint32_t nodesPerPivotServer;
+        /// Flush shared cache as part of initialization. This is required for
+        /// end-to-end millisort benchmark but not for collective operation
+        /// microbenchmarks.
+        bool flushCache;
         /// True if this RPC is initiated from an external client outside the
         /// MilliSort service nodes.
         bool fromClient;
