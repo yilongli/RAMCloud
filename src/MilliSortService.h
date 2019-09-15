@@ -642,6 +642,7 @@ class MilliSortService : public Service {
     /// of the array is undefined before final value rearrangement.
     Value* const sortedValues;
 
+    // TODO: rename to incomingValues;
     /// Holds the unsorted version of #sortedValues. That is, the data received
     /// during value shuffle are stored in this array before final value
     /// rearrangement.
@@ -649,6 +650,9 @@ class MilliSortService : public Service {
 
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;
+
+    /// # keys received by this node during key shuffle.
+    int numKeysReceived;
 
     /// # values received by this node during final value shuffle. Should be
     /// equal to numSortedItems; only used for debugging.
@@ -659,7 +663,13 @@ class MilliSortService : public Service {
     std::atomic_bool printingResult;
 
     // FIXME: this is a bad name; besides, does it have to be class member?
-    std::vector<uint32_t> valueStartIdx;
+    // Note on thread-safety: each element is written once in
+    // shufflePush(ALLSHUFFLE_KEY) and then read multiple times in
+    // shufflePush(ALLSHUFFLE_VALUE). We use lock to protect from write-write
+    // data-race; there should be no write-read data-race as a remote peer
+    // should never push a chunk of value message to us before we ack'ed the
+    // entire key message.
+    std::vector<int> valueStartIdx;
 
     /// Selected keys that evenly divide #localKeys on this node into # nodes
     /// partitions.
@@ -696,6 +706,10 @@ class MilliSortService : public Service {
     /// Records whether we have received the complete value shuffle message from
     /// a server. There is one element for each server, ordered by their ranks.
     Tub<std::vector<std::atomic_bool>> shuffleValsRxFrom;
+
+    // TODO: doc.
+    Tub<std::vector<std::atomic<uint32_t>>> shuffleKeyMsgCopiedBytes;
+    Tub<std::vector<std::atomic<uint32_t>>> shuffleValMsgCopiedBytes;
 
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;

@@ -333,6 +333,9 @@ struct PerfStats {
 
     // FIXME: so which of these are aggregation-based? and which are not?
 
+    /// # nodes participate in the millisort.
+    uint64_t millisortNodes;
+
     /// Time (in cycles) spent by the worker thread to server millisort
     /// requests. This is the end-to-end time that millisort takes.
     uint64_t millisortTime;
@@ -358,7 +361,7 @@ struct PerfStats {
     uint64_t millisortFinalValueBytes;
 
     /// 1 means true; 0 means false.
-    uint64_t millisortIsPivotServer;
+    uint64_t millisortIsPivotSorter;
 
     /// Starting time of the local sorting stage.
     uint64_t localSortStartTime;

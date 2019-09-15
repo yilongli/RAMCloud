@@ -136,6 +136,7 @@ MilliSortService::MilliSortService(Context* context,
     , sortedValues(localValues0 + MAX_RECORDS_PER_NODE)
     , sortedValues0(sortedValues + MAX_RECORDS_PER_NODE)
     , numSortedItems(0)
+    , numKeysReceived()
     , numValuesReceived()
     , printingResult()
     , valueStartIdx()
@@ -147,6 +148,8 @@ MilliSortService::MilliSortService(Context* context,
     , shuffleValsRxCount()
     , shuffleKeysRxFrom()
     , shuffleValsRxFrom()
+    , shuffleKeyMsgCopiedBytes()
+    , shuffleValMsgCopiedBytes()
     , mergeSorter()
     , mergeSorterIsReady()
     , mergeSorterLock("MilliSortService::mergeSorter")
@@ -368,9 +371,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         Arachne::yield();
     }
     numSortedItems = 0;
+    numKeysReceived = 0;
     numValuesReceived = 0;
     valueStartIdx.clear();
-    valueStartIdx.resize(world->size(), 0);
+    valueStartIdx.resize(world->size(), -1);
 
     //
     localPivots.clear();
@@ -381,6 +385,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     shuffleValsRxCount = 0;
     shuffleKeysRxFrom.construct(world->size());
     shuffleValsRxFrom.construct(world->size());
+    shuffleKeyMsgCopiedBytes.construct(world->size());
+    shuffleValMsgCopiedBytes.construct(world->size());
     mergeSorter.construct(world->size(), numDataTuples * world->size() * 2,
             int(Arachne::getCorePolicy()->getCores(0).size()));
     mergeSorterIsReady = false;
@@ -511,7 +517,8 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     timeTrace("MilliSort algorithm started, requestId %d", reqHdr->requestId);
 
     // Kick start the sorting process.
-    ADD_COUNTER(millisortIsPivotServer, isPivotServer ? 1 : 0);
+    ADD_COUNTER(millisortNodes, world->size());
+    ADD_COUNTER(millisortIsPivotSorter, isPivotServer ? 1 : 0);
     ongoingMilliSort = rpc;
     localSortAndPickPivots();
     // FIXME: a better solution is to wait on condition var.
@@ -1023,6 +1030,7 @@ MilliSortService::shuffleKeys() {
     while (shuffleKeysRxCount.load() < world->size()) {
         Arachne::yield();
     }
+    numSortedItems = numKeysReceived;
 
     // Local value rearrangement must be completed before shuffling values.
 #if OVERLAP_INIT_VAL_REARRANGE
@@ -1467,39 +1475,49 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
 
     // Reply to acknowledge the incoming data immediately; no need to wait
     // after processing the request.
-    rpc->sendReply();
+//    rpc->sendReply();
 
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
-            INC_COUNTER(shuffleKeysReceivedRpcs);
-
-            // Prevent duplicate RPCs from messing up our memory.
-            if (shuffleKeysRxCount == world->size()) {
-                LOG(WARNING, "Ignore duplicate message chunk from senderId %u",
-                        senderId);
-                return;
-            }
-
-            // Lock protecting MillisortService::{valueStartIdx, numSortedItems}
+            // Lock protecting MillisortService::{valueStartIdx, numKeysReceived}
             static SpinLock lock("shufflePush::ALLSHUFFLE_KEY");
             uint32_t numKeys = reqHdr->totalLength / PivotKey::SIZE;
+            timeTraceSp("received key shuffle chunk from server %u, offset %u",
+                    senderId, reqHdr->offset);
 
-            // If this is the first chunk of a shuffle message, reserve space
-            // for the entire message.
-            if (reqHdr->offset == 0) {
+            // Reserve space for the entire message if we haven't seen any chunk
+            // of this message before.
+            {
                 SpinLock::Guard _(lock);
-                if (valueStartIdx[senderId] == 0) {
-                    valueStartIdx[senderId] =
-                            downCast<uint32_t>(numSortedItems);
-                    numSortedItems += numKeys;
-                } else {
-                    // Duplicate RPC; we've seen this message before.
-                    return;
+                if (valueStartIdx[senderId] < 0) {
+                    valueStartIdx[senderId] = numKeysReceived;
+                    numKeysReceived += numKeys;
                 }
             }
 
+            // Serialize the copy of message chunks from the same message to
+            // prevent duplicate RPCs from corrupting #incomingKeys.
+            std::atomic<uint32_t>* copiedBytes =
+                    &shuffleKeyMsgCopiedBytes->at(senderId);
+            while (copiedBytes->load() < reqHdr->offset) {
+                Arachne::yield();
+            }
+            uint32_t offset = reqHdr->offset;
+            if (!copiedBytes->compare_exchange_strong(offset,
+                    offset + reqHdr->len)) {
+                LOG(WARNING, "Ignore duplicate message chunk from senderId %u, "
+                        "offset %u", senderId, offset);
+                return;
+            }
+            INC_COUNTER(shuffleKeysReceivedRpcs);
+
+            // Reply to acknowledge the incoming data immediately; no need to
+            // wait for the following copy to finish.
+            rpc->sendReply();
+
             // Copy the message chunk to its destination.
-            const uint32_t startIdx = valueStartIdx[senderId];
+            const uint32_t startIdx =
+                    downCast<uint32_t>(valueStartIdx[senderId]);
             Buffer::Iterator payload(rpc->requestPayload, sizeof(*reqHdr), ~0u);
             char* dst = reinterpret_cast<char*>(&incomingKeys[startIdx]);
             dst += reqHdr->offset;
@@ -1542,16 +1560,31 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             break;
         }
         case ALLSHUFFLE_VALUE: {
-            INC_COUNTER(shuffleValuesReceivedRpcs);
+            timeTraceSp("received val shuffle chunk from server %u, offset %u",
+                    senderId, reqHdr->offset);
 
-            // Prevent duplicate RPCs from messing up our memory.
-            if (shuffleValsRxCount == world->size()) {
-                LOG(WARNING, "Ignore duplicate message chunk from senderId %u",
-                        senderId);
+            // Serialize the copy of message chunks from the same message to
+            // prevent duplicate RPCs from corrupting #incomingValues.
+            std::atomic<uint32_t>* copiedBytes =
+                    &shuffleValMsgCopiedBytes->at(senderId);
+            while (copiedBytes->load() < reqHdr->offset) {
+                Arachne::yield();
+            }
+            uint32_t offset = reqHdr->offset;
+            if (!copiedBytes->compare_exchange_strong(offset,
+                    offset + reqHdr->len)) {
+                LOG(WARNING, "Ignore duplicate message chunk from senderId %u, "
+                        "offset %u", senderId, offset);
                 return;
             }
+            INC_COUNTER(shuffleValuesReceivedRpcs);
+
+            // Reply to acknowledge the incoming data immediately; no need to
+            // wait for the following copy to finish.
+            rpc->sendReply();
 
             // Copy the message chunk to its destination.
+            assert(valueStartIdx[senderId] >= 0);
             uint32_t startIdx = valueStartIdx[senderId];
             Buffer::Iterator payload(rpc->requestPayload, sizeof(*reqHdr), ~0u);
             char* dst = reinterpret_cast<char*>(&sortedValues0[startIdx]);
