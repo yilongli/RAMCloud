@@ -182,7 +182,7 @@ class MilliSortService : public Service {
         }
     }
 
-    static const int MAX_RECORDS_PER_NODE = 1000000;
+    static const int MAX_RECORDS_PER_NODE = 3000000;
 
     static const int MAX_IMBALANCE_RATIO = 2;
 
@@ -550,6 +550,10 @@ class MilliSortService : public Service {
     /// Shared RAMCloud information.
     Context* context;
 
+    /// Single contiguous block of memory backing all of our millisort
+    /// intermediate/final keys and values.
+    LargeBlockOfMemory<uint8_t> block;
+
     /// Pinned memory region that supports zero-copy TX.
     void* const zeroCopyMemoryRegion;
 
@@ -563,6 +567,7 @@ class MilliSortService : public Service {
         ALLSHUFFLE_PIVOTS,
         BROADCAST_DATA_BUCKET_BOUNDARIES,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
+        ALLSHUFFLE_RECORD,
         ALLSHUFFLE_KEY,
         ALLSHUFFLE_VALUE,
         ALLSHUFFLE_BENCHMARK,
@@ -584,8 +589,11 @@ class MilliSortService : public Service {
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
     void pickDataBucketBoundaries();
+    void shuffleRecords();
     void shuffleKeys();
     void shuffleValues();
+    Arachne::ThreadId startMergeSorter();
+    void rearrangeFinalVals();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
 
     enum CommunicationGroupId {
