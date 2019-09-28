@@ -74,6 +74,8 @@ namespace {
     }
 }
 
+#define LOG_TX_COMPLETE_TIME 0
+
 #define DEBUG_ALL_SHUFFLE 0
 
 // FIXME: figure out why we can't use the result of fi_av_straddr in
@@ -610,10 +612,10 @@ OfiUdDriver::readDriverConfigFile()
  * from previously-transmit packets. If there are any available,
  * reclaim them. This method also detects and logs transmission errors.
  */
-void
+int
 OfiUdDriver::reapTransmitBuffers(int txid)
 {
-#define MAX_TO_RETRIEVE 8
+#define MAX_TO_RETRIEVE 16
     fi_cq_entry cqes[MAX_TO_RETRIEVE];
     int numCqes = downCast<int>(fi_cq_read(txcq[txid], cqes, MAX_TO_RETRIEVE));
     if (numCqes <= 0) {
@@ -627,7 +629,7 @@ OfiUdDriver::reapTransmitBuffers(int txid)
                 DIE("fi_cq_read failed: %s", fi_strerror(-numCqes));
             }
         }
-        return;
+        return 0;
     } else if (numCqes > 0) {
         timeTrace("ofiud: polling txcq returned %d CQEs", numCqes);
     }
@@ -656,11 +658,22 @@ OfiUdDriver::reapTransmitBuffers(int txid)
             }
         }
     } else {
+#if LOG_TX_COMPLETE_TIME
+        uint64_t now = numCqes ? Cycles::rdtsc() : 0;
+#endif
         for (int i = 0; i < numCqes; i++) {
             BufferDescriptor* bd = context_to_bd(cqes[i].op_context);
             txPool[txid]->freeBuffers.push_back(bd);
+#if LOG_TX_COMPLETE_TIME
+            if (bd->packetLength >= 4000) {
+                uint64_t delayed = now - bd->transmitTime;
+                TimeTrace::record("ofiud: transmit buffer on the wire, "
+                        "bytes %u, delayed %u cyc", bd->packetLength, delayed);
+            }
+#endif
         }
     }
+    return numCqes;
 }
 
 /*
@@ -750,7 +763,7 @@ OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
         const char* currentChunk =
                 reinterpret_cast<const char*>(payload->getData());
         bool isLastChunk = payload->getLength() == payload->size();
-        if (isLastChunk && (payload->getLength() >= 4000)
+        if (isLastChunk && (payload->getLength() >= 8000)
                 && (currentChunk >= zeroCopyStart)
                 && (currentChunk + payload->getLength() < zeroCopyEnd)) {
             io_vec[1].iov_base = const_cast<char*>(currentChunk);
@@ -782,6 +795,10 @@ OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
     // Post the packet buffer to the transmit queue.
     fid_ep* ep = transmitContext[txid];
     fi_addr_t dstAddr = static_cast<const Address*>(addr)->addr[remoteRxid];
+
+#if LOG_TX_COMPLETE_TIME
+    bd->transmitTime = lastTransmitTime;
+#endif
 
     int ret;
     if (bd->packetLength <= info->tx_attr->inject_size) {
@@ -829,7 +846,8 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     // to improve their latency since the first rxcq will be polled inside the
     // dispatch thread.
     static uint64_t sprayPacketCount;
-    int txid = (packetLength < 8192) ?
+//    int txid = (packetLength < 8192) ?
+    int txid = (packetLength < 4000) ?
             0 : (1 + (sprayPacketCount++) % (MAX_HW_QUEUES - 1));
 
     lastTransmitTime = Cycles::rdtsc();
@@ -1052,6 +1070,18 @@ void
 OfiUdDriver::receivePackets(uint32_t maxPackets,
         std::vector<Received>* receivedPackets)
 {
+    // Eager reap for debugging: get a sense of when the packets are gone
+#if LOG_TX_COMPLETE_TIME
+    static uint64_t reapTxCount = 0;
+    reapTxCount++;
+    if (reapTxCount % 8 == 0) {
+        int numCqes;
+        do {
+            numCqes = reapTransmitBuffers(0);
+        } while (numCqes == 16);
+    }
+#endif
+
     // Receive "small" packets that are addressed to rxcq[0] in the dispatch
     // thread to improve latency.
     receivePacketsImpl(0, maxPackets, receivedPackets);

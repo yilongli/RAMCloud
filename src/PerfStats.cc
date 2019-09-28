@@ -189,6 +189,7 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(shuffleKeysCopyResponseCycles);
         COLLECT(onlineMergeSortStartTime);
         COLLECT(onlineMergeSortElapsedTime);
+        COLLECT(onlineMergeSortExtraTime);
         COLLECT(onlineMergeSortWorkers);
         COLLECT(shuffleValuesStartTime);
         COLLECT(shuffleValuesElapsedTime);
@@ -612,7 +613,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricRatio(&diff, "shuffleKeysElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Online merge-sort (overlaped) (us)",
-            formatMetricRatio(&diff, "onlineMergeSortElapsedTime", "cyclesPerMicros",
+            formatMetricRatio(&diff, "onlineMergeSortExtraTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Shuffle values (us)",
             formatMetricRatio(&diff, "shuffleValuesElapsedTime", "cyclesPerMicros",
@@ -816,8 +817,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Elasped time (us)",
             formatMetricRatio(&diff, "onlineMergeSortElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
+    result.append(format("%-40s %s\n", "  Extra time (us)",
+            formatMetricRatio(&diff, "onlineMergeSortExtraTime",
+            "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Percentage (%)",
-            formatMetricRatio(&diff, "onlineMergeSortElapsedTime", "millisortTime",
+            formatMetricRatio(&diff, "onlineMergeSortExtraTime", "millisortTime",
             " %8.2f", 100).c_str()));
     // TODO: active time
     // TODO: CPU time
@@ -1053,6 +1057,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(shuffleKeysCopyResponseCycles);
         ADD_METRIC(onlineMergeSortStartTime);
         ADD_METRIC(onlineMergeSortElapsedTime);
+        ADD_METRIC(onlineMergeSortExtraTime);
         ADD_METRIC(onlineMergeSortWorkers);
         ADD_METRIC(shuffleValuesStartTime);
         ADD_METRIC(shuffleValuesElapsedTime);

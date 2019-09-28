@@ -126,6 +126,23 @@ CoordinatorServerList::enlistServer(ServiceMask serviceMask,
     if (preferredIndex >= serverList.size()) {
         serverList.resize(preferredIndex + 1);
     }
+
+    // fixme: hack to avoid adding duplicate servers
+#if 1
+    if ((preferredIndex != 0) && serverList[preferredIndex].entry) {
+        if (strcmp(serviceLocator,
+                serverList[preferredIndex].entry->serviceLocator.c_str()) == 0)
+        {
+            index = preferredIndex;
+            GenerationNumberEntryPair* pair = &serverList[index];
+            ServerId id(index, pair->nextGenerationNumber - 1);
+            LOG(NOTICE, "(Duplicate) Enlisting server at %s (server id %s)",
+                    serviceLocator, id.toString().c_str());
+            return id;
+        }
+    }
+#endif
+
     if ((preferredIndex != 0) && (!serverList[preferredIndex].entry)) {
         index = preferredIndex;
     } else {

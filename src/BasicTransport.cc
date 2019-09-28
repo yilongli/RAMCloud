@@ -1815,7 +1815,7 @@ BasicTransport::Poller::poll()
     // for us). As of 07/2016, MAX_PACKETS is set to 8 because our CPU can
     // take at most 8 cache misses at a time (although it's not clear 8 is the
     // best value).
-#define MAX_PACKETS 8
+#define MAX_PACKETS 16
     uint32_t numPackets;
     uint64_t rxCycles = 0;
     {
@@ -1896,7 +1896,8 @@ BasicTransport::Poller::poll()
     }
 
     // TODO: Send queued worker requests?
-    if (t->addRequestLock.try_lock()) {
+    // Give RX priority to optimize for small msg shuffle performance?
+    if ((numPackets < MAX_PACKETS) && t->addRequestLock.try_lock()) {
         for (const WorkerRequest& wr : t->workerRequests) {
             t->dequeuedRequests.emplace_back(wr.session, wr.request,
                     wr.response, wr.notifier);
@@ -1904,12 +1905,18 @@ BasicTransport::Poller::poll()
         t->workerRequests.clear();
         t->addRequestLock.unlock();
 
-        t->driver->corkTransmitQueue();
-        for (const WorkerRequest& wr : t->dequeuedRequests) {
-            wr.session->sendRequest(wr.request, wr.response, wr.notifier);
+        if (!t->dequeuedRequests.empty()) {
+            t->timeTrace("cork transmit queue, %u worker requests await",
+                    t->dequeuedRequests.size());
+            t->driver->corkTransmitQueue();
+            for (const WorkerRequest &wr : t->dequeuedRequests) {
+                wr.session->sendRequest(wr.request, wr.response, wr.notifier);
+            }
+            t->driver->uncorkTransmitQueue();
+            t->timeTrace("uncorked transmit queue");
+            t->dequeuedRequests.clear();
+            result = 1;
         }
-        t->driver->uncorkTransmitQueue();
-        t->dequeuedRequests.clear();
     }
 
     result += totalBytesSent;

@@ -154,6 +154,11 @@ Dispatch::poll()
     uint64_t pollingTime = now - currentTime;
     currentTime = now;
     iteration++;
+
+    if (iteration % 5000000 == 0) {
+        LOG(NOTICE, "Dispatcher still alive, iteration %lu", iteration);
+    }
+
     // Dispatch::poll() execution time will be recorded if
     // profilerFlag is set to true.
     if (profilerFlag) {

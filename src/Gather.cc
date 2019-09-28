@@ -9,7 +9,7 @@ namespace RAMCloud {
 
 // Change the following to 0 to test with k-ary tree, or 1 to test with
 // k-nomial tree.
-#define TREE_TYPE 0
+#define TREE_TYPE 1
 
 // TODO: remove this handcoded constant; can we choose it dynamically?
 // A k1-k2 tree is simple (suppose node 0 is the root):

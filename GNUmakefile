@@ -190,7 +190,7 @@ endif
 
 # Test whether Infiniband support is available. Avoids using $(COMFLAGS)
 # (particularly, -MD) which results in bad interactions with mergedeps.
-INFINIBAND = $(shell $(CXX) -std=$(CXX_STANDARD) $(INCLUDES) src/HaveInfiniband.cc \
+INFINIBAND := $(shell $(CXX) -std=$(CXX_STANDARD) $(INCLUDES) src/HaveInfiniband.cc \
                          $(LIBS) -libverbs -o /dev/null >/dev/null 2>&1 \
                          && echo yes || echo no)
 
@@ -204,6 +204,7 @@ ifeq ($(LIBFABRIC),yes)
 LIBFABRIC_DIR ?= libfabric
 COMFLAGS += -DLIBFABRIC -I${LIBFABRIC_DIR}/build/include
 LIBS += -L${LIBFABRIC_DIR}/build/lib -lfabric
+# LIBS += -Wl,--whole-archive ${LIBFABRIC_DIR}/build/lib/libfabric.a -Wl,--no-whole-archive -ldl $(LIBS)
 endif
 
 # DPDK definitions:

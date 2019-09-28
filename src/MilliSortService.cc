@@ -22,6 +22,7 @@
 #include "AllShuffle.h"
 #include "Broadcast.h"
 #include "TimeTrace.h"
+#include "Util.h"
 
 namespace RAMCloud {
 
@@ -29,7 +30,7 @@ namespace RAMCloud {
 // this transport.
 #define TIME_TRACE 1
 
-#define TIME_TRACE_SP 1
+#define TIME_TRACE_SP 0
 
 #if 0
 /// Hack: redefine timeTrace to log so that we can use it even when server crashes.
@@ -94,7 +95,12 @@ namespace {
 
 // Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
 // with value shuffle.
-#define OVERLAP_MERGE_SORT 1
+#define OVERLAP_MERGE_SORT 0
+
+// FIXME: the current implementation is even slower than plain sorting in many
+// cases (why?); bypass it and plug in local sorting numbers for now.
+// When it is set to 1, OVERLAP_MERGE_SORT has no effect at all.
+#define FAKE_MERGE_SORT 1
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
 // each stage of the algorithm. Note: must be turned off during benchmarking.
@@ -408,9 +414,11 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     // Flush LLC to avoid generating unrealistic numbers; we are doing
     // memory-to-memory sorting (not cache-to-cache sorting)!
     if (reqHdr->flushCache) {
-        flushSharedCache();
-        timeTrace("initMilliSort: flushed shared cache; ready for end-to-end "
-                "benchmark");
+        // FIXME: skip cache flushing to speed up running many millisort
+        // experiments with vary config. parameters.
+//        flushSharedCache();
+//        timeTrace("initMilliSort: flushed shared cache; ready for end-to-end "
+//                "benchmark");
     }
 
     // Wait for its children nodes to finish initialization.
@@ -602,7 +610,7 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
     }
 
     /**
-     * Main method of the worker thread. Each worker is responsible to rearrange 
+     * Main method of the worker thread. Each worker is responsible to rearrange
      * values corresponding to a partition of the keys.
      *
      * For instance, if this worker is assigned keys[a..b], this method will
@@ -1062,7 +1070,7 @@ MilliSortService::shuffleValues()
 {
     timeTrace("=== Stage 7: shuffleValues started");
 
-    Arachne::ThreadId mergeSortPoller = Arachne::createThread([this] () {
+    auto mergeSortPollerMain = [this] () {
         bool done = false;
         while (!done) {
             mergeSorterLock.lock();
@@ -1079,13 +1087,22 @@ MilliSortService::shuffleValues()
                 mergeSorter->stopTick - mergeSorter->startTime);
         ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
         timeTrace("sorted %u final keys", sortedArray.size);
-    });
+    };
+
+#if FAKE_MERGE_SORT
+    // Using null thread turns the following Arachne::join calls to no-ops.
+    Arachne::ThreadId mergeSortPoller = Arachne::NullThread;
+#else
+    Arachne::ThreadId mergeSortPoller =
+            Arachne::createThread(mergeSortPollerMain);
+#endif
 
     // Ideally, online merge of final keys only need to complete before
     // rearranging final values. However, on rc machines, we don't have many
     // cores and sorting will introduce too much noise for value shuffling
 #if !OVERLAP_MERGE_SORT
-    Arachne::join(mergeSortPoller);
+    if (mergeSortPoller != Arachne::NullThread)
+        Arachne::join(mergeSortPoller);
 #endif
 
     ADD_COUNTER(shuffleValuesStartTime, Cycles::rdtsc() - startTime);
@@ -1114,7 +1131,14 @@ MilliSortService::shuffleValues()
     // final values. Normally, the online merge can be hidden completely within
     // value shuffle.
 #if OVERLAP_MERGE_SORT
-    Arachne::join(mergeSortPoller);
+    if (mergeSortPoller != Arachne::NullThread)
+        Arachne::join(mergeSortPoller);
+#endif
+
+#if FAKE_MERGE_SORT
+    // We haven't started the poller thread yet; do it here to allow the final
+    // step of rearranging values to proceed as normal.
+    Arachne::join(Arachne::createThread(mergeSortPollerMain));
 #endif
 
     timeTrace("about to rearrange final values");
@@ -1249,7 +1273,8 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         std::vector<Buffer>* outMessages)
 {
     assert(group->size() == outMessages->size());
-    if (group->size() != outMessages->size()) {
+//    if (group->size() != outMessages->size()) {
+    if (group->size() > outMessages->size()) {
         DIE("wtf??? not enought messages to send?");
     }
 
@@ -1405,14 +1430,17 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             }
         }
 
-#define MAX_TX_PENDING_RPCS 2
+        // TODO: what should be a healthy amout of pending RPCs?
+#define MAX_TX_PENDING_RPCS 8
+#define MAX_OUTSTANDING_CHUNKS 16
 
         // Change 1 -> 0 to turn off power-of-two policy (and use deterministic
         // LRPT policy)
-#if 0
+#if 1
         const int MAX_CHOICES = 2;
         maxBytesLeft = 0;
-        if (transmitPendingRpcs < MAX_TX_PENDING_RPCS) {
+        if (!candidates.empty() && (outstandingChunks < MAX_OUTSTANDING_CHUNKS)
+                && (transmitPendingRpcs < MAX_TX_PENDING_RPCS)) {
             for (int choice = 0; choice < MAX_CHOICES; choice++) {
                 int idx = candidates[Util::wyhash64() % candidates.size()];
                 uint32_t bytesLeft = messageTrackers[idx]->messageIt.size();
@@ -1424,7 +1452,8 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         }
         // TODO: the following buggy version gives better performance???
         // it was power-of-two SRPT by mistake...
-//        if (transmitPendingRpcs < MAX_TX_PENDING_RPCS) {
+//        if (!candidates.empty() &&
+//                (transmitPendingRpcs < MAX_TX_PENDING_RPCS)) {
 //            uint64_t x0 = Util::wyhash64() % candidates.size();
 //            uint64_t x1 = Util::wyhash64() % candidates.size();
 ////            uint64_t x2 = Util::wyhash64() % candidates.size();
@@ -1440,11 +1469,22 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
 #endif
 
         // Send out one more chunk of data, if appropriate.
-        if ((transmitPendingRpcs < MAX_TX_PENDING_RPCS) && (index >= 0)) {
+        if ((transmitPendingRpcs < MAX_TX_PENDING_RPCS) &&
+                (outstandingChunks < MAX_OUTSTANDING_CHUNKS) && (index >= 0)) {
+            if ((transmitPendingRpcs + 1 == MAX_TX_PENDING_RPCS) ||
+                    (outstandingChunks + 1 == MAX_OUTSTANDING_CHUNKS)) {
+                timeTraceSp("shuffle-push: ready to send again, "
+                        "transmitPendingRpcs %u, outstandingChunks %u",
+                        transmitPendingRpcs, outstandingChunks);
+            }
+            // TODO: incast-control? for the first chunk, make it smaller
+//            uint32_t chunkSize = messageTrackers[index]->offset > 0 ?
+//                    MAX_PUSH_CHUNK_SIZE : 8000;
+            uint32_t chunkSize = MAX_PUSH_CHUNK_SIZE;
             uint64_t now = Cycles::rdtsc();
             messageTrackers[index]->lastTransmitTime = now;
             messageTrackers[index]->sendMessageChunk(context, group->rank,
-                    dataId, MAX_PUSH_CHUNK_SIZE);
+                    dataId, chunkSize);
             outstandingChunks++;
 
             if (dataId == ALLSHUFFLE_KEY) {
@@ -1472,11 +1512,6 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             WireFormat::ShufflePush::Response* respHdr, Rpc* rpc)
 {
     uint32_t senderId = downCast<uint32_t>(reqHdr->senderId);
-
-    // Reply to acknowledge the incoming data immediately; no need to wait
-    // after processing the request.
-//    rpc->sendReply();
-
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_KEY: {
             // Lock protecting MillisortService::{valueStartIdx, numKeysReceived}

@@ -439,9 +439,21 @@ Merge<T>::Merge(int numArraysTotal, int maxNumAllItems, int numWorkers)
     printf(" total levels: %d\n", waysList.size());
 #endif
     int numLevels = int(waysList.size());
+
+// Allocating and zeroing-out large chunk of memory can be quite expensive.
+#define BYPASS_MALLOC_BUFFER 1
+#if BYPASS_MALLOC_BUFFER
+    static std::atomic<int> maxElements;
+    static std::unique_ptr<T> memorySpace;
+    if ((numLevels + 1) * numAllItems > maxElements) {
+        maxElements = (numLevels + 1) * numAllItems;
+        memorySpace.reset(new T[(numLevels + 1) * numAllItems]);
+    }
+    buffer = memorySpace.get();
+#else
     buffer = new T[(numLevels + 1) * numAllItems];
     bzero(buffer, sizeof(T) * (numLevels + 1) * numAllItems);
-
+#endif
     perfStats.initialize(numLevels, numWorkers);
 }
 
@@ -460,7 +472,9 @@ Merge<T>::~Merge()
         delete threads[i];
 #endif
     }
+#if !BYPASS_MALLOC_BUFFER
     delete[] buffer;
+#endif
 }
 
 template<class T>

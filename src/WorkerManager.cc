@@ -175,6 +175,9 @@ WorkerManager::handleRpc(Transport::ServerRpc* rpc)
 
     // TODO: what other collective op RPCs have trivial reply?
     if (header->opcode == WireFormat::GATHER_TREE) {
+        // FIXME: we probably want to turn this off in flat gather benchmark
+        // in order to measure RPC receive overhead rather than message receive
+        // overhead.
         rpc->trivialReply = true;
     }
 

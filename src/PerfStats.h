@@ -457,6 +457,8 @@ struct PerfStats {
 
     uint64_t onlineMergeSortElapsedTime;
 
+    uint64_t onlineMergeSortExtraTime;
+
     uint64_t onlineMergeSortWorkers;
 
     uint64_t shuffleValuesStartTime;

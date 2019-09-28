@@ -139,9 +139,12 @@ class OfiUdDriver : public Driver {
         /// Source address of the received packet. Not for transmitted packets.
         Tub<Address> sourceAddress;
 
+        // TODO: time to call fi_sendv; debugging only
+        uint64_t transmitTime;
+
         BufferDescriptor(char *buffer, uint32_t length, fid_mr* region)
             : buffer(buffer), length(length), memoryRegion(region),
-              context(), packetLength(0), sourceAddress() {}
+              context(), packetLength(0), sourceAddress(), transmitTime() {}
 
       private:
         DISALLOW_COPY_AND_ASSIGN(BufferDescriptor);
@@ -289,6 +292,8 @@ class OfiUdDriver : public Driver {
                 assert(arrayLength(this->header) >= headerLen);
                 memcpy(this->header, header, headerLen);
             }
+
+            DISALLOW_COPY_AND_ASSIGN(OutPacket);
         };
 
         /// Callback function invoked by the dispatch thread to delegate
@@ -359,7 +364,7 @@ class OfiUdDriver : public Driver {
             std::vector<Received>* receivedPackets);
     void sendPacketImpl(int txid, int remoteRxid, const Driver::Address* addr,
             const void* header, uint32_t headerLen, Buffer::Iterator* payload);
-    void reapTransmitBuffers(int txid);
+    int reapTransmitBuffers(int txid);
     bool refillReceiver(int rxid);
 
     /// Maximum number of bytes of datagrams to be sent with fi_inject,
@@ -380,11 +385,11 @@ class OfiUdDriver : public Driver {
     /// Maximum number of receive buffers that will be in the possession
     /// of the NIC at once.
 //    static constexpr uint32_t MAX_RX_QUEUE_DEPTH = 1000;
-    static constexpr uint32_t MAX_RX_QUEUE_DEPTH = 16;
+    static constexpr uint32_t MAX_RX_QUEUE_DEPTH = 128;
 
     /// Maximum number of transmit buffers that may be outstanding at once.
-//    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 128;
-    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 16;
+    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 128;
+//    static constexpr uint32_t MAX_TX_QUEUE_DEPTH = 16;
 
     /// Post a signaled send request, which generates a work completion entry
     /// when it completes, after posting SIGNALED_SEND_PERIOD-1 unsignaled send
