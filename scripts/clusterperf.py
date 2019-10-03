@@ -948,6 +948,8 @@ simple_tests = [
     Test("broadcast", broadcast),
     Test("clockSync", clockSync),
     Test("echo_basic", echo),
+    Test("uni_bandwidth", echo),
+    Test("bi_bandwidth", echo),
     Test("multiRead_colocation", default),
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),

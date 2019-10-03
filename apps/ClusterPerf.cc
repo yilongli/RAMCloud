@@ -3165,6 +3165,90 @@ echo_workload()
 
 }
 
+
+// This benchmark measures the network bandwidth between a client and a server.
+// The client keeps a fixed number of outstanding RPCs and measure the sustained
+// bandwidth.
+void
+point2pointBandwidth(bool bidirectional)
+{
+    if (clientIndex != 0)
+        return;
+    vector<uint32_t> outgoingSizes = {1000, 4000, 8000, 16000, 32000};
+    vector<string> ids = {"1K", "4K", "8K", "16K", "32K"};
+
+    // Choose the first master server in the server list as the receiver.
+    ServerMap servers;
+    getServerList(&servers);
+    string receiverLocator;
+    ServerMap::iterator it;
+    for (it = servers.begin(); it != servers.end(); it++) {
+        ServiceMask serviceMask = it->second.second;
+        if (serviceMask.has(WireFormat::MASTER_SERVICE)) {
+            break;
+        }
+    }
+    if (it != servers.end()) {
+        ServerId serverId = it->first;
+        receiverLocator = it->second.first;
+                LOG(NOTICE, "Choose server %lu at %s as the receiver",
+                serverId.getId(), receiverLocator.c_str());
+    } else {
+        LOG(ERROR, "No master server available");
+        return;
+    }
+    Transport::SessionRef session =
+            context->transportManager->getSession(receiverLocator);
+
+    // Allocate and register memory for the request messages to enable
+    // zero-copy TX if possible.
+    uint32_t largestSize =
+            *std::max_element(outgoingSizes.begin(), outgoingSizes.end());
+    const string message(largestSize, 'x');
+    context->transportManager->registerMemory(
+            const_cast<char*>(message.data()), message.length());
+    printf("%8s%8s\n", "msgSize", "Gbps");
+
+    // Each iteration through the following loop measures the round-trip time
+    // of a particular message size.
+    for (uint i = 0; i < outgoingSizes.size(); i++) {
+        uint32_t length = outgoingSizes[i];
+        LOG(NOTICE, "Running uni-directional BW test using %d-byte message for "
+                "%d seconds", length, seconds);
+
+        const uint32_t maxOutstandingRpcs = 10;
+        std::vector<Tub<EchoRpc>> outstandingRpcs(maxOutstandingRpcs);
+
+        uint64_t bytesSent = 0;
+        uint64_t stopTime = Cycles::rdtsc() + Cycles::fromSeconds(seconds);
+        while (context->dispatch->currentTime < stopTime) {
+            context->dispatch->poll();
+
+            // Each iteration of the following loop checks one RPC slot:
+            // if the slot is occupied, check for RPC completion; otherwise,
+            // start a new RPC.
+            for (auto& rpc : outstandingRpcs) {
+                if (rpc && rpc->isReady()) {
+                    rpc.destroy();
+                    bytesSent += length;
+                }
+
+                if (!rpc) {
+                    uint32_t echoLength = bidirectional ? length : 0;
+                    rpc.construct(cluster, session, message.data(), length,
+                            echoLength);
+                }
+            }
+        }
+
+        double bandwidthGbps = double(bytesSent) * 8e-9 / double(seconds);
+        printf("%8s%8.2f\n", ids[i].c_str(), bandwidthGbps);
+    }
+}
+
+void uni_bandwidth() { point2pointBandwidth(false); }
+void bi_bandwidth() { point2pointBandwidth(true); }
+
 /**
  * convenience function to generate a secondary key compatible with
  * generateIndexKeyList.
@@ -7805,6 +7889,8 @@ TestInfo tests[] = {
     {"clockSync", clockSync},
     {"echo_basic", echo_basic},
     {"echo_workload", echo_workload},
+    {"uni_bandwidth", uni_bandwidth},
+    {"bi_bandwidth", bi_bandwidth},
     {"indexBasic", indexBasic},
     {"indexRange", indexRange},
     {"indexMultiple", indexMultiple},
