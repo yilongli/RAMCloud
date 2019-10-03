@@ -205,6 +205,11 @@ LIBFABRIC_DIR ?= libfabric
 COMFLAGS += -DLIBFABRIC -I${LIBFABRIC_DIR}/build/include
 LIBS += -L${LIBFABRIC_DIR}/build/lib -lfabric
 # LIBS += -Wl,--whole-archive ${LIBFABRIC_DIR}/build/lib/libfabric.a -Wl,--no-whole-archive -ldl $(LIBS)
+
+# FIXME: temporary hack to add time trace in libpsm2
+# https://stackoverflow.com/questions/17081131/how-can-a-shared-library-so-call-a-function-that-is-implemented-in-its-loadin
+LIBS += -rdynamic
+# LIBS += -Wl,--export-dynamic
 endif
 
 # DPDK definitions:

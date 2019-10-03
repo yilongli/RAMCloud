@@ -7,7 +7,7 @@
 # EXTRA_CFLAGS="-g -O0"
 
 # Download the latest stable release.
-LIBFABRIC_VER="1.8.0"
+LIBFABRIC_VER="1.8.1"
 LIBFABRIC_SRC="https://github.com/ofiwg/libfabric/releases/download/v${LIBFABRIC_VER}/libfabric-${LIBFABRIC_VER}.tar.bz2"
 LIBFABRIC_DIR="libfabric-${LIBFABRIC_VER}"
 

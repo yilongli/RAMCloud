@@ -88,6 +88,7 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     , receivedPackets()
     , messagesToGrant()
     , dataHeadersToSend()
+    , serverRpcZombies()
     , serverRpcPool()
     , clientRpcPool()
     , outgoingRpcs()
@@ -147,6 +148,11 @@ BasicTransport::~BasicTransport()
         it++;
         deleteServerRpc(serverRpc);
     }
+    while (!serverRpcZombies.empty()) {
+        serverRpcPool.destroy(serverRpcZombies.front().second);
+        serverRpcZombies.pop_front();
+    }
+
     for (ClientRpcMap::iterator it = outgoingRpcs.begin();
             it != outgoingRpcs.end(); ) {
         ClientRpc* clientRpc = it->second;
@@ -222,7 +228,15 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
     if (serverRpc->response.active) {
         erase(activeOutgoingMessages, serverRpc->response);
     }
-    serverRpcPool.destroy(serverRpc);
+
+    // FIXME: schedule the serverRpc object to be returned to the object pool
+    // in the future because we are not sure if the reply buffer is still needed
+    // by the driver. A better solution would be to ask the driver if the last
+    // packet is indeed on the wire (e.g., keep a counter on # packets enqueued
+    // and another counter on # packets transmitted).
+    static uint64_t DELAY_RECYCLE_TIME = Cycles::fromMicroseconds(200);
+    serverRpcZombies.emplace_back(
+            context->dispatch->currentTime + DELAY_RECYCLE_TIME, serverRpc);
     timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
             serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
 }
@@ -1877,7 +1891,7 @@ BasicTransport::Poller::poll()
     // too many of these happen, it will create noise in the logs, which will
     // make it harder to notice when a *real* problem happens. Thus, it's
     // best to eliminate spurious retransmissions as much as possible.
-    uint64_t now = owner->currentTime;
+    const uint64_t now = owner->currentTime;
     if (unlikely(now >= t->nextTimeoutCheck)) {
         if (t->timeoutCheckDeadline == 0) {
             t->timeoutCheckDeadline = now + t->timerInterval;
@@ -1892,6 +1906,17 @@ BasicTransport::Poller::poll()
             result = 1;
             t->nextTimeoutCheck = now + t->timerInterval;
             t->timeoutCheckDeadline = 0;
+        }
+    }
+
+    // Delete serverRpc objects that are scheduled to be recycled.
+    for (auto it = t->serverRpcZombies.begin();
+            it != t->serverRpcZombies.end(); ) {
+        if (now > it->first) {
+            t->serverRpcPool.destroy(it->second);
+            it = t->serverRpcZombies.erase(it);
+        } else {
+            break;
         }
     }
 

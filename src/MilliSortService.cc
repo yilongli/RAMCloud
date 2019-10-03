@@ -30,9 +30,9 @@ namespace RAMCloud {
 // this transport.
 #define TIME_TRACE 1
 
-#define TIME_TRACE_SP 0
+#define TIME_TRACE_SP 1
 
-#if 1
+#if 0
 /// Hack: redefine timeTrace to log so that we can use it even when server crashes.
 #define timeTrace(format, ...) RAMCLOUD_LOG(NOTICE, format, ##__VA_ARGS__)
 #define timeTraceSp(format, ...) RAMCLOUD_LOG(NOTICE, format, ##__VA_ARGS__)

@@ -44,6 +44,8 @@ namespace RAMCloud {
 // this driver.
 #define TIME_TRACE 0
 
+#define TIME_TRACE_PSM2 0
+
 // Provides a cleaner way of invoking TimeTrace::record, with the code
 // conditionally compiled in or out by the TIME_TRACE #ifdef. Arguments
 // are made uint64_t (as opposed to uin32_t) so the caller doesn't have to
@@ -60,6 +62,17 @@ namespace {
                 uint32_t(arg2), uint32_t(arg3));
 #else
         return 0;
+#endif
+    }
+
+    inline void
+    timeTracePsm2(const char* format,
+            uint64_t arg0 = 0, uint64_t arg1 = 0, uint64_t arg2 = 0,
+            uint64_t arg3 = 0)
+    {
+#if TIME_TRACE_PSM2
+        TimeTrace::record(format, uint32_t(arg0), uint32_t(arg1),
+                uint32_t(arg2), uint32_t(arg3));
 #endif
     }
 
@@ -175,9 +188,12 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
         //      export PSM2_MQ_EAGER_SDMA_SZ=16384
         //      export PSM2_MQ_RNDV_HFI_THRESH=1000000000
         //      export FI_PSM2_LOCK_LEVEL=0
+        //      export PSM2_RCVTHREAD=0
+        //      export FI_PSM2_NAME_SERVER=0
+        //      export FI_PSM2_CONN_TIMEOUT=1
         static const char* ENV_VARS[] = {"PSM2_MQ_EAGER_SDMA_SZ",
                 "PSM2_MQ_RNDV_HFI_THRESH", "FI_PSM2_LOCK_LEVEL",
-                "FI_PSM2_PROG_INTERVAL", "FI_PSM2_PROG_AFFINITY"};
+                "PSM2_RCVTHREAD", "FI_PSM2_NAME_SERVER"};
         for (const char* env : ENV_VARS) {
             char* value = std::getenv(env);
             if (value) {
@@ -214,6 +230,10 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
     // be used with other bits.
     hints->domain_attr->mode = ~0lu;
     hints->domain_attr->mr_mode = ~(FI_MR_BASIC | FI_MR_SCALABLE);
+    // We promise to serialize operations on the same endpoint (including its
+    // associated completion queues, tx/rx contexts, etc.). A scalable endpoint
+    // is conceptually equivalent to multiple endpoints.
+    hints->domain_attr->threading = FI_THREAD_ENDPOINT;
     // FIXME: use auto-progress for psm2 provider? NO! It's unclear to me what
     // falls under the responsibility of the background thread (e.g., copying
     // data in eager receive mode doesn't seem to be covered, which is one of
@@ -492,6 +512,27 @@ OfiUdDriver::OfiUdDriver(Context* context, const ServiceLocator *sl)
         workerThreads.push_back(Arachne::createThreadOnCore(
                 coreId, workerThreadMain, workerId));
     }
+
+    // FIXME: hack to yield to kernel SDMA completion interrupt handler
+    // (the bottom half?). c.f. ptl_ips/ips_proto.c: ips_proto_process_ack
+    // -> ips_proto_dma_wait_until
+#if 0
+    for (uint32_t i = 0; i < cores.size(); i++) {
+        auto yieldMain = [this] () {
+            int cpuId = sched_getcpu();
+            if ((cpuId >= 5) && (cpuId <= 19)) {
+                LOG(NOTICE, "Yielder thread started on cpu %d", cpuId);
+                while (!workerThreadStop.load(std::memory_order_acquire)) {
+                    // Give the kernel thread a chance to run every 10 us.
+                    Arachne::sleep(10*1000);
+                    sched_yield();
+                }
+            }
+        };
+        workerThreads.push_back(
+                Arachne::createThreadOnCore(cores[i], yieldMain));
+    }
+#endif
 }
 
 /**
@@ -763,7 +804,8 @@ OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
         const char* currentChunk =
                 reinterpret_cast<const char*>(payload->getData());
         bool isLastChunk = payload->getLength() == payload->size();
-        if (isLastChunk && (payload->getLength() >= 8000)
+        bool largePayload = (payload->getLength() >= 8000);
+        if (isLastChunk && largePayload
                 && (currentChunk >= zeroCopyStart)
                 && (currentChunk + payload->getLength() < zeroCopyEnd)) {
             io_vec[1].iov_base = const_cast<char*>(currentChunk);
@@ -775,7 +817,7 @@ OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
         } else {
             memcpy(dst, currentChunk, payload->getLength());
             dst += payload->getLength();
-            if (isLastChunk) {
+            if (isLastChunk && largePayload) {
                 timeTrace("ofiud: 0-copy TX for last chunk not applicable; "
                         "copied %u bytes", payload->getLength());
             }
@@ -857,6 +899,10 @@ OfiUdDriver::sendPacket(const Driver::Address* addr,
     // immediately after sendPacket for the last packet returns.
     // BTW, I don't see any perf. improvement on 2-server allShuffle test?
     // In fact, even some degradation when the 2 servers are on the same node.
+    // FIXME: another reason I can't use multi-thread TX is because psm2 scalable
+    // ep is vulnerable to distributed deadlock:
+    // https://github.com/ofiwg/libfabric/issues/5326
+    // https://github.com/ofiwg/libfabric/issues/5080
 #if 1
     sendPacketImpl(0, txid, addr, header, headerLen, payload);
 #else
@@ -995,7 +1041,7 @@ OfiUdDriver::receivePacketsImpl(int rxid, uint32_t maxPackets,
     static const uint32_t MAX_COMPLETIONS = 16;
     fi_cq_msg_entry wc[MAX_COMPLETIONS];
     maxPackets = std::min(maxPackets, MAX_COMPLETIONS);
-    uint64_t pollCqTime = timeTrace("ofiud: polled rxcq %d", rxid);
+    uint64_t pollCqTime = timeTrace("ofiud: polling rxcq %d", rxid);
     int numPackets = downCast<int>(fi_cq_read(rxcq[rxid], wc, maxPackets));
     if (numPackets <= 0) {
         if (unlikely(numPackets != -FI_EAGAIN)) {
@@ -1346,3 +1392,34 @@ OfiUdDriver::BufferPool::~BufferPool()
 }
 
 } // namespace RAMCloud
+
+extern "C" {
+using namespace RAMCloud;
+
+void
+psm2_tt_record0(const char* fmt) {
+    timeTracePsm2(fmt);
+}
+
+void
+psm2_tt_record1(const char* fmt, uint32_t arg0) {
+    timeTracePsm2(fmt, arg0);
+}
+
+void
+psm2_tt_record2(const char* fmt, uint32_t arg0, uint32_t arg1) {
+    timeTracePsm2(fmt, arg0, arg1);
+}
+
+void
+psm2_tt_record3(const char* fmt, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
+    timeTracePsm2(fmt, arg0, arg1, arg2);
+}
+
+void
+psm2_tt_record4(const char* fmt, uint32_t arg0, uint32_t arg1, uint32_t arg2,
+        uint32_t arg3) {
+    timeTracePsm2(fmt, arg0, arg1, arg2, arg3);
+}
+
+}

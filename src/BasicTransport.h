@@ -722,6 +722,10 @@ class BasicTransport : public Transport {
     /// except during #sendBytes.
     std::vector<DataHeader> dataHeadersToSend;
 
+    /// Holds ServerRpc objects whose reply buffer may still in use by the
+    /// underlying driver.
+    std::deque<std::pair<uint64_t, ServerRpc*>> serverRpcZombies;
+
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
 
