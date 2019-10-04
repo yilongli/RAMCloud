@@ -472,6 +472,20 @@ def clockSync(name, options, cluster_args, client_args):
         for line in l:
             print(line)
 
+def collectiveBw(name, options, cluster_args, client_args):
+    if 'master_args' not in cluster_args:
+        cluster_args['master_args'] = '--totalMasterMemory 1000'
+    cluster_args['replicas'] = 0
+
+    n = 1e9
+    if options.num_servers is not None:
+        n = cluster_args['num_servers']
+    if options.num_clients is not None:
+        n = min(n, cluster_args['num_clients'])
+    cluster_args['num_clients'] = n
+    cluster_args['num_servers'] = n
+    default(name, options, cluster_args, client_args)
+
 def echo(name, options, cluster_args, client_args):
     if 'master_args' not in cluster_args:
         cluster_args['master_args'] = '--totalMasterMemory 1000'
@@ -947,9 +961,9 @@ simple_tests = [
     Test("basic", basic),
     Test("broadcast", broadcast),
     Test("clockSync", clockSync),
+    Test("uni_bandwidth", collectiveBw),
+    Test("bi_bandwidth", collectiveBw),
     Test("echo_basic", echo),
-    Test("uni_bandwidth", echo),
-    Test("bi_bandwidth", echo),
     Test("multiRead_colocation", default),
     Test("netBandwidth", netBandwidth),
     Test("readAllToAll", readAllToAll),

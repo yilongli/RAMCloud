@@ -3165,27 +3165,29 @@ echo_workload()
 
 }
 
-
-// This benchmark measures the network bandwidth between a client and a server.
-// The client keeps a fixed number of outstanding RPCs and measure the sustained
-// bandwidth.
+// This benchmark measures the network bandwidth between a set of clients and
+// a set of servers; # clients must be equal to # servers. Each client keeps
+// a fixed number of outstanding RPCs to a specific server and measure the
+// sustained bandwidth (uni-directional or bi-directional).
 void
-point2pointBandwidth(bool bidirectional)
+collectiveBandwidth(bool bidirectional)
 {
-    if (clientIndex != 0)
-        return;
     vector<uint32_t> outgoingSizes = {1000, 4000, 8000, 16000, 32000};
     vector<string> ids = {"1K", "4K", "8K", "16K", "32K"};
 
-    // Choose the first master server in the server list as the receiver.
+    // Choose the corresponding server in the server list as the receiver.
     ServerMap servers;
     getServerList(&servers);
     string receiverLocator;
     ServerMap::iterator it;
+    int masterIndex = 0;
     for (it = servers.begin(); it != servers.end(); it++) {
         ServiceMask serviceMask = it->second.second;
         if (serviceMask.has(WireFormat::MASTER_SERVICE)) {
-            break;
+            if (masterIndex == clientIndex) {
+                break;
+            }
+            masterIndex++;
         }
     }
     if (it != servers.end()) {
@@ -3207,17 +3209,29 @@ point2pointBandwidth(bool bidirectional)
     const string message(largestSize, 'x');
     context->transportManager->registerMemory(
             const_cast<char*>(message.data()), message.length());
-    printf("%8s%8s\n", "msgSize", "Gbps");
+    printf("%12s%12s\n", "messageSize",
+            bidirectional ? "BiBW (Gbps)" : "UniBW (Gbps)");
 
     // Each iteration through the following loop measures the round-trip time
     // of a particular message size.
     for (uint i = 0; i < outgoingSizes.size(); i++) {
         uint32_t length = outgoingSizes[i];
-        LOG(NOTICE, "Running uni-directional BW test using %d-byte message for "
-                "%d seconds", length, seconds);
+        LOG(NOTICE, "Running %s-directional BW test using %d-byte message for "
+                "%d seconds", bidirectional ? "bi" : "uni", length, seconds);
 
-        const uint32_t maxOutstandingRpcs = 10;
+        const uint32_t maxOutstandingRpcs = 16;
         std::vector<Tub<EchoRpc>> outstandingRpcs(maxOutstandingRpcs);
+
+        // The master client is responsible for kick starting the benchmark.
+        char command[20];
+        if (clientIndex == 0) {
+            sendCommand("run", "running", 1, numClients - 1);
+        } else {
+            getCommand(command, sizeof(command));
+            if (strcmp(command, "run") == 0) {
+                setSlaveState("running");
+            }
+        }
 
         uint64_t bytesSent = 0;
         uint64_t stopTime = Cycles::rdtsc() + Cycles::fromSeconds(seconds);
@@ -3242,12 +3256,21 @@ point2pointBandwidth(bool bidirectional)
         }
 
         double bandwidthGbps = double(bytesSent) * 8e-9 / double(seconds);
-        printf("%8s%8.2f\n", ids[i].c_str(), bandwidthGbps);
+        printf("%12s%12.2f\n", ids[i].c_str(), bandwidthGbps);
+
+        if (clientIndex == 0) {
+            sendCommand("done", "done", 1, numClients - 1);
+        } else {
+            getCommand(command, sizeof(command));
+            if (strcmp(command, "done") == 0) {
+                setSlaveState("done");
+            }
+        }
     }
 }
 
-void uni_bandwidth() { point2pointBandwidth(false); }
-void bi_bandwidth() { point2pointBandwidth(true); }
+void uni_bandwidth() { collectiveBandwidth(false); }
+void bi_bandwidth() { collectiveBandwidth(true); }
 
 /**
  * convenience function to generate a secondary key compatible with
