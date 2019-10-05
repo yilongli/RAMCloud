@@ -13,6 +13,7 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include "ClientException.h"
 #include "MilliSortClient.h"
 #include "Util.h"
 
@@ -139,15 +140,16 @@ SendDataRpc::wait()
     return response;
 }
 
-ShufflePushRpc::ShufflePushRpc(Context* context, ServerId serverId,
+ShufflePushRpc::ShufflePushRpc(Context* context, Transport::SessionRef session,
         int32_t senderId, uint32_t dataId, uint32_t totalLength,
         uint32_t offset, Buffer::Iterator* payload)
-    : ServerIdRpcWrapper(context, serverId,
-            sizeof(WireFormat::ShufflePush::Response))
+    : RpcWrapper(responseHeaderLength)
+    , context(context)
     , rpcId(Util::wyhash64())
 {
     appendRequest(&request, senderId, dataId, totalLength, offset, payload,
             rpcId);
+    this->session = session;
     send();
 }
 
@@ -168,6 +170,22 @@ ShufflePushRpc::appendRequest(Buffer* request, int32_t senderId,
         request->appendExternal(payload->getData(), payload->getLength());
         payload->next();
     }
+}
+
+void
+ShufflePushRpc::wait()
+{
+    waitInternal(context->dispatch);
+    if (getState() != RpcState::FINISHED) {
+        throw TransportException(HERE);
+    }
+
+    const WireFormat::ShufflePush::Response* respHdr(
+            getResponseHeader<WireFormat::ShufflePush>());
+
+    if (respHdr->common.status != STATUS_OK)
+        ClientException::throwException(HERE, respHdr->common.status);
+    response->truncateFront(responseHeaderLength);
 }
 
 }  // namespace RAMCloud

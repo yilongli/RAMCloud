@@ -143,21 +143,23 @@ PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(SendDataRpc);
 };
 
-class ShufflePushRpc : public ServerIdRpcWrapper {
+class ShufflePushRpc : public RpcWrapper {
   public:
-    ShufflePushRpc(Context* context, ServerId serverId, int32_t senderId,
-            uint32_t dataId, uint32_t totalLength, uint32_t offset,
-            Buffer::Iterator* payload);
+    ShufflePushRpc(Context* context, Transport::SessionRef session,
+            int32_t senderId, uint32_t dataId, uint32_t totalLength,
+            uint32_t offset, Buffer::Iterator* payload);
     ~ShufflePushRpc() {}
 
     static void appendRequest(Buffer* request, int32_t senderId,
             uint32_t dataId, uint32_t totalLength, uint32_t offset,
             Buffer::Iterator* payload, uint32_t rpcId);
 
-    void wait() { waitAndCheckErrors(); }
+    void wait();
 
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::ShufflePush::Response);
+
+    Context* context;
 
     // FIXME: Debug only; remove?
     uint32_t rpcId;

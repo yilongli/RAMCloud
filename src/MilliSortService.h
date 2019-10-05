@@ -186,6 +186,8 @@ class MilliSortService : public Service {
 
     static const int MAX_IMBALANCE_RATIO = 2;
 
+    static uint32_t MAX_SHUFFLE_CHUNK_SIZE;
+
     /**
      * A pivot consists of the original key of the data tuple plus some
      * metadata.
@@ -736,6 +738,9 @@ class MilliSortService : public Service {
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
+
+    /// Sessions to all nodes in #world.
+    std::vector<Transport::SessionRef> sessions;
 
     /// Contains the local node, the pivot server it's assigned to (or the local
     /// node itself is a pivot server), and all other nodes that are assigned to

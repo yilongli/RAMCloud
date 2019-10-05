@@ -115,6 +115,8 @@ namespace {
 // Change 0 -> 1 to enable final result validation.
 #define VALIDATE_RESULT 1
 
+uint32_t MilliSortService::MAX_SHUFFLE_CHUNK_SIZE = 40000;
+
 /**
  * Construct an MilliSortService.
  *
@@ -168,6 +170,7 @@ MilliSortService::MilliSortService(Context* context,
     , mergeSorterLock("MilliSortService::mergeSorter")
     , pendingMergeReqs()
     , world()
+    , sessions()
     , myPivotServerGroup()
     , gatheredPivots()
     , superPivots()
@@ -203,6 +206,13 @@ MilliSortService::MilliSortService(Context* context,
             uint64_t(block.get()) + block.length) {
         DIE("sortedValues0 outside the range of allocated memory!");
     }
+
+    char* str = std::getenv("MILLISORT_SHUFFLE_CHUNK_SIZE");
+    if (str) {
+        std::string val(str);
+        MAX_SHUFFLE_CHUNK_SIZE = std::stoul(val);
+    }
+    LOG(NOTICE, "MAX_SHUFFLE_CHUNK_SIZE = %u", MAX_SHUFFLE_CHUNK_SIZE);
 }
 
 MilliSortService::~MilliSortService()
@@ -303,6 +313,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     // Initialize the world communication group so we know the rank of this
     // server.
     initWorld(reqHdr->numNodes);
+    sessions.clear();
+    for (int i = 0; i < world->size(); i++) {
+        sessions.push_back(context->serverList->getSession(world->getNode(i)));
+    }
 
     // Initialization request from an external client should only be processed
     // by the root node, which also performs error checking.
@@ -1388,6 +1402,9 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         /// Server ID of the message receiver.
         ServerId serverId;
 
+        /// Session to the receiver.
+        Transport::SessionRef session;
+
         /// Size of the complete message, in bytes.
         uint32_t totalLength;
 
@@ -1400,9 +1417,11 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         /// Time, in rdtsc ticks, when we send out #outstandingRpc.
         uint64_t lastTransmitTime;
 
-        ShuffleMessageTracker(ServerId serverId, Buffer* message)
+        ShuffleMessageTracker(ServerId serverId, Transport::SessionRef session,
+                Buffer* message)
             : outstandingRpc()
             , serverId(serverId)
+            , session(session)
             , totalLength(message->size())
             , offset(0)
             , messageIt(message)
@@ -1422,7 +1441,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             size = std::min(size, messageIt.size());
             Buffer::Iterator payload(messageIt);
             payload.truncate(size);
-            outstandingRpc.construct(context, serverId, senderId, dataId,
+            outstandingRpc.construct(context, session, senderId, dataId,
                     totalLength, offset, &payload);
             timeTraceSp("shuffle-push: push rpc constructed, rpcId %u",
                     outstandingRpc->rpcId);
@@ -1439,15 +1458,15 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             new Tub<ShuffleMessageTracker>[totalMessages]);
     for (int i = 0; i < totalMessages; i++) {
         Buffer* message = &(*outMessages)[i];
-        messageTrackers[i].construct(group->getNode(group->rank + i), message);
+        ServerId serverId = group->getNode(group->rank + i);
+        messageTrackers[i].construct(serverId,
+                sessions[serverId.indexNumber()-1], message);
         totalBytesSent += message->size();
     }
 
     // Performance stats.
     uint64_t shuffleStart = Cycles::rdtsc();
     uint32_t outstandingChunks = 0;
-
-#define MAX_PUSH_CHUNK_SIZE 40000
 
     std::vector<int> candidates;
     int messagesUnfinished = totalMessages;
@@ -1582,8 +1601,8 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             }
             // TODO: incast-control? for the first chunk, make it smaller
 //            uint32_t chunkSize = messageTrackers[index]->offset > 0 ?
-//                    MAX_PUSH_CHUNK_SIZE : 8000;
-            uint32_t chunkSize = MAX_PUSH_CHUNK_SIZE;
+//                    MAX_SHUFFLE_CHUNK_SIZE : 1000;
+            uint32_t chunkSize = MAX_SHUFFLE_CHUNK_SIZE;
             uint64_t now = Cycles::rdtsc();
             messageTrackers[index]->lastTransmitTime = now;
             messageTrackers[index]->sendMessageChunk(context, group->rank,
