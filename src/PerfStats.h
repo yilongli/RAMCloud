@@ -461,22 +461,6 @@ struct PerfStats {
 
     uint64_t onlineMergeSortWorkers;
 
-    uint64_t shuffleValuesStartTime;
-
-    uint64_t shuffleValuesElapsedTime;
-
-    uint64_t shuffleValuesInputBytes;
-
-    uint64_t shuffleValuesOutputBytes;
-
-    uint64_t shuffleValuesSentRpcs;
-
-    uint64_t shuffleValuesReceivedRpcs;
-
-    uint64_t shuffleValuesCopyResponseCycles;
-
-    uint64_t shuffleValuesCopyResponseElapsedTime;
-
     uint64_t rearrangeFinalValuesStartTime;
 
     uint64_t rearrangeFinalValuesElapsedTime;
