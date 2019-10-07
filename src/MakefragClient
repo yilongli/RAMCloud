@@ -36,7 +36,6 @@ CLIENT_SRCFILES := \
 		   src/AbstractServerList.cc \
 		   src/AdminClient.cc \
 		   src/AllGather.cc \
-		   src/AllShuffle.cc \
 		   src/ArpCache.cc \
 		   src/BasicTransport.cc \
 		   src/Broadcast.cc \

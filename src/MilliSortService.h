@@ -150,7 +150,7 @@ class MilliSortService : public Service {
      * operation has not been created.
      *
      * \tparam Op
-     *      Type of the collective operation (e.g., AllGather, AllShuffle, etc.)
+     *      Type of the collective operation (e.g., AllGather, etc.)
      * \param reqHdr
      *      Header from the incoming RPC request; contains parameters
      *      for this operation.
@@ -360,9 +360,6 @@ class MilliSortService : public Service {
                 Rpc* rpc);
     void allGather(const WireFormat::AllGather::Request* reqHdr,
                 WireFormat::AllGather::Response* respHdr,
-                Rpc* rpc);
-    void allShuffle(const WireFormat::AllShuffle::Request* reqHdr,
-                WireFormat::AllShuffle::Response* respHdr,
                 Rpc* rpc);
     void sendData(const WireFormat::SendData::Request* reqHdr,
                 WireFormat::SendData::Response* respHdr,
@@ -589,6 +586,8 @@ class MilliSortService : public Service {
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
     void pickDataBucketBoundaries();
+    void copyOutShufflePivots(uint32_t senderId, uint32_t totalLength,
+            uint32_t offset, Buffer* messageChunk);
     void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void shuffleRecords();
@@ -691,22 +690,18 @@ class MilliSortService : public Service {
     /// bucket.
     std::vector<std::pair<int,int>> dataBucketRanges;
 
-    /// # complete key shuffle messages received so far. Note: each shuffle
+    /// # complete record shuffle messages received so far. Note: each shuffle
     /// message is broken down into multiple chunks for transmission, where
     /// each chunk is sent with one ShufflePushRpc.
-    std::atomic<int> shuffleKeysRxCount;
-
-    /// Records whether we have received the complete key shuffle message from
-    /// a server. There is one element for each server, ordered by their ranks.
-    Tub<std::vector<std::atomic_bool>> shuffleKeysRxFrom;
+    std::atomic<int> recordShuffleRxCount;
 
     /// Records # bytes we have received for each incoming shuffle message
     /// so we can filter out duplicate shuffle RPCs. There is one entry for
-    /// each server, ordered by their ranks. Used to
-    Tub<std::vector<std::atomic<uint32_t>>> shuffleMsgRecvProgress;
+    /// each server, ordered by their ranks.
+    Tub<std::vector<std::atomic<uint32_t>>> recordShuffleProgress;
 
     /// Shuffle messages to send during the record shuffle phase, indexed by
-    /// server ID.
+    /// server rank.
     Tub<std::vector<Buffer>> recordShuffleMessages;
 
     /// True means we are ready to service incoming record shuffle RPCs.
@@ -771,6 +766,21 @@ class MilliSortService : public Service {
 
     /// Allows the broadcast operation to execute asynchronously.
     Tub<TreeBcast> bcastDataBucketBoundaries;
+
+    /// True means we are ready to service incoming pivot shuffle RPCs.
+    std::atomic_bool pivotShuffleIsReady;
+
+    // TODO: move it to the right place
+    Tub<std::vector<std::atomic<uint32_t>>> pivotShuffleProgress;
+
+    /// # complete pivot shuffle messages received so far. Note: each shuffle
+    /// message is broken down into multiple chunks for transmission, where
+    /// each chunk is sent with one ShufflePushRpc.
+    std::atomic<int> pivotShuffleRxCount;
+
+    /// Shuffle messages to send during the pivot shuffle phase, indexed by
+    /// pivot-sorter rank.
+    Tub<std::vector<Buffer>> pivotShuffleMessages;
 
     // -------- Root node state --------
     /// Contains super pivots collected from all pivot servers. Always empty on
