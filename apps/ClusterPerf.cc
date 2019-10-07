@@ -7804,7 +7804,7 @@ allShuffle()
         }
 #endif
 
-        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
+        BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::SHUFFLE_PUSH,
                 messageSize);
         Buffer* result = rpc.wait();
         LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",

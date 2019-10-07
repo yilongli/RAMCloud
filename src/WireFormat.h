@@ -137,11 +137,10 @@ enum Opcode {
     BCAST_TREE                  = 84,
     GATHER_TREE                 = 85,
     ALL_GATHER                  = 86,
-    ALL_SHUFFLE                 = 87,
-    SEND_DATA                   = 88,
-    SHUFFLE_PUSH                = 89,
-    BENCHMARK_COLLECTIVE_OP     = 90,
-    ILLEGAL_RPC_TYPE            = 91, // 1 + the highest legitimate Opcode
+    SEND_DATA                   = 87,
+    SHUFFLE_PUSH                = 88,
+    BENCHMARK_COLLECTIVE_OP     = 89,
+    ILLEGAL_RPC_TYPE            = 90, // 1 + the highest legitimate Opcode
 };
 
 /**
@@ -460,18 +459,6 @@ struct AllGather {
         RequestCommonWithOpId common;
         int32_t phase;
         int32_t senderId;
-    } __attribute__((packed));
-    struct Response {
-        ResponseCommon common;
-    } __attribute__((packed));
-};
-
-struct AllShuffle {
-    static const Opcode opcode = ALL_SHUFFLE;
-    static const ServiceType service = MILLISORT_SERVICE;
-    struct Request {
-        RequestCommonWithOpId common;
-        uint32_t senderId;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;

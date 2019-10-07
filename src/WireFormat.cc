@@ -129,7 +129,6 @@ opcodeSymbol(uint32_t opcode)
         case BCAST_TREE:                   return "BCAST_TREE";
         case GATHER_TREE:                  return "GATHER_TREE";
         case ALL_GATHER:                   return "ALL_GATHER";
-        case ALL_SHUFFLE:                  return "ALL_SHUFFLE";
         case SEND_DATA:                    return "SEND_DATA";
         case SHUFFLE_PUSH:                 return "SHUFFLE_PUSH";
         case BENCHMARK_COLLECTIVE_OP:      return "BENCHMARK_COLLECTIVE_OP";

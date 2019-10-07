@@ -297,7 +297,6 @@ class RpcWrapper : public Transport::RpcNotifier {
     const WireFormat::ResponseCommon* responseHeader;
 
     friend class TreeBcast;
-    friend class AllShuffle;
 
   public:
     /// The owning ThreadId, when this Rpc is started by an Arachne thread.
