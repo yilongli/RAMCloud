@@ -322,8 +322,8 @@ class MilliSortService : public Service {
 
     struct Value {
 
-        static const uint32_t SIZE = 96;
-//        static const uint32_t SIZE = 90;
+        static const uint32_t SIZE = 90;
+//        static const uint32_t SIZE = 96;
 
         char bytes[SIZE];
 
@@ -575,7 +575,8 @@ class MilliSortService : public Service {
     // Computation steps
     // ----------------------
 
-    static inline void copyValue(void* dst, const void* src);
+    static inline void moveValues(PivotKey* keys, Value* oldValues,
+            Value* newValues, int start, int numRecords);
     void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
     void partition(PivotKey* keys, int numKeys, int numPartitions,
             std::vector<PivotKey>* pivots);
