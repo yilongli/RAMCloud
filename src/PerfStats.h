@@ -427,9 +427,9 @@ struct PerfStats {
     /// broadcast-pivot-bucket-boundaries operation to complete.
     uint64_t bcastPivotBucketBoundariesElapsedTime;
 
-    uint64_t bucketSortPivotsStartTime;
+    uint64_t shufflePivotsStartTime;
 
-    uint64_t bucketSortPivotsElapsedTime;
+    uint64_t shufflePivotsElapsedTime;
 
     uint64_t mergePivotsInBucketSortCycles;
 
@@ -454,6 +454,8 @@ struct PerfStats {
     uint64_t shuffleKeysCopyResponseCycles;
 
     uint64_t onlineMergeSortStartTime;
+
+    uint64_t onlineMergeSortPollerStartTime;
 
     uint64_t onlineMergeSortElapsedTime;
 
@@ -503,6 +505,9 @@ struct PerfStats {
 
     static string formatMetric(Diff* diff, const char* metric,
             const char* formatString, double scale = 1.0);
+    static string formatMetricGeneric(PerfStats::Diff* diff,
+            std::function<double(vector<vector<double>>&,int)> compute,
+            vector<const char*> metrics, const char* formatString);
     static string formatMetricLambda(PerfStats::Diff* diff,
             std::function<double(vector<double>&)> compute,
             vector<const char*> metrics, const char* formatString);

@@ -895,8 +895,8 @@ MilliSortService::pivotBucketSort()
     // bucket boundaries.
     timeTrace("about to shuffle pivots");
     {
-        ADD_COUNTER(bucketSortPivotsStartTime, Cycles::rdtsc() - startTime);
-        SCOPED_TIMER(bucketSortPivotsElapsedTime);
+        ADD_COUNTER(shufflePivotsStartTime, Cycles::rdtsc() - startTime);
+        SCOPED_TIMER(shufflePivotsElapsedTime);
         uint32_t cmlSmallerPivots = 0;
         uint32_t numLocalPivots = downCast<uint32_t>(gatheredPivots.size());
         for (int rank = 0; rank < allPivotServers->size(); rank++) {
@@ -1083,6 +1083,7 @@ MilliSortService::startMergeSorter()
 {
     auto mergeSortPollerMain = [this] () {
         uint64_t pollerStartTime = Cycles::rdtsc();
+        ADD_COUNTER(onlineMergeSortPollerStartTime, pollerStartTime - startTime)
         bool done = false;
         while (!done) {
             mergeSorterLock.lock();

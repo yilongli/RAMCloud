@@ -174,8 +174,8 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(gatherSuperPivotsMergeCycles);
         COLLECT(bcastPivotBucketBoundariesStartTime);
         COLLECT(bcastPivotBucketBoundariesElapsedTime);
-        COLLECT(bucketSortPivotsStartTime);
-        COLLECT(bucketSortPivotsElapsedTime);
+        COLLECT(shufflePivotsStartTime);
+        COLLECT(shufflePivotsElapsedTime);
         COLLECT(mergePivotsInBucketSortCycles);
         COLLECT(allGatherPivotsStartTime);
         COLLECT(allGatherPivotsElapsedTime);
@@ -188,6 +188,7 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(shuffleKeysSentRpcs);
         COLLECT(shuffleKeysCopyResponseCycles);
         COLLECT(onlineMergeSortStartTime);
+        COLLECT(onlineMergeSortPollerStartTime);
         COLLECT(onlineMergeSortElapsedTime);
         COLLECT(onlineMergeSortExtraTime);
         COLLECT(onlineMergeSortWorkers);
@@ -541,7 +542,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Is PivotSorter?",
             formatMetric(&diff, "millisortIsPivotSorter", " %8.0f").c_str()));
 
-    result.append("\n=== Time Breakdown ===\n");
+    result.append("\n=== Time Breakdown (indiv. server) ===\n");
     result.append(format("%-40s %s\n", "  Local sorting (us)",
             formatMetricRatio(&diff, "localSortElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
@@ -561,7 +562,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricRatio(&diff, "bcastPivotBucketBoundariesElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "    Shuffle pivots (us)",
-            formatMetricRatio(&diff, "bucketSortPivotsElapsedTime", "cyclesPerMicros",
+            formatMetricRatio(&diff, "shufflePivotsElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "    All-gather & bcast pivots (us)",
             formatMetricRatio(&diff, "allGatherPivotsElapsedTime", "cyclesPerMicros",
@@ -576,6 +577,9 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Total time (us)",
+            formatMetricRatio(&diff, "millisortTime", "cyclesPerMicros",
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "    Sort+Part.+Shuffle+Rearrange (us)",
             formatMetricLambda(&diff,
             [] (vector<double>& v) {
                 double sum = .0;
@@ -588,6 +592,68 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
              "onlineMergeSortExtraTime",
              "rearrangeFinalValuesElapsedTime",
              "cyclesPerMicros"},
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "    Unaccounted for (us)",
+            formatMetricLambda(&diff,
+            [] (vector<double>& v) {
+                double sum = 2.0 * v[0];
+                for (double x : v) sum -= x;
+                return (sum - v.back()) / v.back();
+            },
+            {"millisortTime",
+             "localSortElapsedTime",
+             "partitionElapsedTime",
+             "shuffleKeysElapsedTime",
+             "onlineMergeSortExtraTime",
+             "rearrangeFinalValuesElapsedTime",
+             "cyclesPerMicros"},
+            " %8.2f").c_str()));
+
+    result.append("\n=== Time Breakdown (cluster) ===\n");
+    auto adjustElapsedTime = [] (vector<vector<double>>& vs, int serverId) {
+        // The first metric is startTime; the last metric is cyclesPerMicros.
+        // Metrics in between are elapsed times for one or more steps.
+        assert(vs.size() >= 3);
+        double latestStartTime = 0.0;
+        for (double startTime : vs[0]) {
+            latestStartTime = std::max(latestStartTime, startTime);
+        }
+        if (vs[0][serverId] < 1e-3) {
+            return 0.0;
+        } else {
+            double stopTime = 0.0;
+            for (int i = 0; i < vs.size() - 1; i++) {
+                stopTime += vs[i][serverId];
+            }
+            return stopTime > latestStartTime ?
+                    (stopTime - latestStartTime) / vs.back()[0] : 0.0;
+        }
+    };
+    result.append(format("%-40s %s\n", "  Local sorting (us)",
+            formatMetricRatio(&diff, "localSortElapsedTime", "cyclesPerMicros",
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "  Partitioning (overall) (us)",
+            formatMetricGeneric(&diff, adjustElapsedTime,
+            {"gatherPivotsStartTime", "partitionElapsedTime",
+             "cyclesPerMicros"},
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "    Shuffle pivots (us)",
+            formatMetricGeneric(&diff, adjustElapsedTime,
+            {"shufflePivotsStartTime", "shufflePivotsElapsedTime",
+             "cyclesPerMicros"},
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "  Shuffle records (us)",
+            formatMetricGeneric(&diff, adjustElapsedTime,
+            {"shuffleKeysStartTime", "shuffleKeysElapsedTime",
+             "cyclesPerMicros"},
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "  MergeSort + Rearrange (us)",
+            formatMetricGeneric(&diff, adjustElapsedTime,
+            {"onlineMergeSortPollerStartTime", "onlineMergeSortExtraTime",
+             "rearrangeFinalValuesElapsedTime", "cyclesPerMicros"},
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "  Total time (us)",
+            formatMetricRatio(&diff, "millisortTime", "cyclesPerMicros",
             " %8.2f").c_str()));
 
     result.append("\n=== Local Sorting ===\n");
@@ -702,13 +768,13 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
 
     result.append("\n=== Shuffle Pivots ===\n");
     result.append(format("%-40s %s\n", "  Start time (us)",
-            formatMetricRatio(&diff, "bucketSortPivotsStartTime", "cyclesPerMicros",
+            formatMetricRatio(&diff, "shufflePivotsStartTime", "cyclesPerMicros",
             " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Elapsed time (us)",
-            formatMetricRatio(&diff, "bucketSortPivotsElapsedTime",
+            formatMetricRatio(&diff, "shufflePivotsElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Percentage (%)",
-            formatMetricRatio(&diff, "bucketSortPivotsElapsedTime", "millisortTime",
+            formatMetricRatio(&diff, "shufflePivotsElapsedTime", "millisortTime",
             " %8.2f", 100).c_str()));
     result.append(format("%-40s %s\n", "  Merge CPU time (us)",
             formatMetricRatio(&diff, "mergePivotsInBucketSortCycles",
@@ -961,8 +1027,8 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(gatherSuperPivotsMergeCycles);
         ADD_METRIC(bcastPivotBucketBoundariesStartTime);
         ADD_METRIC(bcastPivotBucketBoundariesElapsedTime);
-        ADD_METRIC(bucketSortPivotsStartTime);
-        ADD_METRIC(bucketSortPivotsElapsedTime);
+        ADD_METRIC(shufflePivotsStartTime);
+        ADD_METRIC(shufflePivotsElapsedTime);
         ADD_METRIC(mergePivotsInBucketSortCycles);
         ADD_METRIC(allGatherPivotsStartTime);
         ADD_METRIC(allGatherPivotsElapsedTime);
@@ -975,6 +1041,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(shuffleKeysSentRpcs);
         ADD_METRIC(shuffleKeysCopyResponseCycles);
         ADD_METRIC(onlineMergeSortStartTime);
+        ADD_METRIC(onlineMergeSortPollerStartTime);
         ADD_METRIC(onlineMergeSortElapsedTime);
         ADD_METRIC(onlineMergeSortExtraTime);
         ADD_METRIC(onlineMergeSortWorkers);
@@ -1085,6 +1152,44 @@ PerfStats::formatMetricLambda(PerfStats::Diff* diff,
             vs.push_back((*diff)[metric][i]);
         }
         double value = compute(vs);
+        updateAggMetric(avg, min, max, numSamples, value);
+        result.append(format(formatString, value));
+    }
+    string prefix = format(formatString, avg) + format(formatString, min) +
+            format(formatString, max) + " |";
+    result = prefix + result;
+    return result;
+}
+#pragma GCC diagnostic warning "-Wformat-nonliteral"
+
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+string
+PerfStats::formatMetricGeneric(PerfStats::Diff* diff,
+        std::function<double(vector<vector<double>>&,int)> compute,
+        vector<const char*> metrics, const char* formatString)
+{
+    string result;
+    for (auto& metric : metrics) {
+        if (diff->find(metric) == diff->end()) {
+            return format("no metric %s", metric);
+        }
+    }
+
+    // Collect all metrics from all servers into a vector of vectors.
+    size_t numServers = (*diff)[metrics.front()].size();
+    vector<vector<double>> vs;
+    for (auto& metric : metrics) {
+        vs.emplace_back();
+        for (size_t i = 0; i < numServers; i++) {
+            vs.back().push_back((*diff)[metric][i]);
+        }
+    }
+
+    // Each iteration of the following loop computes the derived metric for one
+    // server.
+    double min = DOUBLE_MAX, max = -DOUBLE_MAX, avg = 0, numSamples = 0;
+    for (size_t i = 0; i < numServers; i++) {
+        double value = compute(vs, i);
         updateAggMetric(avg, min, max, numSamples, value);
         result.append(format(formatString, value));
     }
