@@ -557,18 +557,88 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
 }
 
 void
-MilliSortService::copyValue(void* dst, const void* src)
+MilliSortService::moveValues(PivotKey* keys, Value* oldValues, Value* newValues,
+        int start, int numRecords)
 {
 #if __AVX2__
-    static_assert(Value::SIZE == 96, "Illegal Value::SIZE!");
-    __m256i ymm1 = _mm256_stream_load_si256((__m256i*)src + 0);
-    __m256i ymm2 = _mm256_stream_load_si256((__m256i*)src + 1);
-    __m256i ymm3 = _mm256_stream_load_si256((__m256i*)src + 2);
-    _mm256_stream_si256((__m256i*)dst + 0, ymm1);
-    _mm256_stream_si256((__m256i*)dst + 1, ymm2);
-    _mm256_stream_si256((__m256i*)dst + 2, ymm3);
+if constexpr (Value::SIZE == 90) {
+    // In general, when the value size is not a multiple of 16/32/64 and we
+    // want to use aligned NT stores, we need to first manually accumulate
+    // source values into cacheline-sized chunks so that we can write data
+    // one cache line at a time.
+
+    // Allocate an array of 32-byte integers (__m256i means 256-bit integer)
+    // large enough to hold one full value plus one 32-byte integer. Thus,
+    // we need 4*32B to hold a 90-byte value plus a 32-byte integer.
+    __m256i tmp[5];
+    // Tail position where dest values should be appended to.
+    char* valueDst = (char*) &newValues[start];
+    // How many bytes of the first value should be used to pad
+    // `valueDst` to a 32-byte boundary?
+    uint32_t bytesToPad = (32 - uint64_t(valueDst) % 32) % 32;
+    while (bytesToPad + 32 <= Value::SIZE) {
+        bytesToPad += 32;
+    }
+    char* firstVal = (char*) (oldValues + keys[start].index);
+    memcpy(valueDst, firstVal, bytesToPad);
+    valueDst += bytesToPad;
+
+    // Copy the rest of the first value into the tmp buffer.
+    memcpy(tmp, firstVal + bytesToPad, Value::SIZE - bytesToPad);
+    // # bytes accumulated in tmp.
+    uint32_t tmpSize = Value::SIZE - bytesToPad;
+
+    // Start copying from the second value.
+    for (int i = start + 1; i < start + numRecords; i++) {
+        uint32_t index = keys[i].index;
+        __m256i* valueSrc = (__m256i*) &oldValues[index];
+        __m256i* tmpEnd = (__m256i*)((char*)tmp + tmpSize);
+        // Note: unfortunately, in order to accumulate/grow data in the tmp
+        // buffer, we have to use unaligned stores (this was not necessary in
+        // the 64B value case where we can just load data into xmm registers).
+        _mm256_storeu_si256(tmpEnd+0, _mm256_loadu_si256(valueSrc+0));
+        _mm256_storeu_si256(tmpEnd+1, _mm256_loadu_si256(valueSrc+1));
+        _mm256_storeu_si256(tmpEnd+2, _mm256_loadu_si256(valueSrc+2));
+        tmpSize += Value::SIZE;
+        _mm256_stream_si256((__m256i*)valueDst, tmp[0]);
+        _mm256_stream_si256((__m256i*)valueDst + 1, tmp[1]);
+        tmpSize -= 64;
+        if (tmpSize >= 32) {
+            tmpSize -= 32;
+            _mm256_stream_si256((__m256i*)valueDst + 2, tmp[2]);
+            valueDst += 96;
+            tmp[0] = tmp[3];
+        } else {
+            valueDst += 64;
+            tmp[0] = tmp[2];
+        }
+    }
+
+    // Clear out any remaining bytes in the tmp buffer.
+    memcpy(valueDst, (char*)tmp + tmpSize, tmpSize);
+} else if constexpr (Value::SIZE == 96) {
+    __m256i* valueDst = (__m256i*) &newValues[start];
+    for (int i = start; i < start + numRecords; i++) {
+        uint32_t index = keys[i].index;
+        __m256i* src = (__m256i*) (oldValues + index);
+        __m256i ymm1 = _mm256_stream_load_si256(src);
+        __m256i ymm2 = _mm256_stream_load_si256(src + 1);
+        __m256i ymm3 = _mm256_stream_load_si256(src + 2);
+        _mm256_stream_si256(valueDst++, ymm1);
+        _mm256_stream_si256(valueDst++, ymm2);
+        _mm256_stream_si256(valueDst++, ymm3);
+    }
+} else {
+    for (int i = start; i < start + numRecords; i++) {
+        uint32_t index = keys[i].index;
+        memcpy(newValues + i, oldValues + index, Value::SIZE);
+    }
+}
 #else
-    memcpy(dst, src, Value::SIZE);
+    for (int i = start; i < start + numRecords; i++) {
+        uint32_t index = keys[i].index;
+        memcpy(newValues + i, oldValues + index, Value::SIZE);
+    }
 #endif
 }
 
@@ -670,14 +740,10 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
                 break;
             }
 
-            int endIdx = startIdx + numItems;
-            for (int i = startIdx; i < endIdx; i++) {
-                // Note: it's OK to leave the stale value in keys[i].index
-                // because after rearrangement, the correspondence between keys
-                // and values is trivial (ie. keys[i] -> values[i]).
-                copyValue(dest + i, &src[keys[i].index]);
-            }
-
+            // Note: it's OK to leave the stale value in keys[i].index because
+            // after rearrangement, the correspondence between keys and values
+            // is trivial (ie. keys[i] -> values[i]).
+            moveValues(keys, src, dest, startIdx, numItems);
             workDone += numItems;
             busyTime += (Cycles::rdtsc() - now);
             Arachne::yield();
