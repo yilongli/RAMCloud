@@ -155,7 +155,6 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(millisortIsPivotSorter);
         COLLECT(localSortStartTime);
         COLLECT(localSortElapsedTime);
-        COLLECT(localSortCycles);
         COLLECT(localSortWorkers);
         COLLECT(rearrangeInitValuesStartTime);
         COLLECT(rearrangeInitValuesElapsedTime);
@@ -666,9 +665,6 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Percentage (%)",
             formatMetricRatio(&diff, "localSortElapsedTime", "millisortTime",
             " %8.2f", 100).c_str()));
-    result.append(format("%-40s %s\n", "  CPU time (us)",
-            formatMetricRatio(&diff, "localSortCycles", "cyclesPerMicros",
-            " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "localSortWorkers", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Cost per key (ns)",
@@ -1008,7 +1004,6 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(millisortIsPivotSorter);
         ADD_METRIC(localSortStartTime);
         ADD_METRIC(localSortElapsedTime);
-        ADD_METRIC(localSortCycles);
         ADD_METRIC(localSortWorkers);
         ADD_METRIC(rearrangeInitValuesStartTime);
         ADD_METRIC(rearrangeInitValuesElapsedTime);

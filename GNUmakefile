@@ -108,6 +108,11 @@ ifeq ($(HOMA_BENCHMARK),yes)
 COMFLAGS += -DHOMA_BENCHMARK
 endif
 
+ifeq ($(IPS4O),yes)
+COMFLAGS += -D_REENTRANT=1
+LDFLAGS += -latomic
+endif
+
 TEST_INSTALL_FLAGS =
 
 COMWARNS := -Wall -Wformat=2 -Wextra \
