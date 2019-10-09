@@ -16,6 +16,8 @@
 #include <emmintrin.h>
 #include <immintrin.h>
 
+#include "ips4o/ips4o.hpp"
+
 #include "Arachne/DefaultCorePolicy.h"
 #include "ClockSynchronizer.h"
 #include "MilliSortService.h"
@@ -86,7 +88,7 @@ namespace {
 
 // Change 0 -> 1 in the following line to sort local keys before starting
 // millisort.
-#define BYPASS_LOCAL_SORT 1
+#define BYPASS_LOCAL_SORT 0
 
 // Change 0 -> 1 in the following line to overlap init. value rearrangement
 // with the subsequent partition steps and key shuffle.
@@ -391,6 +393,9 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     }
 #if BYPASS_LOCAL_SORT
     std::sort(localKeys, localKeys + numDataTuples);
+#else
+//    cacheflush(localKeys, numDataTuples * PivotKey::SIZE);
+//    cacheflush(localValues0, numDataTuples * Value::SIZE);
 #endif
 
     while (printingResult) {
@@ -785,9 +790,8 @@ MilliSortService::localSortAndPickPivots()
     {
         ADD_COUNTER(localSortStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(localSortElapsedTime);
-        SCOPED_TIMER(localSortCycles);
-        ADD_COUNTER(localSortWorkers, 1);
 #if BYPASS_LOCAL_SORT
+        ADD_COUNTER(localSortWorkers, 1);
         // Bypass local sorting until we integrate the ips4o module.
         // Assume ~11 ns/item using 10 physical cores (or 20 lcores).
         uint64_t localSortCostMicros =
@@ -801,7 +805,9 @@ MilliSortService::localSortAndPickPivots()
             Arachne::yield();
         }
 #else
-        std::sort(localKeys, localKeys + numDataTuples);
+        ADD_COUNTER(localSortWorkers,
+                Arachne::getCorePolicy()->getCores(0).size());
+        ips4o::parallel::sort(localKeys, localKeys + numDataTuples);
 #endif
     }
     timeTrace("sorted %d keys", numDataTuples);

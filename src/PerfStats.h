@@ -371,11 +371,6 @@ struct PerfStats {
     /// time that the local sort takes.
     uint64_t localSortElapsedTime;
 
-    /// Total time (in cycles) spent by worker threads sorting the keys (i.e.
-    /// if 2 threads are working at once, this counter advances at twice real
-    /// time).
-    uint64_t localSortCycles;
-
     uint64_t localSortWorkers;
 
     uint64_t rearrangeInitValuesStartTime;

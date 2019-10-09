@@ -34,178 +34,130 @@
  *****************************************************************************/
 
 #pragma once
-#ifdef _OPENMP
-#include <omp.h>
-#endif  // _OPENMP
 
-#ifdef _REENTRANT
+
 #include <algorithm>
 #include <functional>
 #include <memory>
-#include <thread>
 #include <vector>
 
+#include "Arachne/Arachne.h"
 #include "synchronization.hpp"
-#endif  // _REENTRANT
+
+#include "TimeTrace.h"
+
+//#define timeTrace_ips4o(fmt, ...) RAMCloud::TimeTrace::record(fmt,##__VA_ARGS__)
+#define timeTrace_ips4o(fmt, ...) ;
 
 namespace ips4o {
-
-#ifdef _OPENMP
-
-/**
- * A thread pool using OpenMP.
- */
-class OpenMPThreadPool {
- public:
-    class Sync {
-     public:
-        void barrier() const {
-#pragma omp barrier
-        }
-
-#ifdef __INTEL_COMPILER
-        // Workaround: icc with OpenMP fails here when using lambdas as template parameter
-        void single(std::function<void()> func) const {
-#else
-        template <class F>
-        void single(F&& func) const {
-#endif
-#pragma omp single
-            func();
-        }
-
-        template <class F>
-        void critical(F&& func) const {
-#pragma omp critical
-            func();
-        }
-    };
-
-    explicit OpenMPThreadPool(int num_threads = OpenMPThreadPool::maxNumThreads())
-            : num_threads_(num_threads) {}
-
-    /**
-    * Entry point for parallel execution.
-    */
-    template <class F>
-    void operator()(F&& func, int num_threads = std::numeric_limits<int>::max()) {
-        num_threads = std::min(num_threads, num_threads_);
-        if (num_threads > 1)
-#pragma omp parallel num_threads(num_threads)
-            func(omp_get_thread_num(), omp_get_num_threads());
-        else
-            func(0, 1);
-    }
-
-    Sync sync() const { return {}; }
-
-    int numThreads() const { return num_threads_; }
-
-    static int maxNumThreads() { return omp_get_max_threads(); }
-
- private:
-    int num_threads_;
-};
-
-#endif  // _OPENMP
-
-
-#ifdef _REENTRANT
 
 /**
  * A thread pool using std::thread.
  */
-class StdThreadPool {
- public:
-    using Sync = detail::Sync;
+    class ArachneThreadPool {
+    public:
+        using Sync = detail::Sync;
 
-    explicit StdThreadPool(int num_threads = StdThreadPool::maxNumThreads())
-            : impl_(new Impl(num_threads)) {}
+        explicit ArachneThreadPool(int num_threads = ArachneThreadPool::maxNumThreads())
+                : impl_(new Impl(num_threads)) {}
 
-    template <class F>
-    void operator()(F&& func, int num_threads = std::numeric_limits<int>::max()) {
-        num_threads = std::min(num_threads, numThreads());
-        if (num_threads > 1)
-            impl_.get()->run(std::forward<F>(func), num_threads);
-        else
-            func(0, 1);
-    }
-
-    Sync& sync() { return impl_.get()->sync_; }
-
-    int numThreads() const { return impl_.get()->threads_.size() + 1; }
-
-    static int maxNumThreads() { return std::thread::hardware_concurrency(); }
-
- private:
-    struct Impl {
-        Sync sync_;
-        detail::Barrier pool_barrier_;
-        std::vector<std::thread> threads_;
-        std::function<void(int, int)> func_;
-        int num_threads_;
-        bool done_ = false;
-
-        /**
-        * Constructor for the std::thread pool.
-        */
-        Impl(int num_threads)
-            : sync_(std::max(1, num_threads))
-            , pool_barrier_(std::max(1, num_threads))
-            , num_threads_(std::max(1, num_threads))
-        {
-            threads_.reserve(num_threads_ - 1);
-            for (int i = 1; i < num_threads_; ++i)
-                threads_.emplace_back(&Impl::main, this, i);
-        }
-
-        /**
-         * Destructor for the std::thread pool.
-         */
-        ~Impl() {
-            done_ = true;
-            pool_barrier_.barrier();
-            for (auto& t : threads_)
-                t.join();
-        }
-
-        /**
-        * Entry point for parallel execution for the std::thread pool.
-        */
         template <class F>
-        void run(F&& func, const int num_threads) {
-            func_ = func;
-            num_threads_ = num_threads;
-            sync_.setNumThreads(num_threads);
-
-            pool_barrier_.barrier();
-            func_(0, num_threads);
-            pool_barrier_.barrier();
+        void operator()(F&& func, int num_threads = std::numeric_limits<int>::max()) {
+            num_threads = std::min(num_threads, numThreads());
+            if (num_threads > 1)
+                impl_.get()->run(std::forward<F>(func), num_threads);
+            else
+                func(0, 1);
         }
 
-        /**
-        * Main loop for threads created by the std::thread pool.
-        */
-        void main(const int my_id) {
-            for (;;) {
+        Sync& sync() { return impl_.get()->sync_; }
+
+        int numThreads() const { return impl_.get()->threads_.size() + 1; }
+
+        static int maxNumThreads() { return Arachne::getCorePolicy()->getCores(0).size(); }
+
+    private:
+        struct Impl {
+            Sync sync_;
+            detail::Barrier pool_barrier_;
+            std::vector<Arachne::ThreadId> threads_;
+            std::function<void(int, int)> func_;
+            int num_threads_;
+            bool done_ = false;
+
+            /**
+            * Constructor for the std::thread pool.
+            */
+            Impl(int num_threads)
+                    : sync_(std::max(1, num_threads))
+                    , pool_barrier_(std::max(1, num_threads))
+                    , num_threads_(std::max(1, num_threads))
+            {
+                threads_.reserve(num_threads_ - 1);
+                auto coreList = Arachne::getCorePolicy()->getCores(0);
+                if (num_threads_ > coreList.size()) {
+                    fprintf(stderr, "Not enough cores! num_threads_ %d, "
+                            "cores avail. %u", num_threads_, coreList.size());
+                }
+                int coreIdx = 0;
+                for (int i = 1; i < num_threads_; ++i) {
+                    int coreId = coreList.get(coreIdx++);
+                    if (coreId == Arachne::core.id) {
+                        coreId = coreList.get(coreIdx++);
+                    }
+                    threads_.push_back(Arachne::createThreadOnCore(
+                            coreId, &Impl::main, this, i));
+                    timeTrace_ips4o("ips4o: created thread %d on core %d", i,
+                            coreId);
+                }
+                timeTrace_ips4o("ips4o: num_threads_ %u, created %u threads",
+                        num_threads_, threads_.size());
+            }
+
+            /**
+             * Destructor for the std::thread pool.
+             */
+            ~Impl() {
+                done_ = true;
                 pool_barrier_.barrier();
-                if (done_) break;
-                if (my_id < num_threads_)
-                    func_(my_id, num_threads_);
+                for (auto& t : threads_)
+                    Arachne::join(t);
+                timeTrace_ips4o("ips4o: all threads joined");
+            }
+
+            /**
+            * Entry point for parallel execution for the std::thread pool.
+            */
+            template <class F>
+            void run(F&& func, const int num_threads) {
+                func_ = func;
+                num_threads_ = num_threads;
+                sync_.setNumThreads(num_threads);
+                timeTrace_ips4o("ips4o: run with %u threads", num_threads);
+
+                pool_barrier_.barrier();
+                func_(0, num_threads);
                 pool_barrier_.barrier();
             }
-        }
+
+            /**
+            * Main loop for threads created by the std::thread pool.
+            */
+            void main(const int my_id) {
+                for (;;) {
+                    pool_barrier_.barrier();
+                    if (done_) break;
+                    if (my_id < num_threads_)
+                        func_(my_id, num_threads_);
+                    pool_barrier_.barrier();
+                }
+                timeTrace_ips4o("ips4o: thread %d done", my_id);
+            }
+        };
+
+        std::unique_ptr<Impl> impl_;
     };
 
-    std::unique_ptr<Impl> impl_;
-};
-
-#endif  // _REENTRANT
-
-#ifdef _OPENMP
-using DefaultThreadPool = OpenMPThreadPool;
-#elif defined(_REENTRANT)
-using DefaultThreadPool = StdThreadPool;
-#endif
+    using DefaultThreadPool = ArachneThreadPool;
 
 }  // namespace ips4o
