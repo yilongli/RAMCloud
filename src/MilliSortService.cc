@@ -99,13 +99,8 @@ namespace {
 #define PIGGYBACK_SHUFFLE_MSG 1
 
 // Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
-// with value shuffle.
-#define OVERLAP_MERGE_SORT 0
-
-// FIXME: the current implementation is even slower than plain sorting in many
-// cases (why?); bypass it and plug in local sorting numbers for now.
-// When it is set to 1, OVERLAP_MERGE_SORT has no effect at all.
-#define FAKE_MERGE_SORT 1
+// with record shuffle.
+#define OVERLAP_MERGE_SORT 1
 
 // Change 0 -> 1 in the following line to log intermediate computation result at
 // each stage of the algorithm. Note: must be turned off during benchmarking.
@@ -150,7 +145,7 @@ MilliSortService::MilliSortService(Context* context,
     , localValues((Value*) incomingKeys + MAX_RECORDS_PER_NODE)
     , localValues0(localValues + MAX_RECORDS_PER_NODE)
     , sortedValues(localValues0 + MAX_RECORDS_PER_NODE)
-    , sortedValues0(sortedValues + MAX_RECORDS_PER_NODE)
+    , incomingValues(sortedValues + MAX_RECORDS_PER_NODE)
     , numSortedItems(0)
     , numRecordsReceived()
     , printingResult()
@@ -164,6 +159,7 @@ MilliSortService::MilliSortService(Context* context,
     , recordShuffleMessages()
     , recordShuffleIsReady()
     , mergeSorter()
+    , mergeSorterPoller()
     , mergeSorterIsReady()
     , mergeSorterLock("MilliSortService::mergeSorter")
     , pendingMergeReqs()
@@ -201,12 +197,12 @@ MilliSortService::MilliSortService(Context* context,
     if (uint64_t(sortedValues) % 64) {
         DIE("sortedalues not aligned to cache line!");
     }
-    if (uint64_t(sortedValues0) % 64) {
-        DIE("sortedValues0 not aligned to cache line!");
+    if (uint64_t(incomingValues) % 64) {
+        DIE("incomingValues not aligned to cache line!");
     }
-    if (uint64_t(sortedValues0 + MAX_RECORDS_PER_NODE) >
+    if (uint64_t(incomingValues + MAX_RECORDS_PER_NODE) >
             uint64_t(block.get()) + block.length) {
-        DIE("sortedValues0 outside the range of allocated memory!");
+        DIE("incomingValues outside the range of allocated memory!");
     }
 
     char* str = std::getenv("MILLISORT_SHUFFLE_CHUNK_SIZE");
@@ -420,6 +416,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     recordShuffleIsReady = false;
     mergeSorter.construct(world->size(), numDataTuples * MAX_IMBALANCE_RATIO,
             int(Arachne::getCorePolicy()->getCores(0).size()));
+    mergeSorterPoller = Arachne::NullThread;
     mergeSorterIsReady = false;
     pendingMergeReqs.clear();
     gatheredPivots.clear();
@@ -816,20 +813,12 @@ MilliSortService::localSortAndPickPivots()
     // needs to be done before key (actually, value) shuffle.
     rearrangeLocalVals->callback = [this] () {
         timeTrace("rearrangeLocalVals completed;");
-        std::lock_guard<Arachne::SpinLock> _(mergeSorterLock);
-        mergeSorter->prepareThreads();
-        mergeSorterIsReady = true;
-        timeTrace("mergeSorter ready to run, %u pending requests",
-                pendingMergeReqs.size());
-        for (auto& request : pendingMergeReqs) {
-            mergeSorter->poll(request.first, request.second);
-        }
-        pendingMergeReqs.clear();
+        startMergeSorter(false);
     };
     rearrangeValues(rearrangeLocalVals.get(), numDataTuples, true);
 
-    // FIXME: to avoid interfering with the partition phase, block till finish.
 #if !OVERLAP_INIT_VAL_REARRANGE
+    // To avoid interfering with the partition phase, block till finish.
     uint64_t elapsedTime = rearrangeLocalVals->wait();
     timeTrace("rearranging init. values completed");
     ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
@@ -1146,16 +1135,36 @@ MilliSortService::shuffleRecords() {
     ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
     timeTrace("shuffle records completed, received %d records", numSortedItems);
 
-    Arachne::join(startMergeSorter());
+    // Wait until the merge-sort is completed.
+    {
+        ADD_COUNTER(onlineMergeSortStartTime, Cycles::rdtsc() - startTime)
+        SCOPED_TIMER(onlineMergeSortElapsedTime)
+        ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
+        startMergeSorter(true);
+        Arachne::join(mergeSorterPoller);
+    }
+
     rearrangeFinalVals();
 }
 
-Arachne::ThreadId
-MilliSortService::startMergeSorter()
+
+void
+MilliSortService::startMergeSorter(bool shuffleDone)
 {
-    auto mergeSortPollerMain = [this] () {
-        uint64_t pollerStartTime = Cycles::rdtsc();
-        ADD_COUNTER(onlineMergeSortPollerStartTime, pollerStartTime - startTime)
+    if (OVERLAP_MERGE_SORT ^ shuffleDone)
+        return;
+
+    std::lock_guard<Arachne::SpinLock> _(mergeSorterLock);
+    mergeSorter->prepareThreads();
+    mergeSorterIsReady = true;
+    timeTrace("mergeSorter ready to run, %u pending requests",
+            pendingMergeReqs.size());
+    for (auto& request : pendingMergeReqs) {
+        mergeSorter->poll(request.first, request.second);
+    }
+    pendingMergeReqs.clear();
+
+    mergeSorterPoller = Arachne::createThread([this] () {
         bool done = false;
         while (!done) {
             mergeSorterLock.lock();
@@ -1166,23 +1175,15 @@ MilliSortService::startMergeSorter()
         auto sortedArray = mergeSorter->getSortedArray();
         assert(int(sortedArray.size) == numSortedItems);
         sortedKeys = sortedArray.data;
-        ADD_COUNTER(onlineMergeSortStartTime,
-                mergeSorter->startTime - startTime);
-        ADD_COUNTER(onlineMergeSortElapsedTime,
-                mergeSorter->stopTick - mergeSorter->startTime);
-        ADD_COUNTER(onlineMergeSortExtraTime,
-                mergeSorter->stopTick - pollerStartTime);
-        ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
         timeTrace("sorted %u final keys", sortedArray.size);
-    };
-    return Arachne::createThread(mergeSortPollerMain);
+    });
 }
 
 void
 MilliSortService::rearrangeFinalVals()
 {
     timeTrace("about to rearrange final values");
-    RearrangeValueTask rearrangeFinalVals(sortedKeys, sortedValues0,
+    RearrangeValueTask rearrangeFinalVals(sortedKeys, incomingValues,
             sortedValues);
     rearrangeValues(&rearrangeFinalVals, numSortedItems, false);
     ADD_COUNTER(rearrangeFinalValuesElapsedTime, rearrangeFinalVals.wait())
@@ -1370,7 +1371,7 @@ MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
     // Copy incoming values, if any, to their destination.
     if (offset + len > keyOffsetEnd) {
         Buffer::Iterator payload(messageChunk, keyBytesInMessage, ~0u);
-        char* dst = reinterpret_cast<char*>(&sortedValues0[startIdx]);
+        char* dst = reinterpret_cast<char*>(&incomingValues[startIdx]);
         if (offset >= keyOffsetEnd) {
             dst += offset - keyOffsetEnd;
         }

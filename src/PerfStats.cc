@@ -187,9 +187,7 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(shuffleKeysSentRpcs);
         COLLECT(shuffleKeysCopyResponseCycles);
         COLLECT(onlineMergeSortStartTime);
-        COLLECT(onlineMergeSortPollerStartTime);
         COLLECT(onlineMergeSortElapsedTime);
-        COLLECT(onlineMergeSortExtraTime);
         COLLECT(onlineMergeSortWorkers);
         COLLECT(rearrangeFinalValuesStartTime);
         COLLECT(rearrangeFinalValuesElapsedTime);
@@ -570,7 +568,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricRatio(&diff, "shuffleKeysElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Online merge-sort (us)",
-            formatMetricRatio(&diff, "onlineMergeSortExtraTime", "cyclesPerMicros",
+            formatMetricRatio(&diff, "onlineMergeSortElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Rearrange final values (us)",
             formatMetricRatio(&diff, "rearrangeFinalValuesElapsedTime", "cyclesPerMicros",
@@ -588,7 +586,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             {"localSortElapsedTime",
              "partitionElapsedTime",
              "shuffleKeysElapsedTime",
-             "onlineMergeSortExtraTime",
+             "onlineMergeSortElapsedTime",
              "rearrangeFinalValuesElapsedTime",
              "cyclesPerMicros"},
             " %8.2f").c_str()));
@@ -603,7 +601,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
              "localSortElapsedTime",
              "partitionElapsedTime",
              "shuffleKeysElapsedTime",
-             "onlineMergeSortExtraTime",
+             "onlineMergeSortElapsedTime",
              "rearrangeFinalValuesElapsedTime",
              "cyclesPerMicros"},
             " %8.2f").c_str()));
@@ -648,7 +646,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  MergeSort + Rearrange (us)",
             formatMetricGeneric(&diff, adjustElapsedTime,
-            {"onlineMergeSortPollerStartTime", "onlineMergeSortExtraTime",
+            {"onlineMergeSortStartTime", "onlineMergeSortElapsedTime",
              "rearrangeFinalValuesElapsedTime", "cyclesPerMicros"},
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Total time (us)",
@@ -832,21 +830,13 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Elasped time (us)",
             formatMetricRatio(&diff, "onlineMergeSortElapsedTime",
             "cyclesPerMicros", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "  Extra time (us)",
-            formatMetricRatio(&diff, "onlineMergeSortExtraTime",
-            "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Percentage (%)",
-            formatMetricRatio(&diff, "onlineMergeSortExtraTime", "millisortTime",
+            formatMetricRatio(&diff, "onlineMergeSortElapsedTime", "millisortTime",
             " %8.2f", 100).c_str()));
     // TODO: active time
     // TODO: CPU time
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "onlineMergeSortWorkers", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "  Slack time (pre. \"Rearr. Values\") (us)",
-            formatMetricLambda(&diff,
-            [] (vector<double>& v) { return (v[2]-(v[0]+v[1]))/v[3]; },
-            {"onlineMergeSortStartTime", "onlineMergeSortElapsedTime",
-            "rearrangeFinalValuesStartTime", "cyclesPerMicros"}, " %8.0f").c_str()));
 
     result.append("\n=== Rearrange Values ===\n");
     result.append(format("%-40s %s\n", "  Start time (us)",
@@ -1036,9 +1026,7 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(shuffleKeysSentRpcs);
         ADD_METRIC(shuffleKeysCopyResponseCycles);
         ADD_METRIC(onlineMergeSortStartTime);
-        ADD_METRIC(onlineMergeSortPollerStartTime);
         ADD_METRIC(onlineMergeSortElapsedTime);
-        ADD_METRIC(onlineMergeSortExtraTime);
         ADD_METRIC(onlineMergeSortWorkers);
         ADD_METRIC(rearrangeFinalValuesStartTime);
         ADD_METRIC(rearrangeFinalValuesElapsedTime);
