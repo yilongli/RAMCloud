@@ -592,7 +592,7 @@ class MilliSortService : public Service {
     void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void shuffleRecords();
-    Arachne::ThreadId startMergeSorter();
+    void startMergeSorter(bool shuffleDone);
     void rearrangeFinalVals();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
 
@@ -650,11 +650,10 @@ class MilliSortService : public Service {
     /// of the array is undefined before final value rearrangement.
     Value* const sortedValues;
 
-    // TODO: rename to incomingValues;
     /// Holds the unsorted version of #sortedValues. That is, the data received
     /// during value shuffle are stored in this array before final value
     /// rearrangement.
-    Value* const sortedValues0;
+    Value* const incomingValues;
 
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;
@@ -710,6 +709,9 @@ class MilliSortService : public Service {
 
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
+
+    /// Poller thread that is responsible for making progress on #mergeSorter.
+    Arachne::ThreadId mergeSorterPoller;
 
     /// True if the merge sorter is ready to accept incoming data via the poll
     /// method (i.e., Merge::prepareThreads() has been called).
