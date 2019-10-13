@@ -257,6 +257,8 @@ class Driver {
         , returnPacketsJobId(0)
         , workerReturnedPackets()
         , queueEstimator(0)
+        , packetsEnqueued(0)
+        , packetsOnTheWire(0)
     {
         // Default: no throttling of transmissions (probably not a good idea).
         maxTransmitQueueSize = 10000000;
@@ -638,6 +640,11 @@ class Driver {
 
     /// Used to estimate # bytes outstanding in the NIC's transmit queue.
     QueueEstimator queueEstimator;
+
+    // FIXME: hack to implement transmit completion notification for ofiud
+  public:
+    uint64_t packetsEnqueued;
+    uint64_t packetsOnTheWire;
 
     DISALLOW_COPY_AND_ASSIGN(Driver)
 };
