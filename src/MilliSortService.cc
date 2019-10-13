@@ -134,6 +134,7 @@ MilliSortService::MilliSortService(Context* context,
     , pivotServerRank(-1)
     , isPivotServer()
     , numDataTuples(-1)
+    , numPivotsPerServer(-1)
     , numPivotServers(-1)
     , localKeys((PivotKey*) zeroCopyMemoryRegion)
     , incomingKeys(localKeys + MAX_RECORDS_PER_NODE)
@@ -148,7 +149,7 @@ MilliSortService::MilliSortService(Context* context,
     , shuffleRecordResv()
     , localPivots()
     , rearrangeLocalVals()
-    , dataBucketBoundaries()
+    , splitters()
     , dataBucketRanges()
     , recordShuffleRxCount()
     , recordShuffleProgress()
@@ -166,10 +167,11 @@ MilliSortService::MilliSortService(Context* context,
     , superPivots()
     , pivotBucketBoundaries()
     , sortedGatheredPivots()
+    , numActiveSources()
+    , numNonBeginPivotsPassed()
     , numSmallerPivots()
-    , numPivotsInTotal()
     , allPivotServers()
-    , bcastDataBucketBoundaries()
+    , broadcastSplitters()
     , pivotShuffleIsReady()
     , pivotShuffleProgress()
     , pivotShuffleRxCount()
@@ -270,7 +272,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         WireFormat::InitMilliSort::Response* respHdr, Rpc* rpc)
 {
     timeTrace("initMilliSort invoked, id %u, dataTuplesPerServer %u, "
-              "nodesPerPivotServer %u", reqHdr->id, reqHdr->dataTuplesPerServer,
+              "pivotsPerServer %u, nodesPerPivotServer %u", reqHdr->id,
+              reqHdr->dataTuplesPerServer, reqHdr->pivotsPerServer,
               reqHdr->nodesPerPivotServer);
 
     // Mutex used to serialize calls of this method.
@@ -332,12 +335,14 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         }
         outgoingRpcs.emplace_back(context, world->getNode(rank),
                 reqHdr->numNodes, reqHdr->dataTuplesPerServer,
-                reqHdr->nodesPerPivotServer, reqHdr->flushCache, false);
+                reqHdr->pivotsPerServer, reqHdr->nodesPerPivotServer,
+                reqHdr->flushCache, false);
     }
 
     // Initialize member fields.
     startTime = 0;
-    numDataTuples = reqHdr->dataTuplesPerServer;
+    numDataTuples = (int) reqHdr->dataTuplesPerServer;
+    numPivotsPerServer = (int) reqHdr->pivotsPerServer;
     int nodesPerPivotServer = (int) reqHdr->nodesPerPivotServer;
     pivotServerRank = world->rank / nodesPerPivotServer *
             nodesPerPivotServer;
@@ -379,7 +384,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         uint64_t key = uint64_t(world->rank + i * world->size());
 #endif
         new(&localKeys[i]) PivotKey(key,
-                downCast<uint16_t>(serverId.indexNumber()),
+                downCast<uint16_t>(serverId.indexNumber() - 1),
                 downCast<uint32_t>(i));
         new(&localValues0[i]) Value(key);
     }
@@ -404,7 +409,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     //
     localPivots.clear();
     rearrangeLocalVals.construct(localKeys, localValues0, localValues);
-    dataBucketBoundaries.clear();
+    splitters.clear();
     dataBucketRanges.clear();
     recordShuffleRxCount = 0;
     recordShuffleProgress.construct(world->size());
@@ -419,10 +424,11 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     superPivots.clear();
     pivotBucketBoundaries.clear();
     sortedGatheredPivots.clear();
+    numActiveSources = 0;
+    numNonBeginPivotsPassed = 0;
     numSmallerPivots = 0;
-    numPivotsInTotal = 0;
     if (isPivotServer) {
-        bcastDataBucketBoundaries.construct(context, myPivotServerGroup.get());
+        broadcastSplitters.construct(context, myPivotServerGroup.get());
         pivotShuffleIsReady = false;
         pivotShuffleRxCount = 0;
         pivotShuffleProgress.construct(allPivotServers->size());
@@ -460,7 +466,6 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         respHdr->numNodes = respHdr->numNodesInited;
         respHdr->numCoresPerNode = static_cast<int>(
                 Arachne::numActiveCores.load());
-        respHdr->numPivotsPerNode = respHdr->numNodes;
         respHdr->keySize = PivotKey::KEY_SIZE;
         respHdr->valueSize = Value::SIZE;
     }
@@ -644,20 +649,23 @@ if constexpr (Value::SIZE == 90) {
 #endif
 }
 
-void
-MilliSortService::inplaceMerge(std::vector<PivotKey>& keys,
-        size_t sizeOfFirstSortedRange)
-{
-    auto middle = keys.begin();
-    std::advance(middle, sizeOfFirstSortedRange);
-    std::inplace_merge(keys.begin(), middle, keys.end());
-}
-
+/**
+ * FIXME: add docs
+ * \param keys
+ * \param numKeys
+ * \param numPartitions
+ * \param includeHead
+ * \param pivots
+ */
 void
 MilliSortService::partition(PivotKey* keys, int numKeys, int numPartitions,
-        std::vector<PivotKey>* pivots)
+        bool includeHead, std::vector<PivotKey>* pivots)
 {
     assert(pivots->empty());
+    if (includeHead) {
+        pivots->push_back(keys[0]);
+    }
+
     // Let P be the number of partitions. Pick P pivots that divide #keys into
     // P partitions as evenly as possible. Since the sizes of any two partitions
     // differ by at most one, we have:
@@ -821,7 +829,7 @@ MilliSortService::localSortAndPickPivots()
 #endif
 
     // Pick local pivots that partitions the local keys evenly.
-    partition(localKeys, numDataTuples, std::min(numDataTuples, world->size()),
+    partition(localKeys, numDataTuples, numPivotsPerServer, false,
             &localPivots);
     timeTrace("picked %lu local pivots, about to gather pivots",
             localPivots.size());
@@ -853,7 +861,7 @@ MilliSortService::localSortAndPickPivots()
     }
 
     // Pivot servers will advance to pick super pivots when the gather op
-    // completes. Normal nodes will wait to receive data bucket boundaries.
+    // completes. Normal nodes will wait to receive splitters.
     if (isPivotServer) {
         timeTrace("gathered %lu pivots from %u nodes", gatheredPivots.size(),
                 uint(myPivotServerGroup->size()));
@@ -871,7 +879,7 @@ MilliSortService::pickSuperPivots()
 
     assert(isPivotServer);
     partition(gatheredPivots.data(), int(gatheredPivots.size()),
-            allPivotServers->size(), &superPivots);
+            allPivotServers->size(), false, &superPivots);
     timeTrace("picked %lu super-pivots, about to gather super-pivots",
             superPivots.size());
     debugLogKeys("super-pivots: ", &superPivots);
@@ -916,7 +924,7 @@ MilliSortService::pickPivotBucketBoundaries()
     timeTrace("=== Stage 3: pickPivotBucketBoundaries started");
     assert(world->rank == 0);
     partition(globalSuperPivots.data(), int(globalSuperPivots.size()),
-            allPivotServers->size(), &pivotBucketBoundaries);
+            allPivotServers->size(), false, &pivotBucketBoundaries);
     debugLogKeys("pivot bucket boundaries: ", &pivotBucketBoundaries);
 
     // Broadcast computed pivot bucket boundaries to the other pivot servers
@@ -955,15 +963,12 @@ MilliSortService::pivotBucketSort()
         ADD_COUNTER(shufflePivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(shufflePivotsElapsedTime);
         uint32_t cmlSmallerPivots = 0;
-        uint32_t numLocalPivots = downCast<uint32_t>(gatheredPivots.size());
         for (int rank = 0; rank < allPivotServers->size(); rank++) {
-            // The message starts with two 32-bit numbers: the number of pivots
-            // smaller than the current bucket and the total number of pivots
-            // this pivot server has. They are used to compute the data bucket
-            // boundaries in the next step.
+            // The message starts with a 32-bit number indicating # pivots
+            // smaller than the current bucket; this is used to compute the
+            // splitters in a distributed fashion on all pivot sorters.
             Buffer* message = &pivotShuffleMessages->at(rank);
             message->appendCopy(&cmlSmallerPivots);
-            message->appendCopy(&numLocalPivots);
 
             // Collect local pivots that should be sent to bucket `rank`.
             PivotKey boundary = pivotBucketBoundaries[rank];
@@ -984,10 +989,14 @@ MilliSortService::pivotBucketSort()
         while (pivotShuffleRxCount.load() < allPivotServers->size()) {
             Arachne::yield();
         }
-        debugLogKeys("sorted pivots (local portion): ", &sortedGatheredPivots);
+#if LOG_INTERMEDIATE_RESULT
+        std::vector<PivotKey> tmp;
+        for (auto p : sortedGatheredPivots) tmp.push_back(p.first);
+        debugLogKeys("sorted pivots (local portion): ", &tmp);
+#endif
     }
 
-    // Pivot servers will advance to pick data bucket boundaries when the
+    // Pivot servers will advance to pick splitters when the
     // shuffle completes.
     timeTrace("finished pivot shuffle");
     pickDataBucketBoundaries();
@@ -999,8 +1008,9 @@ MilliSortService::pickDataBucketBoundaries() {
 
     assert(isPivotServer);
     // TODO: doc. that it's copied from sortAndPartition and modified.
-    int s = numPivotsInTotal / world->size();
-    int k = world->size() * (s + 1) - numPivotsInTotal;
+    int totalPivots = numPivotsPerServer * world->size();
+    int s = totalPivots / world->size();
+    int k = world->size() * (s + 1) - totalPivots;
     int globalIdx = -1;
     for (int i = 0; i < world->size(); i++) {
         if (i < k) {
@@ -1011,48 +1021,55 @@ MilliSortService::pickDataBucketBoundaries() {
 
         int localIdx = globalIdx - numSmallerPivots;
         if ((0 <= localIdx) && (localIdx < (int) sortedGatheredPivots.size())) {
-            dataBucketBoundaries.push_back(sortedGatheredPivots[localIdx]);
+            splitters.push_back(sortedGatheredPivots[localIdx].first);
         }
     }
-    timeTrace("pivot server picked %lu data bucket boundaries locally",
-            dataBucketBoundaries.size());
-    debugLogKeys("data bucket boundaries (local portion): ",
-            &dataBucketBoundaries);
+    if (allPivotServers->rank + 1 == allPivotServers->size()) {
+        if (!(splitters.back() == sortedGatheredPivots.back().first)) {
+            LOG(ERROR, "The last splitter (%lu) is not the last pivot (%lu)?",
+                    splitters.back().keyAsUint64(),
+                    sortedGatheredPivots.back().first.keyAsUint64());
+        }
+    }
+    timeTrace("pivot server picked %lu splitters locally", splitters.size());
+    debugLogKeys("splitters (local portion): ", &splitters);
 
-    // All-gather data bucket boundaries between pivot servers.
-    timeTrace("about to all-gather data bucket boundaries");
+    // All-gather splitters between pivot servers.
+    timeTrace("about to all-gather splitters");
     {
-//        std::vector<PivotKey> local = dataBucketBoundaries;
-        PivotMerger merger(this, &dataBucketBoundaries);
+        PivotMerger merger(this, &splitters);
         ADD_COUNTER(allGatherPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(allGatherPivotsElapsedTime);
         Tub<AllGather> allGather;
         invokeCollectiveOp<AllGather>(allGather,
                 ALLGATHER_DATA_BUCKET_BOUNDARIES, context,
                 allPivotServers.get(),
-                uint32_t(dataBucketBoundaries.size() * PivotKey::SIZE),
-                dataBucketBoundaries.data(), &merger);
+                uint32_t(splitters.size() * PivotKey::SIZE),
+                splitters.data(), &merger);
         allGather->wait();
         removeCollectiveOp(ALLGATHER_DATA_BUCKET_BOUNDARIES);
         ADD_COUNTER(allGatherPivotsMergeCycles, merger.activeCycles);
     }
-    timeTrace("gathered %lu data bucket boundaries",
-            dataBucketBoundaries.size());
+    if (splitters.size() != world->size()) {
+        DIE("Unexpected number of splitters, actual %lu, expected %d",
+                splitters.size(), world->size());
+    }
+    timeTrace("all-gathered %lu splitters", splitters.size());
 
-    // Sort the gathered data bucket boundaries.
-    std::sort(dataBucketBoundaries.begin(), dataBucketBoundaries.end());
-    debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
+    // Sort the gathered splitters.
+    std::sort(splitters.begin(), splitters.end());
+    debugLogKeys("splitters: ", &splitters);
 
-    // Broadcast data bucket boundaries to slave nodes.
-    timeTrace("about to broadcast %lu data bucket boundaries to %d slave nodes",
-            dataBucketBoundaries.size(), myPivotServerGroup->size());
-    bcastDataBucketBoundaries->send<SendDataRpc>(
+    // Broadcast splitters to slave nodes.
+    timeTrace("about to broadcast %lu splitters to %d slave nodes",
+            splitters.size(), myPivotServerGroup->size());
+    broadcastSplitters->send<SendDataRpc>(
             BROADCAST_DATA_BUCKET_BOUNDARIES,
-            uint32_t(PivotKey::SIZE * dataBucketBoundaries.size()),
-            dataBucketBoundaries.data());
+            uint32_t(PivotKey::SIZE * splitters.size()),
+            splitters.data());
     // Note: there is no need to wait for the broadcast to finih as we are not
-    // going to modify #dataBucketBoundaries anymore.
-//    bcastDataBucketBoundaries->wait();
+    // going to modify #splitters anymore.
+//    broadcastSplitters->wait();
 
     // Pivot servers can advance to the final data shuffle immediately while
     // other nodes will have to wait until they receive the data bucket
@@ -1071,18 +1088,17 @@ MilliSortService::shuffleRecords() {
     // Partition the local keys and values according to the data bucket ranges;
     // this will be used to service the ShufflePull handler.
     // TODO: parallelize this step across all cores
-    double keysPerPartition =
-            double(numDataTuples) / double(dataBucketBoundaries.size());
+    double keysPerPartition = double(numDataTuples) / double(splitters.size());
     const int step = std::max(1, int(std::sqrt(keysPerPartition)));
     int rangeEnd = 0;
-    for (const PivotKey& rightBound : dataBucketBoundaries) {
+    for (const PivotKey& splitter : splitters) {
         int rangeStart = rangeEnd;
         while ((rangeEnd < numDataTuples) &&
-                (localKeys[rangeEnd] <= rightBound)) {
+                (localKeys[rangeEnd] <= splitter)) {
             rangeEnd = std::min(rangeEnd + step, numDataTuples);
         }
         while ((rangeEnd > rangeStart) &&
-                !(localKeys[rangeEnd-1] <= rightBound)) {
+                !(localKeys[rangeEnd-1] <= splitter)) {
             rangeEnd--;
         }
         dataBucketRanges.emplace_back(rangeStart, rangeEnd - rangeStart);
@@ -1192,8 +1208,8 @@ MilliSortService::rearrangeFinalVals()
     if (bcastPivotBucketBoundaries) {
         bcastPivotBucketBoundaries->wait();
     }
-    if (bcastDataBucketBoundaries) {
-        bcastDataBucketBoundaries->wait();
+    if (broadcastSplitters) {
+        broadcastSplitters->wait();
     }
 
     printingResult = true;
@@ -1304,14 +1320,17 @@ MilliSortService::copyOutShufflePivots(uint32_t senderId, uint32_t totalLength,
     uint32_t off = 0;
     size_t oldSize = sortedGatheredPivots.size();
     numSmallerPivots += *messageChunk->read<uint32_t>(&off);
-    numPivotsInTotal += *messageChunk->read<uint32_t>(&off);
     while (off < messageChunk->size()) {
-        sortedGatheredPivots.push_back(*messageChunk->read<PivotKey>(&off));
+        sortedGatheredPivots.emplace_back(
+                *messageChunk->read<PivotKey>(&off), NORMAL_PIVOT);
     }
-    inplaceMerge(sortedGatheredPivots, oldSize);
-    pivotShuffleRxCount.fetch_add(1);
+    std::inplace_merge(sortedGatheredPivots.begin(),
+            sortedGatheredPivots.begin() + oldSize,
+            sortedGatheredPivots.end());
     timeTrace("inplace-merged %lu and %lu pivots", oldSize,
             sortedGatheredPivots.size() - oldSize);
+
+    pivotShuffleRxCount.fetch_add(1);
 }
 
 /**
@@ -1330,6 +1349,7 @@ void
 MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
         uint32_t offset, Buffer* messageChunk)
 {
+    assert(totalLength % (PivotKey::SIZE + Value::SIZE) == 0);
     uint32_t numRecords = totalLength / (PivotKey::SIZE + Value::SIZE);
     uint32_t len = messageChunk->size();
 
@@ -1668,8 +1688,10 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
 
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_PIVOTS: {
+            uint32_t serverId =
+                    allPivotServers->getNode(senderId).indexNumber() - 1;
             timeTraceSp("shuffle-pivot: received message chunk from server %u,"
-                    " offset %u, len %u", senderId, offset,
+                    " offset %u, len %u", serverId, offset,
                     rpc->requestPayload->size());
             if (rpc->requestPayload->size() > 0) {
                 // Serialize the processing of incoming message chunks that
@@ -1679,14 +1701,14 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 while (bytesReceived->load() < offset) {
                     Arachne::yield();
                 }
-                if (!bytesReceived->compare_exchange_strong(offset,
+                if (bytesReceived->compare_exchange_strong(offset,
                         offset + rpc->requestPayload->size())) {
+                    copyOutShufflePivots(serverId, totalLength, offset,
+                            rpc->requestPayload);
+                } else {
                     LOG(WARNING, "PivotShuffle: ignore duplicate message chunk "
-                            "from senderId %u, offset %u", senderId, offset);
-                    return;
+                            "from server %u, offset %u", serverId, offset);
                 }
-                copyOutShufflePivots(senderId, totalLength, offset,
-                        rpc->requestPayload);
             }
 
             // Piggyback a message chunk, if any, in the RPC response.
@@ -1714,17 +1736,17 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 while (bytesReceived->load() < offset) {
                     Arachne::yield();
                 }
-                if (!bytesReceived->compare_exchange_strong(offset,
+                if (bytesReceived->compare_exchange_strong(offset,
                         offset + rpc->requestPayload->size())) {
+                    INC_COUNTER(shuffleKeysReceivedRpcs);
+                    copyOutShuffleRecords(senderId, totalLength, offset,
+                            rpc->requestPayload);
+                } else {
                     LOG(WARNING, "RecordShuffle: ignore duplicate message "
                             "chunk from senderId %u, offset %u", senderId,
                             offset);
-                    return;
                 }
-                copyOutShuffleRecords(senderId, totalLength, offset,
-                        rpc->requestPayload);
             }
-            INC_COUNTER(shuffleKeysReceivedRpcs);
 
             // Piggyback a message chunk, if any, in the RPC response.
             if (senderId == world->rank) break;
@@ -2119,13 +2141,11 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
                 Buffer *request = rpc->requestPayload;
                 for (uint32_t offset = sizeof(*reqHdr);
                      offset < request->size();) {
-                    // Put into dataBucketBoundaries directly.
-                    dataBucketBoundaries.push_back(
-                            *request->read<PivotKey>(&offset));
+                    // Put into splitters directly.
+                    splitters.push_back(*request->read<PivotKey>(&offset));
                 }
-                timeTrace("received %lu data bucket boundaries",
-                        dataBucketBoundaries.size());
-                debugLogKeys("data bucket boundaries: ", &dataBucketBoundaries);
+                timeTrace("received %lu splitters", splitters.size());
+                debugLogKeys("splitters: ", &splitters);
 
                 rpc->sendReply();
                 shuffleRecords();

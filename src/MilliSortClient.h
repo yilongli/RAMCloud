@@ -32,7 +32,8 @@ class MilliSortClient {
   public:
     static void initMilliSort(Context* context, ServerId serverId,
             uint32_t numNodes, uint32_t dataTuplesPerServer,
-            uint32_t nodesPerPivotServer, bool fromClient = true);
+            uint32_t pivotsPerServer, uint32_t nodesPerPivotServer,
+            bool flushCache, bool fromClient = true);
     static void startMilliSort(Context* context, ServerId serverId,
             int requestId, uint64_t startTime, bool fromClient = true);
 
@@ -47,13 +48,14 @@ class MilliSortClient {
 class InitMilliSortRpc : public ServerIdRpcWrapper {
   public:
     InitMilliSortRpc(Context* context, ServerId serverId, uint32_t numNodes,
-            uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-            bool flushCache = true, bool fromClient = true);
+            uint32_t dataTuplesPerServer, uint32_t pivotsPerServer,
+            uint32_t nodesPerPivotServer, bool flushCache = true,
+            bool fromClient = true);
     ~InitMilliSortRpc() {}
 
     static void appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
-            uint32_t dataTuplesPerServer, uint32_t nodesPerPivotServer,
-            bool flushCache, bool fromClient);
+            uint32_t dataTuplesPerServer, uint32_t pivotsPerServer,
+            uint32_t nodesPerPivotServer, bool flushCache, bool fromClient);
 
     /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
     WireFormat::InitMilliSort::Response*

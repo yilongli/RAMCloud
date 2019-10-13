@@ -7442,7 +7442,8 @@ syncClusterClock(int numServers)
 {
     static uint64_t nextClockSyncTime = 0;
     if (Cycles::rdtsc() > nextClockSyncTime) {
-        uint32_t secs = uint32_t((numServers + 19) / 20 * 2 + 0.99);
+        uint32_t secs = uint32_t((numServers + 19) / 20 * 1.5 + 0.99);
+        secs = std::max(secs, 5u);
         LOG(NOTICE, "Running clock sync. for %u seconds, numServers %d", secs,
                 numServers);
         cluster->serverControlAll(WireFormat::START_CLOCK_SYNC, &secs,
@@ -7465,6 +7466,14 @@ millisort()
     CoordinatorClient::getServerList(context, &list);
     serverList.applyServerList(list);
 
+    int numMasters = 0;
+    // FIXME: I doubt this is the best/correct way to get # masters...
+    for (uint32_t i = 0; i < serverList.size(); i++) {
+        if (serverList[i].isValid()) {
+            numMasters++;
+        }
+    }
+
     // Start performance counters.
     cluster->serverControlAll(WireFormat::START_PERF_COUNTERS);
 
@@ -7474,13 +7483,52 @@ millisort()
     syncClusterClock(numMasters);
 #endif
 
+#if 0
+    // Compute records/node for the strong-scaling experiment.
+    // 1 ms case:
+    std::vector<uint32_t> totalRecords = {400*1000, 800*1000, 1200*1000,
+            12*1000*1000, 16*1000*1000, 20*1000*1000};
+//    std::vector<uint32_t> totalRecords = {200*1000, 400*1000,
+//            600*1000, 800*1000, 1000*1000, 1200*1000, 1400*1000,
+//            1600*1000, 1800*1000};
+//    std::vector<uint32_t> totalRecords = {200*1000, 400*1000,
+//            600*1000, 800*1000, 1000*1000, 1200*1000, 1400*1000,
+//            1600*1000, 1800*1000, 2000*1000, 4000*1000, 6000*1000,
+//            8000*1000, 10000*1000, 12000*1000, 14000*1000,
+//            16000*1000, 18000*1000, 20000*1000};
+//    std::vector<uint32_t> totalRecords = {2000*1000, 4000*1000,
+//            6000*1000, 8000*1000, 10000*1000, 12000*1000, 14000*1000,
+//            16000*1000, 18000*1000, 20000*1000};
+    std::vector<uint32_t> sizes;
+    for (uint32_t tot : totalRecords) {
+        uint32_t recordsPerNode = tot / numMasters;
+        // FIXME: hack to start sweeping experiments from the middle
+        if ((recordsPerNode > dataTuplesPerNode) && (recordsPerNode < 1500000))
+            sizes.push_back(tot / numMasters);
+    }
+#else
+    std::vector<uint32_t> sizes = {dataTuplesPerNode};
+//    std::vector<uint32_t> sizes = {1000, 2000, 3000};
+//    std::vector<uint32_t> sizes = {80000, 100000};
+//    std::vector<uint32_t> sizes = {1000, 2000, 4000, 6000, 8000, 10000, 20000,
+//                                   40000, 60000, 80000, 100000};
+#endif
+
+    for (uint32_t recordsPerNode : sizes) {
+//    for (int machineCount = 2; machineCount <= numMasters; machineCount += 2) {
+//    for (int machineCount = 20; machineCount <= numMasters; machineCount += 10) {
+    for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
+
     for (int i = 0; i < count; i++) {
+        // Let the cluster idle for a while (e.g., 10 ms) to reduce influence
+        // from previous experiment.
+        Cycles::sleep(10*1000);
+
         // Initialize the experiment.
         LOG(NOTICE, "Initializing millisort service");
-        InitMilliSortRpc initRpc(context, rootServer,
-                downCast<uint32_t>(serverList.size() - 1),
-                downCast<uint32_t>(dataTuplesPerNode),
-                downCast<uint32_t>(nodesPerPivotServer));
+        uint32_t pivotsPerServer = downCast<uint32_t>(machineCount);
+        InitMilliSortRpc initRpc(context, rootServer, machineCount,
+                recordsPerNode, pivotsPerServer, uint32_t(nodesPerPivotServer));
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",
                 initResp->numNodesInited);
@@ -7491,7 +7539,8 @@ millisort()
 
         StartMilliSortRpc startRpc(context, rootServer, i);
         startRpc.wait();
-        LOG(NOTICE, "Finished millisort on %d nodes", initResp->numNodesInited);
+        LOG(NOTICE, "Finished millisort on %d nodes, %u records per node",
+                initResp->numNodesInited, recordsPerNode);
 
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsAfter);
@@ -7507,9 +7556,8 @@ millisort()
                 numPivotServers, nodesPerPivotServer);
         perfStats += format("numCoresPerNode = %d\n",
                 initResp->numCoresPerNode);
-        perfStats += format("numPivotsPerNode = %d\n",
-                initResp->numPivotsPerNode);
-        perfStats += format("numItemsPerNode = %d\n", dataTuplesPerNode);
+        perfStats += format("numPivotsPerNode = %u\n", pivotsPerServer);
+        perfStats += format("numItemsPerNode = %d\n", recordsPerNode);
         perfStats += format("keySize = %d B\n", initResp->keySize);
         perfStats += format("valueSize = %d B\n", initResp->valueSize);
         perfStats += format("\n");
@@ -7518,6 +7566,9 @@ millisort()
         printf("%s", perfStats.c_str());
         fflush(stdout);
     }
+
+    } // end of machineCount sweep
+    } // end of recordsPerNode sweep
 }
 
 void
@@ -7696,7 +7747,14 @@ treeBcast()
 void
 treeGather()
 {
-    benchmarkCollectiveOp(WireFormat::GATHER_TREE, {objectSize});
+    benchmarkCollectiveOp(WireFormat::GATHER_TREE,
+            {18000, 20000, 22000, 24000, 26000, 28000, 30000,
+             32000, 34000, 36000, 38000, 40000});
+//    benchmarkCollectiveOp(WireFormat::GATHER_TREE,
+//            {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000,
+//             11000, 12000, 13000, 14000, 15000, 16000});
+//    benchmarkCollectiveOp(WireFormat::GATHER_TREE, {100, 1000, 4000, 8000, 16000, 32000, 40000});
+//    benchmarkCollectiveOp(WireFormat::GATHER_TREE, {objectSize});
 }
 
 void
@@ -7718,7 +7776,7 @@ point2point()
 // TODO: let allShuffle and treeBcast call benchmarkCollectiveOp too?
 
 void
-allShuffle()
+allShuffleImpl(std::vector<int> sizes)
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7751,8 +7809,9 @@ allShuffle()
     string perfstats;
     // Each iteration of the following loop performs a all-to-all shuffle
     // operation between a specific number of servers.
+    for (int size : sizes) {
     for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-//    for (int machineCount = 33; machineCount <= numMasters; machineCount++) {
+//    for (int machineCount = 120; machineCount <= 180; machineCount += 20) {
     for (int startOffset = 0; startOffset < 1; startOffset++) {
 //    for (int startOffset = 0; startOffset < machineCount; startOffset++) {
         // Let the cluster idle for a while (e.g., 100 ms) to reduce influence
@@ -7781,15 +7840,15 @@ allShuffle()
         // Compute the message size based on workload
         if (workload.compare("weakScaling") == 0) {
             // Fix per-node data.
-            int perNodeData = objectSize;
+            int perNodeData = size;
             messageSize = perNodeData / (machineCount - 1);
         } else if (workload.compare("strongScaling") == 0) {
             // Fix total data.
-            double totalData = objectSize;
+            double totalData = size;
             messageSize = int(totalData / machineCount / (machineCount - 1));
         } else {
             // By default, fix message size.
-            messageSize = objectSize;
+            messageSize = size;
         }
 
         // FIXME: hack to run only a few lock steps of the shuffle
@@ -7894,7 +7953,19 @@ allShuffle()
 #undef COLLECT_PERFSTATS
     }
     }
+    }
     printf("%s", perfstats.c_str());
+}
+
+void
+allShuffle()
+{
+//    allShuffleImpl({15000, 20000, 25000, 30000, 35000, 40000});
+//    allShuffleImpl({1000, 4000, 8000, 10000, 12000, 14000});
+//    allShuffleImpl({1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000,
+//                    10000, 11000, 12000, 13000, 14000, 15000, 20000, 25000,
+//                    30000, 35000, 40000, 45000, 50000, 55000, 60000});
+    allShuffleImpl({objectSize});
 }
 
 // The following struct and table define each performance test in terms of
