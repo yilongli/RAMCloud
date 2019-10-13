@@ -37,12 +37,15 @@ class AllGather {
     class Merger {
       public:
         virtual ~Merger() {}
-        /// Append new data to existing data. This method is guaranteed not to
-        /// modify existing data.
+        /// Append new data to existing data. This method can *NOT* guarantee
+        /// the immutability of existing data in general.
         virtual void append(Buffer* incomingData) = 0;
         // Quick hack: only used to implement the final expansion step.
         virtual void clear() = 0;
-        virtual void getResult(Buffer* out) = 0;
+        /// Fill in the given buffer with existing data. Note: the content must
+        /// be copied into the buffer so that we can change the existing data
+        /// without corrupting the buffer.
+        virtual void fillBuffer(Buffer* out) = 0;
     };
 
     explicit AllGather(int opId, Context* context, CommunicationGroup* group,
@@ -118,6 +121,10 @@ class AllGather {
     std::atomic<int> currentPhase;
 
     int lastPhase;
+
+    /// Indicates if we have received the AllGatherRpc of a certain phase;
+    /// one entry for each phase. Used to filter out duplicate RPCs.
+    Tub<std::vector<std::atomic<bool>>> receivedRpc;
 
     bool expanderNode;
 

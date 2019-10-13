@@ -507,7 +507,6 @@ class MilliSortService : public Service {
         explicit PivotMerger(MilliSortService* millisort,
                 std::vector<PivotKey>* pivots)
             : millisort(millisort)
-            , mutex()
             , pivots(pivots)
             , activeCycles(0)
             , bytesReceived(0)
@@ -517,11 +516,11 @@ class MilliSortService : public Service {
         append(Buffer* incomingPivots)
         {
             CycleCounter<> _(&activeCycles);
-            std::lock_guard<Arachne::SpinLock> lock(mutex);
             bytesReceived += incomingPivots->size();
             uint32_t offset = 0;
             while (offset < incomingPivots->size()) {
-                pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
+                PivotKey* pivot = incomingPivots->read<PivotKey>(&offset);
+                pivots->push_back(*pivot);
             }
         }
 
@@ -531,15 +530,12 @@ class MilliSortService : public Service {
         }
 
         void
-        getResult(Buffer* out)
+        fillBuffer(Buffer* out)
         {
-            out->appendExternal(pivots->data(),
-                    downCast<uint32_t>(pivots->size() * PivotKey::SIZE));
+            out->appendCopy(pivots->data(), pivots->size() * PivotKey::SIZE);
         }
 
         MilliSortService* millisort;
-
-        Arachne::SpinLock mutex;
 
         std::vector<PivotKey>* pivots;
 
@@ -587,7 +583,7 @@ class MilliSortService : public Service {
     void pickSuperPivots();
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
-    void pickDataBucketBoundaries();
+    void pickSplitters();
     void copyOutShufflePivots(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
@@ -779,7 +775,7 @@ class MilliSortService : public Service {
 
     /// # pivots on all nodes that are smaller than #sortedGatherPivots. Only
     /// computed on pivot sorters (during the naive splitter selection process).
-    int numSmallerPivots;
+    int numPivotsPassed;
 
     /// Contains all pivot servers (including the root) in #nodes. Always empty
     /// on normal nodes.
