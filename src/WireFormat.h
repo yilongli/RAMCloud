@@ -269,6 +269,8 @@ struct InitMilliSort {
         uint32_t numNodes;
         /// # tuples on each server.
         uint32_t dataTuplesPerServer;
+        /// # pivots each node selects initially.
+        uint32_t pivotsPerServer;
         /// # nodes assigned to each pivot server (including itself).
         uint32_t nodesPerPivotServer;
         /// Flush shared cache as part of initialization. This is required for
@@ -292,9 +294,6 @@ struct InitMilliSort {
 
         /// # cores allocated to MilliSort service (including dispatch thread).
         int32_t numCoresPerNode;
-
-        /// # pivots each node selects initially.
-        int32_t numPivotsPerNode;
 
         /// Size of the key, in bytes.
         int32_t keySize;

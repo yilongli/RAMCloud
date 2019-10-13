@@ -473,7 +473,9 @@ class MilliSortService : public Service {
             while (offset < incomingPivots->size()) {
                 pivots->push_back(*incomingPivots->read<PivotKey>(&offset));
             }
-            millisort->inplaceMerge(*pivots, numSortedPivots);
+            std::inplace_merge(pivots->begin(),
+                    pivots->begin() + numSortedPivots, pivots->end());
+
         }
 
         Buffer* getResult()
@@ -577,9 +579,8 @@ class MilliSortService : public Service {
 
     static inline void moveValues(PivotKey* keys, Value* oldValues,
             Value* newValues, int start, int numRecords);
-    void inplaceMerge(vector<PivotKey>& keys, size_t sizeOfFirstSortedRange);
-    void partition(PivotKey* keys, int numKeys, int numPartitions,
-            std::vector<PivotKey>* pivots);
+    static void partition(PivotKey* keys, int numKeys, int numPartitions,
+            bool includeHead, std::vector<PivotKey>* pivots);
     void localSortAndPickPivots();
     void rearrangeValues(RearrangeValueTask* rearrangeValueTask, int totalItems,
             bool initialData);
@@ -602,6 +603,12 @@ class MilliSortService : public Service {
         ALL_PIVOT_SERVERS       = 2,
     };
 
+    enum PivotTag : uint8_t {
+        BEGIN_PIVOT             = 0,
+        NORMAL_PIVOT            = 1,
+        END_PIVOT               = 2,
+    };
+
     /// MilliSort request in progress. NULL means the service is idle.e
     std::atomic<Service::Rpc*> ongoingMilliSort;
 
@@ -621,6 +628,9 @@ class MilliSortService : public Service {
     // -------- Node state --------
     /// # data tuples on each node initially. -1 means unknown.
     int numDataTuples;
+
+    /// # pivots each server selects initially. -1 means unknown.
+    int numPivotsPerServer;
 
     /// # pivot servers. -1 means unknown.
     int numPivotServers;
@@ -677,11 +687,11 @@ class MilliSortService : public Service {
     /// Represents the task of rearranging local values.
     Tub<RearrangeValueTask> rearrangeLocalVals;
 
-    /// Data bucket boundaries that determine the final destination of each data
-    /// tuple on this node. Same on all nodes.
-    /// For example, dataBucketBoundaries = {1, 5, 9} means all data are divided
-    /// into 3 buckets: (-Inf, 1], (1, 5], and (5, 9].
-    std::vector<PivotKey> dataBucketBoundaries;
+    /// Right boundaries of the final data buckets of all servers (this vector
+    /// is the same on all servers). Used to determine final destinations of
+    /// each record. For example, splitters = {1, 5, 9} means all records are
+    /// divided / into 3 buckets: (-Inf, 1], (1, 5], and (5, 9].
+    std::vector<PivotKey> splitters;
 
     /// Range of each data bucket in #localKeys. Each range is represented by
     /// a pair of integers: the starting index and # items in the bucket.
@@ -695,9 +705,9 @@ class MilliSortService : public Service {
     /// each chunk is sent with one ShufflePushRpc.
     std::atomic<int> recordShuffleRxCount;
 
-    /// Records # bytes we have received for each incoming shuffle message
-    /// so we can filter out duplicate shuffle RPCs. There is one entry for
-    /// each server, ordered by their ranks.
+    /// Records # bytes we have received for each incoming record shuffle
+    /// message / so we can filter out duplicate shuffle RPCs. There is one
+    /// entry for each server, ordered by their ranks.
     Tub<std::vector<std::atomic<uint32_t>>> recordShuffleProgress;
 
     /// Shuffle messages to send during the record shuffle phase, indexed by
@@ -736,7 +746,7 @@ class MilliSortService : public Service {
     /// this pivot server.
     Tub<CommunicationGroup> myPivotServerGroup;
 
-    // -------- Pivot server state --------
+    // -------- Pivot sorter state --------
     /// Pivots gathered from this pivot server's slave nodes. Always empty on
     /// normal nodes.
     std::vector<PivotKey> gatheredPivots;
@@ -752,28 +762,39 @@ class MilliSortService : public Service {
     std::vector<PivotKey> pivotBucketBoundaries;
 
     /// After #gatheredPivots on all nodes are sorted globally and spread across
-    /// all pivot servers, this variable holds the local portion of this node.
-    /// Always empty on normal nodes.
-    std::vector<PivotKey> sortedGatheredPivots;
+    /// all pivot sorters, this variable holds the local portion of the sorted
+    /// pivots on this node. Always empty on normal nodes.
+    std::vector<std::pair<PivotKey, PivotTag>> sortedGatheredPivots;
+
+    /// # servers that are still contributing to our cumulative data units as
+    /// we sweep through pivots in our gradient-based splitter selection algo.
+    /// That is, # servers whose begin pivots have been passed and whose end
+    /// pivots are still ahead. Only used on pivot sorters (during the splitter
+    /// selection process).
+    int numActiveSources;
+
+    /// # pivots we have swept through that are not begin pivots. Only used on
+    /// pivot sorters (during the splitter selection process).
+    int numNonBeginPivotsPassed;
 
     /// # pivots on all nodes that are smaller than #sortedGatherPivots. Only
-    /// computed on pivot servers.
+    /// computed on pivot sorters (during the naive splitter selection process).
     int numSmallerPivots;
-
-    /// # pivots on all nodes. Only computed on pivot servers.
-    int numPivotsInTotal;
 
     /// Contains all pivot servers (including the root) in #nodes. Always empty
     /// on normal nodes.
     Tub<CommunicationGroup> allPivotServers;
 
-    /// Allows the broadcast operation to execute asynchronously.
-    Tub<TreeBcast> bcastDataBucketBoundaries;
+    /// Allows the broadcast operation to execute asynchronously. Only present
+    /// on pivot sorters.
+    Tub<TreeBcast> broadcastSplitters;
 
     /// True means we are ready to service incoming pivot shuffle RPCs.
     std::atomic_bool pivotShuffleIsReady;
 
-    // TODO: move it to the right place
+    /// Records # bytes we have received for each incoming pivot shuffle
+    /// message so we can filter out duplicate shuffle RPCs. There is one
+    /// entry for each server, ordered by their ranks.
     Tub<std::vector<std::atomic<uint32_t>>> pivotShuffleProgress;
 
     /// # complete pivot shuffle messages received so far. Note: each shuffle
