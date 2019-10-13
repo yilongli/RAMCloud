@@ -43,6 +43,7 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
     , completeTime(0)
     , currentPhase()
     , lastPhase()
+    , receivedRpc()
     , expanderNode(false)
     , ghostNode(false)
     , group(group)
@@ -97,6 +98,7 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
     if (ghostNode || expanderNode) {
         lastPhase++;
     }
+    receivedRpc.construct(lastPhase + 1);
 
     dataBuf.appendExternal(data, length);
     std::vector<int> targets;
@@ -180,6 +182,14 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
             "remote phase %d", reqHdr->senderId, rpc->requestPayload->size(),
             currentPhase.load(), msgPhase);
 
+    // Filter out duplicate RPCs.
+    bool expected = false;
+    if (!receivedRpc->at(msgPhase).compare_exchange_strong(expected, true)) {
+        LOG(WARNING, "AllGather: ignore duplicate RPC; senderId %d, phase %d",
+                reqHdr->senderId, msgPhase);
+        return;
+    }
+
     // If this is a ghost node, advance to the last expansion phase directly
     // because it doesn't participate in the intermediate exchange steps.
     // Otherwise, we must wait for the local node to catch up before merging
@@ -209,7 +219,7 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
         std::vector<int> targets;
         getPeersToSend(nextPhase, &targets);
         dataBuf.reset();
-        merger->getResult(&dataBuf);
+        merger->fillBuffer(&dataBuf);
         for (int target : targets) {
             // Start sending RPCs of the next phase.
             timeTrace("AllGather: sending to server %d, phase %d, size %u",
