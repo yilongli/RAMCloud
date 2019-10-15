@@ -138,6 +138,7 @@ namespace ips4o {
                 pool_barrier_.barrier();
                 func_(0, num_threads);
                 pool_barrier_.barrier();
+                timeTrace_ips4o("ips4o: entry-point run() finished");
             }
 
             /**
