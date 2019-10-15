@@ -94,13 +94,17 @@ namespace {
 // with the subsequent partition steps and key shuffle.
 #define OVERLAP_INIT_VAL_REARRANGE 1
 
-// Change 0 -> 1 in the following line to piggyback shuffle message chunks in
-// the responses of shuffle RPCs to reduce # RPCs to send.
-#define PIGGYBACK_SHUFFLE_MSG 1
+// Change 0 -> 1 in the following line to use SeoJin's online merge-sorter for
+// sorting incoming keys; otherwise, ips4o as in local sort.
+#define ENABLE_MERGE_SORTER 1
 
 // Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
 // with record shuffle.
 #define OVERLAP_MERGE_SORT 1
+
+// Change 0 -> 1 in the following line to piggyback shuffle message chunks in
+// the responses of shuffle RPCs to reduce # RPCs to send.
+#define PIGGYBACK_SHUFFLE_MSG 1
 
 // Change 0 -> 1 in the following line to use the more sophisticated pivot
 // selection algorithm which generates much more balanced data buckets.
@@ -423,8 +427,11 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     recordShuffleProgress.construct(world->size());
     recordShuffleMessages.construct(world->size());
     recordShuffleIsReady = false;
+    mergeSorter.destroy();
+#if ENABLE_MERGE_SORTER
     mergeSorter.construct(world->size(), numDataTuples * MAX_IMBALANCE_RATIO,
             int(Arachne::getCorePolicy()->getCores(0).size()));
+#endif
     mergeSorterPoller = Arachne::NullThread;
     mergeSorterIsReady = false;
     pendingMergeReqs.clear();
@@ -1243,9 +1250,22 @@ MilliSortService::shuffleRecords() {
     {
         ADD_COUNTER(onlineMergeSortStartTime, Cycles::rdtsc() - startTime)
         SCOPED_TIMER(onlineMergeSortElapsedTime)
+#if ENABLE_MERGE_SORTER
         ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
         startMergeSorter(true);
         Arachne::join(mergeSorterPoller);
+        sortedKeys = mergeSorter->getSortedArray().data;
+#else
+        // FIXME: figure out why using ips4o seems to cause stragglers in the
+        // record shuffle above? My current suspicion is that the worker threads
+        // in ips4o::ArachneThreadPool are not designed with collaborative
+        // threading in mind so the ofiud worker threads can't make any progress
+        ADD_COUNTER(onlineMergeSortWorkers,
+                Arachne::getCorePolicy()->getCores(0).size());
+        ips4o::parallel::sort(incomingKeys, incomingKeys + numSortedItems);
+        sortedKeys = incomingKeys;
+        timeTrace("sorted %u final keys", numSortedItems);
+#endif
     }
 
     rearrangeFinalVals();
@@ -1255,7 +1275,7 @@ MilliSortService::shuffleRecords() {
 void
 MilliSortService::startMergeSorter(bool shuffleDone)
 {
-    if (OVERLAP_MERGE_SORT ^ shuffleDone)
+    if (!ENABLE_MERGE_SORTER || (OVERLAP_MERGE_SORT ^ shuffleDone))
         return;
 
     std::lock_guard<Arachne::SpinLock> _(mergeSorterLock);
@@ -1277,8 +1297,7 @@ MilliSortService::startMergeSorter(bool shuffleDone)
             Arachne::yield();
         }
         auto sortedArray = mergeSorter->getSortedArray();
-        sortedKeys = sortedArray.data;
-        timeTrace("sorted %u final keys", sortedArray.size);
+        timeTrace("merge-sorted %u final keys", sortedArray.size);
         assert(int(sortedArray.size) == numSortedItems);
     });
 }
@@ -1311,7 +1330,8 @@ MilliSortService::rearrangeFinalVals()
 #if VALIDATE_RESULT
     uint64_t prevKey = 0;
     bool success = true;
-    if (int(mergeSorter->getSortedArray().size) != numSortedItems) {
+    if (ENABLE_MERGE_SORTER &&
+            (int(mergeSorter->getSortedArray().size) != numSortedItems)) {
         LOG(ERROR, "Validation failed: sortedArray.size != numSortedItems "
                 "(%lu vs %u)", mergeSorter->getSortedArray().size,
                 numSortedItems);
@@ -1541,6 +1561,7 @@ MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
             incomingKeys[i].index = i;
         }
 
+#if ENABLE_MERGE_SORTER
         // Notify the merge sorter about the incoming keys.
         mergeSorterLock.lock();
         if (mergeSorterIsReady) {
@@ -1550,7 +1571,7 @@ MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
                     numRecords);
         }
         mergeSorterLock.unlock();
-
+#endif
         recordShuffleRxCount.fetch_add(1);
         ADD_COUNTER(shuffleKeysInputBytes, totalLength);
     }
