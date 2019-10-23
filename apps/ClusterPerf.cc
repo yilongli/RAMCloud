@@ -7606,7 +7606,7 @@ treeBcastImpl(std::vector<int> sizes)
         syncClusterClock(numMasters);
 
         // Initialize the millisort service.
-        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1,
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1, 1,
                 false);
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes, size %d",
@@ -7706,7 +7706,7 @@ benchmarkCollectiveOp(WireFormat::Opcode opcode, std::vector<int> sizes)
             syncClusterClock(numMasters);
 
             // Initialize the millisort service.
-            InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1,
+            InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1, 1,
                     false);
             auto initResp = initRpc.wait();
             LOG(NOTICE, "Initialized %d millisort service nodes, size %d",
@@ -7823,7 +7823,7 @@ allShuffleImpl(std::vector<int> sizes)
 
         // Initialize the millisort service.
         ServerId rootServer(1, 0);
-        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1,
+        InitMilliSortRpc initRpc(context, rootServer, machineCount, 0, 1, 1,
                 false);
         auto initResp = initRpc.wait();
         LOG(NOTICE, "Initialized %d millisort service nodes",

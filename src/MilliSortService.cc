@@ -104,7 +104,7 @@ namespace {
 
 // Change 0 -> 1 in the following line to piggyback shuffle message chunks in
 // the responses of shuffle RPCs to reduce # RPCs to send.
-#define PIGGYBACK_SHUFFLE_MSG 1
+#define PIGGYBACK_SHUFFLE_MSG 0
 
 // Change 0 -> 1 in the following line to use the more sophisticated pivot
 // selection algorithm which generates much more balanced data buckets.
@@ -1727,8 +1727,9 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                             Cycles::toMicroseconds(Cycles::rdtsc() -
                             messageTracker->lastTransmitTime),
                             outstandingChunks);
-#if PIGGYBACK_SHUFFLE_MSG
+
                     // Copy out records piggybacked in the RPC response.
+#if PIGGYBACK_SHUFFLE_MSG
                     Buffer* reply = rpc->wait();
                     WireFormat::ShufflePush::Response* respHdr = reply->
                             getStart<WireFormat::ShufflePush::Response>();
@@ -1778,16 +1779,16 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         }
 
         // TODO: what should be a healthy amout of pending RPCs?
-#define MAX_TX_PENDING_RPCS 8
-#define MAX_OUTSTANDING_CHUNKS 16
-#define MAX_CHOICES 2
+        const int maxTxPendingRpcs = 8;
+        const uint32_t maxOutstandingChunks = 16;
+        const int maxChoices = 2;
 
         // Power-of-two LRPT policy.
         int index = -1;
         uint32_t maxBytesLeft = 0;
-        if (!candidates.empty() && (outstandingChunks < MAX_OUTSTANDING_CHUNKS)
-                && (transmitPendingRpcs < MAX_TX_PENDING_RPCS)) {
-            for (int choice = 0; choice < MAX_CHOICES; choice++) {
+        if (!candidates.empty() && (outstandingChunks < maxOutstandingChunks)
+                && (transmitPendingRpcs < maxTxPendingRpcs)) {
+            for (int choice = 0; choice < maxChoices; choice++) {
                 int idx = candidates[Util::wyhash64() % candidates.size()];
                 uint32_t bytesLeft = messageTrackers[idx]->getBytesLeft();
                 if (bytesLeft > maxBytesLeft) {
@@ -1798,10 +1799,10 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         }
 
         // Send out one more chunk of data, if appropriate.
-        if ((transmitPendingRpcs < MAX_TX_PENDING_RPCS) &&
-                (outstandingChunks < MAX_OUTSTANDING_CHUNKS) && (index >= 0)) {
-            if ((transmitPendingRpcs + 1 == MAX_TX_PENDING_RPCS) ||
-                    (outstandingChunks + 1 == MAX_OUTSTANDING_CHUNKS)) {
+        if ((transmitPendingRpcs < maxTxPendingRpcs) &&
+                (outstandingChunks < maxOutstandingChunks) && (index >= 0)) {
+            if ((transmitPendingRpcs + 1 == maxTxPendingRpcs) ||
+                    (outstandingChunks + 1 == maxOutstandingChunks)) {
                 timeTraceSp("shuffle: ready to send again, "
                         "transmitPendingRpcs %u, outstandingChunks %u",
                         transmitPendingRpcs, outstandingChunks);
@@ -1872,6 +1873,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             }
 
             // Piggyback a message chunk, if any, in the RPC response.
+#if PIGGYBACK_SHUFFLE_MSG
             if (senderId == allPivotServers->rank) break;
             while (!pivotShuffleIsReady.load()) {
                 Arachne::yield();
@@ -1881,6 +1883,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             respHdr->offset = offset;
             rpc->replyPayload->appendExternal(
                     &pivotShuffleMessages->at(senderId), offset, chunkSize);
+#endif
             break;
         }
         case ALLSHUFFLE_RECORD: {
@@ -1932,6 +1935,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 timeTraceSp("shuffle-bench: received complete message, "
                         "senderId %d", senderId);
             }
+
 #if PIGGYBACK_SHUFFLE_MSG
             if (senderId != world->rank) {
                 respHdr->totalLength = totalLength;
