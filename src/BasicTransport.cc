@@ -114,6 +114,14 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // or rccluster; relax the timeout critieria.
     , timeoutIntervals(150) // 300 ms
     , pingIntervals(6)
+    , sendReplyCount()
+    , sendReplyCycles()
+    , sendRequestCount()
+    , sendRequestCycles()
+    , recvReplyCount()
+    , recvReplyCycles()
+    , recvRequestCount()
+    , recvRequestCycles()
 {
     // Set up the timer to trigger at 2 ms intervals. We use this choice
     // (as of 11/2015) because the Linux kernel appears to buffer packets
@@ -590,6 +598,29 @@ BasicTransport::cancelRecord(uint64_t lastRecordTime) {
 #endif
 }
 
+void
+BasicTransport::monitorRpcCost(uint64_t& count, uint64_t& cycles,
+        uint64_t sample)
+{
+#if TIME_TRACE
+    count++;
+    cycles += sample;
+    if (count % 64 == 0) {
+        uint64_t ns = Cycles::toNanoseconds(cycles / count);
+        if (&count == &sendReplyCount)
+            timeTrace("avg. sendReply cost %u ns", ns);
+        else if (&count == &sendRequestCount)
+            timeTrace("avg. sendRequest cost %u ns", ns);
+        else if (&count == &recvReplyCount)
+            timeTrace("avg. recvReply cost %u ns", ns);
+        else if (&count == &recvRequestCount)
+            timeTrace("avg. recvRequest cost %u ns", ns);
+        count = 0;
+        cycles = 0;
+    }
+#endif
+}
+
 /**
  * This method queues one or more data packets for transmission, if (a) the
  * NIC queue isn't too long and (b) there is data that needs to be transmitted.
@@ -773,9 +804,9 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
 {
     SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = request->size();
-    t->timeTrace("sendRequest invoked, clientId %u, sequence %u, length %u, "
-            "%u outgoing requests", t->clientId, t->nextClientSequenceNumber,
-            length, t->outgoingRequests.size());
+    uint64_t startRequest = t->timeTrace("sendRequest invoked, clientId %u, "
+            "sequence %u, length %u, %u outgoing requests", t->clientId,
+            t->nextClientSequenceNumber, length, t->outgoingRequests.size());
     if (aborted) {
         notifier->failed();
         return;
@@ -819,7 +850,10 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
-        t->timeTrace("sendRequest transmitted %u bytes", bytesSent);
+        uint64_t endRequest =
+                t->timeTrace("sendRequest transmitted %u bytes", bytesSent);
+        t->monitorRpcCost(t->sendRequestCount, t->sendRequestCycles,
+                endRequest - startRequest);
     }
 }
 
@@ -850,6 +884,7 @@ BasicTransport::handlePacket(Driver::Received* received)
                 received->sender->toString().c_str(), received->len);
         return;
     }
+    uint64_t startHandle = timeTrace("about to process incoming packet");
 
     if (common->opcode <= DATA) {
         ADD_COUNTER(basicTransportInputDataBytes, received->len);
@@ -916,6 +951,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 clientRpc->notifier->receiveTime = received->timestamp;
                 clientRpc->notifier->completed();
                 deleteClientRpc(clientRpc);
+#if TIME_TRACE
+                monitorRpcCost(recvReplyCount, recvReplyCycles,
+                        Cycles::rdtsc() - startHandle);
+#endif
                 return;
             }
 
@@ -1176,6 +1215,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                 serverRpc->requestComplete = true;
                 serverRpc->receiveTime = received->timestamp;
                 context->workerManager->handleRpc(serverRpc);
+#if TIME_TRACE
+                monitorRpcCost(recvRequestCount, recvRequestCycles,
+                        Cycles::rdtsc() - startHandle);
+#endif
                 return;
             }
 
@@ -1481,9 +1524,9 @@ BasicTransport::ServerRpc::sendReply()
 {
     SCOPED_TIMER(basicTransportActiveCycles);
     uint32_t length = replyPayload.size();
-    t->timeTrace("sendReply invoked, clientId %u, sequence %u, length %u, "
-            "%u outgoing responses", rpcId.clientId, rpcId.sequence,
-            length, t->outgoingResponses.size());
+    uint64_t startReply = t->timeTrace("sendReply invoked, clientId %u, "
+            "sequence %u, length %u, %u outgoing responses", rpcId.clientId,
+            rpcId.sequence, length, t->outgoingResponses.size());
     if (cancelled) {
         t->deleteServerRpc(this);
         return;
@@ -1513,7 +1556,10 @@ BasicTransport::ServerRpc::sendReply()
         bytesSent = t->tryToTransmitData();
     }
     if (bytesSent > 0) {
-        t->timeTrace("sendReply transmitted %u bytes", bytesSent);
+        uint64_t endReply =
+                t->timeTrace("sendReply transmitted %u bytes", bytesSent);
+        t->monitorRpcCost(t->sendReplyCount, t->sendReplyCycles,
+                endReply - startReply);
     }
 }
 
@@ -1833,9 +1879,11 @@ BasicTransport::Poller::poll()
     {
         CycleCounter<> _(&rxCycles);
         SCOPED_TIMER(basicTransportReceiveCycles);
+        uint64_t pollDriverTime = t->timeTrace("about to receive packets");
         t->driver->receivePackets(MAX_PACKETS, &t->receivedPackets);
         numPackets = static_cast<uint32_t>(t->receivedPackets.size());
         if (numPackets == 0) {
+            t->cancelRecord(pollDriverTime);
             CANCEL_SCOPED_TIMER(basicTransportReceiveCycles);
         }
         ADD_COUNTER(basicTransportInputPackets, numPackets);
@@ -1856,6 +1904,7 @@ BasicTransport::Poller::poll()
         STOP_TIMER(basicTransportHandlePacketCycles);
         t->receivedPackets.clear();
         result = 1;
+        t->timeTrace("handled %u packets", numPackets);
 
         // See if we should send out new GRANT packets. Grants are sent here as
         // opposed to inside #handlePacket because we would like to coalesse
