@@ -668,6 +668,7 @@ class BasicTransport : public Transport {
     template<typename T>
     void sendControlPacket(const Driver::Address* recipient, const T* packet);
     uint32_t tryToTransmitData();
+    void monitorRpcCost(uint64_t& count, uint64_t& cycles, uint64_t sample);
 
     /// Shared RAMCloud information.
     Context* context;
@@ -814,6 +815,18 @@ class BasicTransport : public Transport {
     /// any packets from the server for particular RPC, then it sends a
     /// RESEND request, assuming the response was lost.
     uint32_t pingIntervals;
+
+    /// Used to keep track of RPC send/recv overhead; intented for performance
+    /// debugging only.
+    uint64_t sendReplyCount;
+    uint64_t sendReplyCycles;
+    uint64_t sendRequestCount;
+    uint64_t sendRequestCycles;
+    uint64_t recvReplyCount;
+    uint64_t recvReplyCycles;
+    uint64_t recvRequestCount;
+    uint64_t recvRequestCycles;
+
 
     DISALLOW_COPY_AND_ASSIGN(BasicTransport);
 };
