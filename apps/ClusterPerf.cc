@@ -7718,7 +7718,7 @@ point2point()
 // TODO: let allShuffle and treeBcast call benchmarkCollectiveOp too?
 
 void
-allShuffle()
+allShuffleImpl(std::vector<int> sizes)
 {
     // Normally, cluster->serverList is NULL on clients. Get it from the
     // coordinator.
@@ -7751,8 +7751,9 @@ allShuffle()
     string perfstats;
     // Each iteration of the following loop performs a all-to-all shuffle
     // operation between a specific number of servers.
+    for (int size : sizes) {
     for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-//    for (int machineCount = 33; machineCount <= numMasters; machineCount++) {
+//    for (int machineCount = 20; machineCount <= numMasters; machineCount += 20) {
     for (int startOffset = 0; startOffset < 1; startOffset++) {
 //    for (int startOffset = 0; startOffset < machineCount; startOffset++) {
         // Let the cluster idle for a while (e.g., 100 ms) to reduce influence
@@ -7781,15 +7782,15 @@ allShuffle()
         // Compute the message size based on workload
         if (workload.compare("weakScaling") == 0) {
             // Fix per-node data.
-            int perNodeData = objectSize;
+            int perNodeData = size;
             messageSize = perNodeData / (machineCount - 1);
         } else if (workload.compare("strongScaling") == 0) {
             // Fix total data.
-            double totalData = objectSize;
+            double totalData = size;
             messageSize = int(totalData / machineCount / (machineCount - 1));
         } else {
             // By default, fix message size.
-            messageSize = objectSize;
+            messageSize = size;
         }
 
         // FIXME: hack to run only a few lock steps of the shuffle
@@ -7807,8 +7808,8 @@ allShuffle()
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::ALL_SHUFFLE,
                 messageSize);
         Buffer* result = rpc.wait();
-        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
-                result->size());
+        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, messageSize %d, "
+                "response size %u", messageSize, result->size());
 
         // Retrieve the shuffle completion times of each machine from the RPC
         // response buffer.
@@ -7894,7 +7895,19 @@ allShuffle()
 #undef COLLECT_PERFSTATS
     }
     }
+    }
     printf("%s", perfstats.c_str());
+}
+
+void
+allShuffle()
+{
+//    allShuffleImpl({15000, 20000, 25000, 30000, 35000, 40000});
+    allShuffleImpl({1000, 4000, 8000, 10000, 12000, 14000, 32000, 64000});
+//    allShuffleImpl({1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000,
+//                    10000, 11000, 12000, 13000, 14000, 15000, 20000, 25000,
+//                    30000, 35000, 40000, 45000, 50000, 55000, 60000});
+//    allShuffleImpl({objectSize});
 }
 
 // The following struct and table define each performance test in terms of
