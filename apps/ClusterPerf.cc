@@ -3172,8 +3172,10 @@ echo_workload()
 void
 collectiveBandwidth(bool bidirectional)
 {
-    vector<uint32_t> outgoingSizes = {1000, 4000, 8000, 16000, 32000};
-    vector<string> ids = {"1K", "4K", "8K", "16K", "32K"};
+    vector<uint32_t> outgoingSizes = {1000};
+    vector<string> ids = {"1K"};
+//    vector<uint32_t> outgoingSizes = {1000, 4000, 8000, 16000, 32000};
+//    vector<string> ids = {"1K", "4K", "8K", "16K", "32K"};
 
     // Choose the corresponding server in the server list as the receiver.
     ServerMap servers;
@@ -7811,7 +7813,7 @@ allShuffleImpl(std::vector<int> sizes)
     // operation between a specific number of servers.
     for (int size : sizes) {
     for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-//    for (int machineCount = 120; machineCount <= 180; machineCount += 20) {
+//    for (int machineCount = 20; machineCount <= numMasters; machineCount += 20) {
     for (int startOffset = 0; startOffset < 1; startOffset++) {
 //    for (int startOffset = 0; startOffset < machineCount; startOffset++) {
         // Let the cluster idle for a while (e.g., 100 ms) to reduce influence

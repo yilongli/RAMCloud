@@ -81,7 +81,8 @@ BasicTransport::BasicTransport(Context* context, const ServiceLocator* locator,
     // chosen experimentally so that we can run W3 in Homa paper at 80% load on
     // a 10Gbps network and that no significant queueing delay at the TX queue
     // is observed.
-    , smallMessageThreshold(300)
+//    , smallMessageThreshold(300)
+    , smallMessageThreshold(3000)
     , clientId(clientId)
     , nextClientSequenceNumber(1)
     , nextServerSequenceNumber(1)
@@ -818,7 +819,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
                     request->size(), MAX_RPC_LEN));
     }
 
-    response->reset();
+    assert(response->size() == 0);
     ClientRpc *clientRpc = t->clientRpcPool.construct(this,
             t->nextClientSequenceNumber, request, response, notifier);
     clientRpc->request.transmitLimit = std::min(t->roundTripBytes, length);
@@ -831,7 +832,7 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
     }
 
     uint32_t bytesSent;
-    if (length < t->smallMessageThreshold) {
+    if (likely(length < t->smallMessageThreshold)) {
         RpcId rpcId = clientRpc->rpcId;
         assert(length <= t->maxDataPerPacket);
         AllDataHeader header(rpcId, FROM_CLIENT, uint16_t(length));
@@ -840,9 +841,9 @@ BasicTransport::Session::sendRequest(Buffer* request, Buffer* response,
                 "bytes %u", rpcId.clientId, rpcId.sequence, length);
         t->driver->sendPacket(serverAddress, &header, &iter, 0);
         notifier->transmitTime = t->driver->getLastTransmitTime();
+        notifier->transmitDone = true; // << cache coherence protoc.?
         clientRpc->request.transmitOffset = length;
         clientRpc->transmitPending = false;
-        clientRpc->notifier->transmitDone = true;
         bytesSent = length;
     } else {
         t->outgoingRequests.push_back(*clientRpc);
@@ -950,6 +951,10 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->messageLength, driver, payload);
                 clientRpc->notifier->receiveTime = received->timestamp;
                 clientRpc->notifier->completed();
+//                if (clientRpc->isShufflePush) {
+//                    TimeTrace::record("shuffle-push: transport received ack from server %u",
+//                            clientRpc->response->getStart<WireFormat::ShufflePush::Response>()->receiverId);
+//                }
                 deleteClientRpc(clientRpc);
 #if TIME_TRACE
                 monitorRpcCost(recvReplyCount, recvReplyCycles,
@@ -1214,6 +1219,11 @@ BasicTransport::handlePacket(Driver::Received* received)
                         header->messageLength, driver, payload);
                 serverRpc->requestComplete = true;
                 serverRpc->receiveTime = received->timestamp;
+//                if (WireFormat::SHUFFLE_PUSH ==
+//                    serverRpc->requestPayload.getStart<WireFormat::RequestCommon>()->opcode) {
+//                    TimeTrace::record("shuffle-push: transport received req from senderId %u",
+//                            serverRpc->requestPayload.getStart<WireFormat::ShufflePush::Request>()->senderId);
+//                }
                 context->workerManager->handleRpc(serverRpc);
 #if TIME_TRACE
                 monitorRpcCost(recvRequestCount, recvRequestCycles,

@@ -445,6 +445,8 @@ struct ShufflePush {
     struct Response {
         ResponseCommon common;
 
+        // hack: for logging purpose
+        uint32_t receiverId;
         // # bytes of the message to be received from the server.
         uint32_t totalLength;
         uint32_t offset;
