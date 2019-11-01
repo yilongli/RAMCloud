@@ -570,8 +570,6 @@ class MilliSortService : public Service {
         BROADCAST_DATA_BUCKET_BOUNDARIES,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_RECORD,
-        ALLSHUFFLE_KEY,
-        ALLSHUFFLE_VALUE,
         ALLSHUFFLE_BENCHMARK,
         POINT2POINT_BENCHMARK,
     };
@@ -591,9 +589,9 @@ class MilliSortService : public Service {
     void pickPivotBucketBoundaries();
     void pivotBucketSort();
     void pickDataBucketBoundaries();
+    void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
+            uint32_t offset, Buffer* messageChunk);
     void shuffleRecords();
-    void shuffleKeys();
-    void shuffleValues();
     Arachne::ThreadId startMergeSorter();
     void rearrangeFinalVals();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
@@ -661,25 +659,17 @@ class MilliSortService : public Service {
     /// # data tuples end up on this node when the sorting completes.
     int numSortedItems;
 
-    /// # keys received by this node during key shuffle.
-    int numKeysReceived;
-
-    /// # values received by this node during final value shuffle. Should be
-    /// equal to numSortedItems; only used for debugging.
-    std::atomic<int> numValuesReceived;
+    /// # records received by this node during shuffle.
+    std::atomic<int> numRecordsReceived;
 
     /// True if we haven't finished printing the result of the previous request.
     /// Used to prevent concurrent write from a new InitMilliSort request.
     std::atomic_bool printingResult;
 
-    // FIXME: this is a bad name; besides, does it have to be class member?
-    // Note on thread-safety: each element is written once in
-    // shufflePush(ALLSHUFFLE_KEY) and then read multiple times in
-    // shufflePush(ALLSHUFFLE_VALUE). We use lock to protect from write-write
-    // data-race; there should be no write-read data-race as a remote peer
-    // should never push a chunk of value message to us before we ack'ed the
-    // entire key message.
-    std::vector<int> valueStartIdx;
+    /// Used to reserve a contiguous space for every incoming record shuffle
+    /// message. Furthermore, shuffle messages from different senders are also
+    /// placed contiguously.
+    Tub<std::vector<std::atomic<int>>> shuffleRecordResv;
 
     /// Selected keys that evenly divide #localKeys on this node into # nodes
     /// partitions.
@@ -706,20 +696,21 @@ class MilliSortService : public Service {
     /// each chunk is sent with one ShufflePushRpc.
     std::atomic<int> shuffleKeysRxCount;
 
-    /// # complete value shuffle messages received so far.
-    std::atomic<int> shuffleValsRxCount;
-
     /// Records whether we have received the complete key shuffle message from
     /// a server. There is one element for each server, ordered by their ranks.
     Tub<std::vector<std::atomic_bool>> shuffleKeysRxFrom;
 
-    /// Records whether we have received the complete value shuffle message from
-    /// a server. There is one element for each server, ordered by their ranks.
-    Tub<std::vector<std::atomic_bool>> shuffleValsRxFrom;
+    /// Records # bytes we have received for each incoming shuffle message
+    /// so we can filter out duplicate shuffle RPCs. There is one entry for
+    /// each server, ordered by their ranks. Used to
+    Tub<std::vector<std::atomic<uint32_t>>> shuffleMsgRecvProgress;
 
-    // TODO: doc.
-    Tub<std::vector<std::atomic<uint32_t>>> shuffleKeyMsgCopiedBytes;
-    Tub<std::vector<std::atomic<uint32_t>>> shuffleValMsgCopiedBytes;
+    /// Shuffle messages to send during the record shuffle phase, indexed by
+    /// server ID.
+    Tub<std::vector<Buffer>> recordShuffleMessages;
+
+    /// True means we are ready to service incoming record shuffle RPCs.
+    std::atomic_bool recordShuffleIsReady;
 
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
