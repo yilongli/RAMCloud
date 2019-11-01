@@ -147,14 +147,15 @@ class ShufflePushRpc : public RpcWrapper {
   public:
     ShufflePushRpc(Context* context, Transport::SessionRef session,
             int32_t senderId, uint32_t dataId, uint32_t totalLength,
-            uint32_t offset, Buffer::Iterator* payload);
+            uint32_t offset, uint32_t chunkSize, Buffer::Iterator* payload);
     ~ShufflePushRpc() {}
 
     static void appendRequest(Buffer* request, int32_t senderId,
             uint32_t dataId, uint32_t totalLength, uint32_t offset,
-            Buffer::Iterator* payload, uint32_t rpcId);
+            uint32_t chunkSize, Buffer::Iterator* payload, uint32_t rpcId);
 
-    void wait();
+    Buffer* wait();
+    virtual bool handleTransportError();
 
     static const uint32_t responseHeaderLength =
             sizeof(WireFormat::ShufflePush::Response);
@@ -163,7 +164,7 @@ class ShufflePushRpc : public RpcWrapper {
 
     // FIXME: Debug only; remove?
     uint32_t rpcId;
-
+    int transportErrors;
 PRIVATE:
     DISALLOW_COPY_AND_ASSIGN(ShufflePushRpc);
 };

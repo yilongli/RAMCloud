@@ -435,14 +435,21 @@ struct ShufflePush {
         /// Rank of the message sender within the communication group.
         int32_t senderId;
         uint32_t dataId;
+        // # bytes of the message to be sent from the client.
         uint32_t totalLength;
+        // Offset of the message chunk to push *and* pull.
         uint32_t offset;
-        uint32_t len;
+        // Maximum # bytes of the chunk.
+        uint32_t chunkSize;
         // debug logging only
         uint32_t rpcId;
     } __attribute__((packed));
     struct Response {
         ResponseCommon common;
+
+        // # bytes of the message to be received from the server.
+        uint32_t totalLength;
+        uint32_t offset;
     } __attribute__((packed));
 };
 

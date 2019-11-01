@@ -142,13 +142,14 @@ SendDataRpc::wait()
 
 ShufflePushRpc::ShufflePushRpc(Context* context, Transport::SessionRef session,
         int32_t senderId, uint32_t dataId, uint32_t totalLength,
-        uint32_t offset, Buffer::Iterator* payload)
+        uint32_t offset, uint32_t chunkSize, Buffer::Iterator* payload)
     : RpcWrapper(responseHeaderLength)
     , context(context)
     , rpcId(Util::wyhash64())
+    , transportErrors()
 {
-    appendRequest(&request, senderId, dataId, totalLength, offset, payload,
-            rpcId);
+    appendRequest(&request, senderId, dataId, totalLength, offset, chunkSize,
+            payload, rpcId);
     this->session = session;
     send();
 }
@@ -156,7 +157,7 @@ ShufflePushRpc::ShufflePushRpc(Context* context, Transport::SessionRef session,
 void
 ShufflePushRpc::appendRequest(Buffer* request, int32_t senderId,
         uint32_t dataId, uint32_t totalLength, uint32_t offset,
-        Buffer::Iterator* payload, uint32_t rpcId)
+        uint32_t chunkSize, Buffer::Iterator* payload, uint32_t rpcId)
 {
     WireFormat::ShufflePush::Request* reqHdr(
             allocHeader<WireFormat::ShufflePush>(request));
@@ -164,7 +165,7 @@ ShufflePushRpc::appendRequest(Buffer* request, int32_t senderId,
     reqHdr->dataId = dataId;
     reqHdr->totalLength = totalLength;
     reqHdr->offset = offset;
-    reqHdr->len = payload->size();
+    reqHdr->chunkSize = chunkSize;
     reqHdr->rpcId = rpcId;
     while (!payload->isDone()) {
         request->appendExternal(payload->getData(), payload->getLength());
@@ -172,7 +173,7 @@ ShufflePushRpc::appendRequest(Buffer* request, int32_t senderId,
     }
 }
 
-void
+Buffer*
 ShufflePushRpc::wait()
 {
     waitInternal(context->dispatch);
@@ -185,7 +186,26 @@ ShufflePushRpc::wait()
 
     if (respHdr->common.status != STATUS_OK)
         ClientException::throwException(HERE, respHdr->common.status);
-    response->truncateFront(responseHeaderLength);
+    return response;
+}
+
+// See RpcWrapper for documentation.
+bool
+ShufflePushRpc::handleTransportError()
+{
+    // If there are repeated failures, delay the retries to reduce log
+    // chatter and system load.
+    transportErrors++;
+    if (transportErrors < 3) {
+        // Retry immediately for the first couple of times.
+        send();
+    } else {
+        // The server is probably down. Delay a while before retrying;
+        // this should be enough time for the failure to be detected and
+        // propagated to us.
+        retry(500000, 1500000);
+    }
+    return false;
 }
 
 }  // namespace RAMCloud
