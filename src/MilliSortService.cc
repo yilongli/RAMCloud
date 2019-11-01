@@ -93,6 +93,10 @@ namespace {
 // with the subsequent partition steps and key shuffle.
 #define OVERLAP_INIT_VAL_REARRANGE 1
 
+// Change 0 -> 1 in the following line to piggyback shuffle message chunks in
+// the responses of shuffle RPCs to reduce # RPCs to send.
+#define PIGGYBACK_SHUFFLE_MSG 1
+
 // Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
 // with value shuffle.
 #define OVERLAP_MERGE_SORT 0
@@ -1377,6 +1381,8 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             , session(session)
             , transmitTotalLength(message->size())
             , transmitOffset(0)
+            , receiveTotalLength(~0u)
+            , receiveOffset(0)
             , messageIt(message)
             , lastTransmitTime()
         {}
@@ -1404,22 +1410,36 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
 
         // FIXME: hack to implement piggyback message chunk in shuffle push reply.
         uint32_t getBytesLeft() {
-            return messageIt.size();
+            return messageIt.size() + (PIGGYBACK_SHUFFLE_MSG ?
+                    (receiveTotalLength - receiveOffset) : 0);
         }
 
         bool isDone() {
-            return messageIt.isDone();
+            return messageIt.isDone() && (PIGGYBACK_SHUFFLE_MSG ?
+                    (receiveOffset == receiveTotalLength) : true);
         }
     };
 
     uint64_t activeCycles = context->dispatch->dispatchActiveCycles;
     uint64_t totalBytesSent = 0;
 
+#if !PIGGYBACK_SHUFFLE_MSG
     int numOutMessages = group->size();
+#else
+    int numOutMessages = (group->size() + 1) / 2;
+    if (group->size() % 2 == 0) {
+        if (numOutMessages % 2) {
+            numOutMessages += group->rank % 2 ? 0 : 1;
+        } else {
+            numOutMessages += (group->rank < numOutMessages) ? 1 : 0;
+        }
+    }
+#endif
+
     std::unique_ptr<Tub<ShuffleMessageTracker>[]> messageTrackers(
             new Tub<ShuffleMessageTracker>[numOutMessages]);
     for (int i = 0; i < numOutMessages; i++) {
-        Buffer* message = &(*outMessages)[i];
+        Buffer* message = &(*outMessages)[(world->rank + i) % world->size()];
         ServerId serverId = group->getNode(group->rank + i);
         messageTrackers[i].construct(serverId,
                 sessions[serverId.indexNumber()-1], message);
@@ -1462,6 +1482,27 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                             Cycles::toMicroseconds(Cycles::rdtsc() -
                             messageTracker->lastTransmitTime),
                             outstandingChunks);
+#if PIGGYBACK_SHUFFLE_MSG
+                    // Copy out records piggybacked in the RPC response.
+                    Buffer* reply = rpc->wait();
+                    WireFormat::ShufflePush::Response* respHdr = reply->
+                            getStart<WireFormat::ShufflePush::Response>();
+                    messageTracker->receiveTotalLength = respHdr->totalLength;
+                    assert(messageTracker->receiveOffset == respHdr->offset);
+                    reply->truncateFront(sizeof32(*respHdr));
+                    if (reply->size()) {
+                        timeTraceSp("shuffle-push: found piggybacked message "
+                                "chunk, offset %u, len %u, totalLength %u",
+                                respHdr->offset, reply->size(),
+                                respHdr->totalLength);
+                    }
+                    if (messageTracker->receiverId != world->rank) {
+                        copyOutShuffleRecords(messageTracker->receiverId,
+                                messageTracker->receiveTotalLength,
+                                messageTracker->receiveOffset, reply);
+                        messageTracker->receiveOffset += reply->size();
+                    }
+#endif
                     messageTracker->outstandingRpc.destroy();
                     if (messageTracker->isDone()) {
                         messagesUnfinished--;
@@ -1525,6 +1566,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         Arachne::yield();
     }
 
+#if PIGGYBACK_SHUFFLE_MSG
     activeCycles = context->dispatch->dispatchActiveCycles - activeCycles;
     uint64_t elapsed = Cycles::rdtsc() - shuffleStart;
     timeTraceSp("shuffle-push: operation completed, idle %u us, active %u us, "
@@ -1533,6 +1575,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             Cycles::toMicroseconds(activeCycles),
             uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(activeCycles)),
             uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(elapsed)));
+#endif
 }
 
 void
@@ -1572,6 +1615,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             INC_COUNTER(shuffleKeysReceivedRpcs);
 
             // Piggyback a message chunk, if any, in the RPC response.
+#if PIGGYBACK_SHUFFLE_MSG
             if (senderId == world->rank) break;
             while (!recordShuffleIsReady.load()) {
                 Arachne::yield();
@@ -1581,6 +1625,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             respHdr->offset = std::min(offset, respHdr->totalLength);
             rpc->replyPayload->appendExternal(
                     &recordShuffleMessages->at(senderId), offset, chunkSize);
+#endif
             break;
         }
         case ALLSHUFFLE_BENCHMARK: {
@@ -1592,6 +1637,16 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 timeTraceSp("shuffle-push: received complete message, "
                         "senderId %d", senderId);
             }
+#if PIGGYBACK_SHUFFLE_MSG
+            if (senderId != world->rank) {
+                respHdr->totalLength = reqHdr->totalLength;
+                respHdr->offset = reqHdr->offset;
+                rpc->replyPayload->appendExternal(rpc->requestPayload,
+                        sizeof(*reqHdr), reqHdr->chunkSize);
+            } else {
+                bzero(respHdr, sizeof(*respHdr));
+            }
+#endif
             break;
         }
         default:
