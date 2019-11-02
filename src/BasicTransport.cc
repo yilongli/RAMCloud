@@ -242,7 +242,9 @@ BasicTransport::deleteServerRpc(ServerRpc* serverRpc)
     // by the driver. A better solution would be to ask the driver if the last
     // packet is indeed on the wire (e.g., keep a counter on # packets enqueued
     // and another counter on # packets transmitted).
-    serverRpcZombies.emplace_back(driver->packetsEnqueued, serverRpc);
+    static uint64_t DELAY_RECYCLE_TIME = Cycles::fromMicroseconds(200);
+    serverRpcZombies.emplace_back(
+            context->dispatch->currentTime + DELAY_RECYCLE_TIME, serverRpc);
     timeTrace("deleted server RPC, clientId %u, sequence %u, %u incoming RPCs",
             serverRpc->rpcId.clientId, sequence, incomingRpcs.size());
 }
@@ -1959,7 +1961,7 @@ BasicTransport::Poller::poll()
     // Delete serverRpc objects that are scheduled to be recycled.
     for (auto it = t->serverRpcZombies.begin();
             it != t->serverRpcZombies.end(); ) {
-        if (t->driver->packetsOnTheWire >= it->first) {
+        if (now > it->first) {
             t->serverRpcPool.destroy(it->second);
             it = t->serverRpcZombies.erase(it);
         } else {

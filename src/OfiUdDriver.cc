@@ -689,7 +689,6 @@ OfiUdDriver::reapTransmitBuffers(int txid)
                 BufferDescriptor* bd = txBuffersInUse->front();
                 txBuffersInUse->pop_front();
                 txPool[txid]->freeBuffers.push_back(bd);
-                packetsOnTheWire++;
                 if (bd == signaledCompletion) {
                     matchSignal = true;
                     break;
@@ -706,7 +705,6 @@ OfiUdDriver::reapTransmitBuffers(int txid)
         for (int i = 0; i < numCqes; i++) {
             BufferDescriptor* bd = context_to_bd(cqes[i].op_context);
             txPool[txid]->freeBuffers.push_back(bd);
-            packetsOnTheWire++;
 #if LOG_TX_COMPLETE_TIME
             if (bd->packetLength >= 4000) {
                 uint64_t delayed = now - bd->transmitTime;
@@ -849,7 +847,6 @@ OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
         ret = downCast<int>(fi_inject(ep, bd->buffer, bd->packetLength,
                 dstAddr));
         txPool[txid]->freeBuffers.push_back(bd);
-        packetsOnTheWire++;
     } else {
         ret = downCast<int>(fi_sendv(ep, io_vec, desc, iov_count, dstAddr,
                 &bd->context));
@@ -857,7 +854,6 @@ OfiUdDriver::sendPacketImpl(int txid, int remoteRxid,
             (*txBuffersInNic)[txid].push_back(bd);
         }
     }
-    packetsEnqueued++;
     if (ret) {
         DIE("Error posting transmit packet: %s", fi_strerror(-ret));
     }
