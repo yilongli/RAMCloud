@@ -1665,12 +1665,11 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         }
     };
 
-//    uint64_t activeCycles = context->dispatch->dispatchActiveCycles;
-//    uint64_t totalBytesSent = 0;
+    uint64_t activeCycles = context->dispatch->dispatchActiveCycles;
+    uint64_t totalBytesSent = 0;
 
-    // FIXME: docs
 #if !PIGGYBACK_SHUFFLE_MSG
-    int numOutMessages = group->size()
+    int numOutMessages = group->size();
 #else
     int numOutMessages = (group->size() + 1) / 2;
     if (group->size() % 2 == 0) {
@@ -1689,7 +1688,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         ServerId serverId = group->getNode(group->rank + i);
         messageTrackers[i].construct(serverId,
                 sessions[serverId.indexNumber()-1], message);
-//        totalBytesSent += message->size();
+        totalBytesSent += message->size();
     }
 
     // Performance stats.
@@ -1759,7 +1758,6 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                         messageTracker->receiveOffset += reply->size();
                     }
 #endif
-
                     messageTracker->outstandingRpc.destroy();
                     if (messageTracker->isDone()) {
                         messagesUnfinished--;
@@ -1774,7 +1772,10 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                     continue;
                 }
             }
-            candidates.push_back(i);
+
+            if (messageTrackers[i]->getBytesLeft() > 0) {
+                candidates.push_back(i);
+            }
         }
 
         // TODO: what should be a healthy amout of pending RPCs?
@@ -1785,8 +1786,9 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         // Power-of-two LRPT policy.
         int index = -1;
         uint32_t maxBytesLeft = 0;
-        if (!candidates.empty() && (outstandingChunks < maxOutstandingChunks)
-                && (transmitPendingRpcs < maxTxPendingRpcs)) {
+        bool readyToSend = (outstandingChunks < maxOutstandingChunks) &&
+                (transmitPendingRpcs < maxTxPendingRpcs);
+        if (!candidates.empty() && readyToSend) {
             for (int choice = 0; choice < maxChoices; choice++) {
                 int idx = candidates[Util::wyhash64() % candidates.size()];
                 uint32_t bytesLeft = messageTrackers[idx]->getBytesLeft();
@@ -1798,14 +1800,7 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         }
 
         // Send out one more chunk of data, if appropriate.
-        if ((transmitPendingRpcs < maxTxPendingRpcs) &&
-                (outstandingChunks < maxOutstandingChunks) && (index >= 0)) {
-            if ((transmitPendingRpcs + 1 == maxTxPendingRpcs) ||
-                    (outstandingChunks + 1 == maxOutstandingChunks)) {
-                timeTraceSp("shuffle: ready to send again, "
-                        "transmitPendingRpcs %u, outstandingChunks %u",
-                        transmitPendingRpcs, outstandingChunks);
-            }
+        if (readyToSend && (index >= 0)) {
             uint64_t now = Cycles::rdtsc();
             messageTrackers[index]->lastTransmitTime = now;
             messageTrackers[index]->sendMessageChunk(context, group->rank,
@@ -1822,14 +1817,16 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         Arachne::yield();
     }
 
-//    activeCycles = context->dispatch->dispatchActiveCycles - activeCycles;
-//    uint64_t elapsed = Cycles::rdtsc() - shuffleStart;
-//    timeTraceSp("shuffle: operation completed, idle %u us, active %u us, "
-//            "active BW %u Gbps, actual BW %u Gbps",
-//            Cycles::toMicroseconds(elapsed - activeCycles),
-//            Cycles::toMicroseconds(activeCycles),
-//            uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(activeCycles)),
-//            uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(elapsed)));
+    activeCycles = context->dispatch->dispatchActiveCycles - activeCycles;
+    uint64_t elapsed = Cycles::rdtsc() - shuffleStart;
+#if !PIGGYBACK_SHUFFLE_MSG
+    timeTraceSp("shuffle: operation completed, idle %u us, active %u us, "
+            "active BW %u Gbps, actual BW %u Gbps",
+            Cycles::toMicroseconds(elapsed - activeCycles),
+            Cycles::toMicroseconds(activeCycles),
+            uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(activeCycles)),
+            uint32_t(double(totalBytesSent)*8e-9/Cycles::toSeconds(elapsed)));
+#endif
 }
 
 void
@@ -1842,6 +1839,7 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
     const uint32_t chunkSize = reqHdr->chunkSize;
     const uint32_t senderId = downCast<uint32_t>(reqHdr->senderId);
     rpc->requestPayload->truncateFront(sizeof(*reqHdr));
+    respHdr->receiverId = world->rank;
 
     switch (reqHdr->dataId) {
         case ALLSHUFFLE_PIVOTS: {
