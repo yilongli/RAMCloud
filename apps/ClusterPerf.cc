@@ -3172,8 +3172,10 @@ echo_workload()
 void
 collectiveBandwidth(bool bidirectional)
 {
-    vector<uint32_t> outgoingSizes = {1000, 4000, 8000, 16000, 32000};
-    vector<string> ids = {"1K", "4K", "8K", "16K", "32K"};
+    vector<uint32_t> outgoingSizes = {1000};
+    vector<string> ids = {"1K"};
+//    vector<uint32_t> outgoingSizes = {1000, 4000, 8000, 16000, 32000};
+//    vector<string> ids = {"1K", "4K", "8K", "16K", "32K"};
 
     // Choose the corresponding server in the server list as the receiver.
     ServerMap servers;
@@ -7811,7 +7813,7 @@ allShuffleImpl(std::vector<int> sizes)
     // operation between a specific number of servers.
     for (int size : sizes) {
     for (int machineCount = numMasters; machineCount <= numMasters; machineCount++) {
-//    for (int machineCount = 120; machineCount <= 180; machineCount += 20) {
+//    for (int machineCount = 20; machineCount <= numMasters; machineCount += 20) {
     for (int startOffset = 0; startOffset < 1; startOffset++) {
 //    for (int startOffset = 0; startOffset < machineCount; startOffset++) {
         // Let the cluster idle for a while (e.g., 100 ms) to reduce influence
@@ -7866,8 +7868,8 @@ allShuffleImpl(std::vector<int> sizes)
         BenchmarkCollectiveOpRpc rpc(context, count, WireFormat::SHUFFLE_PUSH,
                 messageSize);
         Buffer* result = rpc.wait();
-        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, response size %u",
-                result->size());
+        LOG(NOTICE, "BenchmarkCollectiveOpRpc completed, messageSize %d, "
+                "response size %u", messageSize, result->size());
 
         // Retrieve the shuffle completion times of each machine from the RPC
         // response buffer.
@@ -7961,11 +7963,11 @@ void
 allShuffle()
 {
 //    allShuffleImpl({15000, 20000, 25000, 30000, 35000, 40000});
-//    allShuffleImpl({1000, 4000, 8000, 10000, 12000, 14000});
+    allShuffleImpl({1000, 4000, 8000, 10000, 12000, 14000, 32000, 64000});
 //    allShuffleImpl({1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000,
 //                    10000, 11000, 12000, 13000, 14000, 15000, 20000, 25000,
 //                    30000, 35000, 40000, 45000, 50000, 55000, 60000});
-    allShuffleImpl({objectSize});
+//    allShuffleImpl({objectSize});
 }
 
 // The following struct and table define each performance test in terms of

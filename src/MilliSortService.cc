@@ -104,7 +104,7 @@ namespace {
 
 // Change 0 -> 1 in the following line to piggyback shuffle message chunks in
 // the responses of shuffle RPCs to reduce # RPCs to send.
-#define PIGGYBACK_SHUFFLE_MSG 0
+#define PIGGYBACK_SHUFFLE_MSG 1
 
 // Change 0 -> 1 in the following line to use the more sophisticated pivot
 // selection algorithm which generates much more balanced data buckets.
