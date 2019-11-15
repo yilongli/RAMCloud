@@ -54,8 +54,9 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
     , numPayloadsToMerge()
     , sendData()
 {
-    if (unlikely(group->size() == 1)) {
-        DIE("Gather of 1 node is currently broken!!!!");
+    // Special case: there is only one node; nothing to do.
+    if (group->size() == 1) {
+        return;
     }
 
     // The gather tree assumes node 0 to be the root. Therefore, to find the

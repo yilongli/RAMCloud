@@ -565,6 +565,8 @@ class MilliSortService : public Service {
         BROADCAST_DATA_BUCKET_BOUNDARIES,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_RECORD,
+        ALLSHUFFLE_RECORD_ROW,
+        ALLSHUFFLE_RECORD_COL,
         ALLSHUFFLE_BENCHMARK,
         POINT2POINT_BENCHMARK,
     };
@@ -588,15 +590,22 @@ class MilliSortService : public Service {
             uint32_t offset, Buffer* messageChunk);
     void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
+    void handleShuffleRowChunk(uint32_t senderId, uint32_t totalLength,
+            uint32_t offset, Buffer* messageChunk);
+    void handleShuffleColChunk(uint32_t senderId, uint32_t totalLength,
+            uint32_t offset, Buffer* messageChunk);
     void shuffleRecords();
     void startMergeSorter(bool shuffleDone);
     void rearrangeFinalVals();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
+    void debugLogKeys(const char* prefix, int numKeys, PivotKey* keys);
 
     enum CommunicationGroupId {
         WORLD                   = 0,
         MY_PIVOT_SERVER_GROUP   = 1,
         ALL_PIVOT_SERVERS       = 2,
+        TWO_LEVEL_ROW_SERVERS   = 3,
+        TWO_LEVEL_COL_SERVERS   = 4,
     };
 
     enum PivotTag : uint8_t {
@@ -713,6 +722,17 @@ class MilliSortService : public Service {
     /// True means we are ready to service incoming record shuffle RPCs.
     std::atomic_bool recordShuffleIsReady;
 
+    // TODO: doc.
+    Tub<std::vector<Buffer>> rowShuffleMessages;
+    Tub<std::vector<Buffer>> colShuffleMessages;
+    Tub<std::vector<SpinLock>> colShuffleMessageLocks;
+    std::atomic_bool rowShuffleIsReady;
+    std::atomic_bool colShuffleIsReady;
+    std::atomic<int> rowShuffleRxCount;
+    std::atomic<int> colShuffleRxCount;
+    Tub<std::vector<std::atomic<uint32_t>>> rowShuffleProgress;
+    Tub<std::vector<std::atomic<uint32_t>>> colShuffleProgress;
+
     /// Used to sort keys as they arrive during the final key shuffle stage.
     Tub<Merge<PivotKey>> mergeSorter;
 
@@ -733,6 +753,14 @@ class MilliSortService : public Service {
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
+
+    /// Contains all nodes that belong to the same row in the 2-level shuffle
+    /// grid.
+    Tub<CommunicationGroup> twoLevelShuffleRowGroup;
+
+    /// Contains all nodes that belong to the same column in the 2-level shuffle
+    /// grid.
+    Tub<CommunicationGroup> twoLevelShuffleColGroup;
 
     /// Sessions to all nodes in #world.
     std::vector<Transport::SessionRef> sessions;

@@ -106,6 +106,10 @@ namespace {
 // the responses of shuffle RPCs to reduce # RPCs to send.
 #define PIGGYBACK_SHUFFLE_MSG 1
 
+// Change 0 -> 1 in the following line to enable two-level shuffle in the record
+// shuffle step.
+#define TWO_LEVEL_SHUFFLE 0
+
 // Change 0 -> 1 in the following line to use the more sophisticated pivot
 // selection algorithm which generates much more balanced data buckets.
 #define GRADIENT_BASED_PIVOT_SELECTION 1
@@ -167,12 +171,23 @@ MilliSortService::MilliSortService(Context* context,
     , recordShuffleProgress()
     , recordShuffleMessages()
     , recordShuffleIsReady()
+    , rowShuffleMessages()
+    , colShuffleMessages()
+    , colShuffleMessageLocks()
+    , rowShuffleIsReady()
+    , colShuffleIsReady()
+    , rowShuffleRxCount()
+    , colShuffleRxCount()
+    , rowShuffleProgress()
+    , colShuffleProgress()
     , mergeSorter()
     , mergeSorterPoller()
     , mergeSorterIsReady()
     , mergeSorterLock("MilliSortService::mergeSorter")
     , pendingMergeReqs()
     , world()
+    , twoLevelShuffleRowGroup()
+    , twoLevelShuffleColGroup()
     , sessions()
     , myPivotServerGroup()
     , gatheredPivots()
@@ -387,6 +402,31 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         allPivotServers.destroy();
     }
 
+#if TWO_LEVEL_SHUFFLE
+    // TODO: compute ncols and nrows without using FP arithmetic
+    int ncols = downCast<int>(ceil(sqrt(world->size())));
+    int nrows = downCast<int>(ceil(world->size() / ncols));
+    if (ncols * nrows != world->size()) {
+        DIE("Unsupported # servers? ncols %d, nrows %d", ncols, nrows);
+    }
+    int rowId = world->rank / ncols;
+    int colId = world->rank % ncols;
+    nodes.clear();
+    for (int i = rowId * ncols; i < (rowId + 1) * ncols; i++) {
+        if (i >= world->size()) {
+            break;
+        }
+        nodes.push_back(world->getNode(i));
+    }
+    twoLevelShuffleRowGroup.construct(TWO_LEVEL_ROW_SERVERS, colId, nodes);
+
+    nodes.clear();
+    for (int i = colId; i < world->size(); i += ncols) {
+        nodes.push_back(world->getNode(i));
+    }
+    twoLevelShuffleColGroup.construct(TWO_LEVEL_COL_SERVERS, rowId, nodes);
+#endif
+
     // Generate data tuples.
     rand.construct(serverId.indexNumber());
     for (int i = 0; i < numDataTuples; i++) {
@@ -427,6 +467,19 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     recordShuffleProgress.construct(world->size());
     recordShuffleMessages.construct(world->size());
     recordShuffleIsReady = false;
+
+#if TWO_LEVEL_SHUFFLE
+    rowShuffleMessages.construct(twoLevelShuffleRowGroup->size());
+    colShuffleMessages.construct(twoLevelShuffleColGroup->size());
+    colShuffleMessageLocks.construct(twoLevelShuffleColGroup->size());
+    rowShuffleIsReady = false;
+    colShuffleIsReady = false;
+    rowShuffleRxCount = 0;
+    colShuffleRxCount = 0;
+    rowShuffleProgress.construct(twoLevelShuffleRowGroup->size());
+    colShuffleProgress.construct(twoLevelShuffleColGroup->size());
+#endif
+
     mergeSorter.destroy();
 #if ENABLE_MERGE_SORTER
     mergeSorter.construct(world->size(), numDataTuples * MAX_IMBALANCE_RATIO,
@@ -1220,6 +1273,7 @@ MilliSortService::shuffleRecords() {
     }
     ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
 
+#if !TWO_LEVEL_SHUFFLE
     // Push records to the right node they belong to (records that should
     // remain in the local node are also sent in the same way to simplify code).
     timeTrace("about to shuffle records");
@@ -1239,6 +1293,49 @@ MilliSortService::shuffleRecords() {
     while (recordShuffleRxCount.load() < world->size()) {
         Arachne::yield();
     }
+#else
+    // Push records to the right node they belong to (records that should
+    // remain in the local node are also sent in the same way to simplify code).
+    timeTrace("about to shuffle records within row group, size %d",
+            twoLevelShuffleRowGroup->size());
+    // Each iteration of the following loop assembles one "row-shuffle" message;
+    // each of which aggregates `nrows` actual shuffle messages.
+    int ncols = twoLevelShuffleRowGroup->size();
+    for (int target = 0; target < ncols; target++) {
+        // Each iteration of the following loop adds one actual message into
+        // the aggregated "row-shuffle" message, with a preceding 32-bit
+        // unsigned int describing its length.
+        Buffer* message = &rowShuffleMessages->at(target);
+        for (int rank = target; rank < world->size(); rank += ncols) {
+            int keyIdx, numKeys;
+            std::tie(keyIdx, numKeys) = dataBucketRanges[rank];
+            uint32_t msgBytes = (PivotKey::SIZE + Value::SIZE) * numKeys;
+            message->appendCopy(&msgBytes);
+            message->append(&localKeys[keyIdx], numKeys * PivotKey::SIZE);
+            message->append(&localValues[keyIdx], numKeys * Value::SIZE);
+        }
+        ADD_COUNTER(shuffleKeysOutputBytes, message->size());
+    }
+    rowShuffleIsReady = true;
+    invokeShufflePush(twoLevelShuffleRowGroup.get(), ALLSHUFFLE_RECORD_ROW,
+            rowShuffleMessages.get());
+
+    // Wait until we have received all keys that belong to us.
+    while (rowShuffleRxCount.load() < twoLevelShuffleRowGroup->size()) {
+        Arachne::yield();
+    }
+
+    timeTrace("about to shuffle records within column group, size %d",
+            twoLevelShuffleColGroup->size());
+    colShuffleIsReady = true;
+    invokeShufflePush(twoLevelShuffleColGroup.get(), ALLSHUFFLE_RECORD_COL,
+            colShuffleMessages.get());
+
+    // Wait until we have received all keys that belong to us.
+    while (colShuffleRxCount.load() < twoLevelShuffleColGroup->size()) {
+        Arachne::yield();
+    }
+#endif
     numSortedItems = numRecordsReceived;
 
     STOP_TIMER(shuffleKeysElapsedTime);
@@ -1377,15 +1474,22 @@ MilliSortService::rearrangeFinalVals()
 void
 MilliSortService::debugLogKeys(const char* prefix, vector<PivotKey>* keys)
 {
+    debugLogKeys(prefix, keys->size(), keys->data());
+}
+
+void
+MilliSortService::debugLogKeys(const char* prefix, int numKeys, PivotKey* keys)
+{
 #if LOG_INTERMEDIATE_RESULT
     string result;
     uint64_t checksum = 0;
     uint64_t index = 0;
-    for (PivotKey& sortKey : *keys) {
-        result += std::to_string(sortKey.keyAsUint64());
+    for (int i = 0; i < numKeys; i++) {
+        PivotKey* sortKey = keys + i;
+        result += std::to_string(sortKey->keyAsUint64());
         result += " ";
         index++;
-        checksum += sortKey.keyAsUint64() * index;
+        checksum += sortKey->keyAsUint64() * index;
     }
     LOG(NOTICE, "%s (csum = %s) %s", prefix, std::to_string(checksum).c_str(),
             result.c_str());
@@ -1577,6 +1681,114 @@ MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
     }
 }
 
+void
+MilliSortService::handleShuffleRowChunk(uint32_t senderId, uint32_t totalLength,
+        uint32_t offset, Buffer* messageChunk)
+{
+    // Special case: not a real chunk; this is a side-effect of piggybacking
+    // shuffle message chunks in RPC responses.
+    if (offset > totalLength) {
+        return;
+    }
+
+    uint32_t len = messageChunk->size();
+    if (offset + len < totalLength) {
+        // TODO: fix this limitation? we need at least 3 more things:
+        // 1) record # bytes in the last incomplete msg
+        // 2) a temp buffer to hold the last incomplete msg
+        // 2) serialize the processing of msg chunks
+        DIE("row message must fit in one chunk for now!");
+    }
+
+    // Each iteration of the following loop slices out one shuffle message and
+    // redirects it to the right out buffer.
+    uint32_t curOffset = 0;
+    for (int i = 0; i < twoLevelShuffleColGroup->size(); i++) {
+        uint32_t msgBytes = *messageChunk->getOffset<uint32_t>(curOffset);
+        curOffset += sizeof32(msgBytes);
+        SpinLock::Guard _(colShuffleMessageLocks->at(i));
+        colShuffleMessages->at(i).appendCopy(&msgBytes);
+        colShuffleMessages->at(i).appendCopy(messageChunk, curOffset, msgBytes);
+        curOffset += msgBytes;
+    }
+
+    if (offset + len == totalLength) {
+        rowShuffleRxCount.fetch_add(1);
+        ADD_COUNTER(shuffleKeysInputBytes, totalLength);
+        ADD_COUNTER(shuffleKeysOutputBytes, totalLength);
+    }
+}
+
+void
+MilliSortService::handleShuffleColChunk(uint32_t senderId, uint32_t totalLength,
+        uint32_t offset, Buffer* messageChunk)
+{
+    // Special case: not a real chunk; this is a side-effect of piggybacking
+    // shuffle message chunks in RPC responses.
+    if (offset > totalLength) {
+        return;
+    }
+
+    int ncols = twoLevelShuffleRowGroup->size();
+    uint32_t dataBytes = totalLength - sizeof32(uint32_t) * ncols;
+    assert(dataBytes % (PivotKey::SIZE + Value::SIZE) == 0);
+    uint32_t len = messageChunk->size();
+    assert(offset + len <= totalLength);
+
+    if (offset + len < totalLength) {
+        // TODO: fix this limitation?
+        DIE("col message must fit in one chunk for now!");
+    }
+
+    // Each iteration of the following loop processes one original shuffle
+    // message.
+    uint32_t curOffset = 0;
+    for (int i = 0; i < ncols; i++) {
+        uint32_t msgBytes = *messageChunk->getOffset<uint32_t>(curOffset);
+        curOffset += sizeof32(msgBytes);
+
+        uint32_t realSenderId = senderId * ncols + i;
+        std::atomic<int>* resv = &shuffleRecordResv->at(realSenderId);
+        int numRecords = msgBytes / (PivotKey::SIZE + Value::SIZE);
+        resv->store(numRecordsReceived.fetch_add(numRecords));
+
+        // Copy incoming keys to their destination.
+        const uint32_t startIdx = downCast<uint32_t>(resv->load());
+        uint32_t keyBytes = numRecords * PivotKey::SIZE;
+        char* dst = reinterpret_cast<char*>(&incomingKeys[startIdx]);
+        memcpy(dst, messageChunk->getRange(curOffset, keyBytes), keyBytes);
+        curOffset += keyBytes;
+
+        // Copy incoming values to their destination.
+        uint32_t valueBytes = numRecords * Value::SIZE;
+        dst = reinterpret_cast<char*>(&incomingValues[startIdx]);
+        memcpy(dst, messageChunk->getRange(curOffset, valueBytes), valueBytes);
+        curOffset += valueBytes;
+
+        // Fix the value indices of incoming keys.
+        for (uint32_t i = startIdx; i < startIdx + numRecords; i++) {
+            incomingKeys[i].index = i;
+        }
+
+#if ENABLE_MERGE_SORTER
+        // Notify the merge sorter about the incoming keys.
+        mergeSorterLock.lock();
+        if (mergeSorterIsReady) {
+            mergeSorter->poll(&incomingKeys[startIdx], numRecords);
+        } else {
+            pendingMergeReqs.emplace_back(&incomingKeys[startIdx],
+                    numRecords);
+        }
+        mergeSorterLock.unlock();
+#endif
+    }
+
+    if (offset + len == totalLength) {
+        colShuffleRxCount.fetch_add(1);
+        ADD_COUNTER(shuffleKeysInputBytes, totalLength);
+    }
+}
+
 /**
  *
  * \param group
@@ -1596,6 +1808,9 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
 
         /// Rank of the message receiver within the communication group of the
         /// shuffle operation.
+        uint32_t rank;
+
+        /// ServerId of the message receiver. Used for logging only.
         uint32_t receiverId;
 
         /// Session to the receiver.
@@ -1619,9 +1834,10 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
         /// Time, in rdtsc ticks, when we send out #outstandingRpc.
         uint64_t lastTransmitTime;
 
-        ShuffleMessageTracker(ServerId serverId, Transport::SessionRef session,
-                Buffer* message)
+        ShuffleMessageTracker(uint32_t rank, ServerId serverId,
+                Transport::SessionRef session, Buffer* message)
             : outstandingRpc()
+            , rank(rank)
             , receiverId(serverId.indexNumber() - 1)
             , session(session)
             , transmitTotalLength(message->size())
@@ -1684,9 +1900,10 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
     std::unique_ptr<Tub<ShuffleMessageTracker>[]> messageTrackers(
             new Tub<ShuffleMessageTracker>[numOutMessages]);
     for (int i = 0; i < numOutMessages; i++) {
-        Buffer* message = &(*outMessages)[(group->rank + i) % group->size()];
-        ServerId serverId = group->getNode(group->rank + i);
-        messageTrackers[i].construct(serverId,
+        uint32_t remoteRank = (group->rank + i) % group->size();
+        Buffer* message = &(*outMessages)[remoteRank];
+        ServerId serverId = group->getNode(remoteRank);
+        messageTrackers[i].construct(remoteRank, serverId,
                 sessions[serverId.indexNumber()-1], message);
         totalBytesSent += message->size();
     }
@@ -1744,14 +1961,21 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                                 respHdr->totalLength);
                     }
                     reply->truncateFront(sizeof32(*respHdr));
-                    if (messageTracker->receiverId !=
-                            group->getNode(group->rank).indexNumber() - 1) {
+                    if (messageTracker->rank != group->rank) {
                         if (dataId == ALLSHUFFLE_PIVOTS) {
-                            copyOutShufflePivots(messageTracker->receiverId,
+                            copyOutShufflePivots(messageTracker->rank,
                                     messageTracker->receiveTotalLength,
                                     respOffset, reply);
                         } else if (dataId == ALLSHUFFLE_RECORD) {
-                            copyOutShuffleRecords(messageTracker->receiverId,
+                            copyOutShuffleRecords(messageTracker->rank,
+                                    messageTracker->receiveTotalLength,
+                                    respOffset, reply);
+                        } else if (dataId == ALLSHUFFLE_RECORD_ROW) {
+                            handleShuffleRowChunk(messageTracker->rank,
+                                    messageTracker->receiveTotalLength,
+                                    respOffset, reply);
+                        } else if (dataId == ALLSHUFFLE_RECORD_COL) {
+                            handleShuffleColChunk(messageTracker->rank,
                                     messageTracker->receiveTotalLength,
                                     respOffset, reply);
                         }
@@ -1808,6 +2032,9 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
             outstandingChunks++;
 
             if (dataId == ALLSHUFFLE_RECORD) {
+                INC_COUNTER(shuffleKeysSentRpcs);
+            } else if ((dataId == ALLSHUFFLE_RECORD_ROW) ||
+                    (dataId == ALLSHUFFLE_RECORD_COL)) {
                 INC_COUNTER(shuffleKeysSentRpcs);
             } else if (dataId == ALLSHUFFLE_PIVOTS) {
                 // TODO
@@ -1918,6 +2145,86 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             respHdr->offset = offset;
             rpc->replyPayload->appendExternal(
                     &recordShuffleMessages->at(senderId), offset, chunkSize);
+#endif
+            break;
+        }
+        case ALLSHUFFLE_RECORD_ROW: {
+            timeTraceSp("shuffle-row: received message chunk from server %u,"
+                    " offset %u, len %u", senderId, offset,
+                    rpc->requestPayload->size());
+            if (rpc->requestPayload->size() > 0) {
+                // Serialize the processing of incoming message chunks that
+                // belong to the same message to prevent duplicate RPCs from
+                // corrupting #incomingKeys.
+                std::atomic<uint32_t>* bytesReceived =
+                        &rowShuffleProgress->at(senderId);
+                while (bytesReceived->load() < offset) {
+                    Arachne::yield();
+                }
+                uint32_t expected = offset;
+                if (bytesReceived->compare_exchange_strong(expected,
+                        offset + rpc->requestPayload->size())) {
+                    INC_COUNTER(shuffleKeysReceivedRpcs);
+                    handleShuffleRowChunk(senderId, totalLength, offset,
+                            rpc->requestPayload);
+                } else {
+                    LOG(WARNING, "RowShuffle: ignore duplicate message "
+                            "chunk from senderId %u, offset %u", senderId,
+                            offset);
+                }
+            }
+
+            // Piggyback a message chunk, if any, in the RPC response.
+#if PIGGYBACK_SHUFFLE_MSG
+            if (senderId == twoLevelShuffleRowGroup->rank) break;
+            while (!rowShuffleIsReady.load()) {
+                Arachne::yield();
+            }
+
+            respHdr->totalLength = rowShuffleMessages->at(senderId).size();
+            respHdr->offset = offset;
+            rpc->replyPayload->appendExternal(
+                    &rowShuffleMessages->at(senderId), offset, chunkSize);
+#endif
+            break;
+        }
+        case ALLSHUFFLE_RECORD_COL: {
+            timeTraceSp("shuffle-col: received message chunk from server %u,"
+                    " offset %u, len %u", senderId, offset,
+                    rpc->requestPayload->size());
+            if (rpc->requestPayload->size() > 0) {
+                // Serialize the processing of incoming message chunks that
+                // belong to the same message to prevent duplicate RPCs from
+                // corrupting #incomingKeys.
+                std::atomic<uint32_t>* bytesReceived =
+                        &colShuffleProgress->at(senderId);
+                while (bytesReceived->load() < offset) {
+                    Arachne::yield();
+                }
+                uint32_t expected = offset;
+                if (bytesReceived->compare_exchange_strong(expected,
+                        offset + rpc->requestPayload->size())) {
+                    INC_COUNTER(shuffleKeysReceivedRpcs);
+                    handleShuffleColChunk(senderId, totalLength, offset,
+                            rpc->requestPayload);
+                } else {
+                    LOG(WARNING, "ColShuffle: ignore duplicate message "
+                            "chunk from senderId %u, offset %u", senderId,
+                            offset);
+                }
+            }
+
+            // Piggyback a message chunk, if any, in the RPC response.
+#if PIGGYBACK_SHUFFLE_MSG
+            if (senderId == twoLevelShuffleColGroup->rank) break;
+            while (!colShuffleIsReady.load()) {
+                Arachne::yield();
+            }
+
+            respHdr->totalLength = colShuffleMessages->at(senderId).size();
+            respHdr->offset = offset;
+            rpc->replyPayload->appendExternal(
+                    &colShuffleMessages->at(senderId), offset, chunkSize);
 #endif
             break;
         }
