@@ -2465,11 +2465,13 @@ MilliSortService::benchmarkCollectiveOp(
 
                 void clear() { localBuf.reset(); }
 
-                void fillBuffer(Buffer* out) { out->appendExternal(&localBuf); }
+                void fillBuffer(Buffer* out) { out->appendCopy(&localBuf); }
 
                 Buffer localBuf;
             };
             DataMerger merger;
+            std::fill(data.get(), data.get() + reqHdr->dataSize,
+                    world->rank % 256);
             merger.localBuf.appendExternal(data.get(), reqHdr->dataSize);
 
             uint64_t startTime = context->clockSynchronizer->getConverter(
@@ -2481,6 +2483,10 @@ MilliSortService::benchmarkCollectiveOp(
             while (Cycles::rdtsc() < startTime) {}
             timeTrace("AllGather operation started, run %d", reqHdr->count);
 
+#if 0
+            // Randomly sleep 0-100us to test the robustness of the protocol.
+            Arachne::sleep((uint64_t(generateRandom()) % 100) * 1000);
+#endif
             const int DUMMY_OP_ID = 999;
             Tub<AllGather> allGatherOp;
             invokeCollectiveOp<AllGather>(allGatherOp, DUMMY_OP_ID, context,
@@ -2503,6 +2509,24 @@ MilliSortService::benchmarkCollectiveOp(
                         merger.localBuf.size());
                 timeTrace("Unexpected final data size %d",
                         merger.localBuf.size());
+            } else {
+                uint32_t offset = 0;
+                bool checkFailed = false;
+                for (int i = 0; i < world->size(); i++) {
+                    char expected = *merger.localBuf.read<char>(&offset);
+                    for (uint32_t j = 1; j < reqHdr->dataSize; j++) {
+                        char actual = *merger.localBuf.read<char>(&offset);
+                        if (expected != actual) {
+                            timeTrace("All-gather result corrupted at index "
+                                    "%u, expected %u, actual %u", offset - 1,
+                                    expected, actual);
+                            checkFailed = true;
+                        }
+                    }
+                }
+                if (checkFailed) {
+                    LOG(ERROR, "All-gather result corrupted");
+                }
             }
         }
     } else if (reqHdr->opcode == WireFormat::SHUFFLE_PUSH) {

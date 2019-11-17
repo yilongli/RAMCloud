@@ -77,7 +77,7 @@ class AllGather {
                     downCast<uint32_t>(opId)));
             reqHdr->phase = phase;
             reqHdr->senderId = senderId;
-            request->appendExternal(data);
+            request->appendCopy(data);
         }
 
         /// \copydoc ServerIdRpcWrapper::waitAndCheckErrors
@@ -150,8 +150,11 @@ class AllGather {
     /// Ongoing RPCs that are sending data to peer nodes.
     OutstandingRpcs outstandingRpcs;
 
-    /// Allocated here to pay the object creation cost only once.
-    Buffer dataBuf;
+    /// Temporary holder of the data to be transmitted by #outstandingRpcs.
+    /// Note the buffer does *NOT* own the data so AllGatherRpc's must use
+    /// Buffer::appendCopy to include data into its internal request buffer.
+    /// Allocated here to pay the cost of allocation only once.
+    Buffer tempSendBuf;
 
     DISALLOW_COPY_AND_ASSIGN(AllGather)
 };

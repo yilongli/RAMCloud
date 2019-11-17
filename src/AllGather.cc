@@ -52,7 +52,7 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
     , nearestPowerOfTwo()
     , numRecursiveDoublingSteps(0)
     , outstandingRpcs()
-    , dataBuf()
+    , tempSendBuf()
 {
     int n = group->size();
     if (n == 1) {
@@ -100,14 +100,14 @@ AllGather::AllGather(int opId, Context* context, CommunicationGroup* group,
     }
     receivedRpc.construct(lastPhase + 1);
 
-    dataBuf.appendExternal(data, length);
+    tempSendBuf.appendExternal(data, length);
     std::vector<int> targets;
     getPeersToSend(currentPhase, &targets);
     for (int target : targets) {
         timeTrace("AllGather: sending to server %d, phase %d", target,
                 currentPhase.load());
         outstandingRpcs.emplace_back(context, group->getNode(target), opId,
-                currentPhase, group->rank, &dataBuf);
+                currentPhase, group->rank, &tempSendBuf);
     }
 }
 
@@ -218,14 +218,14 @@ AllGather::handleRpc(const WireFormat::AllGather::Request* reqHdr,
     if (nextPhase <= lastPhase) {
         std::vector<int> targets;
         getPeersToSend(nextPhase, &targets);
-        dataBuf.reset();
-        merger->fillBuffer(&dataBuf);
+        tempSendBuf.reset();
+        merger->fillBuffer(&tempSendBuf);
         for (int target : targets) {
             // Start sending RPCs of the next phase.
             timeTrace("AllGather: sending to server %d, phase %d, size %u",
-                    target, nextPhase, dataBuf.size());
+                    target, nextPhase, tempSendBuf.size());
             outstandingRpcs.emplace_back(context, group->getNode(target), opId,
-                    nextPhase, group->rank, &dataBuf);
+                    nextPhase, group->rank, &tempSendBuf);
         }
 
         // Check if some older RPCs have finished and then advance the phase.
