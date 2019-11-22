@@ -374,17 +374,22 @@ class MilliSortService : public Service {
 
     struct RandomGenerator {
         explicit RandomGenerator(uint64_t seed = 1)
-            : state(seed)
+            : wyhash64_x(seed)
         {}
 
         uint64_t
         next()
         {
-            state = (164603309694725029ull * state) % 14738995463583502973ull;
-            return state;
+            wyhash64_x += UINT64_C(0x60bee2bee120fc15);
+            __uint128_t tmp;
+            tmp = (__uint128_t)wyhash64_x * UINT64_C(0xa3b195354a39b70d);
+            uint64_t m1 = (tmp >> 64) ^ tmp;
+            tmp = (__uint128_t)m1 * UINT64_C(0x1b03738712fad5c9);
+            uint64_t m2 = (tmp >> 64) ^ tmp;
+            return m2;
         }
 
-        uint64_t state;
+        uint64_t wyhash64_x;
     };
 
     /// Encapsulates the state of method #rearrangeValues, allowing it to finish

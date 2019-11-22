@@ -77,6 +77,7 @@ LDFLAGS += -fuse-ld=gold
 else ifeq ($(LINKER),bfd)
 LDFLAGS += -fuse-ld=bfd
 endif
+COMFLAGS += -pthread
 # Google sanitizers are not compatible with each other, so only apply one at a
 # time.
 ifeq ($(SANITIZER),address)
@@ -109,7 +110,6 @@ COMFLAGS += -DHOMA_BENCHMARK
 endif
 
 ifeq ($(IPS4O),yes)
-COMFLAGS += -D_REENTRANT=1
 LDFLAGS += -latomic
 endif
 
@@ -139,7 +139,7 @@ LIBS := $(LIB_PATHS) $(EXTRALIBS) $(LOGCABIN_LIB) $(ZOOKEEPER_LIB) \
     -L$(TOP)/arachne-all/CoreArbiter/lib -lCoreArbiter \
 	-lpcrecpp -lboost_program_options \
 	-lprotobuf -lrt -lboost_filesystem -lboost_system \
-	-lpthread -lssl -lcrypto
+	-pthread -lssl -lcrypto
 ifeq ($(DEBUG),yes)
 # -rdynamic generates more useful backtraces when you have debugging symbols
 LIBS += -rdynamic

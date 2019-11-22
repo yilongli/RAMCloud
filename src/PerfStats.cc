@@ -669,6 +669,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricLambda(&diff, perItemCostComputer,
             {"localSortElapsedTime", "millisortInitItems", "cyclesPerNanos"},
             " %8.1f").c_str()));
+    result.append(format("%-40s %s\n", "  Sort rate (10^6 keys/s)",
+            formatMetricLambda(&diff,
+            [] (vector<double>& v) { return v[0]/(v[1]/v[2]); },
+            {"millisortInitItems", "localSortElapsedTime", "cyclesPerMicros"},
+            " %8.2f").c_str()));
 
     result.append("\n=== Rearrange Initial Values (overlapped) ===\n");
     result.append(format("%-40s %s\n", "  Start time (us)",

@@ -86,17 +86,13 @@ namespace {
 // initialize the local keys.
 #define USE_PSEUDO_RANDOM 1
 
-// Change 0 -> 1 in the following line to sort local keys before starting
-// millisort.
-#define BYPASS_LOCAL_SORT 0
-
 // Change 0 -> 1 in the following line to overlap init. value rearrangement
 // with the subsequent partition steps and key shuffle.
 #define OVERLAP_INIT_VAL_REARRANGE 1
 
 // Change 0 -> 1 in the following line to use SeoJin's online merge-sorter for
 // sorting incoming keys; otherwise, ips4o as in local sort.
-#define ENABLE_MERGE_SORTER 1
+#define ENABLE_MERGE_SORTER 0
 
 // Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
 // with record shuffle.
@@ -440,12 +436,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
                 downCast<uint32_t>(i));
         new(&localValues0[i]) Value(key);
     }
-#if BYPASS_LOCAL_SORT
-    std::sort(localKeys, localKeys + numDataTuples);
-#else
 //    cacheflush(localKeys, numDataTuples * PivotKey::SIZE);
 //    cacheflush(localValues0, numDataTuples * Value::SIZE);
-#endif
 
     while (printingResult) {
         Arachne::yield();
@@ -859,25 +851,10 @@ MilliSortService::localSortAndPickPivots()
     {
         ADD_COUNTER(localSortStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(localSortElapsedTime);
-#if BYPASS_LOCAL_SORT
-        ADD_COUNTER(localSortWorkers, 1);
-        // Bypass local sorting until we integrate the ips4o module.
-        // Assume ~11 ns/item using 10 physical cores (or 20 lcores).
-        uint64_t localSortCostMicros =
-                uint64_t(double(numDataTuples) * 11 / 1000.0);
-        uint64_t deadline = Cycles::rdtsc() +
-                Cycles::fromMicroseconds(localSortCostMicros);
-        // Prefetch sorted keys into LLC to simulate the cache state after sort.
-        prefetchMemoryBlock<_MM_HINT_T2>(localKeys,
-                downCast<uint32_t>(numDataTuples) * PivotKey::SIZE);
-        while (Cycles::rdtsc() < deadline) {
-            Arachne::yield();
-        }
-#else
-        ADD_COUNTER(localSortWorkers,
-                Arachne::getCorePolicy()->getCores(0).size());
-        ips4o::parallel::sort(localKeys, localKeys + numDataTuples);
-#endif
+        int numWorkers = Arachne::getCorePolicy()->getCores(0).size();
+        ADD_COUNTER(localSortWorkers, numWorkers);
+        ips4o::parallel::sort(localKeys, localKeys + numDataTuples,
+                std::less<PivotKey>(), numWorkers);
     }
     timeTrace("sorted %d keys", numDataTuples);
 
@@ -1357,9 +1334,10 @@ MilliSortService::shuffleRecords() {
         // record shuffle above? My current suspicion is that the worker threads
         // in ips4o::ArachneThreadPool are not designed with collaborative
         // threading in mind so the ofiud worker threads can't make any progress
-        ADD_COUNTER(onlineMergeSortWorkers,
-                Arachne::getCorePolicy()->getCores(0).size());
-        ips4o::parallel::sort(incomingKeys, incomingKeys + numSortedItems);
+        int numWorkers = Arachne::getCorePolicy()->getCores(0).size();
+        ADD_COUNTER(onlineMergeSortWorkers, numWorkers);
+        ips4o::parallel::sort(incomingKeys, incomingKeys + numSortedItems,
+                std::less<PivotKey>(), numWorkers);
         sortedKeys = incomingKeys;
         timeTrace("sorted %u final keys", numSortedItems);
 #endif

@@ -344,7 +344,7 @@ class Logger {
  *      The level of importance of the message (LogLevel).
  */
 #define RAMCLOUD_BACKTRACE(level) do { \
-    RAMCloud::Logger& _logger = Logger::get(); \
+    RAMCloud::Logger& _logger = RAMCloud::Logger::get(); \
     if (_logger.isLogging(RAMCLOUD_CURRENT_LOG_MODULE, level)) { \
         _logger.logBacktrace(RAMCLOUD_CURRENT_LOG_MODULE, level, HERE); \
     } \
@@ -364,7 +364,7 @@ class Logger {
  *      The arguments to the format string.
  */
 #define RAMCLOUD_LOG(level, format, ...) do { \
-    RAMCloud::Logger& _logger = Logger::get(); \
+    RAMCloud::Logger& _logger = RAMCloud::Logger::get(); \
     if (_logger.isLogging(RAMCLOUD_CURRENT_LOG_MODULE, level)) { \
         _logger.logMessage(false, RAMCLOUD_CURRENT_LOG_MODULE, level, HERE, \
                            format "\n", ##__VA_ARGS__); \
@@ -395,7 +395,7 @@ class Logger {
 #define RAMCLOUD_DIE(format_, ...) do { \
     RAMCLOUD_LOG(RAMCloud::ERROR, format_, ##__VA_ARGS__); \
     RAMCLOUD_BACKTRACE(RAMCloud::ERROR); \
-    Logger::get().sync(); \
+    RAMCloud::Logger::get().sync(); \
     throw RAMCloud::FatalError(HERE, \
                                RAMCloud::format(format_, ##__VA_ARGS__)); \
 } while (0)
