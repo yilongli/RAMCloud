@@ -2053,11 +2053,11 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             timeTraceSp("shuffle-pivot: received message chunk from server %u,"
                     " offset %u, len %u", serverId, offset,
                     rpc->requestPayload->size());
+            std::atomic<uint32_t>* bytesReceived =
+                    &pivotShuffleProgress->at(senderId);
             if (rpc->requestPayload->size() > 0) {
                 // Serialize the processing of incoming message chunks that
                 // belong to the same message to prevent duplicate RPCs.
-                std::atomic<uint32_t>* bytesReceived =
-                        &pivotShuffleProgress->at(senderId);
                 while (bytesReceived->load() < offset) {
                     Arachne::yield();
                 }
@@ -2069,6 +2069,16 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 } else {
                     LOG(WARNING, "PivotShuffle: ignore duplicate message chunk "
                             "from server %u, offset %u", serverId, offset);
+                }
+            } else if (offset == 0) {
+                uint32_t expected = offset;
+                if (bytesReceived->compare_exchange_strong(expected, 1)) {
+                    copyOutShufflePivots(senderId, totalLength, offset,
+                            rpc->requestPayload);
+                } else {
+                    LOG(WARNING, "PivotShuffle: ignore duplicate message "
+                            "chunk from senderId %u, offset %u", senderId,
+                            offset);
                 }
             }
 
@@ -2090,12 +2100,12 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             timeTraceSp("shuffle-record: received message chunk from server %u,"
                     " offset %u, len %u", senderId, offset,
                     rpc->requestPayload->size());
+            std::atomic<uint32_t>* bytesReceived =
+                    &recordShuffleProgress->at(senderId);
             if (rpc->requestPayload->size() > 0) {
                 // Serialize the processing of incoming message chunks that
                 // belong to the same message to prevent duplicate RPCs from
                 // corrupting #incomingKeys.
-                std::atomic<uint32_t>* bytesReceived =
-                        &recordShuffleProgress->at(senderId);
                 while (bytesReceived->load() < offset) {
                     Arachne::yield();
                 }
@@ -2103,6 +2113,16 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 if (bytesReceived->compare_exchange_strong(expected,
                         offset + rpc->requestPayload->size())) {
                     INC_COUNTER(shuffleKeysReceivedRpcs);
+                    copyOutShuffleRecords(senderId, totalLength, offset,
+                            rpc->requestPayload);
+                } else {
+                    LOG(WARNING, "RecordShuffle: ignore duplicate message "
+                            "chunk from senderId %u, offset %u", senderId,
+                            offset);
+                }
+            } else if (offset == 0) {
+                uint32_t expected = offset;
+                if (bytesReceived->compare_exchange_strong(expected, 1)) {
                     copyOutShuffleRecords(senderId, totalLength, offset,
                             rpc->requestPayload);
                 } else {
