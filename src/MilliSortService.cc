@@ -92,7 +92,7 @@ namespace {
 
 // Change 0 -> 1 in the following line to use SeoJin's online merge-sorter for
 // sorting incoming keys; otherwise, ips4o as in local sort.
-#define ENABLE_MERGE_SORTER 0
+#define ENABLE_MERGE_SORTER 1
 
 // Change 0 -> 1 in the following line to overlap merge-sorting incoming keys
 // with record shuffle.
@@ -141,6 +141,7 @@ MilliSortService::MilliSortService(Context* context,
     , communicationGroupTable()
     , ongoingMilliSort()
     , rand()
+    , coresAvail()
     , startTime()
     , partitionStartTime()
     , pivotServerRank(-1)
@@ -176,11 +177,8 @@ MilliSortService::MilliSortService(Context* context,
     , colShuffleRxCount()
     , rowShuffleProgress()
     , colShuffleProgress()
-    , mergeSorter()
-    , mergeSorterPoller()
-    , mergeSorterIsReady()
     , mergeSorterLock("MilliSortService::mergeSorter")
-    , pendingMergeReqs()
+    , mergeSortChunks()
     , world()
     , twoLevelShuffleRowGroup()
     , twoLevelShuffleColGroup()
@@ -423,6 +421,13 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     twoLevelShuffleColGroup.construct(TWO_LEVEL_COL_SERVERS, rowId, nodes);
 #endif
 
+    coresAvail.clear();
+    auto coreList = Arachne::getCorePolicy()->getCores(0);
+    for (uint32_t i = 0; i < coreList.size(); i++) {
+        coresAvail.push_back(coreList[i]);
+    }
+    std::sort(coresAvail.begin(), coresAvail.end());
+
     // Generate data tuples.
     rand.construct(serverId.indexNumber());
     for (int i = 0; i < numDataTuples; i++) {
@@ -472,14 +477,7 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     colShuffleProgress.construct(twoLevelShuffleColGroup->size());
 #endif
 
-    mergeSorter.destroy();
-#if ENABLE_MERGE_SORTER
-    mergeSorter.construct(world->size(), numDataTuples * MAX_IMBALANCE_RATIO,
-            int(Arachne::getCorePolicy()->getCores(0).size()));
-#endif
-    mergeSorterPoller = Arachne::NullThread;
-    mergeSorterIsReady = false;
-    pendingMergeReqs.clear();
+    mergeSortChunks.clear();
     gatheredPivots.clear();
     superPivots.clear();
     pivotBucketBoundaries.clear();
@@ -827,10 +825,7 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
 
     // Spin up worker threads on all cores we are allowed to use.
     timeTrace("Spawning workers on coreId %d", Arachne::core.id);
-    Arachne::CorePolicy::CoreList coreList =
-            Arachne::getCorePolicy()->getCores(0);
-    for (uint i = 0; i < coreList.size(); i++) {
-        int coreId = coreList[i];
+    for (int coreId : coresAvail) {
         if (initialData && (coreId == Arachne::core.id)) {
             continue;
         }
@@ -848,22 +843,19 @@ MilliSortService::localSortAndPickPivots()
     ADD_COUNTER(millisortInitKeyBytes, numDataTuples * PivotKey::KEY_SIZE);
     ADD_COUNTER(millisortInitValueBytes, numDataTuples * Value::SIZE);
 
-    {
+    auto localSort = [this] {
         ADD_COUNTER(localSortStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(localSortElapsedTime);
-        int numWorkers = Arachne::getCorePolicy()->getCores(0).size();
+        int numWorkers = coresAvail.size();
         ADD_COUNTER(localSortWorkers, numWorkers);
         ips4o::parallel::sort(localKeys, localKeys + numDataTuples,
                 std::less<PivotKey>(), numWorkers);
-    }
+    };
+    Arachne::join(Arachne::createThreadOnCore(coresAvail[0], localSort));
     timeTrace("sorted %d keys", numDataTuples);
 
     // Overlap rearranging initial values with subsequent stages. This only
     // needs to be done before key (actually, value) shuffle.
-    rearrangeLocalVals->callback = [this] () {
-        timeTrace("rearrangeLocalVals completed;");
-        startMergeSorter(false);
-    };
     rearrangeValues(rearrangeLocalVals.get(), numDataTuples, true);
 
 #if !OVERLAP_INIT_VAL_REARRANGE
@@ -1325,57 +1317,143 @@ MilliSortService::shuffleRecords() {
         ADD_COUNTER(onlineMergeSortStartTime, Cycles::rdtsc() - startTime)
         SCOPED_TIMER(onlineMergeSortElapsedTime)
 #if ENABLE_MERGE_SORTER
-        ADD_COUNTER(onlineMergeSortWorkers, mergeSorter->numWorkers);
-        startMergeSorter(true);
-        Arachne::join(mergeSorterPoller);
-        sortedKeys = mergeSorter->getSortedArray().data;
+        ADD_COUNTER(onlineMergeSortWorkers, coresAvail.size());
+        std::sort(mergeSortChunks.begin(), mergeSortChunks.end());
+        mergeSortChunks.push_back(incomingKeys + numRecordsReceived.load());
+        std::unique_ptr<PivotKey> tmpBuffer(
+                new PivotKey[numRecordsReceived.load()]);
+        PivotKey* dest = tmpBuffer.get();
+        uint32_t iter = 0;
+        while (mergeSortChunks.size() > 2) {
+            timeTrace("mergesort: start of iter %u, chunks left %u", iter,
+                    mergeSortChunks.size() - 1);
+            iter++;
+            debugLogKeys("itermediate result", numRecordsReceived,
+                    mergeSortChunks.front());
+
+            std::vector<PivotKey*> newChunks;
+            std::vector<Arachne::ThreadId> mergeTasks;
+            for (uint32_t i = 0; i < mergeSortChunks.size() - 1;) {
+                PivotKey* s = mergeSortChunks[i];
+                PivotKey* m = mergeSortChunks[i+1];
+                PivotKey* e;
+                if (i + 2 < mergeSortChunks.size()) {
+                    e = mergeSortChunks[i+2];
+                    i += 2;
+                } else {
+                    e = m;
+                    i += 1;
+                }
+                int coreId = coresAvail[i % coresAvail.size()];
+                Arachne::ThreadId topTask;
+                while (true) {
+                    topTask = Arachne::createThreadOnCore(coreId,
+                            &MilliSortService::parallelMergeTop, s, m, m, e,
+                            dest);
+                    if (topTask == Arachne::NullThread) {
+                        Arachne::yield();
+                    } else {
+                        break;
+                    }
+                }
+                mergeTasks.push_back(topTask);
+                newChunks.push_back(dest);
+                dest += (e - s);
+            }
+            newChunks.push_back(dest);
+            mergeSortChunks = newChunks;
+            for (auto& tid : mergeTasks) {
+                Arachne::join(tid);
+            }
+            dest = (mergeSortChunks.front() == incomingKeys) ?
+                    tmpBuffer.get() : incomingKeys;
+        }
+        debugLogKeys("merge-sort:", mergeSortChunks[1] - mergeSortChunks[0],
+                mergeSortChunks[0]);
+
+        if (mergeSortChunks.front() != incomingKeys) {
+            std::move(mergeSortChunks.front(), mergeSortChunks.back(),
+                    incomingKeys);
+        }
+        sortedKeys = incomingKeys;
 #else
         // FIXME: figure out why using ips4o seems to cause stragglers in the
         // record shuffle above? My current suspicion is that the worker threads
         // in ips4o::ArachneThreadPool are not designed with collaborative
         // threading in mind so the ofiud worker threads can't make any progress
-        int numWorkers = Arachne::getCorePolicy()->getCores(0).size();
+        int numWorkers = coresAvail.size();
         ADD_COUNTER(onlineMergeSortWorkers, numWorkers);
         ips4o::parallel::sort(incomingKeys, incomingKeys + numSortedItems,
                 std::less<PivotKey>(), numWorkers);
         sortedKeys = incomingKeys;
         timeTrace("sorted %u final keys", numSortedItems);
 #endif
-    }
+    };
 
     rearrangeFinalVals();
 }
 
+void
+MilliSortService::parallelMergeTop(PivotKey* xs, PivotKey* xe, PivotKey* ys,
+        PivotKey* ye, PivotKey* zs)
+{
+    timeTrace("parallelMerge: top-level task started, size %d", ye - xs);
+    parallelMergeSubTask(xs, xe, ys, ye, zs);
+    timeTrace("parallelMerge: top-level task completed");
+}
 
 void
-MilliSortService::startMergeSorter(bool shuffleDone)
+MilliSortService::parallelMergeSubTask(PivotKey* xs, PivotKey* xe, PivotKey* ys,
+        PivotKey* ye, PivotKey* zs)
 {
-    if (!ENABLE_MERGE_SORTER || (OVERLAP_MERGE_SORT ^ shuffleDone))
-        return;
+//    timeTrace("parallelMerge: merging %d and %d keys", xe - xs, ye - ys);
+    const size_t MERGE_CUT_OFF = 1000;
+    auto nx = xe - xs;
+    auto ny = ye - ys;
+    auto n = nx + ny;
+    if (n <= MERGE_CUT_OFF) {
+        // Base case: serial merge
+        uint64_t elapsed = Cycles::rdtsc();
+        while (xs < xe) {
+            if (ys == ye) {
+                ys = xs;
+                ye = xe;
+                break;
+            }
 
-    std::lock_guard<Arachne::SpinLock> _(mergeSorterLock);
-    mergeSorter->prepareThreads();
-    mergeSorterIsReady = true;
-    timeTrace("mergeSorter ready to run, %u pending requests",
-            pendingMergeReqs.size());
-    for (auto& request : pendingMergeReqs) {
-        mergeSorter->poll(request.first, request.second);
-    }
-    pendingMergeReqs.clear();
-
-    mergeSorterPoller = Arachne::createThread([this] () {
-        bool done = false;
-        while (!done) {
-            mergeSorterLock.lock();
-            done = !mergeSorter->poll();
-            mergeSorterLock.unlock();
-            Arachne::yield();
+            PivotKey*& min = (*xs < *ys) ? xs : ys;
+            *zs = std::move(*min);
+            min++;
+            zs++;
         }
-        auto sortedArray = mergeSorter->getSortedArray();
-        timeTrace("merge-sorted %u final keys", sortedArray.size);
-        assert(int(sortedArray.size) == numSortedItems);
-    });
+        std::move(ys, ye, zs);
+        elapsed = Cycles::rdtsc() - elapsed;
+        timeTrace("parallelMerge: serial merged %d (%d + %d) keys in %u us", n,
+                nx, ny, Cycles::toMicroseconds(elapsed));
+    } else {
+        PivotKey* xm;
+        PivotKey* ym;
+        if (nx < ny) {
+            ym = ys + ny / 2;
+            xm = std::upper_bound(xs, xe, *ym);
+        } else {
+            xm = xs + nx / 2;
+            ym = std::lower_bound(ys, ye, *xm);
+        }
+        PivotKey* zm = zs + ((xm - xs) + (ym - ys));
+        auto tid = Arachne::createThread(
+                &MilliSortService::parallelMergeSubTask, xs, xm, ys, ym, zs);
+        if (tid == Arachne::NullThread) {
+            timeTrace("parallelMerge: can't spawn more tasks!");
+            parallelMergeSubTask(xs, xm, ys, ym, zs);
+            parallelMergeSubTask(xm, xe, ym, ye, zm);
+        } else {
+            parallelMergeSubTask(xm, xe, ym, ye, zm);
+            Arachne::join(tid);
+        }
+    }
 }
+
 
 void
 MilliSortService::rearrangeFinalVals()
@@ -1405,13 +1483,6 @@ MilliSortService::rearrangeFinalVals()
 #if VALIDATE_RESULT
     uint64_t prevKey = 0;
     bool success = true;
-    if (ENABLE_MERGE_SORTER &&
-            (int(mergeSorter->getSortedArray().size) != numSortedItems)) {
-        LOG(ERROR, "Validation failed: sortedArray.size != numSortedItems "
-                "(%lu vs %u)", mergeSorter->getSortedArray().size,
-                numSortedItems);
-        success = false;
-    }
     for (int i = 0; i < numSortedItems; i++) {
         // TODO: how to check if keys are globally sorted?
         uint64_t key = sortedKeys[i].keyAsUint64();
@@ -1646,12 +1717,7 @@ MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
 #if ENABLE_MERGE_SORTER
         // Notify the merge sorter about the incoming keys.
         mergeSorterLock.lock();
-        if (mergeSorterIsReady) {
-            mergeSorter->poll(&incomingKeys[startIdx], numRecords);
-        } else {
-            pendingMergeReqs.emplace_back(&incomingKeys[startIdx],
-                    numRecords);
-        }
+        mergeSortChunks.push_back(&incomingKeys[startIdx]);
         mergeSorterLock.unlock();
 #endif
         recordShuffleRxCount.fetch_add(1);
@@ -1751,12 +1817,7 @@ MilliSortService::handleShuffleColChunk(uint32_t senderId, uint32_t totalLength,
 #if ENABLE_MERGE_SORTER
         // Notify the merge sorter about the incoming keys.
         mergeSorterLock.lock();
-        if (mergeSorterIsReady) {
-            mergeSorter->poll(&incomingKeys[startIdx], numRecords);
-        } else {
-            pendingMergeReqs.emplace_back(&incomingKeys[startIdx],
-                    numRecords);
-        }
+        mergeSortChunks.push_back(&incomingKeys[startIdx]);
         mergeSorterLock.unlock();
 #endif
     }

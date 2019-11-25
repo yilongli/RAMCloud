@@ -600,7 +600,10 @@ class MilliSortService : public Service {
     void handleShuffleColChunk(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void shuffleRecords();
-    void startMergeSorter(bool shuffleDone);
+    static void parallelMergeTop(PivotKey* xs, PivotKey* xe, PivotKey* ys,
+            PivotKey* ye, PivotKey* zs);
+    static void parallelMergeSubTask(PivotKey* xs, PivotKey* xe, PivotKey* ys,
+            PivotKey* ye, PivotKey* zs);
     void rearrangeFinalVals();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
     void debugLogKeys(const char* prefix, int numKeys, PivotKey* keys);
@@ -623,6 +626,10 @@ class MilliSortService : public Service {
     std::atomic<Service::Rpc*> ongoingMilliSort;
 
     Tub<RandomGenerator> rand;
+
+    /// Arachne core IDs that can be used for millisort computation. Always
+    /// sorted to reduce variations across benchmark runs.
+    std::vector<int> coresAvail;
 
     uint64_t startTime;
 
@@ -738,23 +745,12 @@ class MilliSortService : public Service {
     Tub<std::vector<std::atomic<uint32_t>>> rowShuffleProgress;
     Tub<std::vector<std::atomic<uint32_t>>> colShuffleProgress;
 
-    /// Used to sort keys as they arrive during the final key shuffle stage.
-    Tub<Merge<PivotKey>> mergeSorter;
-
-    /// Poller thread that is responsible for making progress on #mergeSorter.
-    Arachne::ThreadId mergeSorterPoller;
-
-    /// True if the merge sorter is ready to accept incoming data via the poll
-    /// method (i.e., Merge::prepareThreads() has been called).
-    bool mergeSorterIsReady;
-
     /// Serializes all calls to the merge sorter's poll method and protects
-    /// #pendingMergeReqs.
+    /// #mergeSortChunks.
     Arachne::SpinLock mergeSorterLock;
 
-    /// Holds incoming shuffled keys temporarily before the merge sorter starts.
-    /// Always empty after #mergeSorter is constructed.
-    std::vector<std::pair<PivotKey*, uint32_t>> pendingMergeReqs;
+    /// Chunks of pre-sorted keys.
+    std::vector<PivotKey*> mergeSortChunks;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;
