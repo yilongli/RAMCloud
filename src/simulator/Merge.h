@@ -13,284 +13,202 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#ifndef MERGE_H
-#define MERGE_H
+#ifndef MILLISORT_MERGE_H
+#define MILLISORT_MERGE_H
 
+#include "Common.h"
 #include <algorithm>
-#include <atomic>
-#include <byteswap.h>
-#include <sys/resource.h>
-#include <mutex>
-#include <thread>
-#include <vector>
-#include <queue>
-#include <cstring>
 
-#include "Cycles.h"
-#include "Arachne/Arachne.h"
+namespace RAMCloud {
 
-#define MERGE_WORKER mergeWorker
-#define MAX_LEVELS 20
-#define MAX_WORKERS 32
+template <typename T, int N = 4>
+struct MergeJob {
+    T* srcBegin[N];
+    T* srcEnd[N];
+    T* dest;
 
-#define USE_ARACHNE 1
+    // No initialization.
+    MergeJob() {}
+};
 
 /**
- * Tracks performance statistics of a merge task.
+ * Find the first element within [begin, end) that is greater than or equal to
+ * a specified value.
+ *
+ * \tparam T
+ *      Type of the element.
+ * \param begin
+ *      Left inclusive bound the elements to search from.
+ * \param end
+ *      Right exclusive bound of the elements to search from.
+ * \param target
+ *      The target value to search for.
+ * \return
+ *      Pointer to the first element that is greater than or equal to #target;
+ *      or #end if no such element exists.
  */
-struct MergeStats {
-    ///////////////////////////////////////////////////////////////
-    // Some key configurations used during merge.
-    ///////////////////////////////////////////////////////////////
-    int numLevels = 0;
-    std::vector<int> waysList;
-    int maxWays;
-    int numMasters;
-    int totalItemCounts;
-    int itemSize;
-    int keySize;
-    int valueSize;
-    int numWorkers;
+template <typename T, int K = 2>
+T* upperbound(T* begin, T* end, const T target)
+{
+    // Each iteration of the following loop reduces the search range to 1/K.
+    size_t n = end - begin;
+    while (n >= K) {
+        end = begin + n;
+        size_t part = (n + K - 1) / K;
+        std::array<bool, K> less;
+        for (int i = 1; i < K; i++) {
+            less[i] = (begin[part * i] < target);
+        }
+        for (int i = 1; i < K; i++) {
+            begin += (less[i] ? part : 0);
+        }
+        n = std::min(part, static_cast<size_t>(end - begin));
+    }
 
-    ///////////////////////////////////////////////////////////////
-    // Performance counters
-    ///////////////////////////////////////////////////////////////
-    std::vector<double> msByLevel;
-    std::vector<uint64_t> busyCyclesByThreadAndLevel[MAX_WORKERS];
-    std::vector<uint64_t> noJobCyclesByThreadAndLevel[MAX_WORKERS];
-    std::vector<uint64_t> jobSizeByThreadAndLevel[MAX_WORKERS];
-    int scheduleSplit[MAX_LEVELS] = {};
-    int scheduleSplitJob[MAX_LEVELS] = {};
-    int scheduleNormal[MAX_LEVELS] = {};
-
-    ///////////////////////////////////////////////////////////////
-    // Summarized/derived statistics
-    ///////////////////////////////////////////////////////////////
-    double msTotal;
-    double busyMsByThread[MAX_WORKERS];
-    double noJobMsByThread[MAX_WORKERS];
-
-    void initialize(int numLevels, int numWorkers) {
-        this->numWorkers = numWorkers;
-        this->numLevels = numLevels;
-        msByLevel.resize(numLevels);
-        for (int tid = 0; tid < numWorkers; tid++) {
-            busyCyclesByThreadAndLevel[tid].resize(numLevels);
-            noJobCyclesByThreadAndLevel[tid].resize(numLevels);
-            jobSizeByThreadAndLevel[tid].resize(numLevels);
-            bzero(jobSizeByThreadAndLevel[tid].data(),
-                    sizeof(uint64_t) * numLevels);
+    // Sequential search
+    for (size_t i = 0; i < n; i++) {
+        if (__glibc_unlikely(!(begin[i] < target))) {
+            return &begin[i];
         }
     }
-    
-    void printStats();
-    void calcSecondaryStats();
-};
+    return begin + n;
+}
 
-/**
- * This class implements online parallel merge of Millisort.
- */
-template<class T>
-class Merge {
-public:
-    /**
-     * Represents a c-style array with length.
-     */
-    struct ArrayPtr {
-        T* data;
-        size_t size;
-    };
-    
-    Merge(int numArraysTotal, int maxNumAllItems, int numWorkers = 4);
-    ~Merge();
-    void prepareThreads();
-    bool poll();
-    bool poll(T* newData, size_t size);
-    ArrayPtr getSortedArray();
-    MergeStats* getPerfStats();
-
-private:
-    /**
-     * Per-thread context for each worker.
-     * Holds a job that need to be processed, current work state, and
-     * performance statistics.
-     */
-    struct MergeWorkerContext {
-        // Variable used for synchronization between dispatcher and worker.
-        // 0: idle; dispatch can modify.
-        // 1: done; dispatch can read and modify.
-        // 2: working; dispatch shouldn't touch. Worker can read/modify.
-        // 3: die; poison to exit this worker thread.
-        std::atomic<int> state; 
-
-        // Description of merge job. Worker will merge #arrays to #dest.
-        std::vector<ArrayPtr> arrays;
-        ArrayPtr dest;
-        bool isSplittedSubJob;
-        
-        // Current level in the big merge tree. Used by dispatch only.
-        int currentLevel = 0;
-        
-        // Time spent for this job. Will be read by dispatch when job is done.
-        uint64_t currentJobCycles = 0;
-
-        // State used to calculate performance statistics later.
-        uint64_t lastIdleTime = 0;
-    };
-
-    static void mergeWorker(MergeWorkerContext* context);
-
-public:
-    ///////////////////////////////////////////////////////////////
-    // Configurations
-    ///////////////////////////////////////////////////////////////
-    
-    // Maximum merge ways per dispatch. Bigger number allows more batching on
-    // dispatch and improves performance. This will be ignored for higher levels
-    // to allow more parallelism.
-    // THIS MUST BE POWER OF 2.
-    const int maxWays = 64;
-//    const int maxWays = 32;
-    
-private:
-    ///////////////////////////////////////////////////////////////
-    // Variable for initial configuration
-    ///////////////////////////////////////////////////////////////
-    
-    // Number of arrays that are fed (or will be fed) to this merger.
-    const int initialArraysToMergeCounts;
-    
-    // Total number of elements across all arrays that need to be merged.
-    const int numAllItems;
-    
-    // Number of arrays to merge at a time in each level.
-    std::vector<int> waysList;
-    
-    // Total number of merged arrays that need to be generated for next level to
-    // complete and advance to the next level.
-    std::vector<int> numArraysTargets;
-public:
-    // Number of merge workers (each running on an Arachne or std thread).
-    const int numWorkers;
-private:
-    ///////////////////////////////////////////////////////////////
-    // Variable tracking current progress
-    ///////////////////////////////////////////////////////////////
-    MergeWorkerContext contexts[MAX_WORKERS];
-
-#if USE_ARACHNE
-    Arachne::ThreadId threads[MAX_WORKERS];
-#else
-    std::thread *threads[MAX_WORKERS];
-#endif
-
-    // Memory chunk that are used to store intermediately merged arrays.
-    T* buffer;
-    
-    // Tracks the position in memory buffer that are available to store
-    // the resulted arrays from merging.
-    size_t nextAvailable[MAX_LEVELS + 1] = {};
-    
-    // Tracks arrays that need to be merged in each level.
-    std::queue<ArrayPtr> arraysToMerge[MAX_LEVELS + 1];
-
-    // Tracks the count of arrays that are already merged. This counter tracks
-    // the resulted arrays in each level (not the count of merged-from arrays).
-    int numArraysCompleted[MAX_LEVELS];
-
-    /**
-     * If the merger splits the big source arrays into smaller ones for more
-     * parallelism, this structure holds the each splitted job.
-     *
-     * #dest may have size of 0 if this job is not the first partial job of the
-     * big regular job.
-     */
-    struct SplittedMergeJob {
-        ArrayPtr src1;
-        ArrayPtr src2;
-        ArrayPtr dest;
-        bool isSubJob;
-    };
-    std::queue<SplittedMergeJob> splittedJobs;
-    void scheduleSplitted(SplittedMergeJob job, int tid);
-    
-    // Tracks the current level of merge.
-    // A merge task is split by each level. For example, if we are merging
-    // 8 arrays into a single array, we may have total of 3 levels.
-    // Level 0: merges 8 arrays into 4 arrays.
-    // Level 1: merges 4 arrays into 2 arrays.
-    // Level 2: merges 2 arrays into 1 arrays.
-    int level;
-
-    // Time
-    bool isStarted = false;
-    bool preparedThreads = false;
-    uint64_t lastLevelEndTime;
-    uint64_t lastDebugInfoPrint;
-public:
-    uint64_t startTick;
-    uint64_t stopTick;
-    MergeStats perfStats;
-
-    // FIXME: startTick is set in poll(), which doesn't seem right to me
-    uint64_t startTime;
-};
-
-/**
- * Useful tools to test #merge class. It generates inputs and validate the
- * correctness of the result of a merge.
- */
-template<class T>
-class MergeTestTools {
-public:
-    explicit MergeTestTools()
-        : mcg64State(1)
-    {}
-
-    void initializeInput(int itemsPerNode, int numMasters);
-    void verifyOutput(T* mergedData, size_t mergedSize);
-
-    std::vector<T> input;
-    std::vector<typename Merge< T >::ArrayPtr > initialArrays;
-private:
-    //
-    uint64_t mcg64()
-    {
-        return (mcg64State = (164603309694725029ull * mcg64State) %
-                             14738995463583502973ull);
+template <typename T, int N>
+bool
+splitMergeJob(const int serialMergeCutOff, MergeJob<T, N>* task,
+        std::vector<MergeJob<T, N>>* outputTasks)
+{
+    std::array<int, N> length;
+    int totalLength = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        length[i] = task->srcEnd[i] - task->srcBegin[i];
+        totalLength += length[i];
     }
 
-    uint64_t mcg64State;
-
-    void fillRandom(char* dest, uint32_t length);
-};
-
-/// FOR DEBUGGING....
-struct MillisortItem {
-    static const int KeyLength = 10;
-    static const int ValueLength = 6;
-    char key[KeyLength];
-    char data[ValueLength];
-
-    MillisortItem()
-        : key(), data()
-    {}
-
-    inline unsigned __int128
-    asUint128() const
-    {
-        return *((const unsigned __int128*) this);
+    // The task is too small; we'd better process it sequentially.
+    if (totalLength < serialMergeCutOff) {
+        return false;
     }
 
-    bool operator<(const MillisortItem &other) const {
-        return asUint128() < other.asUint128();
+    // In order to split the task as evenly as possible, find the longest
+    // input source array ...
+    std::array<T*, N> splitPoints;
+    uint32_t longestIdx = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        splitPoints[i] = task->srcBegin[i] + length[i] / 2;
+        if (length[i] > length[longestIdx]) {
+            longestIdx = i;
+        }
     }
 
-    bool operator==(const MillisortItem& other)
-    {
-        return asUint128() == other.asUint128();
+    // ... and use its median element to split other arrays.
+    T* dest1 = task->dest;
+    T* dest2 = task->dest;
+    for (uint32_t i = 0; i < N; i++) {
+        if (i != longestIdx) {
+            // TODO: investigate if K-ary search would be faster
+//            splitPoints[i] = upperbound<T, 4>(
+            splitPoints[i] = std::upper_bound(
+                    task->srcBegin[i], task->srcEnd[i],
+                    *splitPoints[longestIdx]);
+        }
+        dest2 += (splitPoints[i] - task->srcBegin[i]);
     }
-};
-static_assert(sizeof(MillisortItem) == 16, "Unexpected padding in MillisortItem");
 
-#endif  // MERGE_H
+    // Put the generated subtasks into the output queue.
+    outputTasks->emplace_back();
+    auto* subtask1 = &outputTasks->back();
+    for (uint32_t i = 0; i < N; i++) {
+        subtask1->srcBegin[i] = task->srcBegin[i];
+        subtask1->srcEnd[i] = splitPoints[i];
+    }
+    subtask1->dest = dest1;
+
+    outputTasks->emplace_back();
+    auto* subtask2 = &outputTasks->back();
+    for (uint32_t i = 0; i < N; i++) {
+        subtask2->srcBegin[i] = splitPoints[i];
+        subtask2->srcEnd[i] = task->srcEnd[i];
+    }
+    subtask2->dest = dest2;
+    return true;
+}
+
+template <typename T>
+void serialMerge2Way(T* xs, T* xe, T* ys, T* ye, T* dest)
+{
+    while (xs < xe) {
+        if (ys == ye) {
+            ys = xs;
+            ye = xe;
+            break;
+        }
+
+        T*& min = (*xs < *ys) ? xs : ys;
+        *dest = std::move(*min);
+        min++;
+        dest++;
+    }
+    std::move(ys, ye, dest);
+}
+
+template <typename T>
+void serialMerge3Way(T* xs, T* xe, T* ys, T* ye, T* zs, T* ze, T* dest)
+{
+    while (xs < xe) {
+        if (ys == ye) {
+            ys = xs;
+            ye = xe;
+            break;
+        }
+        if (zs == ze) {
+            zs = xs;
+            ze = xe;
+            break;
+        }
+
+        T*& a = (*xs < *ys) ? xs : ys;
+        T*& min = (*a < *zs) ? a : zs;
+        *dest = std::move(*min);
+        min++;
+        dest++;
+    }
+    serialMerge2Way(ys, ye, zs, ze, dest);
+}
+
+
+template <typename T>
+void
+serialMerge4Way(T* xs, T* xe, T* ys, T* ye, T* zs, T* ze, T* us, T* ue, T* dest)
+{
+    while (xs < xe) {
+        if (ys == ye) {
+            ys = xs;
+            ye = xe;
+            break;
+        }
+        if (zs == ze) {
+            zs = xs;
+            ze = xe;
+            break;
+        }
+        if (us == ue) {
+            us = xs;
+            ue = xe;
+            break;
+        }
+
+        T*& a = (*xs < *ys) ? xs : ys;
+        T*& b = (*zs < *us) ? zs : us;
+        T*& min = (*a < *b) ? a : b;
+        *dest = std::move(*min);
+        min++;
+        dest++;
+    }
+    serialMerge3Way(ys, ye, zs, ze, us, ue, dest);
+}
+
+}
+
+#endif  // MILLISORT_MERGE_H

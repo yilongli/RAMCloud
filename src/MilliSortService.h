@@ -600,10 +600,7 @@ class MilliSortService : public Service {
     void handleShuffleColChunk(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void shuffleRecords();
-    static void parallelMergeTop(PivotKey* xs, PivotKey* xe, PivotKey* ys,
-            PivotKey* ye, PivotKey* zs);
-    static void parallelMergeSubTask(PivotKey* xs, PivotKey* xe, PivotKey* ys,
-            PivotKey* ye, PivotKey* zs);
+    void mergeSortKeys();
     void rearrangeFinalVals();
     void debugLogKeys(const char* prefix, vector<PivotKey>* keys);
     void debugLogKeys(const char* prefix, int numKeys, PivotKey* keys);
@@ -660,8 +657,8 @@ class MilliSortService : public Service {
     /// sorted by the online merge sorter.
     PivotKey* const incomingKeys;
 
-    /// Sorted keys on this node when the sorting completes. Not owned by this
-    /// class.
+    /// Sorted keys on this node when the sorting completes. Points to either
+    /// #incomingKeys or #mergeSortTmpBuffer.
     PivotKey* sortedKeys;
 
     /// Values of the data tuples that are sorted locally. The backing memory
@@ -751,6 +748,9 @@ class MilliSortService : public Service {
 
     /// Chunks of pre-sorted keys.
     std::vector<PivotKey*> mergeSortChunks;
+
+    /// Temporary buffer space to be used by merge-sort.
+    std::unique_ptr<PivotKey> mergeSortTmpBuffer;
 
     /// Contains all nodes in the service.
     Tub<CommunicationGroup> world;

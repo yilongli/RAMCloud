@@ -179,6 +179,7 @@ MilliSortService::MilliSortService(Context* context,
     , colShuffleProgress()
     , mergeSorterLock("MilliSortService::mergeSorter")
     , mergeSortChunks()
+    , mergeSortTmpBuffer()
     , world()
     , twoLevelShuffleRowGroup()
     , twoLevelShuffleColGroup()
@@ -478,6 +479,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
 #endif
 
     mergeSortChunks.clear();
+    // Release the old buffer first before `new`, hoping to reuse the same
+    // memory.
+    mergeSortTmpBuffer.reset(NULL);
+    mergeSortTmpBuffer.reset(new PivotKey[numDataTuples*2]);
     gatheredPivots.clear();
     superPivots.clear();
     pivotBucketBoundaries.clear();
@@ -1211,18 +1216,18 @@ MilliSortService::shuffleRecords() {
     // TODO: parallelize this step across all cores
     double keysPerPartition = double(numDataTuples) / double(splitters.size());
     const int step = std::max(1, int(std::sqrt(keysPerPartition)));
-    int rangeEnd = 0;
+    int srcEnd = 0;
     for (const PivotKey& splitter : splitters) {
-        int rangeStart = rangeEnd;
-        while ((rangeEnd < numDataTuples) &&
-                (localKeys[rangeEnd] <= splitter)) {
-            rangeEnd = std::min(rangeEnd + step, numDataTuples);
+        int srcBegin = srcEnd;
+        while ((srcEnd < numDataTuples) &&
+                (localKeys[srcEnd] <= splitter)) {
+            srcEnd = std::min(srcEnd + step, numDataTuples);
         }
-        while ((rangeEnd > rangeStart) &&
-                !(localKeys[rangeEnd-1] <= splitter)) {
-            rangeEnd--;
+        while ((srcEnd > srcBegin) &&
+                !(localKeys[srcEnd-1] <= splitter)) {
+            srcEnd--;
         }
-        dataBucketRanges.emplace_back(rangeStart, rangeEnd - rangeStart);
+        dataBucketRanges.emplace_back(srcBegin, srcEnd - srcBegin);
     }
     timeTrace("partitioned keys to be ready for key shuffle");
 
@@ -1312,148 +1317,206 @@ MilliSortService::shuffleRecords() {
     ADD_COUNTER(millisortFinalValueBytes, numSortedItems * Value::SIZE);
     timeTrace("shuffle records completed, received %d records", numSortedItems);
 
-    // Wait until the merge-sort is completed.
-    {
-        ADD_COUNTER(onlineMergeSortStartTime, Cycles::rdtsc() - startTime)
-        SCOPED_TIMER(onlineMergeSortElapsedTime)
-#if ENABLE_MERGE_SORTER
-        ADD_COUNTER(onlineMergeSortWorkers, coresAvail.size());
-        std::sort(mergeSortChunks.begin(), mergeSortChunks.end());
-        mergeSortChunks.push_back(incomingKeys + numRecordsReceived.load());
-        std::unique_ptr<PivotKey> tmpBuffer(
-                new PivotKey[numRecordsReceived.load()]);
-        PivotKey* dest = tmpBuffer.get();
-        uint32_t iter = 0;
-        while (mergeSortChunks.size() > 2) {
-            timeTrace("mergesort: start of iter %u, chunks left %u", iter,
-                    mergeSortChunks.size() - 1);
-            iter++;
-            debugLogKeys("itermediate result", numRecordsReceived,
-                    mergeSortChunks.front());
-
-            std::vector<PivotKey*> newChunks;
-            std::vector<Arachne::ThreadId> mergeTasks;
-            for (uint32_t i = 0; i < mergeSortChunks.size() - 1;) {
-                PivotKey* s = mergeSortChunks[i];
-                PivotKey* m = mergeSortChunks[i+1];
-                PivotKey* e;
-                if (i + 2 < mergeSortChunks.size()) {
-                    e = mergeSortChunks[i+2];
-                    i += 2;
-                } else {
-                    e = m;
-                    i += 1;
-                }
-                int coreId = coresAvail[i % coresAvail.size()];
-                Arachne::ThreadId topTask;
-                while (true) {
-                    topTask = Arachne::createThreadOnCore(coreId,
-                            &MilliSortService::parallelMergeTop, s, m, m, e,
-                            dest);
-                    if (topTask == Arachne::NullThread) {
-                        Arachne::yield();
-                    } else {
-                        break;
-                    }
-                }
-                mergeTasks.push_back(topTask);
-                newChunks.push_back(dest);
-                dest += (e - s);
-            }
-            newChunks.push_back(dest);
-            mergeSortChunks = newChunks;
-            for (auto& tid : mergeTasks) {
-                Arachne::join(tid);
-            }
-            dest = (mergeSortChunks.front() == incomingKeys) ?
-                    tmpBuffer.get() : incomingKeys;
-        }
-        debugLogKeys("merge-sort:", mergeSortChunks[1] - mergeSortChunks[0],
-                mergeSortChunks[0]);
-
-        if (mergeSortChunks.front() != incomingKeys) {
-            std::move(mergeSortChunks.front(), mergeSortChunks.back(),
-                    incomingKeys);
-        }
-        sortedKeys = incomingKeys;
-#else
-        // FIXME: figure out why using ips4o seems to cause stragglers in the
-        // record shuffle above? My current suspicion is that the worker threads
-        // in ips4o::ArachneThreadPool are not designed with collaborative
-        // threading in mind so the ofiud worker threads can't make any progress
-        int numWorkers = coresAvail.size();
-        ADD_COUNTER(onlineMergeSortWorkers, numWorkers);
-        ips4o::parallel::sort(incomingKeys, incomingKeys + numSortedItems,
-                std::less<PivotKey>(), numWorkers);
-        sortedKeys = incomingKeys;
-        timeTrace("sorted %u final keys", numSortedItems);
-#endif
-    };
-
+    // Wait until the merge-sort is completed, then proceed to rearrange values.
+    mergeSortKeys();
     rearrangeFinalVals();
 }
 
 void
-MilliSortService::parallelMergeTop(PivotKey* xs, PivotKey* xe, PivotKey* ys,
-        PivotKey* ye, PivotKey* zs)
+MilliSortService::mergeSortKeys()
 {
-    timeTrace("parallelMerge: top-level task started, size %d", ye - xs);
-    parallelMergeSubTask(xs, xe, ys, ye, zs);
-    timeTrace("parallelMerge: top-level task completed");
-}
+    static const int DIV_FACTOR = 20;
+    static const int K_WAY = 4;
 
-void
-MilliSortService::parallelMergeSubTask(PivotKey* xs, PivotKey* xe, PivotKey* ys,
-        PivotKey* ye, PivotKey* zs)
-{
-//    timeTrace("parallelMerge: merging %d and %d keys", xe - xs, ye - ys);
-    const size_t MERGE_CUT_OFF = 1000;
-    auto nx = xe - xs;
-    auto ny = ye - ys;
-    auto n = nx + ny;
-    if (n <= MERGE_CUT_OFF) {
-        // Base case: serial merge
-        uint64_t elapsed = Cycles::rdtsc();
-        while (xs < xe) {
-            if (ys == ye) {
-                ys = xs;
-                ye = xe;
-                break;
+    ADD_COUNTER(onlineMergeSortStartTime, Cycles::rdtsc() - startTime)
+    SCOPED_TIMER(onlineMergeSortElapsedTime)
+#if ENABLE_MERGE_SORTER
+    ADD_COUNTER(onlineMergeSortWorkers, coresAvail.size());
+//        const uint32_t MERGE_CUT_OFF = 10;
+    const uint32_t MERGE_CUT_OFF = std::max(2000u, downCast<uint32_t>(
+            numRecordsReceived.load() / coresAvail.size() / DIV_FACTOR));
+    timeTrace("mergesort started, MERGE_CUT_OFF %u, K_WAY %d",
+            MERGE_CUT_OFF, K_WAY);
+
+    std::sort(mergeSortChunks.begin(), mergeSortChunks.end());
+    mergeSortChunks.push_back(incomingKeys + numRecordsReceived.load());
+    PivotKey* dest = mergeSortTmpBuffer.get();
+    uint32_t iter = 0;
+    // Each iteration of the following loop roughly reduces # sorted chunks
+    // by a factor of K_WAY.
+    while (mergeSortChunks.size() > 2) {
+        timeTrace("mergesort: start of iter %u, chunks left %u", iter,
+                mergeSortChunks.size() - 1);
+        iter++;
+        debugLogKeys("itermediate result", numRecordsReceived,
+                mergeSortChunks.front());
+
+        // In order to make the following processing easier, append dummy
+        // chunks to make # chunks to merge is a multiple of K_WAY.
+        while (mergeSortChunks.size() % K_WAY != 1) {
+            mergeSortChunks.push_back(mergeSortChunks.back());
+        }
+
+        // Create top-level K-way merge tasks; one in each iteration.
+        using MergeTask = MergeJob<PivotKey, K_WAY>;
+        std::vector<PivotKey*> resultChunks;
+        std::vector<MergeTask> splittableTasks;
+        for (uint32_t i = 0; i < mergeSortChunks.size() - 1; i += K_WAY) {
+            splittableTasks.emplace_back();
+            auto& task = splittableTasks.back();
+            for (uint32_t k = 0; k < K_WAY; k++) {
+                task.srcBegin[k] = mergeSortChunks[i+k];
+                task.srcEnd[k] = mergeSortChunks[i+k+1];
             }
+            task.dest = dest;
+            resultChunks.push_back(dest);
+            dest += (task.srcEnd[K_WAY-1] - task.srcBegin[0]);
+        }
+        resultChunks.push_back(dest);
+        dest = (resultChunks.front() == incomingKeys) ?
+                mergeSortTmpBuffer.get() : incomingKeys;
+        mergeSortChunks = resultChunks;
 
-            PivotKey*& min = (*xs < *ys) ? xs : ys;
-            *zs = std::move(*min);
-            min++;
-            zs++;
+        // The following while-loop splits tasks into smaller tasks, using
+        // as many cores as possible, until no task can be further divided.
+        // Each iteration of the loop forks multiple workers to process all
+        // tasks within #splittableTasks in parallel and sync in the end to
+        // obtain subtasks generated by the workers.
+        std::vector<MergeTask> atomicTasks;
+        using OutputQueue = std::pair<std::vector<int>, std::vector<MergeTask>>;
+        std::vector<OutputQueue> outputQueues;
+        outputQueues.resize(coresAvail.size());
+        uint64_t splitElapsed = 0;
+        while (!splittableTasks.empty()) {
+            CycleCounter<> _(&splitElapsed);
+
+            // To simplify the synchronization between split workers,
+            // the following function treats splittableTasks as read-only
+            // and writes generated subtasks into a worker-specific output
+            // queue.
+            std::atomic<int> nextTask(0);
+            auto splitMain = [&splittableTasks, &nextTask] (
+                    OutputQueue* outputQueue, uint32_t MERGE_CUT_OFF) {
+                // Each iteration of the following loop splits one task.
+                while (true) {
+                    int taskIdx = nextTask.fetch_add(1);
+                    if (taskIdx >= splittableTasks.size()) {
+                        break;
+                    }
+
+                    if (!splitMergeJob(MERGE_CUT_OFF,
+                            &splittableTasks[taskIdx], &outputQueue->second)) {
+                        outputQueue->first.push_back(taskIdx);
+                    }
+                }
+                timeTrace("mergesort: split worker finished, generated "
+                        "%u atomic tasks and %u sub-tasks",
+                        outputQueue->first.size(),
+                        outputQueue->second.size());
+            };
+
+            timeTrace("mergesort: about to split %u merge-tasks",
+                    splittableTasks.size());
+            int workerId = 0;
+            std::vector<Arachne::ThreadId> splitWorkers;
+            for (int coreId : coresAvail) {
+                splitWorkers.push_back(Arachne::createThreadOnCore(coreId,
+                        splitMain, &outputQueues[workerId], MERGE_CUT_OFF));
+                workerId++;
+
+                // Don't spawn more workers than tasks.
+                if (workerId >= splittableTasks.size()) {
+                    break;
+                }
+            }
+            for (auto& tid : splitWorkers) {
+                Arachne::join(tid);
+            }
+            timeTrace("mergesort: all split workers finished");
+
+            // Grab the generated subtasks and put them back into
+            // #splittableTasks.
+            for (OutputQueue& outputQueue : outputQueues) {
+                for (int taskIdx : outputQueue.first) {
+                    atomicTasks.push_back(splittableTasks[taskIdx]);
+                }
+                outputQueue.first.clear();
+            }
+            splittableTasks.clear();
+            for (OutputQueue& outputQueue : outputQueues) {
+                for (auto& subtask : outputQueue.second) {
+                    splittableTasks.push_back(subtask);
+                }
+                outputQueue.second.clear();
+            }
         }
-        std::move(ys, ye, zs);
-        elapsed = Cycles::rdtsc() - elapsed;
-        timeTrace("parallelMerge: serial merged %d (%d + %d) keys in %u us", n,
-                nx, ny, Cycles::toMicroseconds(elapsed));
-    } else {
-        PivotKey* xm;
-        PivotKey* ym;
-        if (nx < ny) {
-            ym = ys + ny / 2;
-            xm = std::upper_bound(xs, xe, *ym);
-        } else {
-            xm = xs + nx / 2;
-            ym = std::lower_bound(ys, ye, *xm);
+        timeTrace("mergesort: generated %u atomic tasks in %u us",
+                atomicTasks.size(), Cycles::toMicroseconds(splitElapsed));
+
+        std::atomic<int> nextTask(0);
+        auto workerMain = [&atomicTasks, &nextTask] {
+            int totalTasks = 0;
+            int totalKeys = 0;
+            while (true) {
+                int taskId = nextTask.fetch_add(1);
+                if (taskId >= atomicTasks.size()) {
+                    break;
+                }
+                auto& task = atomicTasks[taskId];
+                totalTasks++;
+                for (int i = 0; i < K_WAY; i++) {
+                    totalKeys += (task.srcEnd[i] - task.srcBegin[i]);
+                }
+
+                if constexpr (K_WAY == 4)
+                    serialMerge4Way(task.srcBegin[0], task.srcEnd[0],
+                            task.srcBegin[1], task.srcEnd[1],
+                            task.srcBegin[2], task.srcEnd[2],
+                            task.srcBegin[3], task.srcEnd[3],
+                            task.dest);
+                else if constexpr (K_WAY == 3)
+                    serialMerge3Way(task.srcBegin[0], task.srcEnd[0],
+                            task.srcBegin[1], task.srcEnd[1],
+                            task.srcBegin[2], task.srcEnd[2],
+                            task.dest);
+                else if constexpr (K_WAY == 2)
+                    serialMerge2Way(task.srcBegin[0], task.srcEnd[0],
+                            task.srcBegin[1], task.srcEnd[1],
+                            task.dest);
+                else {
+                    assert(false);
+                }
+            }
+            timeTrace("mergesort: serial-merge worker finished, "
+                    "tasks %d, keys %d", totalTasks, totalKeys);
+        };
+
+        std::vector<Arachne::ThreadId> workers;
+        for (int coreId : coresAvail) {
+            workers.push_back(Arachne::createThreadOnCore(coreId,
+                    workerMain));
         }
-        PivotKey* zm = zs + ((xm - xs) + (ym - ys));
-        auto tid = Arachne::createThread(
-                &MilliSortService::parallelMergeSubTask, xs, xm, ys, ym, zs);
-        if (tid == Arachne::NullThread) {
-            timeTrace("parallelMerge: can't spawn more tasks!");
-            parallelMergeSubTask(xs, xm, ys, ym, zs);
-            parallelMergeSubTask(xm, xe, ym, ye, zm);
-        } else {
-            parallelMergeSubTask(xm, xe, ym, ye, zm);
+        for (auto& tid : workers) {
             Arachne::join(tid);
         }
     }
+    debugLogKeys("merge-sort:", mergeSortChunks[1] - mergeSortChunks[0],
+            mergeSortChunks[0]);
+    sortedKeys = (mergeSortChunks.front() == incomingKeys) ?
+            incomingKeys : mergeSortTmpBuffer.get();
+#else
+    // FIXME: figure out why using ips4o seems to cause stragglers in the
+    // record shuffle above? My current suspicion is that the worker threads
+    // in ips4o::ArachneThreadPool are not designed with collaborative
+    // threading in mind so the ofiud worker threads can't make any progress
+    int numWorkers = coresAvail.size();
+    ADD_COUNTER(onlineMergeSortWorkers, numWorkers);
+    ips4o::parallel::sort(incomingKeys, incomingKeys + numSortedItems,
+            std::less<PivotKey>(), numWorkers);
+    sortedKeys = incomingKeys;
+    timeTrace("sorted %u final keys", numSortedItems);
+#endif
 }
-
 
 void
 MilliSortService::rearrangeFinalVals()
