@@ -16,8 +16,12 @@
 #ifndef MILLISORT_MERGE_H
 #define MILLISORT_MERGE_H
 
-#include "Common.h"
 #include <algorithm>
+#include <Arachne/Arachne.h>
+
+#include "Common.h"
+#include "Cycles.h"
+#include "TimeTrace.h"
 
 namespace RAMCloud {
 
@@ -29,6 +33,18 @@ struct MergeJob {
 
     // No initialization.
     MergeJob() {}
+};
+
+/// Per-core performance statistics collected during parallel mergesort.
+struct MergeStats {
+    uint64_t mergeCycles;
+    uint64_t splitCycles;
+    uint64_t mergeTasks;
+    uint64_t splitTasks;
+
+    MergeStats()
+        : mergeCycles(), splitCycles(), mergeTasks(), splitTasks()
+    {}
 };
 
 /**
@@ -77,7 +93,7 @@ T* upperbound(T* begin, T* end, const T target)
 template <typename T, int N>
 bool
 splitMergeJob(const int serialMergeCutOff, MergeJob<T, N>* task,
-        std::vector<MergeJob<T, N>>* outputTasks)
+        MergeJob<T, N> subtask[2])
 {
     std::array<int, N> length;
     int totalLength = 0;
@@ -117,21 +133,14 @@ splitMergeJob(const int serialMergeCutOff, MergeJob<T, N>* task,
     }
 
     // Put the generated subtasks into the output queue.
-    outputTasks->emplace_back();
-    auto* subtask1 = &outputTasks->back();
     for (uint32_t i = 0; i < N; i++) {
-        subtask1->srcBegin[i] = task->srcBegin[i];
-        subtask1->srcEnd[i] = splitPoints[i];
+        subtask[0].srcBegin[i] = task->srcBegin[i];
+        subtask[0].srcEnd[i] = splitPoints[i];
+        subtask[1].srcBegin[i] = splitPoints[i];
+        subtask[1].srcEnd[i] = task->srcEnd[i];
     }
-    subtask1->dest = dest1;
-
-    outputTasks->emplace_back();
-    auto* subtask2 = &outputTasks->back();
-    for (uint32_t i = 0; i < N; i++) {
-        subtask2->srcBegin[i] = splitPoints[i];
-        subtask2->srcEnd[i] = task->srcEnd[i];
-    }
-    subtask2->dest = dest2;
+    subtask[0].dest = dest1;
+    subtask[1].dest = dest2;
     return true;
 }
 
@@ -177,7 +186,6 @@ void serialMerge3Way(T* xs, T* xe, T* ys, T* ye, T* zs, T* ze, T* dest)
     serialMerge2Way(ys, ye, zs, ze, dest);
 }
 
-
 template <typename T>
 void
 serialMerge4Way(T* xs, T* xe, T* ys, T* ye, T* zs, T* ze, T* us, T* ue, T* dest)
@@ -208,6 +216,163 @@ serialMerge4Way(T* xs, T* xe, T* ys, T* ye, T* zs, T* ze, T* us, T* ue, T* dest)
     }
     serialMerge3Way(ys, ye, zs, ze, us, ue, dest);
 }
+
+template <typename T, int N>
+inline void
+serialMerge(MergeJob<T, N>* task)
+{
+    static_assert((2 <= N) && (N <= 4), "Invalid N");
+    if constexpr (N == 4)
+        serialMerge4Way(task->srcBegin[0], task->srcEnd[0],
+                task->srcBegin[1], task->srcEnd[1],
+                task->srcBegin[2], task->srcEnd[2],
+                task->srcBegin[3], task->srcEnd[3],
+                task->dest);
+    else if constexpr (N == 3)
+        serialMerge3Way(task->srcBegin[0], task->srcEnd[0],
+                task->srcBegin[1], task->srcEnd[1],
+                task->srcBegin[2], task->srcEnd[2],
+                task->dest);
+    else if constexpr (N == 2)
+        serialMerge2Way(task->srcBegin[0], task->srcEnd[0],
+                task->srcBegin[1], task->srcEnd[1],
+                task->dest);
+}
+
+template <typename T, int N>
+void
+parallelMerge(MergeJob<T, N>* task, MergeStats perCoreStats[],
+        const uint16_t mergeCutOff)
+{
+    MergeStats* mergeStats = &perCoreStats[Arachne::core.id];
+    uint64_t startTime = Cycles::rdtsc();
+    MergeJob<T, N> subtask[2];
+    bool success = splitMergeJob<T, N>(mergeCutOff, task, subtask);
+
+    // The task is too small; we'd better process it sequentially.
+    if (!success) {
+        serialMerge(task);
+        mergeStats->mergeTasks++;
+        mergeStats->mergeCycles += Cycles::rdtsc() - startTime;
+        return;
+    }
+
+    Arachne::ThreadId tid = Arachne::createThread(&parallelMerge<T, N>,
+            &subtask[0], perCoreStats, mergeCutOff);
+    mergeStats->splitTasks++;
+    mergeStats->splitCycles += Cycles::rdtsc() - startTime;
+    if (tid == Arachne::NullThread) {
+        parallelMerge<T, N>(&subtask[0], perCoreStats, mergeCutOff);
+        parallelMerge<T, N>(&subtask[1], perCoreStats, mergeCutOff);
+    } else {
+        parallelMerge<T, N>(&subtask[1], perCoreStats, mergeCutOff);
+        Arachne::join(tid);
+    }
+}
+
+// Change the following from 0 to 1 to use the slower but more direct
+// implementation of parallel splitting algorithm. The faster implementation
+// fuses the splitMergeJob method and checks the problem size before spawning
+// threads to ensure atomic tasks are handled inline.
+#if 0
+template <typename T, int N>
+void
+parallelSplit(MergeJob<T, N>* task, std::vector<MergeJob<T, N>> outputQueues[],
+        const uint16_t mergeCutOff)
+{
+    TimeTrace::record("mergesort: parallelSplit invoked, core %d", Arachne::core.id);
+    MergeJob<T, N> subtask[2];
+    bool success = splitMergeJob<T, N>(mergeCutOff, task, subtask);
+
+    // The task is too small; we'd better process it sequentially.
+    if (!success) {
+        outputQueues[Arachne::core.id].push_back(*task);
+        TimeTrace::record("mergesort: generated atomic task, core %d", Arachne::core.id);
+        return;
+    }
+
+    Arachne::ThreadId tid = Arachne::createThread(&parallelSplit<T, N>,
+            &subtask[0], outputQueues, mergeCutOff);
+    TimeTrace::record("mergesort: task splitted, core %d", Arachne::core.id);
+    if (tid == Arachne::NullThread) {
+        parallelSplit<T, N>(&subtask[0], outputQueues, mergeCutOff);
+        parallelSplit<T, N>(&subtask[1], outputQueues, mergeCutOff);
+    } else {
+        parallelSplit<T, N>(&subtask[1], outputQueues, mergeCutOff);
+        Arachne::join(tid);
+    }
+}
+#else
+template <typename T, int N>
+void
+parallelSplit(MergeJob<T, N>* task, std::vector<MergeJob<T, N>> outputQueues[],
+        const uint16_t mergeCutOff)
+{
+    // In order to split the task as evenly as possible, find the longest
+    // input source array ...
+    uint32_t k = 0;
+    int totalLength = 0;
+    std::array<int, N> length;
+    for (uint32_t i = 0; i < N; i++) {
+        length[i] = task->srcEnd[i] - task->srcBegin[i];
+        totalLength += length[i];
+        if (length[i] > length[k]) {
+            k = i;
+        }
+    }
+    if (totalLength <= mergeCutOff) {
+        outputQueues[Arachne::core.id].push_back(*task);
+        return;
+    }
+
+    // ... and use its median element to split other arrays.
+    MergeJob<T, N> subtasks[2];
+    subtasks[0].dest = task->dest;
+    subtasks[1].dest = task->dest;
+    std::array<T*, N> splitters;
+    splitters[k] = task->srcBegin[k] + length[k] / 2;
+    for (uint32_t i = 0; i < N; i++) {
+        if (i != k) {
+            // TODO: investigate if K-ary search would be faster
+//            splitters[i] = upperbound<T, 3>(task->srcBegin[i], task->srcEnd[i],
+            splitters[i] = std::upper_bound(task->srcBegin[i], task->srcEnd[i],
+                    *splitters[k]);
+        }
+        subtasks[1].dest += (splitters[i] - task->srcBegin[i]);
+    }
+
+    // Create the subtasks and delegate the first task to another thread. Note
+    // that we prefer to handle the new subtasks in the same thread unless
+    // they can be further splitted.
+    for (uint32_t i = 0; i < N; i++) {
+        subtasks[0].srcBegin[i] = task->srcBegin[i];
+        subtasks[0].srcEnd[i] = splitters[i];
+        subtasks[1].srcBegin[i] = splitters[i];
+        subtasks[1].srcEnd[i] = task->srcEnd[i];
+    }
+
+    Arachne::ThreadId child = Arachne::NullThread;
+    bool firstTask = true;
+    for (auto& subtask : subtasks) {
+        int problemSize = firstTask ? (subtasks[1].dest - subtasks[0].dest) :
+                (task->dest + totalLength - subtasks[1].dest);
+        if (problemSize > mergeCutOff) {
+            if (firstTask) {
+                child = Arachne::createThread(&parallelSplit<T, N>,
+                        &subtask, outputQueues, mergeCutOff);
+            } else {
+                parallelSplit<T, N>(&subtask, outputQueues, mergeCutOff);
+            }
+        } else {
+            outputQueues[Arachne::core.id].push_back(subtask);
+        }
+        firstTask = false;
+    }
+    if (child != Arachne::NullThread) {
+        Arachne::join(child);
+    }
+}
+#endif
 
 }
 
