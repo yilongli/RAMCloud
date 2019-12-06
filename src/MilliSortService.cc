@@ -29,9 +29,9 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
-#define TIME_TRACE_SP 1
+#define TIME_TRACE_SP 0
 
 #if 0
 /// Hack: redefine timeTrace to log so that we can use it even when server crashes.
@@ -1206,10 +1206,6 @@ MilliSortService::pickSplitters() {
 void
 MilliSortService::shuffleRecords() {
     timeTrace("=== Stage 6: shuffleRecords started");
-    uint64_t now = Cycles::rdtsc();
-    ADD_COUNTER(partitionElapsedTime, now - partitionStartTime);
-    ADD_COUNTER(shuffleKeysStartTime, now - startTime);
-    START_TIMER(shuffleKeysElapsedTime);
 
     // Partition the local keys and values according to the data bucket ranges;
     // this will be used to service the ShufflePull handler.
@@ -1229,24 +1225,27 @@ MilliSortService::shuffleRecords() {
         }
         dataBucketRanges.emplace_back(srcBegin, srcEnd - srcBegin);
     }
+    ADD_COUNTER(partitionElapsedTime, Cycles::rdtsc() - partitionStartTime);
     timeTrace("partitioned keys to be ready for key shuffle");
 
     // Local value rearrangement must be completed before shuffling values.
-    now = Cycles::rdtsc();
+    uint64_t startWait = Cycles::rdtsc();
     uint64_t elapsedTime = rearrangeLocalVals->wait();
-    if (rearrangeLocalVals->stopTime < now) {
-        uint64_t slackTime = Cycles::rdtsc() - rearrangeLocalVals->stopTime;
+    if (rearrangeLocalVals->stopTime < startWait) {
+        uint64_t slackTime = startWait - rearrangeLocalVals->stopTime;
         timeTrace("rearrangeLocalVals completed %u us ago, elapsed %u us",
                 Cycles::toMicroseconds(slackTime),
                 Cycles::toMicroseconds(elapsedTime));
     } else {
-        uint64_t delayTime = Cycles::rdtsc() - now;
+        uint64_t delayTime = Cycles::rdtsc() - startWait;
         timeTrace("rearrangeLocalVals completed %u us late, elapsed %u us",
                 Cycles::toMicroseconds(delayTime),
                 Cycles::toMicroseconds(elapsedTime));
     }
     ADD_COUNTER(rearrangeInitValuesElapsedTime, elapsedTime)
 
+    ADD_COUNTER(shuffleKeysStartTime, Cycles::rdtsc() - startTime);
+    START_TIMER(shuffleKeysElapsedTime);
 #if !TWO_LEVEL_SHUFFLE
     // Push records to the right node they belong to (records that should
     // remain in the local node are also sent in the same way to simplify code).

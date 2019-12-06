@@ -579,11 +579,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "    Sort+Part.+Shuffle+Rearrange (us)",
             formatMetricLambda(&diff,
             [] (vector<double>& v) {
-                double sum = .0;
-                for (double x : v) sum += x;
+                double sum = v[0] + std::max(v[1], v[2]) + v[3] + v[4] + v[5];
                 return (sum - v.back()) / v.back();
             },
             {"localSortElapsedTime",
+             "rearrangeInitValuesElapsedTime",
              "partitionElapsedTime",
              "shuffleKeysElapsedTime",
              "onlineMergeSortElapsedTime",
@@ -593,12 +593,13 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "    Unaccounted for (us)",
             formatMetricLambda(&diff,
             [] (vector<double>& v) {
-                double sum = 2.0 * v[0];
-                for (double x : v) sum -= x;
+                double sum = v[0] -
+                        (v[1] + std::max(v[2], v[3]) + v[4] + v[5] + v[6]);
                 return (sum - v.back()) / v.back();
             },
             {"millisortTime",
              "localSortElapsedTime",
+             "rearrangeInitValuesElapsedTime",
              "partitionElapsedTime",
              "shuffleKeysElapsedTime",
              "onlineMergeSortElapsedTime",
@@ -629,6 +630,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
     result.append(format("%-40s %s\n", "  Local sorting (us)",
             formatMetricRatio(&diff, "localSortElapsedTime", "cyclesPerMicros",
             " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "  Rearrange (overlap) (us)",
+            formatMetricGeneric(&diff, adjustElapsedTime,
+            {"rearrangeInitValuesStartTime", "rearrangeInitValuesElapsedTime",
+             "cyclesPerMicros"},
+            " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Partitioning (overall) (us)",
             formatMetricGeneric(&diff, adjustElapsedTime,
             {"gatherPivotsStartTime", "partitionElapsedTime",
@@ -648,6 +654,11 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             formatMetricGeneric(&diff, adjustElapsedTime,
             {"onlineMergeSortStartTime", "onlineMergeSortElapsedTime",
              "rearrangeFinalValuesElapsedTime", "cyclesPerMicros"},
+            " %8.2f").c_str()));
+    result.append(format("%-40s %s\n", "    MergeSort (us)",
+            formatMetricGeneric(&diff, adjustElapsedTime,
+            {"onlineMergeSortStartTime", "onlineMergeSortElapsedTime",
+             "cyclesPerMicros"},
             " %8.2f").c_str()));
     result.append(format("%-40s %s\n", "  Total time (us)",
             formatMetricRatio(&diff, "millisortTime", "cyclesPerMicros",
@@ -690,7 +701,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "rearrangeInitValuesWorkers", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "  Move rate (values/s)",
+    result.append(format("%-40s %s\n", "  Move rate (10^6 values/s)",
             formatMetricRate(&diff, "millisortInitItems",
             "rearrangeInitValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Move rate (MB/s)",
@@ -858,7 +869,7 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             "cyclesPerMicros", " %8.0f").c_str()));
     result.append(format("%-40s %s\n", "  Parallel workers",
             formatMetric(&diff, "rearrangeFinalValuesWorkers", " %8.0f").c_str()));
-    result.append(format("%-40s %s\n", "  Move rate (values/sec)",
+    result.append(format("%-40s %s\n", "  Move rate (10^6 values/s)",
             formatMetricRate(&diff, "millisortFinalItems",
             "rearrangeFinalValuesElapsedTime", " %8.2f", 1e-6).c_str()));
     result.append(format("%-40s %s\n", "  Move rate (MB/s)",
