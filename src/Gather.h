@@ -28,15 +28,8 @@ class TreeGather {
     // is no RPC involved because any processing on local data can be simply
     // performed before calling the ctor
 
-    template <typename T>
     explicit TreeGather(int opId, Context* context, CommunicationGroup* group,
-            int root, uint32_t numElements, const T* elements, Merger* merger)
-        : TreeGather(opId, context, group, root, numElements * sizeof32(T),
-                static_cast<const void*>(elements), merger)
-    {}
-
-    explicit TreeGather(int opId, Context* context, CommunicationGroup* group,
-            int root, uint32_t numBytes, const void* data, Merger* merger);
+            int root, Merger* merger);
     ~TreeGather() = default;
 
     bool isReady();

@@ -38,7 +38,7 @@ namespace {
 }
 
 TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
-        int root, uint32_t numBytes, const void* data, Merger* merger)
+        int root, Merger* merger)
     : context(context)
     , group(group)
     , merger(merger)
@@ -71,21 +71,18 @@ TreeGather::TreeGather(int opId, Context* context, CommunicationGroup* group,
 
     // If this is an interior node, wait until we have received data from
     // all its children before sending to its parent; otherwise, send out
-    // the data immediately.
+    // the data immediately. Note that the merger should've been initialized
+    // with the local data!
     if (numChildren > 0) {
         nodesToGather.construct(children.begin(), children.end());
         numPayloadsToMerge = downCast<int>(numChildren);
-        // Don't add the data duplicately; the merger should've been initialized
-        // with the local data!
-//        merger->add(&dataBuf);
     } else {
         int parent = gatherTree.getParent(relativeRank);
-        Buffer dataBuf;
-        dataBuf.appendExternal(data, numBytes);
+        Buffer* dataBuf = merger->getResult();
         timeTrace("TreeGather: sending data to parent %u, size %u, opId %d",
-                parent, numBytes, opId);
+                parent, dataBuf->size(), opId);
         sendData.construct(context, group->getNode(root + parent), opId,
-                group->rank, &dataBuf);
+                group->rank, dataBuf);
     }
 }
 

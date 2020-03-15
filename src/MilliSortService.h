@@ -458,10 +458,8 @@ class MilliSortService : public Service {
     // TODO: add document, especially memory ownership design and thread-safety (none?)
     class PivotMergeSorter : public TreeGather::Merger {
       public:
-        explicit PivotMergeSorter(MilliSortService* millisort,
-                std::vector<PivotKey>* pivots)
-            : millisort(millisort)
-            , result()
+        explicit PivotMergeSorter(std::vector<PivotKey>* pivots)
+            : result()
             , mutex()
             , pivots(pivots)
             , activeCycles(0)
@@ -491,8 +489,6 @@ class MilliSortService : public Service {
             }
             return &result;
         }
-
-        MilliSortService* millisort;
 
         Buffer result;
 
@@ -584,6 +580,10 @@ class MilliSortService : public Service {
             Value* newValues, int start, int numRecords);
     static void partition(PivotKey* keys, int numKeys, int numPartitions,
             bool includeHead, std::vector<PivotKey>* pivots);
+    void bigQueryQ1();
+    void bigQueryQ2();
+    void bigQueryQ3();
+    void bigQueryQ4();
     void localSortAndPickPivots();
     void rearrangeValues(RearrangeValueTask* rearrangeValueTask, int totalItems,
             bool initialData);

@@ -50,7 +50,8 @@ print(f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} {"max":>12} {
       f'{"p90":>12} {"localSort":>12} {"rearrange1":>12} {"partition":>12} {"shuffleRecs":>12} '
       f'{"rearrange2":>12} {"mergeSort":>12} {"shufflePiv":>12} '
       f'{"records/ms":>12} {"runID(p50)":>12} {"sortImbal":>12} {"partImbal":>12} '
-      f'{"shufPivImbal":>12} {"shufRecImbal":>12} {"rearrImbal":>12}')
+      f'{"shufPivImbal":>12} {"shufRecImbal":>12} {"rearrImbal":>12} '
+      f'{"shuffleGbps":>12}')
 
 for num_items_per_node in sorted(data_range_set):
     for num_nodes in sorted(node_range_set):
@@ -122,4 +123,5 @@ for num_items_per_node in sorted(data_range_set):
               f'{run_id:12} '
               f'{local_sort_imbalance:12.2f} {partition_imbalance:12.2f} '
               f'{shuffle_pivots_imbalance:12.2f} '
-              f'{shuffle_records_imbalance:12.2f} {rearrange2_imbalance:12.2f}')
+              f'{shuffle_records_imbalance:12.2f} {rearrange2_imbalance:12.2f} '
+              f'{num_items_per_node*106*8*1e-3/shuffle_records_time:12.2f}')

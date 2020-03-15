@@ -581,7 +581,8 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
 
         // Start broadcasting the start request.
         TreeBcast startBcast(context, world.get());
-        startBcast.send<StartMilliSortRpc>(reqHdr->requestId, startTime, false);
+        startBcast.send<StartMilliSortRpc>(reqHdr->requestId, reqHdr->queryNo,
+                startTime, false);
         startBcast.wait();
         timeTrace("MilliSort finished at master node, requestId %d",
                 reqHdr->requestId);
@@ -618,7 +619,15 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
     ADD_COUNTER(millisortNodes, world->size());
     ADD_COUNTER(millisortIsPivotSorter, isPivotServer ? 1 : 0);
     ongoingMilliSort = rpc;
-    localSortAndPickPivots();
+    switch (reqHdr->queryNo) {
+        case 0: localSortAndPickPivots(); break;
+        case 1: bigQueryQ1(); break;
+        case 2: bigQueryQ2(); break;
+        case 3: bigQueryQ3(); break;
+        case 4: bigQueryQ4(); break;
+        default:
+            DIE("Unexpected queryNo %d", reqHdr->queryNo);
+    }
     // FIXME: a better solution is to wait on condition var.
     while (ongoingMilliSort != NULL) {
         Arachne::yield();
@@ -841,6 +850,149 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
 }
 
 void
+MilliSortService::bigQueryQ1()
+{
+    using GroupByMap = std::unordered_map<std::string, uint64_t>;
+
+    /// Group records of (lang, views)-pairs by the first element; sum up the
+    /// views.
+    struct GroupByLang : public TreeGather::Merger {
+        /// Aggregate partial results from children nodes.
+        GroupByMap* numViews;
+
+        /// Serializes #numViews in wire format so it can be sent over the
+        /// network.
+        Buffer result;
+
+        /// Serializes the calls to #add.
+        Arachne::SpinLock mutex;
+
+        explicit GroupByLang(GroupByMap* numViews)
+            : numViews(numViews), result(), mutex() {}
+
+        void add(Buffer* partialResult)
+        {
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
+            uint32_t offset = 0;
+            while (offset < partialResult->size()) {
+                std::string lang;
+                while (char c = *partialResult->getOffset<char>(offset++)) {
+                    lang.append(1, c);
+                }
+                uint64_t views = *partialResult->read<uint64_t>(&offset);
+                (*numViews)[lang] += views;
+            }
+        }
+
+        Buffer* getResult()
+        {
+            if (result.size() == 0) {
+                char empty = 0;
+                for (auto iter = numViews->begin(); iter != numViews->end();
+                        iter++) {
+                    result.appendCopy(iter->first.c_str(), iter->first.size());
+                    result.appendCopy(&empty);
+                    result.appendCopy(&iter->second);
+                }
+            }
+            return &result;
+        }
+    };
+
+    // Step 0: initialize input data
+    static std::vector<std::pair<std::string, uint64_t>> tablet;
+    static const std::vector<std::string> LANGUAGES =
+            {"cn", "en", "fr", "jp", "simple"};
+    rand.construct(serverId.indexNumber());
+    if (tablet.size() != numDataTuples) {
+        tablet.clear();
+        for (int i = 0; i < numDataTuples; i++) {
+            uint64_t r = rand->next();
+            std::string lang = LANGUAGES[r % LANGUAGES.size()];
+            tablet.emplace_back(lang, r % 100);
+        }
+    }
+
+    uint64_t elapsed = Cycles::rdtsc();
+
+    // Step 1: scan the local tablet to obtain the partial result; use all
+    // worker cores to parallelize the work.
+    GroupByMap numViews;
+    std::vector<Arachne::ThreadId> workers;
+    std::vector<GroupByMap> groupByMaps(coresAvail.size());
+    std::atomic<size_t> nextStart(0);
+    auto workerMain = [&tablet, &nextStart] (GroupByMap* groupBy) {
+        while (true) {
+            size_t start = nextStart.fetch_add(1000);
+            size_t end = std::min(start + 1000, tablet.size());
+            if (start >= tablet.size()) {
+                break;
+            }
+
+            for (size_t i = start; i < end; i++) {
+                (*groupBy)[tablet[i].first] += tablet[i].second;
+            }
+        }
+    };
+
+    int id = 0;
+    for (int coreId : coresAvail) {
+        workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
+                &groupByMaps[id]));
+        id++;
+    }
+    for (auto& tid : workers) {
+        Arachne::join(tid);
+    }
+    for (GroupByMap& m : groupByMaps) {
+        for (auto iter = m.begin(); iter != m.end(); iter++) {
+            numViews[iter->first] += iter->second;
+        }
+    }
+
+    // Step 2: reduce/aggregate partial results back to the root
+    const int DUMMY_OP_ID = 999;
+    GroupByLang countViewsByLang(&numViews);
+    {
+        Tub<TreeGather> gatherOp;
+        invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
+                world.get(), 0, &countViewsByLang);
+        gatherOp->wait();
+        removeCollectiveOp(DUMMY_OP_ID);
+    }
+    elapsed = Cycles::rdtsc() - elapsed;
+
+    ongoingMilliSort.load()->sendReply();
+    ongoingMilliSort = NULL;
+
+    if (world->rank == 0) {
+        LOG(NOTICE, "BigQuery Q1 result (scan %d records in %.3f ms):",
+                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3);
+        int row = 0;
+        for (auto iter = numViews.begin(); iter != numViews.end(); iter++) {
+            row++;
+            LOG(NOTICE, "%d, %s, %d", row, iter->first.c_str(), iter->second);
+        }
+    }
+}
+void
+MilliSortService::bigQueryQ2()
+{
+
+}
+void
+MilliSortService::bigQueryQ3()
+{
+
+}
+
+void
+MilliSortService::bigQueryQ4()
+{
+
+}
+
+void
 MilliSortService::localSortAndPickPivots()
 {
     timeTrace("=== Stage 1: localSortAndPickPivots started");
@@ -881,14 +1033,13 @@ MilliSortService::localSortAndPickPivots()
     // Merge pivots from slave nodes as they arrive.
     partitionStartTime = Cycles::rdtsc();
     gatheredPivots = localPivots;
-    PivotMergeSorter merger(this, &gatheredPivots);
+    PivotMergeSorter merger(&gatheredPivots);
     {
         ADD_COUNTER(gatherPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(gatherPivotsElapsedTime);
         Tub<TreeGather> gatherPivots;
         invokeCollectiveOp<TreeGather>(gatherPivots, GATHER_PIVOTS, context,
-                myPivotServerGroup.get(), 0, (uint32_t) localPivots.size(),
-                localPivots.data(), &merger);
+                myPivotServerGroup.get(), 0, &merger);
         gatherPivots->wait();
         // TODO: the cleanup is not very nice; how to do RAII?
         removeCollectiveOp(GATHER_PIVOTS);
@@ -929,14 +1080,13 @@ MilliSortService::pickSuperPivots()
     // Initiate the gather op that collects super pivots to the root node.
     // Merge super pivots from pivot servers as they arrive.
     globalSuperPivots = superPivots;
-    PivotMergeSorter merger(this, &globalSuperPivots);
+    PivotMergeSorter merger(&globalSuperPivots);
     if (allPivotServers->size() > 1) {
         ADD_COUNTER(gatherSuperPivotsStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(gatherSuperPivotsElapsedTime);
         Tub<TreeGather> gatherSuperPivots;
         invokeCollectiveOp<TreeGather>(gatherSuperPivots, GATHER_SUPER_PIVOTS,
-                context, allPivotServers.get(), 0,
-                (uint32_t) superPivots.size(), superPivots.data(), &merger);
+                context, allPivotServers.get(), 0, &merger);
         // fixme: this is duplicated everywhere
         gatherSuperPivots->wait();
         removeCollectiveOp(GATHER_SUPER_PIVOTS);
@@ -2483,7 +2633,7 @@ MilliSortService::benchmarkCollectiveOp(
             const int DUMMY_OP_ID = 999;
             Tub<TreeGather> gatherOp;
             invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
-                    world.get(), 0, reqHdr->dataSize, data.get(), &merger);
+                    world.get(), 0, &merger);
             gatherOp->wait();
             uint64_t endTime = Cycles::rdtsc();
             timeTrace("Gather operation completed");

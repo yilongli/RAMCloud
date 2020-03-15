@@ -7457,7 +7457,7 @@ syncClusterClock(int numServers)
 /// This benchmark runs a prototype implementation of the MilliSort application
 /// inside RAMCloud and measures its end-to-end latency.
 void
-millisort()
+millisortImpl(int queryNo)
 {
     ServerId rootServer(1, 0);
 
@@ -7539,7 +7539,7 @@ millisort()
         cluster->serverControlAll(WireFormat::GET_PERF_STATS, NULL, 0,
                 &statsBefore);
 
-        StartMilliSortRpc startRpc(context, rootServer, i);
+        StartMilliSortRpc startRpc(context, rootServer, i, queryNo);
         startRpc.wait();
         LOG(NOTICE, "Finished millisort on %d nodes, %u records per node",
                 initResp->numNodesInited, recordsPerNode);
@@ -7572,6 +7572,12 @@ millisort()
     } // end of machineCount sweep
     } // end of recordsPerNode sweep
 }
+
+void millisort() { return millisortImpl(0); }
+void bigQueryQ1() { return millisortImpl(1); }
+void bigQueryQ2() { return millisortImpl(2); }
+void bigQueryQ3() { return millisortImpl(3); }
+void bigQueryQ4() { return millisortImpl(4); }
 
 void
 treeBcastImpl(std::vector<int> sizes)
@@ -8024,6 +8030,10 @@ TestInfo tests[] = {
     {"writeThroughput", writeThroughput},
     {"workloadThroughput", workloadThroughput},
     {"millisort", millisort},
+    {"bigQueryQ1", bigQueryQ1},
+    {"bigQueryQ2", bigQueryQ2},
+    {"bigQueryQ3", bigQueryQ3},
+    {"bigQueryQ4", bigQueryQ4},
     {"treeBcast", treeBcast},
     {"treeGather", treeGather},
     {"allGather", allGather},

@@ -312,6 +312,9 @@ struct StartMilliSort {
         /// Identifier of the millisort request set by the client.
         int32_t requestId;
 
+        /// Query number: 0 mean millisort; 1/2/3/4 means BigQuery Q1/2/3/4
+        int32_t queryNo;
+
         /// When (in Cycles::rdtsc ticks at the master node) shall each node
         /// start the millisort process. Only used when #fromClient is false.
         uint64_t startTime;

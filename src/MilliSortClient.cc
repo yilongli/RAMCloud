@@ -61,32 +61,35 @@ InitMilliSortRpc::appendRequest(Buffer* request, uint32_t id, uint32_t numNodes,
 
 void
 MilliSortClient::startMilliSort(Context* context, ServerId serverId,
-        int requestId, uint64_t startTime, bool fromClient)
+        int requestId, int queryNo, uint64_t startTime, bool fromClient)
 {
-    StartMilliSortRpc rpc(context, serverId, requestId, startTime, fromClient);
+    StartMilliSortRpc rpc(context, serverId, requestId, queryNo, startTime,
+            fromClient);
     rpc.wait();
 }
 
 StartMilliSortRpc::StartMilliSortRpc(Context* context, ServerId serverId,
-        int requestId, uint64_t startTime, bool fromClient)
+        int requestId, int queryNo, uint64_t startTime, bool fromClient)
     : ServerIdRpcWrapper(context, serverId,
             sizeof(WireFormat::StartMilliSort::Response))
 {
     WireFormat::StartMilliSort::Request* reqHdr(
             allocHeader<WireFormat::StartMilliSort>());
     reqHdr->requestId = requestId;
+    reqHdr->queryNo = queryNo;
     reqHdr->startTime = startTime;
     reqHdr->fromClient = fromClient;
     send();
 }
 
 void
-StartMilliSortRpc::appendRequest(Buffer* request, int requestId,
+StartMilliSortRpc::appendRequest(Buffer* request, int requestId, int queryNo,
         uint64_t startTime, bool fromClient)
 {
     WireFormat::StartMilliSort::Request* reqHdr(
             RpcWrapper::allocHeader<WireFormat::StartMilliSort>(request));
     reqHdr->requestId = requestId;
+    reqHdr->queryNo = queryNo;
     reqHdr->startTime = startTime;
     reqHdr->fromClient = fromClient;
 }
