@@ -921,7 +921,9 @@ MilliSortService::bigQueryQ1()
     std::vector<Arachne::ThreadId> workers;
     std::vector<GroupByMap> groupByMaps(coresAvail.size());
     std::atomic<size_t> nextStart(0);
-    auto workerMain = [&tablet, &nextStart] (GroupByMap* groupBy) {
+    auto workerMain = [&nextStart] (
+            std::vector<std::pair<std::string, uint64_t>> tablet,
+            GroupByMap* groupBy) {
         while (true) {
             size_t start = nextStart.fetch_add(1000);
             size_t end = std::min(start + 1000, tablet.size());
@@ -938,7 +940,7 @@ MilliSortService::bigQueryQ1()
     int id = 0;
     for (int coreId : coresAvail) {
         workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                &groupByMaps[id]));
+                tablet, &groupByMaps[id]));
         id++;
     }
     for (auto& tid : workers) {
@@ -975,11 +977,183 @@ MilliSortService::bigQueryQ1()
         }
     }
 }
-void
-MilliSortService::bigQueryQ2()
-{
 
+void
+MilliSortService::bigQueryQ2() {
+    using Ipv4Address = uint32_t;
+    using TopIPv4List = std::vector<std::pair<uint64_t, Ipv4Address>>;
+
+    /// # top IPv4 addresses to keep.
+    static const int K = 10;
+
+    /// Compute the top-K IPv4 addresses that contribute the most edits.
+    struct TopContributors : public TreeGather::Merger {
+        /// Used to hold the top-K IPv4 addresses that are aggregated over
+        /// partial results from children nodes.
+        TopIPv4List* topAddrs;
+
+        /// Serializes #topAddrs in wire format so it can be sent over the
+        /// network.
+        Buffer result;
+
+        /// Serializes the calls to #add.
+        Arachne::SpinLock mutex;
+
+        explicit TopContributors(TopIPv4List* topAddrs)
+                : topAddrs(topAddrs), result(), mutex() {}
+
+        void add(Buffer* partialResult) {
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
+            uint32_t offset = 0;
+            while (offset < partialResult->size()) {
+                uint64_t edits = *partialResult->read<uint64_t>(&offset);
+                Ipv4Address ipv4 = *partialResult->read<Ipv4Address>(&offset);
+                topAddrs->emplace_back(edits, ipv4);
+            }
+            std::partial_sort(topAddrs->begin(), topAddrs->begin() + K,
+                    topAddrs->end(), std::greater<TopIPv4List::value_type>());
+            topAddrs->resize(K);
+        }
+
+        Buffer* getResult() {
+            if (result.size() == 0) {
+                for (auto iter = topAddrs->begin(); iter != topAddrs->end();
+                     iter++) {
+                    result.appendCopy(&iter->first);
+                    result.appendCopy(&iter->second);
+                }
+            }
+            return &result;
+        }
+    };
+
+    // Step 0: initialize input data
+    static std::vector<Ipv4Address> tablet;
+    rand.construct(serverId.indexNumber());
+    if (tablet.size() != numDataTuples) {
+        tablet.clear();
+        for (int i = 0; i < numDataTuples; i++) {
+            // TODO: use real data or fix the random IP generation
+            tablet.emplace_back(rand->next() % 256);
+        }
+    }
+
+    uint64_t elapsed = Cycles::rdtsc();
+
+    // Step 1: scan the local tablet to build up the shuffle messages; use all
+    // worker cores to parallelize the work.
+    std::vector<Tub<std::vector<Buffer>>> messages(coresAvail.size());
+    for (auto &tub : messages) {
+        tub.construct(world->size());
+    }
+    std::vector<Arachne::ThreadId> workers;
+    std::atomic<size_t> nextStart(0);
+    auto workerMain = [&nextStart](std::vector<Ipv4Address> &tablet,
+            std::vector<Buffer>* messages, uint16_t maxTargets) {
+        while (true) {
+            size_t start = nextStart.fetch_add(1000);
+            size_t end = std::min(start + 1000, tablet.size());
+            if (start >= tablet.size()) {
+                break;
+            }
+
+            for (size_t i = start; i < end; i++) {
+                size_t target = tablet[i] % maxTargets;
+                (*messages)[target].appendCopy(&tablet[i]);
+            }
+        }
+    };
+
+    int id = 0;
+    for (int coreId : coresAvail) {
+        workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
+                tablet, messages[id].get(), uint16_t(world->size())));
+        id++;
+    }
+    for (auto &tid : workers) {
+        Arachne::join(tid);
+    }
+    for (size_t i = 0; i < coresAvail.size(); i++) {
+        for (size_t j = 0; j < world->size(); j++) {
+            recordShuffleMessages->at(j).appendExternal(&messages[i]->at(j));
+        }
+    }
+
+    // Step 2: shuffle the records s.t. all records of the same IPv4 address
+    // end up on the same node.
+    recordShuffleIsReady = true;
+    invokeShufflePush(world.get(), ALLSHUFFLE_BQ_IPV4,
+            recordShuffleMessages.get());
+
+    // Wait until we have received all keys that belong to us.
+    while (recordShuffleRxCount.load() < world->size()) {
+        Arachne::yield();
+    }
+//    LOG(NOTICE, "received %d ipv4 addresses", numRecordsReceived.load());
+
+    // Step 3: sort all incoming shuffled records so that we can count the
+    // ocurrences of each IP address by scanning the records sequentially;
+    // without sorting, we would have to use a huge hash table instead, which
+    // is likely going to be much slower due to cache misses
+    // TODO: use radix or ips4o sort?
+    Ipv4Address* incomingIPv4Addrs = (Ipv4Address*) incomingKeys;
+    ips4o::parallel::sort(incomingIPv4Addrs,
+            incomingIPv4Addrs + numRecordsReceived,
+            std::less<Ipv4Address>(), coresAvail.size());
+    // TODO: the following scan can be parallelized but it makes the code more
+    // complicated; wait until this becomes necessary.
+    uint64_t step3ElapsedTime;
+    TopIPv4List numEdits;
+    numEdits.reserve(numRecordsReceived);
+    if (numRecordsReceived > 0) {
+        CycleCounter<> _(&step3ElapsedTime);
+        Ipv4Address currentIp = incomingIPv4Addrs[0];
+        numEdits.emplace_back(1, currentIp);
+        for (size_t i = 1; i < numRecordsReceived; i++) {
+            Ipv4Address ip = incomingIPv4Addrs[i];
+            if (currentIp == ip) {
+                numEdits.back().first++;
+            } else {
+                numEdits.emplace_back(1, ip);
+                currentIp = ip;
+            }
+        }
+    }
+//    LOG(NOTICE, "Step 3 took %.3fms", Cycles::toSeconds(step3ElapsedTime)*1e3);
+
+    // Step 4: Keep only the top-K IP addresses then reduce/aggregate partial
+    // results back to the root
+    TopIPv4List topAddrs(K);
+    std::partial_sort_copy(numEdits.begin(), numEdits.end(), topAddrs.begin(),
+            topAddrs.end(), std::greater<TopIPv4List::value_type>());
+
+    const int DUMMY_OP_ID = 999;
+    TopContributors topContributors(&numEdits);
+    {
+        Tub<TreeGather> gatherOp;
+        invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
+                world.get(), 0, &topContributors);
+        gatherOp->wait();
+        removeCollectiveOp(DUMMY_OP_ID);
+    }
+    elapsed = Cycles::rdtsc() - elapsed;
+
+    recordShuffleMessages.destroy();
+    ongoingMilliSort.load()->sendReply();
+    ongoingMilliSort = NULL;
+
+    if (world->rank == 0) {
+        LOG(NOTICE, "BigQuery Q2 result (scan %d records in %.3f ms):",
+                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3);
+        for (auto iter = numEdits.begin(); iter != numEdits.end(); iter++) {
+            uint64_t ip = iter->second;
+            std::string ipStr = format("%d.%d.%d.%d", (ip>>24)&0xff,
+                    (ip>>16)&0xff, (ip>>8)&0xff, ip&0xff);
+            LOG(NOTICE, "%s, %d", ipStr.c_str(), iter->first);
+        }
+    }
 }
+
 void
 MilliSortService::bigQueryQ3()
 {
@@ -1904,6 +2078,59 @@ MilliSortService::copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
 }
 
 void
+MilliSortService::copyOutShuffleIPv4(uint32_t senderId, uint32_t totalLength,
+        uint32_t offset, Buffer* messageChunk)
+{
+    // Special case: not a real chunk; this is a side-effect of piggybacking
+    // shuffle message chunks in RPC responses.
+    if (offset > totalLength) {
+        return;
+    }
+
+    static const uint32_t RECORD_SIZE = sizeof32(uint32_t);
+    assert(totalLength % RECORD_SIZE == 0);
+    uint32_t numRecords = totalLength / RECORD_SIZE;
+    uint32_t len = messageChunk->size();
+    assert(offset + len <= totalLength);
+
+    // Reserve space for the entire message if this is the first chunk of the
+    // message. Note: the caller of this method should've filtered out duplicate
+    // RPCs, or message chunks, already; otherwise, we may risk double-counting
+    // incoming records.
+    std::atomic<int>* resv = &shuffleRecordResv->at(senderId);
+    if (offset == 0) {
+        assert(resv->load() == -1);
+        resv->store(numRecordsReceived.fetch_add(numRecords));
+    } else {
+        while (resv->load() < 0) {
+            Arachne::yield();
+        }
+    }
+
+    // Copy incoming IPv4 addresses to their destination.
+    const uint32_t startIdx = downCast<uint32_t>(resv->load());
+    if (offset < totalLength) {
+        Buffer::Iterator payload(messageChunk);
+        char* dst = reinterpret_cast<char*>(incomingKeys) +
+                startIdx * RECORD_SIZE;
+        dst += offset;
+        while (!payload.isDone()) {
+            memcpy(dst, payload.getData(), payload.getLength());
+            dst += payload.getLength();
+            payload.next();
+        }
+    }
+
+    // This is the last chunk of the message, which implies that we
+    // have received the entire message because our push-based shuffle
+    // implementation doesn't send out the next data chunk before the
+    // preceding one is finished.
+    if (offset + len == totalLength) {
+        recordShuffleRxCount.fetch_add(1);
+    }
+}
+
+void
 MilliSortService::handleShuffleRowChunk(uint32_t senderId, uint32_t totalLength,
         uint32_t offset, Buffer* messageChunk)
 {
@@ -2187,6 +2414,10 @@ MilliSortService::invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
                             copyOutShuffleRecords(messageTracker->rank,
                                     messageTracker->receiveTotalLength,
                                     respOffset, reply);
+                        } else if (dataId == ALLSHUFFLE_BQ_IPV4) {
+                            copyOutShuffleIPv4(messageTracker->rank,
+                                    messageTracker->receiveTotalLength,
+                                    respOffset, reply);
                         } else if (dataId == ALLSHUFFLE_RECORD_ROW) {
                             handleShuffleRowChunk(messageTracker->rank,
                                     messageTracker->receiveTotalLength,
@@ -2335,7 +2566,8 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
 #endif
             break;
         }
-        case ALLSHUFFLE_RECORD: {
+        case ALLSHUFFLE_RECORD:
+        case ALLSHUFFLE_BQ_IPV4: {
             timeTraceSp("shuffle-record: received message chunk from server %u,"
                     " offset %u, len %u", senderId, offset,
                     rpc->requestPayload->size());
@@ -2352,8 +2584,14 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
                 if (bytesReceived->compare_exchange_strong(expected,
                         offset + rpc->requestPayload->size())) {
                     INC_COUNTER(shuffleKeysReceivedRpcs);
-                    copyOutShuffleRecords(senderId, totalLength, offset,
-                            rpc->requestPayload);
+                    if (reqHdr->dataId == ALLSHUFFLE_BQ_IPV4) {
+                        copyOutShuffleIPv4(senderId, totalLength, offset,
+                                rpc->requestPayload);
+
+                    } else {
+                        copyOutShuffleRecords(senderId, totalLength, offset,
+                                rpc->requestPayload);
+                    }
                 } else {
                     LOG(WARNING, "RecordShuffle: ignore duplicate message "
                             "chunk from senderId %u, offset %u", senderId,
@@ -2362,8 +2600,14 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
             } else if (offset == 0) {
                 uint32_t expected = offset;
                 if (bytesReceived->compare_exchange_strong(expected, 1)) {
-                    copyOutShuffleRecords(senderId, totalLength, offset,
-                            rpc->requestPayload);
+                    if (reqHdr->dataId == ALLSHUFFLE_BQ_IPV4) {
+                        copyOutShuffleIPv4(senderId, totalLength, offset,
+                                rpc->requestPayload);
+
+                    } else {
+                        copyOutShuffleRecords(senderId, totalLength, offset,
+                                rpc->requestPayload);
+                    }
                 } else {
                     LOG(WARNING, "RecordShuffle: ignore duplicate message "
                             "chunk from senderId %u, offset %u", senderId,

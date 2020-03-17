@@ -568,6 +568,7 @@ class MilliSortService : public Service {
         ALLSHUFFLE_RECORD,
         ALLSHUFFLE_RECORD_ROW,
         ALLSHUFFLE_RECORD_COL,
+        ALLSHUFFLE_BQ_IPV4,
         ALLSHUFFLE_BENCHMARK,
         POINT2POINT_BENCHMARK,
     };
@@ -594,6 +595,8 @@ class MilliSortService : public Service {
     void copyOutShufflePivots(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
+            uint32_t offset, Buffer* messageChunk);
+    void copyOutShuffleIPv4(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void handleShuffleRowChunk(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
