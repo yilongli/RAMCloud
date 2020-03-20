@@ -141,9 +141,6 @@ class MilliSortService : public Service {
 //        removeCollectiveOp(opId);
     }
 
-    void invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
-            std::vector<Buffer>* outMessages);
-
     /**
      * Helper function for use in handling RPCs used by collective operations.
      * Record the RPC for future processing if the corresponding collective
@@ -545,6 +542,112 @@ class MilliSortService : public Service {
         uint64_t bytesReceived;
     };
 
+    struct ShuffleOp {
+        /// Unique identifier of this shuffle operation. Must be same on all
+        /// participating nodes.
+        int opId;
+
+        /// Contains all nodes that participate in the shuffle.
+        CommunicationGroup* group;
+
+        /// Shuffle messages that are received, indexed by source server rank.
+        std::vector<std::vector<char>> incomingMessages;
+
+        /// Has the memory space for incomingMessages[i] been allocated and
+        /// initialized?
+        std::vector<std::atomic_bool> bufferInited;
+
+        /// Shuffle messages to send, indexed by target server rank.
+        std::vector<Buffer> outgoingMessages;
+
+        /// Records # bytes we have received for each incoming shuffle message;
+        /// this can be used to filter out duplicate shuffle RPCs. There is one
+        /// entry for each server, ordered by their ranks.
+        std::vector<std::atomic<uint32_t>> rxBytes;
+
+        /// # complete shuffle messages received so far. Note: each shuffle
+        /// message is broken down into multiple chunks for transmission,
+        /// where each chunk is sent with one ShufflePushRpc.
+        std::atomic_int rxCompleted;
+
+        /// Total # bytes received from all source nodes.
+        std::atomic<uint64_t> totalRxBytes;
+
+        explicit ShuffleOp(int opId, CommunicationGroup* group)
+            : opId(opId)
+            , group(group)
+            , incomingMessages(group->size())
+            , bufferInited(group->size())
+            , outgoingMessages(group->size())
+            , rxBytes(group->size())
+            , rxCompleted(0)
+            , totalRxBytes(0)
+        {}
+
+        void onReceive(const WireFormat::ShufflePush::Request* reqHdr,
+                WireFormat::ShufflePush::Response* respHdr,
+                Buffer* request, Buffer* reply);
+
+        virtual char* getCopyDest(uint32_t senderId, uint32_t totalLength,
+                uint32_t offset);
+
+        void copyOut(uint32_t senderId, uint32_t totalLength, uint32_t offset,
+                Buffer* messageChunk);
+
+        bool isDone()
+        {
+            return (rxCompleted == group->size());
+        }
+    };
+
+    struct ShuffleOpOpt : public ShuffleOp {
+        /// Starting address of the external buffer used to hold all incoming
+        /// messages contiguously; for now, we assume this buffer is large
+        /// enough.
+        char* externalBuffer;
+
+        /// # bytes in #externalBuffer.
+        const size_t bufferSize;
+
+        /// # bytes in #externalBuffer that have been reserved for incoming
+        /// messages.
+        std::atomic<uint64_t> reservedBytes;
+
+        /// Starting addresses of incoming messages.
+        std::vector<std::atomic<char*>> messageBase;
+
+        explicit ShuffleOpOpt(int opId, CommunicationGroup* group, char* buffer,
+                size_t size)
+            : ShuffleOp(opId, group)
+            , externalBuffer(buffer)
+            , bufferSize(size)
+            , reservedBytes(0)
+            , messageBase(group->size())
+        {}
+
+        virtual char* getCopyDest(uint32_t senderId, uint32_t totalLength,
+                uint32_t offset)
+        {
+            // Reserve space for the entire message if this is the first chunk
+            // of the message. Note: the caller of this method must've filtered
+            // out duplicate RPCs already; or, we will mess up our state.
+            std::atomic<char*>& base = messageBase[senderId];
+            if (offset == 0) {
+                assert(base.load() == NULL);
+                base = externalBuffer + reservedBytes.fetch_add(totalLength);
+                assert(base + totalLength < externalBuffer + bufferSize);
+            } else {
+                while (base == NULL) {
+                    Arachne::yield();
+                }
+            }
+            return base.load() + offset;
+        }
+    };
+
+    void invokeShufflePush(CommunicationGroup* group, uint32_t dataId,
+            std::vector<Buffer>* outMessages, ShuffleOp* shuffleOp = NULL);
+
     /// Shared RAMCloud information.
     Context* context;
 
@@ -568,7 +671,9 @@ class MilliSortService : public Service {
         ALLSHUFFLE_RECORD,
         ALLSHUFFLE_RECORD_ROW,
         ALLSHUFFLE_RECORD_COL,
-        ALLSHUFFLE_BQ_IPV4,
+        ALLSHUFFLE_BIGQUERY_0,
+        ALLSHUFFLE_BIGQUERY_1,
+        ALLSHUFFLE_BIGQUERY_2,
         ALLSHUFFLE_BENCHMARK,
         POINT2POINT_BENCHMARK,
     };
@@ -595,8 +700,6 @@ class MilliSortService : public Service {
     void copyOutShufflePivots(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void copyOutShuffleRecords(uint32_t senderId, uint32_t totalLength,
-            uint32_t offset, Buffer* messageChunk);
-    void copyOutShuffleIPv4(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
     void handleShuffleRowChunk(uint32_t senderId, uint32_t totalLength,
             uint32_t offset, Buffer* messageChunk);
@@ -744,6 +847,8 @@ class MilliSortService : public Service {
     std::atomic<int> colShuffleRxCount;
     Tub<std::vector<std::atomic<uint32_t>>> rowShuffleProgress;
     Tub<std::vector<std::atomic<uint32_t>>> colShuffleProgress;
+
+    std::atomic<ShuffleOp*> globalShuffleOpTable[64];
 
     /// Serializes all calls to the merge sorter's poll method and protects
     /// #mergeSortChunks.
