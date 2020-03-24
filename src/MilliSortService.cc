@@ -1153,6 +1153,322 @@ MilliSortService::bigQueryQ2() {
 void
 MilliSortService::bigQueryQ3()
 {
+    static const int K = 10;
+    // Step 0: initialize input data
+    // (repo_name, author)
+    using CommitTableEntry = std::pair<std::string, std::string>;
+    // (repo_name, lang, lang_bytes)
+    using LangTableEntry = std::tuple<std::string, std::string, uint64_t>;
+    static std::vector<CommitTableEntry> commitTablet;
+    static std::vector<LangTableEntry> langTablet;
+
+    static const int MAX_REPOS = 1000;
+    static const int MAX_AUTHORS = 1000;
+    static const int MAX_REPOS_CONTRIBUTED = 5;
+    static const std::vector<std::string> LANGUAGES =
+            {"C", "C++", "Java", "JavaScript", "Rust"};
+    if (commitTablet.size() != numDataTuples) {
+        rand.construct(serverId.indexNumber());
+        std::vector<std::string> repos;
+        std::vector<std::pair<std::string, std::vector<uint32_t>>> authors;
+        for (int i = 0; i < MAX_REPOS; i++) {
+            repos.push_back(format("repo_%d", i));
+        }
+        for (int i = 0; i < MAX_AUTHORS; i++) {
+            authors.emplace_back();
+            authors.back().first = format("author_%d", i);
+            for (int j = 0; j < MAX_REPOS_CONTRIBUTED; j++) {
+                authors.back().second.emplace_back(rand->next() % repos.size());
+            }
+        }
+
+        commitTablet.clear();
+        for (int i = 0; i < numDataTuples; i++) {
+            size_t r1 = rand->next() % authors.size();
+            size_t r2 = rand->next() % MAX_REPOS_CONTRIBUTED;
+            std::string repo = repos[authors[r1].second[r2]];
+            std::string author = authors[r1].first;
+            commitTablet.emplace_back(repo, author);
+        }
+        langTablet.clear();
+        int repoId0 = world->rank * MAX_REPOS / world->size();
+        int repoId1 = (world->rank + 1) * MAX_REPOS / world->size();
+        for (int i = repoId0; i < repoId1; i++) {
+            for (auto& lang : LANGUAGES) {
+                uint64_t bytes = rand->next() % 10000;
+                langTablet.emplace_back(format("repo_%d", i), lang, bytes);
+            }
+        }
+    }
+
+    uint64_t elapsed = Cycles::rdtsc();
+
+    // Step 1: scan the local tablet to build up the shuffle messages; use all
+    // worker cores to parallelize the work.
+    std::vector<Tub<std::vector<Buffer>>> messages(coresAvail.size());
+    for (auto &tub : messages) {
+        tub.construct(world->size());
+    }
+    std::vector<Arachne::ThreadId> workers;
+    std::atomic<size_t> nextStart(0);
+    auto workerMain = [&nextStart](std::vector<CommitTableEntry> &tablet,
+            std::vector<Buffer>* messages, uint16_t maxTargets) {
+        while (true) {
+            size_t start = nextStart.fetch_add(1000);
+            size_t end = std::min(start + 1000, tablet.size());
+            if (start >= tablet.size()) {
+                break;
+            }
+
+            char empty = 0;
+            for (size_t i = start; i < end; i++) {
+                std::string& repo = tablet[i].first;
+                std::string& author = tablet[i].second;
+                size_t h1 = std::hash<std::string>()(repo);
+                size_t h2 = std::hash<std::string>()(author);
+                size_t target = (h1 ^ h2) % maxTargets;
+                (*messages)[target].appendCopy(repo.c_str(), repo.size());
+                (*messages)[target].appendCopy(&empty);
+                (*messages)[target].appendCopy(author.c_str(), author.size());
+                (*messages)[target].appendCopy(&empty);
+            }
+        }
+    };
+
+    int id = 0;
+    for (int coreId : coresAvail) {
+        workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
+                commitTablet, messages[id].get(), uint16_t(world->size())));
+        id++;
+    }
+    for (auto &tid : workers) {
+        Arachne::join(tid);
+    }
+
+    std::unique_ptr<ShuffleOp> shuffleOp0(new ShuffleOp(
+            ALLSHUFFLE_BIGQUERY_0, world.get()));
+    for (size_t i = 0; i < coresAvail.size(); i++) {
+        for (size_t j = 0; j < world->size(); j++) {
+            shuffleOp0->outgoingMessages[j].appendExternal(&messages[i]->at(j));
+        }
+    }
+
+    // Step 2: shuffle the commit table records s.t. all records of the same
+    // (repo, author)-pair end up on the same node.
+    globalShuffleOpTable[shuffleOp0->opId] = shuffleOp0.get();
+    invokeShufflePush(shuffleOp0->group, shuffleOp0->opId,
+            &shuffleOp0->outgoingMessages, shuffleOp0.get());
+
+    // Step 3: sort all incoming shuffled records so that we can remove
+    // duplicate (repo, author)-pairs by scanning the records sequentially;
+    // without sorting, we would have to use a huge hash table instead, which
+    // is likely going to be much slower due to cache misses
+    std::vector<CommitTableEntry> incomingCommits;
+    for (std::vector<char>& msg : shuffleOp0->incomingMessages) {
+        size_t offset = 0;
+        while (offset < msg.size()) {
+            incomingCommits.emplace_back("", "");
+            CommitTableEntry* entry = &incomingCommits.back();
+            while (char ch = msg[offset++]) entry->first.append(1, ch);
+            while (char ch = msg[offset++]) entry->second.append(1, ch);
+        }
+    }
+    ips4o::parallel::sort(incomingCommits.begin(), incomingCommits.end(),
+            std::less<CommitTableEntry>(), coresAvail.size());
+    size_t uniqueCount = 0;
+    if (!incomingCommits.empty()) {
+        uniqueCount = 1;
+        for (size_t i = 1; i < incomingCommits.size(); i++) {
+            if (incomingCommits[i] != incomingCommits[uniqueCount-1]) {
+                incomingCommits[uniqueCount] = incomingCommits[i];
+                uniqueCount++;
+            }
+        }
+        incomingCommits.resize(uniqueCount);
+    }
+
+    // Step 4: perform the second shuffle to the (repo, author)-pairs based on
+    // the repo
+    std::unique_ptr<ShuffleOp> shuffleOp1(new ShuffleOp(
+            ALLSHUFFLE_BIGQUERY_1, world.get()));
+    for (CommitTableEntry& entry : incomingCommits) {
+        size_t target = std::hash<std::string>()(entry.first) % world->size();
+        Buffer* buffer = &shuffleOp1->outgoingMessages[target];
+        const char null = 0;
+        buffer->appendCopy(entry.first.c_str(), entry.first.size());
+        buffer->appendCopy(&null);
+        buffer->appendCopy(entry.second.c_str(), entry.second.size());
+        buffer->appendCopy(&null);
+    }
+
+    globalShuffleOpTable[shuffleOp1->opId] = shuffleOp1.get();
+    invokeShufflePush(shuffleOp1->group, shuffleOp1->opId,
+            &shuffleOp1->outgoingMessages, shuffleOp1.get());
+
+    incomingCommits.clear();
+    for (std::vector<char>& msg : shuffleOp1->incomingMessages) {
+        size_t offset = 0;
+        while (offset < msg.size()) {
+            incomingCommits.emplace_back("", "");
+            CommitTableEntry* entry = &incomingCommits.back();
+            while (char ch = msg[offset++]) entry->first.append(1, ch);
+            while (char ch = msg[offset++]) entry->second.append(1, ch);
+        }
+    }
+    ips4o::parallel::sort(incomingCommits.begin(), incomingCommits.end(),
+            std::less<CommitTableEntry>(), coresAvail.size());
+//    for (auto& c : incomingCommits) {
+//        LOG(NOTICE, "commit (%s, %s)", c.first.c_str(), c.second.c_str());
+//    }
+
+    // Step 5: perform the third shuffle to the language table based on the repo
+    std::unique_ptr<ShuffleOp> shuffleOp2(new ShuffleOp(
+            ALLSHUFFLE_BIGQUERY_2, world.get()));
+    for (LangTableEntry& entry : langTablet) {
+        std::string repo, lang;
+        uint64_t bytes;
+        std::tie(repo, lang, bytes) = entry;
+        size_t target = std::hash<std::string>()(repo) % world->size();
+        Buffer* buffer = &shuffleOp2->outgoingMessages[target];
+        buffer->appendCopy(repo.c_str(), repo.size() + 1);
+        buffer->appendCopy(lang.c_str(), lang.size() + 1);
+        buffer->appendCopy(&bytes);
+    }
+
+    globalShuffleOpTable[shuffleOp2->opId] = shuffleOp2.get();
+    invokeShufflePush(shuffleOp2->group, shuffleOp2->opId,
+            &shuffleOp2->outgoingMessages, shuffleOp2.get());
+
+    std::vector<LangTableEntry> incomingLangEntries;
+    for (std::vector<char>& msg : shuffleOp2->incomingMessages) {
+        size_t offset = 0;
+        while (offset < msg.size()) {
+            incomingLangEntries.emplace_back("", "", 0);
+            LangTableEntry& entry = incomingLangEntries.back();
+            while (char ch = msg[offset++]) std::get<0>(entry).append(1, ch);
+            while (char ch = msg[offset++]) std::get<1>(entry).append(1, ch);
+            std::get<2>(entry) = *((uint64_t*) &msg[offset]);
+            offset += sizeof(uint64_t);
+        }
+    }
+    ips4o::parallel::sort(incomingLangEntries.begin(), incomingLangEntries.end(),
+            std::less<LangTableEntry>(), coresAvail.size());
+//    for (auto& le : incomingLangEntries) {
+//        LOG(NOTICE, "lang (%s, %s, %lu)", std::get<0>(le).c_str(),
+//                std::get<1>(le).c_str(), std::get<2>(le));
+//    }
+
+    // Step 6: join the commit table and the language table on repo
+    // FIXME: fix this naive O(n^2) join implementation
+    using LangAuthorEntry = std::tuple<std::string, std::string, uint64_t>;
+    std::vector<LangAuthorEntry> langAuthorBytes;
+    for (auto& e0 : incomingCommits) {
+        for (auto& e1 : incomingLangEntries) {
+            if (std::get<0>(e0) == std::get<0>(e1)) {
+                langAuthorBytes.emplace_back(std::get<1>(e1), std::get<1>(e0),
+                        std::get<2>(e1));
+            }
+        }
+    }
+    std::sort(langAuthorBytes.begin(), langAuthorBytes.end());
+    if (!langAuthorBytes.empty()) {
+        uniqueCount = 1;
+        for (size_t i = 1; i < langAuthorBytes.size(); i++) {
+            LangAuthorEntry& a = langAuthorBytes[i];
+            LangAuthorEntry& b = langAuthorBytes[uniqueCount - 1];
+            if ((std::get<0>(a) != std::get<0>(b)) ||
+                    (std::get<1>(a) != std::get<1>(b))) {
+                langAuthorBytes[uniqueCount] = a;
+                uniqueCount++;
+            } else {
+                std::get<2>(b) += std::get<2>(a);
+            }
+        }
+        langAuthorBytes.resize(uniqueCount);
+    }
+    std::sort(langAuthorBytes.begin(), langAuthorBytes.end(),
+            [] (const LangAuthorEntry& lhs, const LangAuthorEntry& rhs) {
+                    return std::get<2>(lhs) > std::get<2>(rhs);
+    });
+    langAuthorBytes.resize(K);
+
+    // Step 7: reduce to compute the top-K (lang, author, bytes)-tuples
+    /// Compute the top-K IPv4 addresses that contribute the most edits.
+    struct TopBytes : public TreeGather::Merger {
+        /// Used to hold the top-K (lang, author, bytes) tuples aggregated over
+        /// partial results from children nodes.
+        std::vector<LangAuthorEntry>* topBytes;
+
+        /// Serializes #topBytes in wire format so it can be sent over the
+        /// network.
+        Buffer result;
+
+        /// Serializes the calls to #add.
+        Arachne::SpinLock mutex;
+
+        explicit TopBytes(std::vector<LangAuthorEntry>* topBytes)
+                : topBytes(topBytes), result(), mutex() {}
+
+        void add(Buffer* partialResult) {
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
+            uint32_t offset = 0;
+            while (offset < partialResult->size()) {
+                topBytes->emplace_back("", "", 0);
+                auto& entry = topBytes->back();
+                while (char ch = *partialResult->read<char>(&offset))
+                    std::get<0>(entry).append(1, ch);
+                while (char ch = *partialResult->read<char>(&offset))
+                    std::get<1>(entry).append(1, ch);
+                std::get<2>(entry) = *partialResult->read<uint64_t>(&offset);
+            }
+            std::partial_sort(topBytes->begin(), topBytes->begin() + K,
+                    topBytes->end(),
+                    [] (const LangAuthorEntry& lhs, const LangAuthorEntry& rhs)
+                    { return std::get<2>(lhs) > std::get<2>(rhs); }
+            );
+            topBytes->resize(K);
+        }
+
+        Buffer* getResult() {
+            if (result.size() == 0) {
+                for (auto iter = topBytes->begin(); iter != topBytes->end();
+                        iter++) {
+                    auto& lang = std::get<0>(*iter);
+                    auto& author = std::get<1>(*iter);
+                    result.appendCopy(lang.c_str(), lang.size() + 1);
+                    result.appendCopy(author.c_str(), author.size() + 1);
+                    result.appendCopy(&std::get<2>(*iter));
+                }
+            }
+            return &result;
+        }
+    };
+
+    const int DUMMY_OP_ID = 999;
+    TopBytes topBytes(&langAuthorBytes);
+    {
+        Tub<TreeGather> gatherOp;
+        invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
+                world.get(), 0, &topBytes);
+        gatherOp->wait();
+        removeCollectiveOp(DUMMY_OP_ID);
+    }
+    elapsed = Cycles::rdtsc() - elapsed;
+
+    globalShuffleOpTable[shuffleOp0->opId] = NULL;
+    globalShuffleOpTable[shuffleOp1->opId] = NULL;
+    globalShuffleOpTable[shuffleOp2->opId] = NULL;
+    ongoingMilliSort.load()->sendReply();
+    ongoingMilliSort = NULL;
+
+    if (world->rank == 0) {
+        LOG(NOTICE, "BigQuery Q3 result (scan %d records in %.3f ms):",
+                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3);
+        for (auto& e : langAuthorBytes) {
+            LOG(NOTICE, "(%s, %s, %lu)", std::get<0>(e).c_str(),
+                    std::get<1>(e).c_str(), std::get<2>(e));
+        }
+    }
 }
 
 void
