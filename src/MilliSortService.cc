@@ -15,6 +15,7 @@
 
 #include <emmintrin.h>
 #include <immintrin.h>
+#include <fstream>
 
 #include "ips4o/ips4o.hpp"
 
@@ -322,7 +323,8 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     // We are busy serving another sorting request.
     if (ongoingMilliSort) {
         LOG(WARNING, "Sorting already in progress!");
-        respHdr->common.status = STATUS_SORTING_IN_PROGRESS;
+        throw RetryException(HERE, 250*1000, 500*1000,
+                "Sorting already in progress");
         return;
     }
 
@@ -567,14 +569,16 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
             if (reqHdr->requestId == lastMilliSortId) {
                 LOG(WARNING, "Skipped duplicate StartMilliSort RPC from client,"
                         " requestId = %d", reqHdr->requestId);
+                mutex.unlock();
                 return;
             }
             mutex.unlock();
         } else {
             // Can't acquire the lock: there must another millisort in progress;
             // retry later.
-            respHdr->common.status = STATUS_RETRY;
-            return;
+            uint64_t delayMicros = 250 * 1000;
+            throw RetryException(HERE, delayMicros, delayMicros * 2,
+                    "Another millisort in progress");
         }
 
         // Set the global time where all nodes should start millisort.
@@ -853,6 +857,7 @@ MilliSortService::rearrangeValues(RearrangeValueTask* task, int totalItems,
 void
 MilliSortService::bigQueryQ1()
 {
+    /// Hashmap keeping the number of views of each language.
     using GroupByMap = std::unordered_map<std::string, uint64_t>;
 
     /// Group records of (lang, views)-pairs by the first element; sum up the
@@ -902,6 +907,42 @@ MilliSortService::bigQueryQ1()
 
     // Step 0: initialize input data
     static std::vector<std::pair<std::string, uint64_t>> tablet;
+#if 1
+    static const int recordsPerTablet = 10*1000000;
+    if (tablet.size() != numDataTuples) {
+        tablet.clear();
+        tablet.reserve(numDataTuples);
+        int sid = serverId.indexNumber() - 1;
+        int startRecId = sid * numDataTuples;
+        int stopRecId = (sid + 1) * numDataTuples - 1;
+        size_t totalRecords = 0;
+        for (int tabletId = startRecId / recordsPerTablet;
+                tabletId <= stopRecId / recordsPerTablet; tabletId++) {
+            int curRecId = tabletId * recordsPerTablet - 1;
+            string filename = format(
+                    "/home/yilongl/work/wiki1B/tablet-%03d.txt", tabletId);
+            std::ifstream tabletFile(filename.c_str());
+            if (tabletFile.is_open()) {
+                std::string line;
+                while (std::getline(tabletFile, line)) {
+                    curRecId++;
+                    if (curRecId < startRecId) continue;
+                    if (curRecId > stopRecId) break;
+                    size_t comma = line.find(',');
+                    if (comma == string::npos) continue;
+                    std::string lang = line.substr(0, comma);
+                    uint64_t views = std::stol(line.substr(comma + 1));
+                    tablet.emplace_back(lang, views);
+                }
+            } else {
+                LOG(ERROR, "File not found: %s", filename.c_str());
+            }
+            LOG(NOTICE, "Initialized tablet with %d records from %s",
+                    tablet.size() - totalRecords, filename.c_str());
+            totalRecords = tablet.size();
+        }
+    }
+#else
     static const std::vector<std::string> LANGUAGES =
             {"cn", "en", "fr", "jp", "simple"};
     rand.construct(serverId.indexNumber());
@@ -913,6 +954,7 @@ MilliSortService::bigQueryQ1()
             tablet.emplace_back(lang, r % 100);
         }
     }
+#endif
 
     uint64_t elapsed = Cycles::rdtsc();
 
@@ -938,18 +980,21 @@ MilliSortService::bigQueryQ1()
         }
     };
 
-    int id = 0;
-    for (int coreId : coresAvail) {
-        workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                tablet, &groupByMaps[id]));
-        id++;
-    }
-    for (auto& tid : workers) {
-        Arachne::join(tid);
-    }
-    for (GroupByMap& m : groupByMaps) {
-        for (auto iter = m.begin(); iter != m.end(); iter++) {
-            numViews[iter->first] += iter->second;
+    {
+        SCOPED_TIMER(bigQueryStep1ElapsedTime)
+        int id = 0;
+        for (int coreId : coresAvail) {
+            workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
+                    tablet, &groupByMaps[id]));
+            id++;
+        }
+        for (auto& tid : workers) {
+            Arachne::join(tid);
+        }
+        for (GroupByMap& m : groupByMaps) {
+            for (auto iter = m.begin(); iter != m.end(); iter++) {
+                numViews[iter->first] += iter->second;
+            }
         }
     }
 
@@ -957,6 +1002,7 @@ MilliSortService::bigQueryQ1()
     const int DUMMY_OP_ID = 999;
     GroupByLang countViewsByLang(&numViews);
     {
+        SCOPED_TIMER(bigQueryStep2ElapsedTime)
         Tub<TreeGather> gatherOp;
         invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
                 world.get(), 0, &countViewsByLang);
@@ -964,19 +1010,30 @@ MilliSortService::bigQueryQ1()
         removeCollectiveOp(DUMMY_OP_ID);
     }
     elapsed = Cycles::rdtsc() - elapsed;
+    ADD_COUNTER(bigQueryTime, elapsed);
 
+    // Pretty-print the query result that will be returned to the BQ client
+    if (world->rank == 0) {
+        std::vector<std::pair<std::string, uint64_t>> result;
+        for (auto& kv : numViews) {
+            result.emplace_back(kv.first, kv.second);
+        }
+        std::sort(result.begin(), result.end());
+        std::string prettyPrint;
+        for (size_t row = 0; row < result.size(); row++) {
+            prettyPrint += format("%lu, %s, %lu | ", row + 1,
+                    result[row].first.c_str(), result[row].second);
+        }
+        LOG(NOTICE, "BigQuery Q1 result (scan %d records in %.3f ms):\n%s",
+                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3,
+                prettyPrint.c_str());
+    } else {
+        LOG(NOTICE, "Finished processing BigQuery Q1");
+    }
+
+    // Notify the master server that we are done.
     ongoingMilliSort.load()->sendReply();
     ongoingMilliSort = NULL;
-
-    if (world->rank == 0) {
-        LOG(NOTICE, "BigQuery Q1 result (scan %d records in %.3f ms):",
-                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3);
-        int row = 0;
-        for (auto iter = numViews.begin(); iter != numViews.end(); iter++) {
-            row++;
-            LOG(NOTICE, "%d, %s, %d", row, iter->first.c_str(), iter->second);
-        }
-    }
 }
 
 void
@@ -1030,14 +1087,58 @@ MilliSortService::bigQueryQ2() {
 
     // Step 0: initialize input data
     static std::vector<Ipv4Address> tablet;
+#if 1
+    static const int recordsPerTablet = 10*1000000;
+    if (tablet.size() != numDataTuples) {
+        tablet.clear();
+        tablet.reserve(numDataTuples);
+        int sid = serverId.indexNumber() - 1;
+        int startRecId = sid * numDataTuples;
+        int stopRecId = (sid + 1) * numDataTuples - 1;
+        size_t totalRecords = 0;
+        for (int tabletId = startRecId / recordsPerTablet;
+                tabletId <= stopRecId / recordsPerTablet; tabletId++) {
+            int curRecId = tabletId * recordsPerTablet - 1;
+            string filename = format(
+                    "/home/yilongl/work/wiki_ip/tablet-%03d.csv", tabletId);
+            std::ifstream tabletFile(filename.c_str());
+            if (tabletFile.is_open()) {
+                std::string line;
+                std::string token;
+                while (std::getline(tabletFile, line)) {
+                    curRecId++;
+                    if (curRecId < startRecId) continue;
+                    if (curRecId > stopRecId) break;
+                    try {
+                        Ipv4Address ip = 0;
+                        std::istringstream stream(line);
+                        while (std::getline(stream, token, '.')) {
+                            ip <<= 8;
+                            ip |= token.empty() ? 0 :
+                                    uint32_t(std::stoi(token));
+                        }
+                        tablet.emplace_back(ip);
+                    } catch (...) {
+                        LOG(WARNING, "Couldn't parse address %s", line.c_str());
+                    }
+                }
+            } else {
+                LOG(ERROR, "File not found: %s", filename.c_str());
+            }
+            LOG(NOTICE, "Initialized tablet with %d records from %s",
+                    tablet.size() - totalRecords, filename.c_str());
+            totalRecords = tablet.size();
+        }
+    }
+#else
     rand.construct(serverId.indexNumber());
     if (tablet.size() != numDataTuples) {
         tablet.clear();
         for (int i = 0; i < numDataTuples; i++) {
-            // TODO: use real data or fix the random IP generation
             tablet.emplace_back(rand->next() % 256);
         }
     }
+#endif
 
     uint64_t elapsed = Cycles::rdtsc();
 
@@ -1065,44 +1166,60 @@ MilliSortService::bigQueryQ2() {
         }
     };
 
-    int id = 0;
-    for (int coreId : coresAvail) {
-        workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                tablet, messages[id].get(), uint16_t(world->size())));
-        id++;
-    }
-    for (auto &tid : workers) {
-        Arachne::join(tid);
-    }
-    std::unique_ptr<ShuffleOp> shuffleOp(new ShuffleOpOpt(
-            ALLSHUFFLE_BIGQUERY_0, world.get(), (char*) incomingKeys, ~0lu));
-    for (size_t i = 0; i < coresAvail.size(); i++) {
-        for (size_t j = 0; j < world->size(); j++) {
-            shuffleOp->outgoingMessages[j].appendExternal(&messages[i]->at(j));
+    std::unique_ptr<ShuffleOp> shuffleOp;
+    {
+        SCOPED_TIMER(bigQueryStep1ElapsedTime)
+        int id = 0;
+        for (int coreId : coresAvail) {
+            workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
+                    tablet, messages[id].get(), uint16_t(world->size())));
+            id++;
+        }
+        for (auto &tid : workers) {
+            Arachne::join(tid);
+        }
+
+        shuffleOp.reset(new ShuffleOpOpt(ALLSHUFFLE_BIGQUERY_0, world.get(),
+                (char*) incomingKeys, ~0lu));
+        for (size_t target = 0; target < world->size(); target++) {
+            for (size_t c = 0; c < coresAvail.size(); c++) {
+                shuffleOp->outgoingMessages[target].appendExternal(
+                        &messages[c]->at(target));
+            }
+    //        LOG(NOTICE, "shuffling %u bytes to node %u",
+    //                shuffleOp->outgoingMessages[target].size(), target);
         }
     }
 
     // Step 2: shuffle the records s.t. all records of the same IPv4 address
     // end up on the same node.
-    globalShuffleOpTable[shuffleOp->opId] = shuffleOp.get();
-    invokeShufflePush(shuffleOp->group, shuffleOp->opId,
-            &shuffleOp->outgoingMessages, shuffleOp.get());
+    {
+        SCOPED_TIMER(bigQueryStep2ElapsedTime)
+        globalShuffleOpTable[shuffleOp->opId] = shuffleOp.get();
+        invokeShufflePush(shuffleOp->group, shuffleOp->opId,
+                &shuffleOp->outgoingMessages, shuffleOp.get());
+        // Note: we can't delete this shuffle op yet; suppose some other node X
+        // issues a ShufflePushRpc to us and we piggyback some data for X in the
+        // reply but the reply gets lost: from our perspective, this shuffle op
+        // is done (i.e., we received and sent all data) but when X retries the
+        // RPC we will have no record for it...
+//        globalShuffleOpTable[shuffleOp->opId] = NULL;
+    }
 
     // Step 3: sort all incoming shuffled records so that we can count the
     // ocurrences of each IP address by scanning the records sequentially;
     // without sorting, we would have to use a huge hash table instead, which
-    // is likely going to be much slower due to cache misses
+    // is likely going to be much slower due to cache misses.
     size_t numIPv4Addrs = shuffleOp->totalRxBytes.load() / sizeof(Ipv4Address);
     Ipv4Address* incomingIPv4Addrs = (Ipv4Address*) incomingKeys;
     ips4o::parallel::sort(incomingIPv4Addrs, incomingIPv4Addrs + numIPv4Addrs,
             std::less<Ipv4Address>(), coresAvail.size());
-    // TODO: the following scan can be parallelized but it makes the code more
-    // complicated; wait until this becomes necessary.
-    uint64_t step3ElapsedTime;
     TopIPv4List numEdits;
-    numEdits.reserve(numIPv4Addrs);
     if (numIPv4Addrs > 0) {
-        CycleCounter<> _(&step3ElapsedTime);
+        // Note: the following scan can be parallelized but it makes the code
+        // less readable; wait until this becomes necessary.
+        SCOPED_TIMER(bigQueryStep3ElapsedTime);
+        numEdits.reserve(numIPv4Addrs);
         Ipv4Address currentIp = incomingIPv4Addrs[0];
         numEdits.emplace_back(1, currentIp);
         for (size_t i = 1; i < numIPv4Addrs; i++) {
@@ -1115,17 +1232,23 @@ MilliSortService::bigQueryQ2() {
             }
         }
     }
-//    LOG(NOTICE, "Step 3 took %.3fms", Cycles::toSeconds(step3ElapsedTime)*1e3);
+    LOG(NOTICE, "Got %lu IPs (%lu unique)", numIPv4Addrs, numEdits.size());
 
-    // Step 4: Keep only the top-K IP addresses then reduce/aggregate partial
-    // results back to the root
+    // Step 4: retain only the local top-K IP addresses by doing a partial sort
     TopIPv4List topAddrs(K);
-    std::partial_sort_copy(numEdits.begin(), numEdits.end(), topAddrs.begin(),
-            topAddrs.end(), std::greater<TopIPv4List::value_type>());
+    {
+        SCOPED_TIMER(bigQueryStep4ElapsedTime)
+        std::partial_sort_copy(numEdits.begin(), numEdits.end(),
+                topAddrs.begin(), topAddrs.end(),
+                std::greater<TopIPv4List::value_type>());
+    }
 
+    // Step 5: reduce/aggregate partial results on each node to compute the
+    // global top-K IP addresses.
     const int DUMMY_OP_ID = 999;
     TopContributors topContributors(&numEdits);
     {
+        SCOPED_TIMER(bigQueryStep5ElapsedTime)
         Tub<TreeGather> gatherOp;
         invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
                 world.get(), 0, &topContributors);
@@ -1133,21 +1256,28 @@ MilliSortService::bigQueryQ2() {
         removeCollectiveOp(DUMMY_OP_ID);
     }
     elapsed = Cycles::rdtsc() - elapsed;
+    ADD_COUNTER(bigQueryTime, elapsed);
 
+    // Pretty-print the query result that will be returned to the BQ client
+    if (world->rank == 0) {
+        std::string prettyPrint;
+        for (auto iter = numEdits.begin(); iter != numEdits.end(); iter++) {
+            Ipv4Address ip = iter->second;
+            std::string ipStr = format("%u.%u.%u.%u", (ip>>24)&0xff,
+                    (ip>>16)&0xff, (ip>>8)&0xff, ip&0xff);
+            prettyPrint += format("%s, %lu | ", ipStr.c_str(), iter->first);
+        }
+        LOG(NOTICE, "BigQuery Q2 result (scan %d records in %.3f ms):\n%s",
+                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3,
+                prettyPrint.c_str());
+    } else {
+        LOG(NOTICE, "Finished processing BigQuery Q2");
+    }
+
+    // Notify the master server that we are done.
     globalShuffleOpTable[shuffleOp->opId] = NULL;
     ongoingMilliSort.load()->sendReply();
     ongoingMilliSort = NULL;
-
-    if (world->rank == 0) {
-        LOG(NOTICE, "BigQuery Q2 result (scan %d records in %.3f ms):",
-                numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3);
-        for (auto iter = numEdits.begin(); iter != numEdits.end(); iter++) {
-            uint64_t ip = iter->second;
-            std::string ipStr = format("%d.%d.%d.%d", (ip>>24)&0xff,
-                    (ip>>16)&0xff, (ip>>8)&0xff, ip&0xff);
-            LOG(NOTICE, "%s, %d", ipStr.c_str(), iter->first);
-        }
-    }
 }
 
 void
@@ -2935,7 +3065,11 @@ MilliSortService::shufflePush(const WireFormat::ShufflePush::Request* reqHdr,
         case ALLSHUFFLE_BIGQUERY_1:
         case ALLSHUFFLE_BIGQUERY_2: {
             auto& shuffleOp = globalShuffleOpTable[reqHdr->dataId];
+            uint64_t deadline = Cycles::rdtsc() + Cycles::fromSeconds(10);
             while (shuffleOp.load() == NULL) {
+                if (Cycles::rdtsc() > deadline) {
+                    DIE("Couldn't find shuffleOp %u after 10s", reqHdr->dataId);
+                }
                 Arachne::yield();
             }
             shuffleOp.load()->onReceive(reqHdr, respHdr, rpc->requestPayload,

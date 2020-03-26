@@ -462,6 +462,16 @@ struct PerfStats {
 
     uint64_t rearrangeFinalValuesWorkers;
 
+    //--------------------------------------------------------------------
+    // Statistics for BigQuery follow below.
+    //--------------------------------------------------------------------
+    uint64_t bigQueryTime;
+    uint64_t bigQueryStep1ElapsedTime;
+    uint64_t bigQueryStep2ElapsedTime;
+    uint64_t bigQueryStep3ElapsedTime;
+    uint64_t bigQueryStep4ElapsedTime;
+    uint64_t bigQueryStep5ElapsedTime;
+    uint64_t bigQueryStep6ElapsedTime;
 
     //--------------------------------------------------------------------
     // Temporary counters. The values below have no pre-defined use;

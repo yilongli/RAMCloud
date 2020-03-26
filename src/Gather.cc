@@ -195,6 +195,13 @@ TreeGather::GatherTree::getParent(int child)
 bool
 TreeGather::isReady()
 {
+    // TODO: actually, I think the following termination criterion can be
+    // problematic; it only says we have received everything we need and
+    // our parent node has ACK'ed our data BUT there is no guarantee that
+    // our children nodes have been ACK'ed (i.e., our ACKs to children could
+    // get lost); this becomes a problem if we delete this gather op after
+    // this method returns and some of our children nodes retry the RPCs
+    // only to find the corresponding gather op object is missing...
     if (group->rank != root) {
         return sendData && sendData->isReady();
     } else {

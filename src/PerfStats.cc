@@ -193,6 +193,13 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(rearrangeFinalValuesElapsedTime);
         COLLECT(rearrangeFinalValuesCycles);
         COLLECT(rearrangeFinalValuesWorkers);
+        COLLECT(bigQueryTime);
+        COLLECT(bigQueryStep1ElapsedTime);
+        COLLECT(bigQueryStep2ElapsedTime);
+        COLLECT(bigQueryStep3ElapsedTime);
+        COLLECT(bigQueryStep4ElapsedTime);
+        COLLECT(bigQueryStep5ElapsedTime);
+        COLLECT(bigQueryStep6ElapsedTime);
         total->temp1 += stats->temp1;
         total->temp2 += stats->temp2;
         total->temp3 += stats->temp3;
@@ -509,8 +516,38 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
             "cyclesPerSecond", " %8.3f").c_str()));
 #endif
 
+    auto vs = diff.find("bigQueryTime")->second;
+    if (std::accumulate(vs.begin(), vs.end(), 0.0) > 1e-6) {
+        result.append("\nBigQuery:\n");
+        result.append("\n=== Total ===\n");
+        result.append(format("%-40s %s\n", "  Elapsed time (ms)",
+                formatMetricRatio(&diff, "bigQueryTime", "cyclesPerMillis",
+                " %8.3f").c_str()));
+
+        result.append("\n=== Time Breakdown (indiv. server) ===\n");
+        result.append(format("%-40s %s\n", "  Step 1 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep1ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 2 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep2ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 3 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep3ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 4 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep4ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 5 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep5ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 6 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep6ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        return result;
+    }
+
     // TODO: Arachne core util.
-    auto vs = diff.find("millisortTime")->second;
+    vs = diff.find("millisortTime")->second;
     if (std::accumulate(vs.begin(), vs.end(), 0.0) < 1e-6) {
         return result;
     }
@@ -1048,6 +1085,13 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(rearrangeFinalValuesElapsedTime);
         ADD_METRIC(rearrangeFinalValuesCycles);
         ADD_METRIC(rearrangeFinalValuesWorkers);
+        ADD_METRIC(bigQueryTime);
+        ADD_METRIC(bigQueryStep1ElapsedTime);
+        ADD_METRIC(bigQueryStep2ElapsedTime);
+        ADD_METRIC(bigQueryStep3ElapsedTime);
+        ADD_METRIC(bigQueryStep4ElapsedTime);
+        ADD_METRIC(bigQueryStep5ElapsedTime);
+        ADD_METRIC(bigQueryStep6ElapsedTime);
         ADD_METRIC(temp1);
         ADD_METRIC(temp2);
         ADD_METRIC(temp3);

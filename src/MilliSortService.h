@@ -635,7 +635,7 @@ class MilliSortService : public Service {
             if (offset == 0) {
                 assert(base.load() == NULL);
                 base = externalBuffer + reservedBytes.fetch_add(totalLength);
-                assert(base + totalLength < externalBuffer + bufferSize);
+                assert(totalLength - (externalBuffer - base) < bufferSize);
             } else {
                 while (base == NULL) {
                     Arachne::yield();

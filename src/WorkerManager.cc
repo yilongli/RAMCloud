@@ -373,10 +373,13 @@ WorkerManager::workerMain(Transport::ServerRpc* serverRpc)
         rpc.arriveTime = serverRpc->arriveTime;
         rpc.dispatchTime = start;
 
-        // TODO: bypass Service::handleRpc for all millisort RPCs
+        // TODO: bypass Service::handleRpc for all millisort RPCs except
+        // {Init,Start}MilliSort because we used "throw RetryException" in
+        // their handlers
         const WireFormat::RequestCommon* header =
                 serverRpc->requestPayload.getStart<WireFormat::RequestCommon>();
-        if ((header->opcode >= WireFormat::INIT_MILLISORT) &&
+//        if ((header->opcode >= WireFormat::INIT_MILLISORT) &&
+        if ((header->opcode > WireFormat::START_MILLISORT) &&
                 (header->opcode <= WireFormat::BENCHMARK_COLLECTIVE_OP)) {
             MilliSortService* service = static_cast<MilliSortService*>(
                     context->services[WireFormat::MILLISORT_SERVICE]);
