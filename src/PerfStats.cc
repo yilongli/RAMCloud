@@ -200,6 +200,8 @@ PerfStats::collectStats(PerfStats* total)
         COLLECT(bigQueryStep4ElapsedTime);
         COLLECT(bigQueryStep5ElapsedTime);
         COLLECT(bigQueryStep6ElapsedTime);
+        COLLECT(bigQueryStep7ElapsedTime);
+        COLLECT(bigQueryStep8ElapsedTime);
         total->temp1 += stats->temp1;
         total->temp2 += stats->temp2;
         total->temp3 += stats->temp3;
@@ -542,6 +544,12 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
                 "cyclesPerMillis", " %8.3f").c_str()));
         result.append(format("%-40s %s\n", "  Step 6 (ms)",
                 formatMetricRatio(&diff, "bigQueryStep6ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 7 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep7ElapsedTime",
+                "cyclesPerMillis", " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Step 8 (ms)",
+                formatMetricRatio(&diff, "bigQueryStep8ElapsedTime",
                 "cyclesPerMillis", " %8.3f").c_str()));
         return result;
     }
@@ -1092,6 +1100,8 @@ PerfStats::clusterDiff(Buffer* before, Buffer* after, int numServers,
         ADD_METRIC(bigQueryStep4ElapsedTime);
         ADD_METRIC(bigQueryStep5ElapsedTime);
         ADD_METRIC(bigQueryStep6ElapsedTime);
+        ADD_METRIC(bigQueryStep7ElapsedTime);
+        ADD_METRIC(bigQueryStep8ElapsedTime);
         ADD_METRIC(temp1);
         ADD_METRIC(temp2);
         ADD_METRIC(temp3);

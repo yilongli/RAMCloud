@@ -472,6 +472,8 @@ struct PerfStats {
     uint64_t bigQueryStep4ElapsedTime;
     uint64_t bigQueryStep5ElapsedTime;
     uint64_t bigQueryStep6ElapsedTime;
+    uint64_t bigQueryStep7ElapsedTime;
+    uint64_t bigQueryStep8ElapsedTime;
 
     //--------------------------------------------------------------------
     // Temporary counters. The values below have no pre-defined use;
