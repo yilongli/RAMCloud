@@ -667,6 +667,7 @@ class MilliSortService : public Service {
         BROADCAST_PIVOT_BUCKET_BOUNDARIES,
         ALLSHUFFLE_PIVOTS,
         BROADCAST_DATA_BUCKET_BOUNDARIES,
+        BROADCAST_SHAKESPEARE_WORDS,
         ALLGATHER_DATA_BUCKET_BOUNDARIES,
         ALLSHUFFLE_RECORD,
         ALLSHUFFLE_RECORD_ROW,
@@ -949,6 +950,10 @@ class MilliSortService : public Service {
     std::vector<PivotKey> globalSuperPivots;
 
     Tub<TreeBcast> bcastPivotBucketBoundaries;
+
+    // -------- BigQuery state --------
+    std::vector<std::string> bigQueryQ4UniqueWords;
+    std::atomic_bool bigQueryQ4BcastDone;
 
     friend class TreeBcast;
     friend class Merge;

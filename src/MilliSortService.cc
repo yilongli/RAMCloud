@@ -202,6 +202,9 @@ MilliSortService::MilliSortService(Context* context,
     , pivotShuffleMessages()
     , globalSuperPivots()
     , bcastPivotBucketBoundaries()
+    // BigQuery-related
+    , bigQueryQ4UniqueWords()
+    , bigQueryQ4BcastDone()
 {
     context->services[WireFormat::MILLISORT_SERVICE] = this;
     if (uint64_t(localKeys) % 64) {
@@ -504,6 +507,10 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
     if (world->rank == 0) {
         bcastPivotBucketBoundaries.construct(context, allPivotServers.get());
     }
+
+    // Clear BigQuery-related states
+    bigQueryQ4UniqueWords.clear();
+    bigQueryQ4BcastDone = false;
 
     // Flush LLC to avoid generating unrealistic numbers; we are doing
     // memory-to-memory sorting (not cache-to-cache sorting)!
@@ -1832,7 +1839,188 @@ MilliSortService::bigQueryQ3()
 void
 MilliSortService::bigQueryQ4()
 {
+    // Step 0: initialize input data
+    static std::vector<std::string> titles;
+    static std::vector<std::string> words;
+    static const int recordsPerTablet = 10*1000000;
+    if (titles.size() != numDataTuples) {
+        titles.clear();
+        titles.reserve(numDataTuples);
+        int sid = serverId.indexNumber() - 1;
+        int startRecId = sid * numDataTuples;
+        int stopRecId = (sid + 1) * numDataTuples - 1;
+        size_t totalRecords = 0;
+        for (int tabletId = startRecId / recordsPerTablet;
+                tabletId <= stopRecId / recordsPerTablet; tabletId++) {
+            int curRecId = tabletId * recordsPerTablet - 1;
+            string filename = format(
+                    "/home/yilongl/work/publicdata-samples/wiki-titles-%03d.csv", tabletId);
+            std::ifstream tabletFile(filename.c_str());
+            if (tabletFile.is_open()) {
+                std::string line;
+                while (std::getline(tabletFile, line)) {
+                    curRecId++;
+                    if (curRecId < startRecId) continue;
+                    if (curRecId > stopRecId) break;
+                    titles.emplace_back(line);
+                }
+            } else {
+                LOG(ERROR, "File not found: %s", filename.c_str());
+            }
+            LOG(NOTICE, "Initialized tablet with %lu records from %s",
+                    titles.size() - totalRecords, filename.c_str());
+            totalRecords = titles.size();
+        }
+    }
 
+    if (world->rank == 0) {
+        std::string filename(
+                "/home/yilongl/work/publicdata-samples/shakespeare-words.csv");
+        if (words.empty()) {
+            std::ifstream file(filename.c_str());
+            if (file.is_open()) {
+                std::string line;
+                while (std::getline(file, line)) {
+                    words.emplace_back(line);
+                }
+                LOG(NOTICE, "Initialized %lu words from %s", words.size(),
+                        filename.c_str());
+            } else {
+                LOG(ERROR, "File not found: %s", filename.c_str());
+            }
+        }
+    } else {
+        words.clear();
+    }
+
+    // Auxilary data structure to support indirect sort on #words.
+    std::vector<std::string*> wordPtrs;
+    wordPtrs.reserve(words.size());
+    for (std::string& word : words) {
+        wordPtrs.emplace_back(&word);
+    }
+
+    // Define our customized string comparison function
+    auto stringCompare = [] (const string* a, const string* b) {
+        // We don't really need lexicographical order; only perform
+        // the expensive char-by-char comparison when two strings
+        // are equally long.
+        if (a->size() == b->size()) {
+            return a->compare(*b) < 0;
+        } else {
+            return a->size() < b->size();
+        }
+    };
+
+    uint64_t elapsed = Cycles::rdtsc();
+    timeTrace("BigQuery Q4 started");
+
+    // Step 1: compute unique words at the root; broadcast them to others
+    TreeBcast bcastWordsTable(context, world.get());
+    if (world->rank == 0) {
+        SCOPED_TIMER(bigQueryStep1ElapsedTime)
+        // Sort the words tablet to compute a small table of unique words
+        // to be used in the broadcast join later
+        ips4o::parallel::sort(wordPtrs.begin(), wordPtrs.end(), stringCompare,
+                coresAvail.size());
+        timeTrace("step 1: sorted %u words", words.size());
+
+        // TODO: parallelize the following scan
+        bigQueryQ4UniqueWords.emplace_back(*wordPtrs.front());
+        for (std::string* word : wordPtrs) {
+            if (bigQueryQ4UniqueWords.back().compare(*word) != 0) {
+                bigQueryQ4UniqueWords.emplace_back(*word);
+            }
+        }
+        timeTrace("step 1: got %u unique words", bigQueryQ4UniqueWords.size());
+
+        // Broadcast the small join table of unique words
+        char* buffer = (char*) localKeys;
+        char* dst = buffer;
+        for (std::string& word : bigQueryQ4UniqueWords) {
+            memcpy(dst, word.c_str(), word.size() + 1);
+            dst += word.size() + 1;
+        }
+        uint32_t nbytes = uint32_t(dst - buffer);
+        timeTrace("step 1: about to broadcast the words table (%u bytes)",
+                nbytes);
+        // TODO: optimize broadcast
+        bcastWordsTable.send<SendDataRpc>(BROADCAST_SHAKESPEARE_WORDS, nbytes,
+                buffer);
+        bcastWordsTable.wait();
+    } else {
+        SCOPED_TIMER(bigQueryStep1ElapsedTime)
+        while (!bigQueryQ4BcastDone.load()) {
+            Arachne::yield();
+        }
+    }
+    timeTrace("step 1: received %u unique words", bigQueryQ4UniqueWords.size());
+
+    // Step 2: join the smaller words table with the titles tablet; we use
+    // a sorted list instead of a hash set to store the words table because
+    // building the hash set is inherently hard to parallelize (although hash
+    // set lookup is much faster than binary search).
+    std::vector<std::vector<std::string>> results(coresAvail.size());
+    std::atomic<size_t> nextStart(0);
+    auto args = std::make_tuple(&bigQueryQ4UniqueWords, &titles, &nextStart);
+    auto workerMain = [&args, &stringCompare]
+            (std::vector<std::string>* result) {
+        // Unpack arguments
+        std::vector<std::string>* words;
+        std::vector<std::string>* titles;
+        std::atomic<size_t>* nextStart;
+        std::tie(words, titles, nextStart) = args;
+
+        while (true) {
+            size_t start = nextStart->fetch_add(1000);
+            size_t end = std::min(start + 1000, titles->size());
+            if (start >= titles->size()) {
+                break;
+            }
+
+            for (size_t i = start; i < end; i++) {
+                std::string& title = (*titles)[i];
+                bool found = std::binary_search(words->begin(), words->end(),
+                        title,
+                        [&stringCompare] (const string& a, const string& b) {
+                            return stringCompare(&a, &b);
+                        });
+                if (found) {
+                    result->emplace_back(title);
+                }
+            }
+        }
+    };
+
+    {
+        SCOPED_TIMER(bigQueryStep2ElapsedTime)
+        // Scan the titles tablet to filter out titles that don't exist in
+        // the words table; use all cores to parallelize the work.
+        int id = 0;
+        std::vector<Arachne::ThreadId> workers;
+        for (int coreId : coresAvail) {
+            workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
+                    &results[id]));
+            id++;
+        }
+        for (auto& tid : workers) {
+            Arachne::join(tid);
+        }
+        size_t count = 0;
+        for (auto& result : results) {
+            count += result.size();
+        }
+        timeTrace("step 2: found %u wiki titles in the words table", count);
+    }
+    ADD_COUNTER(bigQueryTime, elapsed);
+
+    // The result of this query is a bit large so we are not going to aggregate
+    // them back to the root (and return to the client).
+    LOG(NOTICE, "Finished processing BigQuery Q4");
+
+    // Notify the master server that we are done.
+    ongoingMilliSort.load()->sendReply();
+    ongoingMilliSort = NULL;
 }
 
 void
@@ -3850,6 +4038,25 @@ MilliSortService::sendData(const WireFormat::SendData::Request* reqHdr,
 
                 rpc->sendReply();
                 shuffleRecords();
+            }
+            break;
+        }
+        case BROADCAST_SHAKESPEARE_WORDS: {
+            // FIXME: info leak in handler; have to handle differently based on
+            // rank
+            if (world->rank > 0) {
+                assert(bigQueryQ4UniqueWords.empty());
+                Buffer *request = rpc->requestPayload;
+                for (uint32_t offset = sizeof(*reqHdr);
+                        offset < request->size();) {
+                    bigQueryQ4UniqueWords.emplace_back("");
+                    std::string& word = bigQueryQ4UniqueWords.back();
+                    while (char ch = *request->read<char>(&offset)) {
+                        word.append(1, ch);
+                    }
+                }
+                bigQueryQ4BcastDone = true;
+                rpc->sendReply();
             }
             break;
         }
