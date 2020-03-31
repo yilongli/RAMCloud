@@ -18,6 +18,7 @@
 #include <fstream>
 
 #include "ips4o/ips4o.hpp"
+#include "robin-hood/robin_hood.h"
 
 #include "Arachne/DefaultCorePolicy.h"
 #include "ClockSynchronizer.h"
@@ -865,7 +866,12 @@ void
 MilliSortService::bigQueryQ1()
 {
     /// Hashmap keeping the number of views of each language.
-    using GroupByMap = std::unordered_map<std::string, uint64_t>;
+//    using GroupByMap = std::unordered_map<std::string, uint64_t>;
+    using GroupByMap = robin_hood::unordered_map<std::string, uint64_t>;
+
+    /// Columnar storage for the input table.
+    using LangCol = std::vector<std::string>;
+    using ViewCol = std::vector<uint64_t>;
 
     /// Group records of (lang, views)-pairs by the first element; sum up the
     /// views.
@@ -883,9 +889,16 @@ MilliSortService::bigQueryQ1()
         explicit GroupByLang(GroupByMap* numViews)
             : numViews(numViews), result(), mutex() {}
 
+        /**
+         * Update the aggregation result with the partial result coming from
+         * a children node.
+         */
         void add(Buffer* partialResult)
         {
+            timeTrace("GroupByLang::add invoked, buffer size %u",
+                    partialResult->size());
             std::lock_guard<Arachne::SpinLock> lock(mutex);
+            timeTrace("GroupByLang::add entered critical section");
             uint32_t offset = 0;
             while (offset < partialResult->size()) {
                 std::string lang;
@@ -895,30 +908,33 @@ MilliSortService::bigQueryQ1()
                 uint64_t views = *partialResult->read<uint64_t>(&offset);
                 (*numViews)[lang] += views;
             }
+            timeTrace("GroupByLang::add finished");
         }
 
         Buffer* getResult()
         {
             if (result.size() == 0) {
-                char empty = 0;
-                for (auto iter = numViews->begin(); iter != numViews->end();
-                        iter++) {
-                    result.appendCopy(iter->first.c_str(), iter->first.size());
-                    result.appendCopy(&empty);
-                    result.appendCopy(&iter->second);
+                timeTrace("GroupByLang::getResult serializing current result");
+                for (auto& kv : *numViews) {
+                    result.appendCopy(kv.first.c_str(), kv.first.size() + 1);
+                    result.appendCopy(&kv.second);
                 }
+                timeTrace("GroupByLang::getResult finished serialization");
             }
             return &result;
         }
     };
 
     // Step 0: initialize input data
-    static std::vector<std::pair<std::string, uint64_t>> tablet;
-#if 1
     static const int recordsPerTablet = 10*1000000;
-    if (tablet.size() != numDataTuples) {
-        tablet.clear();
-        tablet.reserve(numDataTuples);
+    static std::pair<LangCol, ViewCol> tablet;
+    if (tablet.first.size() != numDataTuples) {
+        LangCol& langCol = tablet.first;
+        ViewCol& viewCol = tablet.second;
+        langCol.clear();
+        langCol.reserve(numDataTuples);
+        viewCol.clear();
+        viewCol.reserve(numDataTuples);
         int sid = serverId.indexNumber() - 1;
         int startRecId = sid * numDataTuples;
         int stopRecId = (sid + 1) * numDataTuples - 1;
@@ -939,75 +955,93 @@ MilliSortService::bigQueryQ1()
                     if (comma == string::npos) continue;
                     std::string lang = line.substr(0, comma);
                     uint64_t views = std::stol(line.substr(comma + 1));
-                    tablet.emplace_back(lang, views);
+                    langCol.emplace_back(lang);
+                    viewCol.emplace_back(views);
                 }
             } else {
                 LOG(ERROR, "File not found: %s", filename.c_str());
             }
-            LOG(NOTICE, "Initialized tablet with %d records from %s",
-                    tablet.size() - totalRecords, filename.c_str());
-            totalRecords = tablet.size();
+            LOG(NOTICE, "Initialized tablet with %lu records from %s",
+                    langCol.size() - totalRecords, filename.c_str());
+            totalRecords = langCol.size();
         }
     }
-#else
-    static const std::vector<std::string> LANGUAGES =
-            {"cn", "en", "fr", "jp", "simple"};
-    rand.construct(serverId.indexNumber());
-    if (tablet.size() != numDataTuples) {
-        tablet.clear();
-        for (int i = 0; i < numDataTuples; i++) {
-            uint64_t r = rand->next();
-            std::string lang = LANGUAGES[r % LANGUAGES.size()];
-            tablet.emplace_back(lang, r % 100);
-        }
-    }
-#endif
-
-    uint64_t elapsed = Cycles::rdtsc();
+    timeTrace("BigQuery Q1 started");
 
     // Step 1: scan the local tablet to obtain the partial result; use all
     // worker cores to parallelize the work.
-    GroupByMap numViews;
-    std::vector<Arachne::ThreadId> workers;
     std::vector<GroupByMap> groupByMaps(coresAvail.size());
     std::atomic<size_t> nextStart(0);
-    auto workerMain = [&nextStart] (
-            std::vector<std::pair<std::string, uint64_t>> tablet,
+
+    /// Scanner function that processes a number of (lang, views) pairs and
+    /// count the views per language.
+    auto scanner = [&nextStart] (std::pair<LangCol, ViewCol>* tablet,
             GroupByMap* groupBy) {
+        timeTrace("worker started on core %d", Arachne::core.id);
+        static const int BATCH_SIZE = 512;
+
+        LangCol& langCol = tablet->first;
+        ViewCol& viewCol = tablet->second;
+        size_t numRecords = 0;
         while (true) {
-            size_t start = nextStart.fetch_add(1000);
-            size_t end = std::min(start + 1000, tablet.size());
-            if (start >= tablet.size()) {
+            size_t start = nextStart.fetch_add(BATCH_SIZE);
+            size_t end = std::min(start + BATCH_SIZE, langCol.size());
+            if (start >= langCol.size()) {
                 break;
             }
 
             for (size_t i = start; i < end; i++) {
-                (*groupBy)[tablet[i].first] += tablet[i].second;
+                (*groupBy)[langCol[i]] += viewCol[i];
             }
+            numRecords += (end - start);
+        }
+        timeTrace("worker done, processed %u records", numRecords);
+    };
+
+    auto combiner = [] (GroupByMap* a, GroupByMap* b) {
+        for (auto& kv : *b) {
+            (*a)[kv.first] += kv.second;
         }
     };
 
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
+        std::vector<Arachne::ThreadId> workers;
         int id = 0;
         for (int coreId : coresAvail) {
-            workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                    tablet, &groupByMaps[id]));
+            workers.push_back(Arachne::createThreadOnCore(coreId, scanner,
+                    &tablet, &groupByMaps[id]));
             id++;
         }
         for (auto& tid : workers) {
             Arachne::join(tid);
         }
-        for (GroupByMap& m : groupByMaps) {
-            for (auto iter = m.begin(); iter != m.end(); iter++) {
-                numViews[iter->first] += iter->second;
+        workers.clear();
+        timeTrace("step 1: scanned the table to sum up views per language");
+
+        size_t n = groupByMaps.size();
+        while (n > 1) {
+            size_t k = (n / 2);
+            size_t s = (n % 2);
+            for (size_t i = 0; i < k; i++, s++) {
+                workers.push_back(Arachne::createThreadOnCore(coresAvail[i],
+                        combiner, &groupByMaps[s], &groupByMaps[s + k]));
             }
+            n -= k;
+
+            for (auto& tid : workers) {
+                Arachne::join(tid);
+            }
+            workers.clear();
         }
+        groupByMaps.resize(1);
+        timeTrace("step 1: combined per-core results, languages %u",
+                groupByMaps.front().size());
     }
 
     // Step 2: reduce/aggregate partial results back to the root
     const int DUMMY_OP_ID = 999;
-    GroupByLang countViewsByLang(&numViews);
+    GroupByLang countViewsByLang(&groupByMaps.front());
     {
         SCOPED_TIMER(bigQueryStep2ElapsedTime)
         Tub<TreeGather> gatherOp;
@@ -1015,14 +1049,15 @@ MilliSortService::bigQueryQ1()
                 world.get(), 0, &countViewsByLang);
         gatherOp->wait();
         removeCollectiveOp(DUMMY_OP_ID);
+        timeTrace("step 2: gather op completed");
     }
-    elapsed = Cycles::rdtsc() - elapsed;
+    uint64_t elapsed = Cycles::rdtsc() - startTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     // Pretty-print the query result that will be returned to the BQ client
     if (world->rank == 0) {
         std::vector<std::pair<std::string, uint64_t>> result;
-        for (auto& kv : numViews) {
+        for (auto& kv : groupByMaps.front()) {
             result.emplace_back(kv.first, kv.second);
         }
         std::sort(result.begin(), result.end());
@@ -1148,8 +1183,6 @@ MilliSortService::bigQueryQ2() {
     }
 #endif
 
-    uint64_t elapsed = Cycles::rdtsc();
-
     // Step 1: scan the local tablet to build up the shuffle messages; use all
     // worker cores to parallelize the work.
     std::vector<Tub<std::vector<Buffer>>> messages(coresAvail.size());
@@ -1158,18 +1191,18 @@ MilliSortService::bigQueryQ2() {
     }
     std::vector<Arachne::ThreadId> workers;
     std::atomic<size_t> nextStart(0);
-    auto workerMain = [&nextStart](std::vector<Ipv4Address> &tablet,
+    auto workerMain = [&nextStart](std::vector<Ipv4Address>* tablet,
             std::vector<Buffer>* messages, uint16_t maxTargets) {
         while (true) {
             size_t start = nextStart.fetch_add(1000);
-            size_t end = std::min(start + 1000, tablet.size());
-            if (start >= tablet.size()) {
+            size_t end = std::min(start + 1000, tablet->size());
+            if (start >= tablet->size()) {
                 break;
             }
 
             for (size_t i = start; i < end; i++) {
-                size_t target = tablet[i] % maxTargets;
-                (*messages)[target].appendCopy(&tablet[i]);
+                size_t target = (*tablet)[i] % maxTargets;
+                (*messages)[target].appendCopy(&(*tablet)[i]);
             }
         }
     };
@@ -1180,7 +1213,7 @@ MilliSortService::bigQueryQ2() {
         int id = 0;
         for (int coreId : coresAvail) {
             workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                    tablet, messages[id].get(), uint16_t(world->size())));
+                    &tablet, messages[id].get(), uint16_t(world->size())));
             id++;
         }
         for (auto &tid : workers) {
@@ -1263,7 +1296,7 @@ MilliSortService::bigQueryQ2() {
         gatherOp->wait();
         removeCollectiveOp(DUMMY_OP_ID);
     }
-    elapsed = Cycles::rdtsc() - elapsed;
+    uint64_t elapsed = Cycles::rdtsc() - startTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     // Pretty-print the query result that will be returned to the BQ client
@@ -1421,8 +1454,6 @@ MilliSortService::bigQueryQ3()
     }
 #endif
 
-    uint64_t elapsed = Cycles::rdtsc();
-
     // Step 1: scan the local tablet to build up the shuffle messages; use all
     // worker cores to parallelize the work.
     std::vector<Tub<std::vector<Buffer>>> messages(coresAvail.size());
@@ -1431,18 +1462,18 @@ MilliSortService::bigQueryQ3()
     }
     std::vector<Arachne::ThreadId> workers;
     std::atomic<size_t> nextStart(0);
-    auto workerMain = [&nextStart](std::vector<RepoAuthorPair> &tablet,
+    auto workerMain = [&nextStart] (std::vector<RepoAuthorPair>* tablet,
             std::vector<Buffer>* messages, uint16_t maxTargets) {
         while (true) {
             size_t start = nextStart.fetch_add(1000);
-            size_t end = std::min(start + 1000, tablet.size());
-            if (start >= tablet.size()) {
+            size_t end = std::min(start + 1000, tablet->size());
+            if (start >= tablet->size()) {
                 break;
             }
 
             for (size_t i = start; i < end; i++) {
-                std::string& repo = tablet[i].first;
-                std::string& author = tablet[i].second;
+                std::string& repo = (*tablet)[i].first;
+                std::string& author = (*tablet)[i].second;
                 size_t h1 = std::hash<std::string>()(repo);
                 size_t h2 = std::hash<std::string>()(author);
                 Buffer* target = &messages->at((h1 ^ h2) % maxTargets);
@@ -1458,7 +1489,7 @@ MilliSortService::bigQueryQ3()
         int id = 0;
         for (int coreId : coresAvail) {
             workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                    rawCommits, messages[id].get(), uint16_t(world->size())));
+                    &rawCommits, messages[id].get(), uint16_t(world->size())));
             id++;
         }
         for (auto &tid : workers) {
@@ -1816,7 +1847,7 @@ MilliSortService::bigQueryQ3()
         removeCollectiveOp(DUMMY_OP_ID);
         timeTrace("step 8: performed gather to produce the final result");
     }
-    elapsed = Cycles::rdtsc() - elapsed;
+    uint64_t elapsed = Cycles::rdtsc() - startTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     globalShuffleOpTable[shuffleOp0->opId] = NULL;
@@ -1912,7 +1943,6 @@ MilliSortService::bigQueryQ4()
         }
     };
 
-    uint64_t elapsed = Cycles::rdtsc();
     timeTrace("BigQuery Q4 started");
 
     // Step 1: compute unique words at the root; broadcast them to others
@@ -2012,6 +2042,7 @@ MilliSortService::bigQueryQ4()
         }
         timeTrace("step 2: found %u wiki titles in the words table", count);
     }
+    uint64_t elapsed = Cycles::rdtsc() - startTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     // The result of this query is a bit large so we are not going to aggregate
