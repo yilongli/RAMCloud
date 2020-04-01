@@ -619,33 +619,41 @@ MilliSortService::startMilliSort(const WireFormat::StartMilliSort::Request* reqH
             context->clockSynchronizer->getConverter(world->getNode(0));
     startTime = converter.isValid() ?
             converter.toLocalTsc(reqHdr->startTime) : Cycles::rdtsc();
-    if (Cycles::rdtsc() - startTime > Cycles::fromMicroseconds(1)) {
+    if (Cycles::rdtsc() > Cycles::fromMicroseconds(1) + startTime) {
         LOG(ERROR, "Millisort started %.2f us late!",
                 Cycles::toSeconds(Cycles::rdtsc() - startTime)*1e6);
     }
     while (Cycles::rdtsc() < startTime) {
         Arachne::yield();
     }
-    timeTrace("MilliSort algorithm started, requestId %d", reqHdr->requestId);
 
     // Kick start the sorting process.
     ADD_COUNTER(millisortNodes, world->size());
     ADD_COUNTER(millisortIsPivotSorter, isPivotServer ? 1 : 0);
-    ongoingMilliSort = rpc;
-    switch (reqHdr->queryNo) {
-        case 0: localSortAndPickPivots(); break;
-        case 1: bigQueryQ1(); break;
-        case 2: bigQueryQ2(); break;
-        case 3: bigQueryQ3(); break;
-        case 4: bigQueryQ4(); break;
-        default:
-            DIE("Unexpected queryNo %d", reqHdr->queryNo);
+
+    if (reqHdr->queryNo == 0) {
+        timeTrace("MilliSort algorithm started, run %d", reqHdr->requestId);
+        ongoingMilliSort = rpc;
+        localSortAndPickPivots();
+        // FIXME: a better solution is to wait on condition var.
+        while (ongoingMilliSort != NULL) {
+            Arachne::yield();
+        }
+        timeTrace("MilliSort algorithm run %d completed", reqHdr->requestId);
+    } else {
+        timeTrace("BigQuery Q%d started, run %d", reqHdr->queryNo,
+                reqHdr->requestId);
+        switch (reqHdr->queryNo) {
+            case 1: bigQueryQ1(); break;
+            case 2: bigQueryQ2(); break;
+            case 3: bigQueryQ3(); break;
+            case 4: bigQueryQ4(); break;
+            default:
+               DIE("Unexpected queryNo %d", reqHdr->queryNo);
+        }
+        timeTrace("BigQuery Q%d run %d completed", reqHdr->queryNo,
+                reqHdr->requestId);
     }
-    // FIXME: a better solution is to wait on condition var.
-    while (ongoingMilliSort != NULL) {
-        Arachne::yield();
-    }
-    timeTrace("MilliSort algorithm stopped, requestId %d", reqHdr->requestId);
 }
 
 void
@@ -883,7 +891,7 @@ MilliSortService::bigQueryQ1()
         /// network.
         Buffer result;
 
-        /// Serializes the calls to #add.
+        /// Protects #numViews.
         Arachne::SpinLock mutex;
 
         explicit GroupByLang(GroupByMap* numViews)
@@ -897,16 +905,28 @@ MilliSortService::bigQueryQ1()
         {
             timeTrace("GroupByLang::add invoked, buffer size %u",
                     partialResult->size());
-            std::lock_guard<Arachne::SpinLock> lock(mutex);
-            timeTrace("GroupByLang::add entered critical section");
+            size_t cnt = 0;
+            std::array<std::pair<std::string, uint64_t>, 8> pairs;
             uint32_t offset = 0;
             while (offset < partialResult->size()) {
-                std::string lang;
+                pairs[cnt].first.clear();
                 while (char c = *partialResult->getOffset<char>(offset++)) {
-                    lang.append(1, c);
+                    pairs[cnt].first.append(1, c);
                 }
-                uint64_t views = *partialResult->read<uint64_t>(&offset);
-                (*numViews)[lang] += views;
+                pairs[cnt].second = *partialResult->read<uint64_t>(&offset);
+
+                cnt = (cnt + 1) % pairs.size();
+                if (cnt == 0) {
+                    std::lock_guard<Arachne::SpinLock> lock(mutex);
+                    for (auto& p : pairs) {
+                        (*numViews)[p.first] += p.second;
+                    }
+                }
+            }
+
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
+            for (size_t i = 0; i < cnt; i++) {
+                (*numViews)[pairs[i].first] += pairs[i].second;
             }
             timeTrace("GroupByLang::add finished");
         }
@@ -1072,10 +1092,6 @@ MilliSortService::bigQueryQ1()
     } else {
         LOG(NOTICE, "Finished processing BigQuery Q1");
     }
-
-    // Notify the master server that we are done.
-    ongoingMilliSort.load()->sendReply();
-    ongoingMilliSort = NULL;
 }
 
 void
@@ -1315,10 +1331,8 @@ MilliSortService::bigQueryQ2() {
         LOG(NOTICE, "Finished processing BigQuery Q2");
     }
 
-    // Notify the master server that we are done.
+    // Clean up shuffle operations.
     globalShuffleOpTable[shuffleOp->opId] = NULL;
-    ongoingMilliSort.load()->sendReply();
-    ongoingMilliSort = NULL;
 }
 
 void
@@ -1850,13 +1864,6 @@ MilliSortService::bigQueryQ3()
     uint64_t elapsed = Cycles::rdtsc() - startTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
-    globalShuffleOpTable[shuffleOp0->opId] = NULL;
-    globalShuffleOpTable[shuffleOp1->opId] = NULL;
-    globalShuffleOpTable[shuffleOp2->opId] = NULL;
-    globalShuffleOpTable[shuffleOp3->opId] = NULL;
-    ongoingMilliSort.load()->sendReply();
-    ongoingMilliSort = NULL;
-
     if (world->rank == 0) {
         LOG(NOTICE, "BigQuery Q3 result (scan %d records in %.3f ms):",
                 numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3);
@@ -1865,6 +1872,12 @@ MilliSortService::bigQueryQ3()
                     std::get<1>(tuple).c_str(), std::get<2>(tuple));
         }
     }
+
+    // Clean up shuffle operations.
+    globalShuffleOpTable[shuffleOp0->opId] = NULL;
+    globalShuffleOpTable[shuffleOp1->opId] = NULL;
+    globalShuffleOpTable[shuffleOp2->opId] = NULL;
+    globalShuffleOpTable[shuffleOp3->opId] = NULL;
 }
 
 void
@@ -2048,10 +2061,6 @@ MilliSortService::bigQueryQ4()
     // The result of this query is a bit large so we are not going to aggregate
     // them back to the root (and return to the client).
     LOG(NOTICE, "Finished processing BigQuery Q4");
-
-    // Notify the master server that we are done.
-    ongoingMilliSort.load()->sendReply();
-    ongoingMilliSort = NULL;
 }
 
 void
