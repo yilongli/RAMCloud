@@ -1097,56 +1097,13 @@ MilliSortService::bigQueryQ1()
 void
 MilliSortService::bigQueryQ2() {
     using Ipv4Address = uint32_t;
-    using TopIPv4List = std::vector<std::pair<uint64_t, Ipv4Address>>;
+    using IPv4Col = std::vector<Ipv4Address>;
 
-    /// # top IPv4 addresses to keep.
-    static const int K = 10;
-
-    /// Compute the top-K IPv4 addresses that contribute the most edits.
-    struct TopContributors : public TreeGather::Merger {
-        /// Used to hold the top-K IPv4 addresses that are aggregated over
-        /// partial results from children nodes.
-        TopIPv4List* topAddrs;
-
-        /// Serializes #topAddrs in wire format so it can be sent over the
-        /// network.
-        Buffer result;
-
-        /// Serializes the calls to #add.
-        Arachne::SpinLock mutex;
-
-        explicit TopContributors(TopIPv4List* topAddrs)
-                : topAddrs(topAddrs), result(), mutex() {}
-
-        void add(Buffer* partialResult) {
-            std::lock_guard<Arachne::SpinLock> lock(mutex);
-            uint32_t offset = 0;
-            while (offset < partialResult->size()) {
-                uint64_t edits = *partialResult->read<uint64_t>(&offset);
-                Ipv4Address ipv4 = *partialResult->read<Ipv4Address>(&offset);
-                topAddrs->emplace_back(edits, ipv4);
-            }
-            if (topAddrs->size() <= K) return;
-            std::partial_sort(topAddrs->begin(), topAddrs->begin() + K,
-                    topAddrs->end(), std::greater<TopIPv4List::value_type>());
-            topAddrs->resize(K);
-        }
-
-        Buffer* getResult() {
-            if (result.size() == 0) {
-                for (auto iter = topAddrs->begin(); iter != topAddrs->end();
-                     iter++) {
-                    result.appendCopy(&iter->first);
-                    result.appendCopy(&iter->second);
-                }
-            }
-            return &result;
-        }
-    };
+    /// # top IPv4 addresses to keep, specified in the LIMIT clause.
+    static const size_t LIMIT_K = 10;
 
     // Step 0: initialize input data
-    static std::vector<Ipv4Address> tablet;
-#if 1
+    static IPv4Col tablet;
     static const int recordsPerTablet = 10*1000000;
     if (tablet.size() != numDataTuples) {
         tablet.clear();
@@ -1189,62 +1146,60 @@ MilliSortService::bigQueryQ2() {
             totalRecords = tablet.size();
         }
     }
-#else
-    rand.construct(serverId.indexNumber());
-    if (tablet.size() != numDataTuples) {
-        tablet.clear();
-        for (int i = 0; i < numDataTuples; i++) {
-            tablet.emplace_back(rand->next() % 256);
-        }
-    }
-#endif
 
-    // Step 1: scan the local tablet to build up the shuffle messages; use all
+    // Step 1: scan the local tablet to build the shuffle messages; use all
     // worker cores to parallelize the work.
-    std::vector<Tub<std::vector<Buffer>>> messages(coresAvail.size());
-    for (auto &tub : messages) {
+    using PartitionByDest = std::vector<Buffer>;
+    std::vector<Tub<PartitionByDest>> msgsPerCore(coresAvail.size());
+    for (auto &tub : msgsPerCore) {
         tub.construct(world->size());
     }
-    std::vector<Arachne::ThreadId> workers;
     std::atomic<size_t> nextStart(0);
-    auto workerMain = [&nextStart](std::vector<Ipv4Address>* tablet,
-            std::vector<Buffer>* messages, uint16_t maxTargets) {
+    auto partitioner = [&nextStart] (IPv4Col* tablet, PartitionByDest* parts,
+            uint16_t maxTargets) {
+        timeTrace("worker spawned on core %d", Arachne::core.id);
+        static const int BATCH_SIZE = 512;
+        size_t numRecords = 0;
         while (true) {
-            size_t start = nextStart.fetch_add(1000);
-            size_t end = std::min(start + 1000, tablet->size());
+            size_t start = nextStart.fetch_add(BATCH_SIZE);
+            size_t end = std::min(start + BATCH_SIZE, tablet->size());
             if (start >= tablet->size()) {
                 break;
             }
 
             for (size_t i = start; i < end; i++) {
                 size_t target = (*tablet)[i] % maxTargets;
-                (*messages)[target].appendCopy(&(*tablet)[i]);
+                (*parts)[target].appendCopy(&(*tablet)[i]);
             }
+            numRecords += (end - start);
         }
+        timeTrace("worker done, processed %u records", numRecords);
     };
 
     std::unique_ptr<ShuffleOp> shuffleOp;
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
+        std::vector<Arachne::ThreadId> workers;
         int id = 0;
         for (int coreId : coresAvail) {
-            workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                    &tablet, messages[id].get(), uint16_t(world->size())));
+            workers.push_back(Arachne::createThreadOnCore(coreId, partitioner,
+                    &tablet, msgsPerCore[id].get(), uint16_t(world->size())));
             id++;
         }
         for (auto &tid : workers) {
             Arachne::join(tid);
         }
+        timeTrace("step 1: hash-partitioned ipv4 addresses");
 
         shuffleOp.reset(new ShuffleOpOpt(ALLSHUFFLE_BIGQUERY_0, world.get(),
                 (char*) incomingKeys, ~0lu));
         for (size_t target = 0; target < world->size(); target++) {
             for (size_t c = 0; c < coresAvail.size(); c++) {
                 shuffleOp->outgoingMessages[target].appendExternal(
-                        &messages[c]->at(target));
+                        &msgsPerCore[c]->at(target));
             }
-    //        LOG(NOTICE, "shuffling %u bytes to node %u",
-    //                shuffleOp->outgoingMessages[target].size(), target);
+            timeTrace("step 1: sending %u bytes to node %u",
+                    shuffleOp->outgoingMessages[target].size(), target);
         }
     }
 
@@ -1261,56 +1216,161 @@ MilliSortService::bigQueryQ2() {
         // is done (i.e., we received and sent all data) but when X retries the
         // RPC we will have no record for it...
 //        globalShuffleOpTable[shuffleOp->opId] = NULL;
+        timeTrace("step 2: finished shuffling ipv4 addresses");
     }
 
     // Step 3: sort all incoming shuffled records so that we can count the
     // ocurrences of each IP address by scanning the records sequentially;
     // without sorting, we would have to use a huge hash table instead, which
     // is likely going to be much slower due to cache misses.
-    size_t numIPv4Addrs = shuffleOp->totalRxBytes.load() / sizeof(Ipv4Address);
-    Ipv4Address* incomingIPv4Addrs = (Ipv4Address*) incomingKeys;
-    ips4o::parallel::sort(incomingIPv4Addrs, incomingIPv4Addrs + numIPv4Addrs,
-            std::less<Ipv4Address>(), coresAvail.size());
-    TopIPv4List numEdits;
-    if (numIPv4Addrs > 0) {
-        // Note: the following scan can be parallelized but it makes the code
-        // less readable; wait until this becomes necessary.
-        SCOPED_TIMER(bigQueryStep3ElapsedTime);
-        numEdits.reserve(numIPv4Addrs);
-        Ipv4Address currentIp = incomingIPv4Addrs[0];
-        numEdits.emplace_back(1, currentIp);
-        for (size_t i = 1; i < numIPv4Addrs; i++) {
-            Ipv4Address ip = incomingIPv4Addrs[i];
-            if (currentIp == ip) {
-                numEdits.back().first++;
+
+    // List of (count, IPv4)-pairs.
+    using CountIpList = std::vector<std::pair<uint64_t, Ipv4Address>>;
+
+    auto scanner = [] (Ipv4Address* ipAddrs, size_t cnt, CountIpList* topIPs) {
+        timeTrace("scanner spawned on core %d", Arachne::core.id);
+        assert(cnt > 0);
+        CountIpList ipCnt;
+        ipCnt.reserve(cnt);
+        Ipv4Address current = *ipAddrs;
+        ipCnt.emplace_back(1, current);
+        for (size_t i = 1; i < cnt; i++) {
+            if (current == ipAddrs[i]) {
+                ipCnt.back().first++;
             } else {
-                numEdits.emplace_back(1, ip);
-                currentIp = ip;
+                ipCnt.emplace_back(1, ipAddrs[i]);
+                current = ipAddrs[i];
             }
         }
-    }
-    LOG(NOTICE, "Got %lu IPs (%lu unique)", numIPv4Addrs, numEdits.size());
+        timeTrace("scanned %u IP's, found %u unique", cnt, ipCnt.size());
 
-    // Step 4: retain only the local top-K IP addresses by doing a partial sort
-    TopIPv4List topAddrs(K);
-    {
-        SCOPED_TIMER(bigQueryStep4ElapsedTime)
-        std::partial_sort_copy(numEdits.begin(), numEdits.end(),
-                topAddrs.begin(), topAddrs.end(),
-                std::greater<TopIPv4List::value_type>());
+        // Always keep the first and last IP's because # edits contributed by
+        // these two IP's could be incomplete yet.
+        topIPs->clear();
+        CountIpList tmp;
+        if (ipCnt.size() > 1) {
+            tmp.push_back(ipCnt[0]);
+            ipCnt[0].first = 0;
+            tmp.push_back(ipCnt.back());
+            ipCnt.pop_back();
+        }
+
+        // Perform a partial-sort to get the top-K contributor IP addresses
+        size_t n = std::min(ipCnt.size(), LIMIT_K);
+        topIPs->resize(n);
+        std::partial_sort_copy(ipCnt.begin(), ipCnt.end(),
+                topIPs->begin(), topIPs->end(),
+                std::greater<CountIpList::value_type>());
+        topIPs->insert(topIPs->end(), tmp.begin(), tmp.end());
+        timeTrace("scanner done, retained %u ipv4 addresses", topIPs->size());
+    };
+
+    size_t numIPs = shuffleOp->totalRxBytes.load() / sizeof(Ipv4Address);
+    CountIpList topIPs;
+    if (numIPs > 0) {
+        SCOPED_TIMER(bigQueryStep3ElapsedTime);
+        Ipv4Address* incomingIPs = (Ipv4Address*) incomingKeys;
+        ips4o::parallel::sort(incomingIPs, incomingIPs + numIPs,
+                std::less<Ipv4Address>(), coresAvail.size());
+        timeTrace("step 3: sorted %u ipv4 addresses w/ %u cores", numIPs,
+                coresAvail.size());
+
+        // Scan all IP's in parallel to determine unique IP's.
+        std::vector<CountIpList> topIPsByCore(coresAvail.size());
+        std::vector<Arachne::ThreadId> workers;
+        Ipv4Address* rangeStart = incomingIPs;
+        size_t addrsPerCore =
+                (numIPs + coresAvail.size() - 1) / coresAvail.size();
+        size_t addrsLeft = numIPs;
+        int id = 0;
+        for (int coreId : coresAvail) {
+            size_t n = std::min(addrsPerCore, addrsLeft);
+            workers.push_back(Arachne::createThreadOnCore(coreId, scanner,
+                    rangeStart, n, &topIPsByCore[id]));
+            rangeStart += n;
+            addrsLeft -= n;
+            id++;
+        }
+        for (auto &tid : workers) {
+            Arachne::join(tid);
+        }
+        timeTrace("step 3: each core scanned a portion of ipv4 addresses");
+
+        // Combine top K contributing IP addresses found by each core to compute
+        // the overall top K IP addresses.
+        robin_hood::unordered_map<Ipv4Address, uint64_t> ipCounter;
+        for (CountIpList& list : topIPsByCore) {
+            for (auto& kv : list) {
+                ipCounter[kv.second] += kv.first;
+            }
+        }
+        for (auto& kv : ipCounter) {
+            topIPs.emplace_back(kv.second, kv.first);
+        }
+        std::sort(topIPs.begin(), topIPs.end(),
+                std::greater<CountIpList::value_type>());
+        topIPs.resize(std::min(topIPs.size(), LIMIT_K));
     }
+    timeTrace("step 3: retained %u ipv4 addresses", topIPs.size());
 
     // Step 5: reduce/aggregate partial results on each node to compute the
     // global top-K IP addresses.
+
+    /// Compute the top-K IPv4 addresses that contribute the most edits.
+    struct TopContributors : public TreeGather::Merger {
+        /// Used to hold the top-K IPv4 addresses that are aggregated over
+        /// partial results from children nodes.
+        CountIpList* topIPs;
+
+        /// Serializes #topAddrs in wire format so it can be sent over the
+        /// network.
+        Buffer result;
+
+        /// Serializes the calls to #add.
+        Arachne::SpinLock mutex;
+
+        explicit TopContributors(CountIpList* topIPs)
+                : topIPs(topIPs), result(), mutex() {}
+
+        void add(Buffer* partialResult) {
+            timeTrace("TopContributor::add invoked, buffer size %u",
+                    partialResult->size());
+            std::lock_guard<Arachne::SpinLock> lock(mutex);
+            uint32_t offset = 0;
+            while (offset < partialResult->size()) {
+                uint64_t cnt = *partialResult->read<uint64_t>(&offset);
+                Ipv4Address ip = *partialResult->read<Ipv4Address>(&offset);
+                topIPs->emplace_back(cnt, ip);
+            }
+
+            size_t n = std::min(topIPs->size(), LIMIT_K);
+            std::partial_sort(topIPs->begin(), topIPs->begin() + n,
+                    topIPs->end(), std::greater<CountIpList::value_type>());
+            topIPs->resize(n);
+            timeTrace("TopContributor::add finished");
+        }
+
+        Buffer* getResult() {
+            if (result.size() == 0) {
+                for (auto& kv : *topIPs) {
+                    result.appendCopy(&kv.first);
+                    result.appendCopy(&kv.second);
+                }
+            }
+            return &result;
+        }
+    };
+
     const int DUMMY_OP_ID = 999;
-    TopContributors topContributors(&numEdits);
+    TopContributors topContributors(&topIPs);
     {
-        SCOPED_TIMER(bigQueryStep5ElapsedTime)
+        SCOPED_TIMER(bigQueryStep4ElapsedTime)
         Tub<TreeGather> gatherOp;
         invokeCollectiveOp<TreeGather>(gatherOp, DUMMY_OP_ID, context,
                 world.get(), 0, &topContributors);
         gatherOp->wait();
         removeCollectiveOp(DUMMY_OP_ID);
+        timeTrace("step 5: gather op completed");
     }
     uint64_t elapsed = Cycles::rdtsc() - startTime;
     ADD_COUNTER(bigQueryTime, elapsed);
@@ -1318,11 +1378,11 @@ MilliSortService::bigQueryQ2() {
     // Pretty-print the query result that will be returned to the BQ client
     if (world->rank == 0) {
         std::string prettyPrint;
-        for (auto iter = numEdits.begin(); iter != numEdits.end(); iter++) {
-            Ipv4Address ip = iter->second;
+        for (auto& kv : topIPs) {
+            Ipv4Address ip = kv.second;
             std::string ipStr = format("%u.%u.%u.%u", (ip>>24)&0xff,
                     (ip>>16)&0xff, (ip>>8)&0xff, ip&0xff);
-            prettyPrint += format("%s, %lu | ", ipStr.c_str(), iter->first);
+            prettyPrint += format("%s, %lu | ", ipStr.c_str(), kv.first);
         }
         LOG(NOTICE, "BigQuery Q2 result (scan %d records in %.3f ms):\n%s",
                 numDataTuples * world->size(), Cycles::toSeconds(elapsed)*1e3,
