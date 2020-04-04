@@ -44,7 +44,7 @@ with open(client_log, 'r') as file:
             words = line.split()
             key = (num_nodes, num_items_per_node, run_id,
                    words[0] + ' ' + words[1])
-            record_table[key] = [float(x) for x in line.split()[-num_nodes:]]
+            record_table[key] = [float(x) for x in line.split('|')[1].split()[:num_nodes]]
 
 print(f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} {"max":>12} {"p50":>12} '
       f'{"p90":>12} {"localSort":>12} {"rearrange1":>12} {"partition":>12} {"shuffleRecs":>12} '

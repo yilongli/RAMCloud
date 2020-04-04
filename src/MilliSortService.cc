@@ -903,30 +903,45 @@ MilliSortService::bigQueryQ1()
          */
         void add(Buffer* partialResult)
         {
-            timeTrace("GroupByLang::add invoked, buffer size %u",
-                    partialResult->size());
+            uint32_t length = partialResult->size();
+            timeTrace("GroupByLang::add invoked, buffer size %u", length);
             size_t cnt = 0;
-            std::array<std::pair<std::string, uint64_t>, 8> pairs;
+            static const size_t MIN_BATCH = 8;
+            static const size_t MAX_BATCH = 32;
+            std::array<std::pair<std::string, uint64_t>, MAX_BATCH> tmp;
             uint32_t offset = 0;
-            while (offset < partialResult->size()) {
-                pairs[cnt].first.clear();
-                while (char c = *partialResult->getOffset<char>(offset++)) {
-                    pairs[cnt].first.append(1, c);
+            while (offset < length) {
+                tmp[cnt].first.clear();
+                while (char c = *partialResult->read<char>(&offset)) {
+                    tmp[cnt].first.append(1, c);
                 }
-                pairs[cnt].second = *partialResult->read<uint64_t>(&offset);
+                tmp[cnt].second = *partialResult->read<uint64_t>(&offset);
 
-                cnt = (cnt + 1) % pairs.size();
-                if (cnt == 0) {
-                    std::lock_guard<Arachne::SpinLock> lock(mutex);
-                    for (auto& p : pairs) {
-                        (*numViews)[p.first] += p.second;
+                cnt = (cnt + 1) % MAX_BATCH;
+                // Check if we can drain the temp buffer once in a while.
+                if (cnt % MIN_BATCH == 0) {
+                    if (!mutex.try_lock()) {
+                        // If the buffer is full, we must acquire the lock and
+                        // drain it; otherwise, keep on parsing more KV pairs.
+                        if (cnt % MAX_BATCH != 0) {
+                            continue;
+                        }
+                        timeTrace("GroupByLang::add contending for lock");
+                        mutex.lock();
                     }
+                    timeTrace("GroupByLang::add acquired lock");
+                    for (size_t i = 0; i < cnt; i++) {
+                        (*numViews)[tmp[i].first] += tmp[i].second;
+                    }
+                    cnt = 0;
+                    mutex.unlock();
+                    timeTrace("GroupByLang::add released lock");
                 }
             }
 
             std::lock_guard<Arachne::SpinLock> lock(mutex);
             for (size_t i = 0; i < cnt; i++) {
-                (*numViews)[pairs[i].first] += pairs[i].second;
+                (*numViews)[tmp[i].first] += tmp[i].second;
             }
             timeTrace("GroupByLang::add finished");
         }
@@ -948,7 +963,9 @@ MilliSortService::bigQueryQ1()
     // Step 0: initialize input data
     static const int recordsPerTablet = 10*1000000;
     static std::pair<LangCol, ViewCol> tablet;
+    uint64_t initTime = 0;
     if (tablet.first.size() != numDataTuples) {
+        CycleCounter<> _(&initTime);
         LangCol& langCol = tablet.first;
         ViewCol& viewCol = tablet.second;
         langCol.clear();
@@ -1071,7 +1088,7 @@ MilliSortService::bigQueryQ1()
         removeCollectiveOp(DUMMY_OP_ID);
         timeTrace("step 2: gather op completed");
     }
-    uint64_t elapsed = Cycles::rdtsc() - startTime;
+    uint64_t elapsed = Cycles::rdtsc() - startTime - initTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     // Pretty-print the query result that will be returned to the BQ client
@@ -1105,7 +1122,9 @@ MilliSortService::bigQueryQ2() {
     // Step 0: initialize input data
     static IPv4Col tablet;
     static const int recordsPerTablet = 10*1000000;
+    uint64_t initTime = 0;
     if (tablet.size() != numDataTuples) {
+        CycleCounter<> _(&initTime);
         tablet.clear();
         tablet.reserve(numDataTuples);
         int sid = serverId.indexNumber() - 1;
@@ -1372,7 +1391,7 @@ MilliSortService::bigQueryQ2() {
         removeCollectiveOp(DUMMY_OP_ID);
         timeTrace("step 5: gather op completed");
     }
-    uint64_t elapsed = Cycles::rdtsc() - startTime;
+    uint64_t elapsed = Cycles::rdtsc() - startTime - initTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     // Pretty-print the query result that will be returned to the BQ client
@@ -1409,7 +1428,9 @@ MilliSortService::bigQueryQ3()
 
 #if 1
     static const int recordsPerTablet = 10*1000000;
+    uint64_t initTime = 0;
     if (rawCommits.size() != numDataTuples) {
+        CycleCounter<> _(&initTime);
         // Initialize the commit tablet
         rawCommits.clear();
         rawCommits.reserve(numDataTuples);
@@ -1921,7 +1942,7 @@ MilliSortService::bigQueryQ3()
         removeCollectiveOp(DUMMY_OP_ID);
         timeTrace("step 8: performed gather to produce the final result");
     }
-    uint64_t elapsed = Cycles::rdtsc() - startTime;
+    uint64_t elapsed = Cycles::rdtsc() - startTime - initTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     if (world->rank == 0) {
@@ -1947,7 +1968,9 @@ MilliSortService::bigQueryQ4()
     static std::vector<std::string> titles;
     static std::vector<std::string> words;
     static const int recordsPerTablet = 10*1000000;
+    uint64_t initTime = 0;
     if (titles.size() != numDataTuples) {
+        CycleCounter<> _(&initTime);
         titles.clear();
         titles.reserve(numDataTuples);
         int sid = serverId.indexNumber() - 1;
@@ -2115,7 +2138,7 @@ MilliSortService::bigQueryQ4()
         }
         timeTrace("step 2: found %u wiki titles in the words table", count);
     }
-    uint64_t elapsed = Cycles::rdtsc() - startTime;
+    uint64_t elapsed = Cycles::rdtsc() - startTime - initTime;
     ADD_COUNTER(bigQueryTime, elapsed);
 
     // The result of this query is a bit large so we are not going to aggregate
