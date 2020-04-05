@@ -3,10 +3,12 @@
 import sys
 from statistics import mean
 
-if len(sys.argv) == 2:
-    client_log = sys.argv[1]
+query_no = 0
+if len(sys.argv) == 3:
+    query_no = int(sys.argv[1])
+    client_log = sys.argv[2]
 else:
-    print('Usage: extractDataFromBQDashboard.py <client-log>')
+    print('Usage: extractDataFromBQDashboard.py <query-no> <client-log>')
     exit(0)
 
 record_table = {}
@@ -38,12 +40,24 @@ with open(client_log, 'r') as file:
                    words[0] + ' ' + words[1])
             record_table[key] = [float(x) for x in line.split('|')[1].split()[:num_nodes]]
 
-print(f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} {"max":>12} {"p50":>12} '
-      f'{"p90":>12} {"records/ms":>12} {"runs":>12} {"runID(p50)":>12} '
-      f'{"step1":>12} {"step1Imbal":>12} {"step2":>12} {"step2Imbal":>12} '
-      f'{"step3":>12} {"step3Imbal":>12} {"step4":>12}  {"step4Imbal":>12} '
-      f'{"step5":>12} {"step5Imbal":>12} {"step6":>12} {"step6Imbal":>12} '
-      f'{"step7":>12} {"step7Imbal":>12} {"step8":>12} {"step8Imbal":>12}')
+column_titles = f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} ' \
+                f'{"max":>12} {"p50":>12} {"p90":>12} {"records/ms":>12} ' \
+                f'{"runs":>12} {"runID(p50)":>12} '
+if query_no == 1:
+    max_steps = 2
+    column_titles += f'{"localScan":>12} {"localScanImb":>12} {"gather":>12} {"gatherImb":>12}'
+elif query_no == 2:
+    max_steps = 4
+    column_titles += f'{"hashPart":>12} {"hashPartImb":>12} {"shuffle":>12} {"shuffleImb":>12} ' \
+                     f'{"countUniq":>12} {"countUniqImb":>12} {"gather":>12} {"gatherImb":>12}'
+else:
+    max_steps = 8
+    column_titles += f'{"step1":>12} {"step1Imb":>12} {"step2":>12} ' \
+                     f'{"step2Imb":>12} {"step3":>12} {"step3Imb":>12} ' \
+                     f'{"step4":>12}  {"step4Imb":>12} {"step5":>12} ' \
+                     f'{"step5Imb":>12} {"step6":>12} {"step6Imb":>12} ' \
+                     f'{"step7":>12} {"step7Imb":>12} {"step8":>12} {"step8Imb":>12}'
+print(column_titles)
 
 for num_items_per_node in sorted(data_range_set):
     for num_nodes in sorted(node_range_set):
@@ -78,7 +92,6 @@ for num_items_per_node in sorted(data_range_set):
             key = (num_nodes, num_items_per_node, run_id, str_phase)
             return max(record_table[key]) / min([x for x in record_table[key] if x > 0])
 
-        max_steps = 8
         step_time = [.0] * max_steps
         step_imbalance = [1] * max_steps
         for step in range(max_steps):
@@ -88,16 +101,12 @@ for num_items_per_node in sorted(data_range_set):
             except:
                 pass
 
-        print(f'{num_nodes:12} {num_items_per_node:12} {num_nodes*num_items_per_node*1e-6:12.2f} '
-              f'{min_total_time:12.2f} {max_total_time:12.2f} '
-              f'{p50_total_time:12.2f} {p90_total_time:12.2f} '
-              f'{num_items_per_node/p50_total_time:12.1f} {len(total_times):12} {run_id:12} '
-              f'{step_time[0]:12.2f} {step_imbalance[0]:12.2f} '
-              f'{step_time[1]:12.2f} {step_imbalance[1]:12.2f} '
-              f'{step_time[2]:12.2f} {step_imbalance[2]:12.2f} '
-              f'{step_time[3]:12.2f} {step_imbalance[3]:12.2f} '
-              f'{step_time[4]:12.2f} {step_imbalance[4]:12.2f} '
-              f'{step_time[5]:12.2f} {step_imbalance[5]:12.2f} '
-              f'{step_time[6]:12.2f} {step_imbalance[6]:12.2f} '
-              f'{step_time[7]:12.2f} {step_imbalance[7]:12.2f} '
-              )
+        result = f'{num_nodes:12} {num_items_per_node:12} ' \
+                 f'{num_nodes*num_items_per_node*1e-6:12.2f} ' \
+                 f'{min_total_time:12.2f} {max_total_time:12.2f} ' \
+                 f'{p50_total_time:12.2f} {p90_total_time:12.2f} ' \
+                 f'{num_items_per_node/p50_total_time:12.1f} ' \
+                 f'{len(total_times):12} {run_id:12} '
+        for step in range(max_steps):
+            result += f'{step_time[step]:12.2f} {step_imbalance[step]:12.2f} '
+        print(result)
