@@ -1439,7 +1439,7 @@ MilliSortService::bigQueryQ3()
             return std::hash<std::string_view>()(sv);
         }
 
-        int compare(const StringView& other)
+        int compare(const StringView& other) const
         {
             if (len == other.len) {
                 return strncmp(s, other.s, len);
@@ -1613,7 +1613,7 @@ MilliSortService::bigQueryQ3()
 
     // Step 1: shuffle commit records based on their repos; that is, all records
     // with the same repo shall end up on the same node.
-    std::vector<RepoAuthorRecView> leftJoinTable;
+    std::vector<RepoAuthorRecView> incomingCommits;
     std::unique_ptr<ShuffleOp> shuffleOp0;
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
@@ -1633,8 +1633,8 @@ MilliSortService::bigQueryQ3()
             for (auto& perCoreMessages : messages) {
                 outgoing->appendExternal(&perCoreMessages->at(target));
             }
-            timeTrace("need to send %u bytes to node %u", outgoing->size(),
-                    target);
+//            timeTrace("need to send %u bytes to node %u", outgoing->size(),
+//                    target);
         }
         timeTrace("step 1: hash-partitioned the commit records based on repo");
 
@@ -1655,34 +1655,42 @@ MilliSortService::bigQueryQ3()
                 uint32_t len2 = uint32_t(&msg[offset] - s2) - 1;
                 StringView repo(s1, len1);
                 StringView author(s2, len2);
-                leftJoinTable.emplace_back(repo, author);
+                incomingCommits.emplace_back(repo, author);
             }
         }
         timeTrace("step 1: deserialized %u incoming commit records",
-                leftJoinTable.size());
+                incomingCommits.size());
     }
 
     // Step 2: remove duplicate incoming commit records; this is implemented by
     // sorting and then scanning the commit records (in parallel). Note: another
     // solution is to use a huge hash table, but this is likely going to be much
     // slower due to cache misses.
+    std::vector<RepoAuthorRecView> leftJoinTable;
+    std::vector<decltype(incomingCommits)::value_type*> commitPtrs;
+    commitPtrs.reserve(incomingCommits.size());
     {
         SCOPED_TIMER(bigQueryStep2ElapsedTime)
-        ips4o::parallel::sort(leftJoinTable.begin(), leftJoinTable.end(),
-                std::less<>(), coresAvail.size());
-        timeTrace("step 2: sorted %u commit records", leftJoinTable.size());
+        for (auto& rec : incomingCommits) {
+            commitPtrs.push_back(&rec);
+        }
+        ips4o::parallel::sort(commitPtrs.begin(), commitPtrs.end(),
+                [] (auto x, auto y) {
+                    int r = x->first.compare(y->first);
+                    return (r != 0) ? (r < 0) : (x->second.compare(y->second) < 0);
+                },
+                coresAvail.size());
+
+        timeTrace("step 2: sorted %u commit records", incomingCommits.size());
 
         // TODO: parallelize?
-        size_t uniqueCount = 0;
-        if (!leftJoinTable.empty()) {
-            uniqueCount = 1;
-            for (size_t i = 1; i < leftJoinTable.size(); i++) {
-                if (leftJoinTable[i] != leftJoinTable[uniqueCount-1]) {
-                    leftJoinTable[uniqueCount] = leftJoinTable[i];
-                    uniqueCount++;
+        if (!incomingCommits.empty()) {
+            leftJoinTable.push_back(*commitPtrs.front());
+            for (auto& commitPtr : commitPtrs) {
+                if (leftJoinTable.back() != *commitPtr) {
+                    leftJoinTable.push_back(*commitPtr);
                 }
             }
-            leftJoinTable.resize(uniqueCount);
         }
         timeTrace("step 2: found %u unique (repo, author) records",
                 leftJoinTable.size());
@@ -1691,7 +1699,7 @@ MilliSortService::bigQueryQ3()
     // Step 3: shuffle the language table based on repo as well (so each node
     // can later perform the join operation independently).
     std::unique_ptr<ShuffleOp> shuffleOp1;
-    std::vector<RepoLangBytesRecView> rightJoinTable;
+    std::vector<RepoLangBytesRecView> incomingLangs;
     {
         SCOPED_TIMER(bigQueryStep3ElapsedTime)
         shuffleOp1.reset(new ShuffleOp(ALLSHUFFLE_BIGQUERY_2, world.get()));
@@ -1726,37 +1734,47 @@ MilliSortService::bigQueryQ3()
                 offset += sizeof(decltype(bytes));
                 StringView repo(s1, len1);
                 StringView lang(s2, len2);
-                rightJoinTable.emplace_back(repo, lang, bytes);
+                incomingLangs.emplace_back(repo, lang, bytes);
             }
         }
         timeTrace("step 3: deserialized %u language records",
-                rightJoinTable.size());
+                incomingLangs.size());
     }
-//    for (auto& tuple : rightJoinTable) {
+//    for (auto& tuple : incomingLangs) {
 //        LOG(NOTICE, "lang (%s, %s, %lu)", std::get<0>(tuple).c_str(),
 //                std::get<1>(tuple).c_str(), std::get<2>(tuple));
 //    }
 
     // Step 4: join the commit table and the language table on repo
-    std::vector<LangAuthorBytesRecView> joinResult;
+    std::vector<decltype(incomingLangs)::value_type*> rightJoinPtrs;
+    rightJoinPtrs.reserve(incomingLangs.size());
+    std::vector<LangAuthorBytesRecView> localGroupBy;
     {
         SCOPED_TIMER(bigQueryStep4ElapsedTime)
 
         // By now, the leftJoinTable should've been sorted according to repo;
         // we just need to sort the rightJoinTable too.
-        // TODO: only need to compare the first element of the tuple
-        ips4o::parallel::sort(rightJoinTable.begin(), rightJoinTable.end(),
-                std::less<>(), coresAvail.size());
+        for (auto& rec : incomingLangs) {
+            rightJoinPtrs.push_back(&rec);
+        }
+        ips4o::parallel::sort(rightJoinPtrs.begin(), rightJoinPtrs.end(),
+                [] (const auto* x, const auto* y) {
+                    return std::get<0>(*x).compare(std::get<0>(*y)) < 0;
+                },
+                coresAvail.size());
         timeTrace("step 4: sorted %u records in rightJoinTable based on repo",
-                rightJoinTable.size());
+                rightJoinPtrs.size());
 
         // The following implements the mergesort-join algorithm.
+        // TODO: how to avoid dynamic vector relocation?
+        std::vector<LangAuthorBytesRecView> joinResult;
+        std::vector<LangAuthorBytesRecView*> joinResultPtrs;
         size_t leftIdx = 0;
         size_t rightIdx = 0;
         while ((leftIdx < leftJoinTable.size()) &&
-                (rightIdx < rightJoinTable.size())) {
+                (rightIdx < rightJoinPtrs.size())) {
             StringView& repo = std::get<0>(leftJoinTable[leftIdx]);
-            int r = repo.compare(std::get<0>(rightJoinTable[rightIdx]));
+            int r = repo.compare(std::get<0>(*rightJoinPtrs[rightIdx]));
             if (r < 0) {
                 leftIdx++;
                 continue;
@@ -1770,16 +1788,16 @@ MilliSortService::bigQueryQ3()
                         (repo == std::get<0>(leftJoinTable[leftIdxEnd]))) {
                     leftIdxEnd++;
                 }
-                while ((rightIdxEnd < rightJoinTable.size()) &&
-                        (repo == std::get<0>(rightJoinTable[rightIdxEnd]))) {
+                while ((rightIdxEnd < rightJoinPtrs.size()) &&
+                        (repo == std::get<0>(*rightJoinPtrs[rightIdxEnd]))) {
                     rightIdxEnd++;
                 }
                 for (size_t i = leftIdx; i < leftIdxEnd; i++) {
                     for (size_t j = rightIdx; j < rightIdxEnd; j++) {
                         joinResult.emplace_back(
-                                std::get<1>(rightJoinTable[j]),
+                                std::get<1>(*rightJoinPtrs[j]),
                                 std::get<1>(leftJoinTable[i]),
-                                std::get<2>(rightJoinTable[j]));
+                                std::get<2>(*rightJoinPtrs[j]));
                     }
                 }
                 leftIdx = leftIdxEnd;
@@ -1788,32 +1806,39 @@ MilliSortService::bigQueryQ3()
         }
         timeTrace("step 4: joined the commit and language tables on repo");
 
-        // TODO: only need to sort based on the first two elements (does it matter?)
-        ips4o::parallel::sort(joinResult.begin(), joinResult.end(),
-                std::less<>(), coresAvail.size());
+        // Indirect-sort based on (lang, author)
+        joinResultPtrs.reserve(joinResult.size());
+        for (auto& rec : joinResult) {
+            joinResultPtrs.push_back(&rec);
+        }
+        ips4o::parallel::sort(joinResultPtrs.begin(), joinResultPtrs.end(),
+                [] (const auto* x, const auto* y) {
+                    int r = std::get<0>(*x).compare(std::get<0>(*y));
+                    return (r != 0) ? (r < 0) :
+                            (std::get<1>(*x).compare(std::get<1>(*y)) < 0);
+                },
+                coresAvail.size());
         timeTrace("step 4: sorted %u records in the join result",
                 joinResult.size());
 
-        size_t uniqueCount;
+        // TODO: parallelize?
         if (!joinResult.empty()) {
-            uniqueCount = 1;
+            localGroupBy.push_back(*joinResultPtrs.front());
             for (size_t i = 1; i < joinResult.size(); i++) {
-                LangAuthorBytesRecView& a = joinResult[i];
-                LangAuthorBytesRecView& b = joinResult[uniqueCount - 1];
+                auto& a = *joinResultPtrs[i];
+                auto& b = localGroupBy.back();
                 if ((std::get<0>(a) != std::get<0>(b)) ||
                         (std::get<1>(a) != std::get<1>(b))) {
-                    joinResult[uniqueCount] = a;
-                    uniqueCount++;
+                    localGroupBy.push_back(a);
                 } else {
                     std::get<2>(b) += std::get<2>(a);
                 }
             }
-            joinResult.resize(uniqueCount);
         }
         timeTrace("step 4: summed up bytes for %u (lang, author) combinations",
-                joinResult.size());
+                localGroupBy.size());
     }
-//    for (auto& tuple : joinResult) {
+//    for (auto& tuple : localGroupBy) {
 //        LOG(NOTICE, "result (%s, %s, %lu)", std::get<0>(tuple).c_str(),
 //                std::get<1>(tuple).c_str(), std::get<2>(tuple));
 //    }
@@ -1821,11 +1846,11 @@ MilliSortService::bigQueryQ3()
     // Step 5: shuffle the output table produced by join based on (lang, author)
     // in order to sum up the bytes.
     std::unique_ptr<ShuffleOp> shuffleOp2;
-    std::vector<LangAuthorBytesRecView> groupBySum;
+    std::vector<LangAuthorBytesRecView> topBytes;
     {
         SCOPED_TIMER(bigQueryStep5ElapsedTime)
         shuffleOp2.reset(new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get()));
-        for (LangAuthorBytesRecView& tuple : joinResult) {
+        for (LangAuthorBytesRecView& tuple : localGroupBy) {
             StringView lang, author;
             uint64_t bytes;
             std::tie(lang, author, bytes) = tuple;
@@ -1843,9 +1868,11 @@ MilliSortService::bigQueryQ3()
         globalShuffleOpTable[shuffleOp2->opId] = shuffleOp2.get();
         invokeShufflePush(shuffleOp2->group, shuffleOp2->opId,
                 &shuffleOp2->outgoingMessages, shuffleOp2.get());
-        timeTrace("step 5: shuffled the JOIN result by (lang, author)");
+        timeTrace("step 5: shuffled the join result by (lang, author)");
 
         // TODO: parallelize
+        std::vector<LangAuthorBytesRecView> groupBySum;
+        std::vector<LangAuthorBytesRecView*> groupBySumPtrs;
         for (std::vector<char>& msg : shuffleOp2->incomingMessages) {
             size_t offset = 0;
             while (offset < msg.size()) {
@@ -1865,37 +1892,44 @@ MilliSortService::bigQueryQ3()
         timeTrace("step 5: deserialized %u (lang, author, bytes) records",
                 groupBySum.size());
 
-        // TODO: only needs to sort based on first two elements?
-        ips4o::parallel::sort(groupBySum.begin(), groupBySum.end(),
-                std::less<>(), coresAvail.size());
+        // Indirect-sort based on (lang, author)
+        groupBySumPtrs.reserve(groupBySum.size());
+        for (auto& rec : groupBySum) {
+            groupBySumPtrs.push_back(&rec);
+        }
+        ips4o::parallel::sort(groupBySumPtrs.begin(), groupBySumPtrs.end(),
+                [] (const auto* x, const auto* y) {
+                    int r = std::get<0>(*x).compare(std::get<0>(*y));
+                    return (r != 0) ? (r < 0) :
+                            (std::get<1>(*x).compare(std::get<1>(*y)) < 0);
+                },
+                coresAvail.size());
         timeTrace("step 5: sorted %u (lang, author, bytes) records",
                 groupBySum.size());
 
-        size_t uniqueCount = 0;
         if (!groupBySum.empty()) {
-            uniqueCount = 1;
+            topBytes.push_back(*groupBySumPtrs.front());
             for (size_t i = 1; i < groupBySum.size(); i++) {
-                auto& a = groupBySum[uniqueCount-1];
-                auto& b = groupBySum[i];
+                auto& a = topBytes.back();
+                auto& b = *groupBySumPtrs[i];
                 if ((std::get<0>(b) != std::get<0>(a)) ||
                         (std::get<1>(b) != std::get<1>(a))) {
-                    groupBySum[uniqueCount++] = b;
+                    topBytes.push_back(b);
                 } else {
                     std::get<2>(a) += std::get<2>(b);
                 }
             }
-            groupBySum.resize(uniqueCount);
         }
-        timeTrace("step 5: reduced to %u records", groupBySum.size());
+        timeTrace("step 5: merge duplicate records, %u left", topBytes.size());
 
         // Sort by bytes in descending order
-        size_t n = std::min(groupBySum.size(), size_t(LIMIT_K));
-        std::partial_sort(groupBySum.begin(), groupBySum.begin() + n,
-                groupBySum.end(), [] (const auto& lhs, const auto& rhs)
+        size_t n = std::min(topBytes.size(), size_t(LIMIT_K));
+        std::partial_sort(topBytes.begin(), topBytes.begin() + n,
+                topBytes.end(), [] (const auto& lhs, const auto& rhs)
                 { return std::get<2>(lhs) > std::get<2>(rhs); }
         );
-        groupBySum.resize(n);
-        timeTrace("step 5: partial-sorted top %u records", groupBySum.size());
+        topBytes.resize(n);
+        timeTrace("step 5: partial-sorted top %u records", topBytes.size());
     }
 
     // Step 6: reduce to compute the top-K (lang, author, bytes)-tuples
@@ -1958,7 +1992,7 @@ MilliSortService::bigQueryQ3()
     };
 
     const int DUMMY_OP_ID = 999;
-    TopBytes aggTopBytes(&groupBySum);
+    TopBytes aggTopBytes(&topBytes);
     {
         SCOPED_TIMER(bigQueryStep6ElapsedTime)
         Tub<TreeGather> gatherOp;
