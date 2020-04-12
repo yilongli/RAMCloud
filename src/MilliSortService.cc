@@ -509,6 +509,12 @@ MilliSortService::initMilliSort(const WireFormat::InitMilliSort::Request* reqHdr
         bcastPivotBucketBoundaries.construct(context, allPivotServers.get());
     }
 
+    // Clean up shuffle operations.
+    for (auto& entry : globalShuffleOpTable) {
+        ShuffleOp* shuffleOp = entry.exchange(NULL);
+        delete shuffleOp;
+    }
+
     // Clear BigQuery-related states
     bigQueryQ4UniqueWords.clear();
     bigQueryQ4BcastDone = false;
@@ -1195,7 +1201,7 @@ MilliSortService::bigQueryQ2() {
         timeTrace("worker done, processed %u records", numRecords);
     };
 
-    std::unique_ptr<ShuffleOp> shuffleOp;
+    ShuffleOp* shuffleOp;
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
         std::vector<Arachne::ThreadId> workers;
@@ -1210,8 +1216,8 @@ MilliSortService::bigQueryQ2() {
         }
         timeTrace("step 1: hash-partitioned ipv4 addresses");
 
-        shuffleOp.reset(new ShuffleOpOpt(ALLSHUFFLE_BIGQUERY_0, world.get(),
-                (char*) incomingKeys, ~0lu));
+        shuffleOp = new ShuffleOpOpt(ALLSHUFFLE_BIGQUERY_0, world.get(),
+                (char*) incomingKeys, ~0lu);
         for (size_t target = 0; target < world->size(); target++) {
             for (size_t c = 0; c < coresAvail.size(); c++) {
                 shuffleOp->outgoingMessages[target].appendExternal(
@@ -1226,9 +1232,9 @@ MilliSortService::bigQueryQ2() {
     // end up on the same node.
     {
         SCOPED_TIMER(bigQueryStep2ElapsedTime)
-        globalShuffleOpTable[shuffleOp->opId] = shuffleOp.get();
+        globalShuffleOpTable[shuffleOp->opId] = shuffleOp;
         invokeShufflePush(shuffleOp->group, shuffleOp->opId,
-                &shuffleOp->outgoingMessages, shuffleOp.get());
+                &shuffleOp->outgoingMessages, shuffleOp);
         // Note: we can't delete this shuffle op yet; suppose some other node X
         // issues a ShufflePushRpc to us and we piggyback some data for X in the
         // reply but the reply gets lost: from our perspective, this shuffle op
@@ -1409,9 +1415,6 @@ MilliSortService::bigQueryQ2() {
     } else {
         LOG(NOTICE, "Finished processing BigQuery Q2");
     }
-
-    // Clean up shuffle operations.
-    globalShuffleOpTable[shuffleOp->opId] = NULL;
 }
 
 void
@@ -1614,7 +1617,7 @@ MilliSortService::bigQueryQ3()
     // Step 1: shuffle commit records based on their repos; that is, all records
     // with the same repo shall end up on the same node.
     std::vector<RepoAuthorRecView> incomingCommits;
-    std::unique_ptr<ShuffleOp> shuffleOp0;
+    ShuffleOp* shuffleOp0 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_0, world.get());
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
         int id = 0;
@@ -1627,7 +1630,6 @@ MilliSortService::bigQueryQ3()
             Arachne::join(tid);
         }
 
-        shuffleOp0.reset(new ShuffleOp(ALLSHUFFLE_BIGQUERY_0, world.get()));
         for (size_t target = 0; target < world->size(); target++) {
             Buffer* outgoing = &shuffleOp0->outgoingMessages[target];
             for (auto& perCoreMessages : messages) {
@@ -1638,9 +1640,9 @@ MilliSortService::bigQueryQ3()
         }
         timeTrace("step 1: hash-partitioned the commit records based on repo");
 
-        globalShuffleOpTable[shuffleOp0->opId] = shuffleOp0.get();
+        globalShuffleOpTable[shuffleOp0->opId] = shuffleOp0;
         invokeShufflePush(shuffleOp0->group, shuffleOp0->opId,
-                &shuffleOp0->outgoingMessages, shuffleOp0.get());
+                &shuffleOp0->outgoingMessages, shuffleOp0);
         timeTrace("step 1: shuffled commit records, outgoing %u",
                 rawCommits.first.size());
 
@@ -1698,11 +1700,10 @@ MilliSortService::bigQueryQ3()
 
     // Step 3: shuffle the language table based on repo as well (so each node
     // can later perform the join operation independently).
-    std::unique_ptr<ShuffleOp> shuffleOp1;
+    ShuffleOp* shuffleOp1 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_2, world.get());
     std::vector<RepoLangBytesRecView> incomingLangs;
     {
         SCOPED_TIMER(bigQueryStep3ElapsedTime)
-        shuffleOp1.reset(new ShuffleOp(ALLSHUFFLE_BIGQUERY_2, world.get()));
         StringCol& repoCol = std::get<0>(repoLangs);
         StringCol& langCol = std::get<1>(repoLangs);
         IntCol& bytesCol = std::get<2>(repoLangs);
@@ -1715,9 +1716,9 @@ MilliSortService::bigQueryQ3()
         }
         timeTrace("step 3: hash-partitioned the language records");
 
-        globalShuffleOpTable[shuffleOp1->opId] = shuffleOp1.get();
+        globalShuffleOpTable[shuffleOp1->opId] = shuffleOp1;
         invokeShufflePush(shuffleOp1->group, shuffleOp1->opId,
-                &shuffleOp1->outgoingMessages, shuffleOp1.get());
+                &shuffleOp1->outgoingMessages, shuffleOp1);
         timeTrace("step 3: shuffled the language records");
 
         // TODO: parallelize
@@ -1845,11 +1846,10 @@ MilliSortService::bigQueryQ3()
 
     // Step 5: shuffle the output table produced by join based on (lang, author)
     // in order to sum up the bytes.
-    std::unique_ptr<ShuffleOp> shuffleOp2;
+    ShuffleOp* shuffleOp2 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get());
     std::vector<LangAuthorBytesRecView> topBytes;
     {
         SCOPED_TIMER(bigQueryStep5ElapsedTime)
-        shuffleOp2.reset(new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get()));
         for (LangAuthorBytesRecView& tuple : localGroupBy) {
             StringView lang, author;
             uint64_t bytes;
@@ -1865,9 +1865,9 @@ MilliSortService::bigQueryQ3()
         }
         timeTrace("step 5: hash-partitioned join result based on (lang, author)");
 
-        globalShuffleOpTable[shuffleOp2->opId] = shuffleOp2.get();
+        globalShuffleOpTable[shuffleOp2->opId] = shuffleOp2;
         invokeShufflePush(shuffleOp2->group, shuffleOp2->opId,
-                &shuffleOp2->outgoingMessages, shuffleOp2.get());
+                &shuffleOp2->outgoingMessages, shuffleOp2);
         timeTrace("step 5: shuffled the join result by (lang, author)");
 
         // TODO: parallelize
@@ -2013,11 +2013,6 @@ MilliSortService::bigQueryQ3()
                     std::get<1>(tuple).c_str(), std::get<2>(tuple));
         }
     }
-
-    // Clean up shuffle operations.
-    globalShuffleOpTable[shuffleOp0->opId] = NULL;
-    globalShuffleOpTable[shuffleOp1->opId] = NULL;
-    globalShuffleOpTable[shuffleOp2->opId] = NULL;
 }
 
 void
