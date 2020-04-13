@@ -1610,45 +1610,38 @@ MilliSortService::bigQueryQ3()
         }
     };
 
-    CommitRecordPartitioner serializeCommits(world->size(), &coresAvail,
-            &rawCommits);
+    struct CommitRecordDeserializer : public Deserializer<RepoAuthorRecView> {
 
-    std::atomic<size_t> nextMsg(0);
-    auto deserializer = [&nextMsg] (vector<vector<char>>* rxMessages,
-            vector<RepoAuthorRecView>* output) {
-        while (true) {
-            const static size_t B = 4;
-            size_t start = nextMsg.fetch_add(B);
-            size_t end = std::min(start + B, rxMessages->size());
-            if (start >= rxMessages->size()) {
-                break;
-            }
+        CommitRecordDeserializer(std::vector<int>* coresAvail,
+                std::vector<std::vector<char>>* incomingMessages)
+            : Deserializer<RepoAuthorRecView>(coresAvail, incomingMessages)
+        {}
 
-            for (size_t i = start; i < end; i++) {
-                vector<char>& msg = rxMessages->at(i);
-                size_t offset = 0;
-                while (offset < msg.size()) {
-                    char* s1 = &msg[offset];
-                    while (msg[offset++]);
-                    uint32_t len1 = uint32_t(&msg[offset] - s1) - 1;
-                    char* s2 = &msg[offset];
-                    while (msg[offset++]);
-                    uint32_t len2 = uint32_t(&msg[offset] - s2) - 1;
-                    StringView repo(s1, len1);
-                    StringView author(s2, len2);
-                    output->emplace_back(repo, author);
-                }
+        virtual void process(size_t msgId,
+                std::vector<RepoAuthorRecView>* outRecords)
+        {
+            vector<char>& msg = incomingMessages->at(msgId);
+            uint32_t len;
+            char* old;
+            char* s = msg.data();
+            while (s < msg.data() + msg.size()) {
+                // (repo, author)
+                old = nextString(s, len);
+                StringView repo(old, len);
+                old = nextString(s, len);
+                StringView author(old, len);
+                outRecords->emplace_back(repo, author);
             }
         }
-//        timeTrace("deserializer: copy out %u incoming commit records",
-//                output->size());
     };
 
     // Step 1: shuffle commit records based on their repos; that is, all records
     // with the same repo shall end up on the same node.
-    vector<vector<RepoAuthorRecView>> incomingCommits(coresAvail.size());
-    size_t numIncomingCommits = 0;
     ShuffleOp* shuffleOp0 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_0, world.get());
+    CommitRecordPartitioner serializeCommits(world->size(), &coresAvail,
+            &rawCommits);
+    CommitRecordDeserializer commitDeserializer(&coresAvail,
+            &shuffleOp0->incomingMessages);
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
         serializeCommits.start(&shuffleOp0->outgoingMessages);
@@ -1662,19 +1655,9 @@ MilliSortService::bigQueryQ3()
 
         // Deserialize commit records from incoming shuffle messages; use all
         // cores in parallel.
-        std::vector<Arachne::ThreadId> workers;
-        for (size_t id = 0; id < coresAvail.size(); id++) {
-            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
-                    deserializer, &shuffleOp0->incomingMessages,
-                    &incomingCommits[id]));
-        }
-        for (auto& tid : workers) Arachne::join(tid);
-
-        for (auto& vec : incomingCommits) {
-            numIncomingCommits += vec.size();
-        }
+        commitDeserializer.start();
         timeTrace("step 1: deserialized %u incoming commit records",
-                numIncomingCommits);
+                commitDeserializer.numRecords);
     }
 
     // Step 2: remove duplicate incoming commit records; this is implemented by
@@ -1683,10 +1666,10 @@ MilliSortService::bigQueryQ3()
     // slower due to cache misses.
     std::vector<RepoAuthorRecView> leftJoinTable;
     std::vector<RepoAuthorRecView*> commitPtrs;
-    commitPtrs.reserve(numIncomingCommits);
+    commitPtrs.reserve(commitDeserializer.numRecords);
     {
         SCOPED_TIMER(bigQueryStep2ElapsedTime)
-        for (auto& vec : incomingCommits) {
+        for (auto& vec : commitDeserializer.perCoreRecords) {
             for (auto& rec : vec) {
                 commitPtrs.push_back(&rec);
             }
@@ -1699,10 +1682,10 @@ MilliSortService::bigQueryQ3()
                 },
                 coresAvail.size());
 
-        timeTrace("step 2: sorted %u commit records", numIncomingCommits);
+        timeTrace("step 2: sorted %u commit records", commitPtrs.size());
 
         // TODO: parallelize?
-        if (numIncomingCommits > 0) {
+        if (!commitPtrs.empty()) {
             leftJoinTable.push_back(*commitPtrs.front());
             for (auto& commitPtr : commitPtrs) {
                 if (leftJoinTable.back() != *commitPtr) {
@@ -1740,11 +1723,36 @@ MilliSortService::bigQueryQ3()
         }
     };
 
+    struct LangRecordDeserializer : public Deserializer<RepoLangBytesRecView> {
+
+        LangRecordDeserializer(std::vector<int>* coresAvail,
+                std::vector<std::vector<char>>* incomingMessages)
+            : Deserializer<RepoLangBytesRecView>(coresAvail, incomingMessages)
+        {}
+
+        virtual void process(size_t msgId,
+                std::vector<RepoLangBytesRecView>* outRecords)
+        {
+            vector<char>& msg = incomingMessages->at(msgId);
+            uint32_t len;
+            char* old;
+            char* s = msg.data();
+            while (s < msg.data() + msg.size()) {
+                // (repo, lang, bytes)
+                old = nextString(s, len);
+                StringView repo(old, len);
+                old = nextString(s, len);
+                StringView lang(old, len);
+                outRecords->emplace_back(repo, lang, next8BInt(s));
+            }
+        }
+    };
+
     LangRecordPartitioner serializeLangs(world->size(), &coresAvail,
             &repoLangs);
-
     ShuffleOp* shuffleOp1 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_2, world.get());
-    std::vector<RepoLangBytesRecView> incomingLangs;
+    LangRecordDeserializer langDeserializer(&coresAvail,
+            &shuffleOp1->incomingMessages);
     {
         SCOPED_TIMER(bigQueryStep3ElapsedTime)
         serializeLangs.start(&shuffleOp1->outgoingMessages);
@@ -1755,25 +1763,9 @@ MilliSortService::bigQueryQ3()
                 &shuffleOp1->outgoingMessages, shuffleOp1);
         timeTrace("step 3: shuffled the language records");
 
-        // TODO: parallelize
-        for (std::vector<char>& msg : shuffleOp1->incomingMessages) {
-            size_t offset = 0;
-            while (offset < msg.size()) {
-                char* s1 = &msg[offset];
-                while (msg[offset++]);
-                uint32_t len1 = uint32_t(&msg[offset] - s1) - 1;
-                char* s2 = &msg[offset];
-                while (msg[offset++]);
-                uint32_t len2 = uint32_t(&msg[offset] - s2) - 1;
-                uint64_t bytes = *((uint64_t*) &msg[offset]);
-                offset += sizeof(decltype(bytes));
-                StringView repo(s1, len1);
-                StringView lang(s2, len2);
-                incomingLangs.emplace_back(repo, lang, bytes);
-            }
-        }
+        langDeserializer.start();
         timeTrace("step 3: deserialized %u language records",
-                incomingLangs.size());
+                langDeserializer.numRecords);
     }
 //    for (auto& tuple : incomingLangs) {
 //        LOG(NOTICE, "lang (%s, %s, %lu)", std::get<0>(tuple).c_str(),
@@ -1834,8 +1826,8 @@ MilliSortService::bigQueryQ3()
         }
     };
 
-    std::vector<decltype(incomingLangs)::value_type*> rightJoinPtrs;
-    rightJoinPtrs.reserve(incomingLangs.size());
+    std::vector<RepoLangBytesRecView*> rightJoinPtrs;
+    rightJoinPtrs.reserve(langDeserializer.numRecords);
     std::unique_ptr<LangAuthorBytesRecView[]> localGroupBy;
     std::atomic<size_t> numGroupBys(0);
     {
@@ -1844,8 +1836,10 @@ MilliSortService::bigQueryQ3()
         // By now, the leftJoinTable should've been sorted according to repo;
         // we just need to sort the rightJoinTable too.
         // TODO: parallelize?
-        for (auto& rec : incomingLangs) {
-            rightJoinPtrs.push_back(&rec);
+        for (auto& vec : langDeserializer.perCoreRecords) {
+            for (auto& rec : vec) {
+                rightJoinPtrs.push_back(&rec);
+            }
         }
         timeTrace("step 4: prepared ptr array for indirect sort");
         ips4o::parallel::sort(rightJoinPtrs.begin(), rightJoinPtrs.end(),
@@ -1975,10 +1969,37 @@ MilliSortService::bigQueryQ3()
         }
     };
 
+    struct JoinResultDeserializer : public Deserializer<LangAuthorBytesRecView>
+    {
+        JoinResultDeserializer(std::vector<int>* coresAvail,
+                std::vector<std::vector<char>>* incomingMessages)
+            : Deserializer<LangAuthorBytesRecView>(coresAvail, incomingMessages)
+        {}
+
+        virtual void process(size_t msgId,
+                std::vector<RepoLangBytesRecView>* outRecords)
+        {
+            vector<char>& msg = incomingMessages->at(msgId);
+            uint32_t len;
+            char* old;
+            char* s = msg.data();
+            while (s < msg.data() + msg.size()) {
+                // (lang, author, bytes)
+                old = nextString(s, len);
+                StringView lang(old, len);
+                old = nextString(s, len);
+                StringView author(old, len);
+                outRecords->emplace_back(lang, author, next8BInt(s));
+            }
+        }
+    };
+
+
     JoinResultPartitioner joinResultPartitioner(numGroupBys, world->size(),
             &coresAvail, localGroupBy.get());
-
     ShuffleOp* shuffleOp2 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get());
+    JoinResultDeserializer joinResultDeserializer(&coresAvail,
+            &shuffleOp2->incomingMessages);
     std::vector<LangAuthorBytesRecView> topBytes;
     {
         SCOPED_TIMER(bigQueryStep5ElapsedTime)
@@ -1990,32 +2011,18 @@ MilliSortService::bigQueryQ3()
                 &shuffleOp2->outgoingMessages, shuffleOp2);
         timeTrace("step 5: shuffled the join result by (lang, author)");
 
-        // TODO: parallelize
-        std::vector<LangAuthorBytesRecView> groupBySum;
-        std::vector<LangAuthorBytesRecView*> groupBySumPtrs;
-        for (std::vector<char>& msg : shuffleOp2->incomingMessages) {
-            size_t offset = 0;
-            while (offset < msg.size()) {
-                char* s1 = &msg[offset];
-                while (msg[offset++]);
-                uint32_t len1 = uint32_t(&msg[offset] - s1) - 1;
-                char* s2 = &msg[offset];
-                while (msg[offset++]);
-                uint32_t len2 = uint32_t(&msg[offset] - s2) - 1;
-                uint64_t bytes = *((uint64_t*) &msg[offset]);
-                offset += sizeof(decltype(bytes));
-                StringView lang(s1, len1);
-                StringView author(s2, len2);
-                groupBySum.emplace_back(lang, author, bytes);
-            }
-        }
+        joinResultDeserializer.start();
         timeTrace("step 5: deserialized %u (lang, author, bytes) records",
-                groupBySum.size());
+                joinResultDeserializer.numRecords);
 
         // Indirect-sort based on (lang, author)
-        groupBySumPtrs.reserve(groupBySum.size());
-        for (auto& rec : groupBySum) {
-            groupBySumPtrs.push_back(&rec);
+        std::vector<LangAuthorBytesRecView*> groupBySumPtrs;
+        groupBySumPtrs.reserve(joinResultDeserializer.numRecords);
+        // TODO: parallelize?
+        for (auto& vec : joinResultDeserializer.perCoreRecords) {
+            for (auto& rec : vec) {
+                groupBySumPtrs.push_back(&rec);
+            }
         }
         ips4o::parallel::sort(groupBySumPtrs.begin(), groupBySumPtrs.end(),
                 [] (const auto* x, const auto* y) {
@@ -2025,12 +2032,12 @@ MilliSortService::bigQueryQ3()
                 },
                 coresAvail.size());
         timeTrace("step 5: sorted %u (lang, author, bytes) records",
-                groupBySum.size());
+                groupBySumPtrs.size());
 
         // TODO: parallelize?
-        if (!groupBySum.empty()) {
+        if (!groupBySumPtrs.empty()) {
             topBytes.push_back(*groupBySumPtrs.front());
-            for (size_t i = 1; i < groupBySum.size(); i++) {
+            for (size_t i = 1; i < groupBySumPtrs.size(); i++) {
                 auto& a = topBytes.back();
                 auto& b = *groupBySumPtrs[i];
                 if ((std::get<0>(b) != std::get<0>(a)) ||
