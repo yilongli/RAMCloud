@@ -21,6 +21,7 @@
 #include "robin-hood/robin_hood.h"
 
 #include "Arachne/DefaultCorePolicy.h"
+#include "BigQuery.h"
 #include "ClockSynchronizer.h"
 #include "MilliSortService.h"
 #include "Broadcast.h"
@@ -1585,33 +1586,32 @@ MilliSortService::bigQueryQ3()
 
     // Step 1: scan the local tablet to build up the shuffle messages; use all
     // worker cores to parallelize the work.
-    std::vector<Tub<std::vector<Buffer>>> messages(coresAvail.size());
-    for (auto &tub : messages) {
-        tub.construct(world->size());
-    }
-    std::atomic<size_t> nextStart(0);
-    auto workerMain = [&nextStart] (CommitTable* tablet,
-            std::vector<Buffer>* messages, uint16_t maxTargets) {
-        StringCol& repoCol = tablet->first;
-        StringCol& authorCol = tablet->second;
-        while (true) {
-            size_t start = nextStart.fetch_add(1000);
-            size_t end = std::min(start + 1000, repoCol.size());
-            if (start >= repoCol.size()) {
-                break;
-            }
+    struct CommitRecordPartitioner : public HashPartitioner {
+        StringCol& repoCol;
+        StringCol& authorCol;
 
-            for (size_t i = start; i < end; i++) {
-                std::string& repo = repoCol[i];
-                std::string& author = authorCol[i];
-                // TODO: use lightweight string hash function?
-                size_t h = std::hash<std::string>()(repo);
-                Buffer* target = &messages->at(h % maxTargets);
-                target->appendCopy(repo.c_str(), repo.size() + 1);
-                target->appendCopy(author.c_str(), author.size() + 1);
-            }
+        CommitRecordPartitioner(size_t nodes, std::vector<int>* coresAvail,
+                CommitTable* commitTable)
+            : HashPartitioner(commitTable->first.size(), nodes, coresAvail)
+            , repoCol(commitTable->first)
+            , authorCol(commitTable->second)
+        {}
+
+        virtual void
+        doWork(std::vector<Buffer>* outMsgs, size_t recordId) override
+        {
+            std::string& repo = repoCol[recordId];
+            std::string& author = authorCol[recordId];
+            // TODO: use lightweight string hash function?
+            size_t h = std::hash<std::string>()(repo);
+            Buffer* target = &outMsgs->at(h % outMsgs->size());
+            target->appendCopy(repo.c_str(), repo.size() + 1);
+            target->appendCopy(author.c_str(), author.size() + 1);
         }
     };
+
+    CommitRecordPartitioner serializeCommits(world->size(), &coresAvail,
+            &rawCommits);
 
     std::atomic<size_t> nextMsg(0);
     auto deserializer = [&nextMsg] (vector<vector<char>>* rxMessages,
@@ -1651,22 +1651,7 @@ MilliSortService::bigQueryQ3()
     ShuffleOp* shuffleOp0 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_0, world.get());
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
-        std::vector<Arachne::ThreadId> workers;
-        for (size_t id = 0; id < coresAvail.size(); id++) {
-            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
-                    workerMain, &rawCommits, messages[id].get(),
-                    uint16_t(world->size())));
-        }
-        for (auto& tid : workers) Arachne::join(tid);
-
-        for (size_t target = 0; target < world->size(); target++) {
-            Buffer* outgoing = &shuffleOp0->outgoingMessages[target];
-            for (auto& perCoreMessages : messages) {
-                outgoing->appendExternal(&perCoreMessages->at(target));
-            }
-//            timeTrace("need to send %u bytes to node %u", outgoing->size(),
-//                    target);
-        }
+        serializeCommits.start(&shuffleOp0->outgoingMessages);
         timeTrace("step 1: hash-partitioned the commit records based on repo");
 
         globalShuffleOpTable[shuffleOp0->opId] = shuffleOp0;
@@ -1677,7 +1662,7 @@ MilliSortService::bigQueryQ3()
 
         // Deserialize commit records from incoming shuffle messages; use all
         // cores in parallel.
-        workers.clear();
+        std::vector<Arachne::ThreadId> workers;
         for (size_t id = 0; id < coresAvail.size(); id++) {
             workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
                     deserializer, &shuffleOp0->incomingMessages,
@@ -1731,20 +1716,38 @@ MilliSortService::bigQueryQ3()
 
     // Step 3: shuffle the language table based on repo as well (so each node
     // can later perform the join operation independently).
+    struct LangRecordPartitioner : public HashPartitioner {
+        StringCol& repoCol = std::get<0>(repoLangs);
+        StringCol& langCol = std::get<1>(repoLangs);
+        IntCol& bytesCol = std::get<2>(repoLangs);
+
+        LangRecordPartitioner(size_t nodes, std::vector<int>* coresAvail,
+                LanguageTable* langTable)
+            : HashPartitioner(std::get<0>(*langTable).size(), nodes, coresAvail)
+            , repoCol(std::get<0>(*langTable))
+            , langCol(std::get<1>(*langTable))
+            , bytesCol(std::get<2>(*langTable))
+        {}
+
+        virtual void
+        doWork(std::vector<Buffer>* outMsgs, size_t i) override
+        {
+            size_t h = std::hash<std::string>()(repoCol[i]) % outMsgs->size();
+            Buffer* target = &outMsgs->at(h);
+            target->appendCopy(repoCol[i].c_str(), repoCol[i].size() + 1);
+            target->appendCopy(langCol[i].c_str(), langCol[i].size() + 1);
+            target->appendCopy(&bytesCol[i]);
+        }
+    };
+
+    LangRecordPartitioner serializeLangs(world->size(), &coresAvail,
+            &repoLangs);
+
     ShuffleOp* shuffleOp1 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_2, world.get());
     std::vector<RepoLangBytesRecView> incomingLangs;
     {
         SCOPED_TIMER(bigQueryStep3ElapsedTime)
-        StringCol& repoCol = std::get<0>(repoLangs);
-        StringCol& langCol = std::get<1>(repoLangs);
-        IntCol& bytesCol = std::get<2>(repoLangs);
-        for (size_t i = 0; i < repoCol.size(); i++) {
-            size_t target = std::hash<std::string>()(repoCol[i]) % world->size();
-            Buffer* buffer = &shuffleOp1->outgoingMessages[target];
-            buffer->appendCopy(repoCol[i].c_str(), repoCol[i].size() + 1);
-            buffer->appendCopy(langCol[i].c_str(), langCol[i].size() + 1);
-            buffer->appendCopy(&bytesCol[i]);
-        }
+        serializeLangs.start(&shuffleOp1->outgoingMessages);
         timeTrace("step 3: hash-partitioned the language records");
 
         globalShuffleOpTable[shuffleOp1->opId] = shuffleOp1;
@@ -1778,7 +1781,7 @@ MilliSortService::bigQueryQ3()
 //    }
 
     // Step 4: join the commit table and the language table on repo
-    nextStart = 0;
+    std::atomic<size_t> nextStart(0);
     vector<vector<LangAuthorBytesRecView>> joinResults(coresAvail.size());
     auto joiner = [&nextStart, &leftJoinTable]
             (std::vector<RepoLangBytesRecView*>* rightJoinPtrs,
@@ -1840,9 +1843,11 @@ MilliSortService::bigQueryQ3()
 
         // By now, the leftJoinTable should've been sorted according to repo;
         // we just need to sort the rightJoinTable too.
+        // TODO: parallelize?
         for (auto& rec : incomingLangs) {
             rightJoinPtrs.push_back(&rec);
         }
+        timeTrace("step 4: prepared ptr array for indirect sort");
         ips4o::parallel::sort(rightJoinPtrs.begin(), rightJoinPtrs.end(),
                 [] (const auto* x, const auto* y) {
                     return std::get<0>(*x).compare(std::get<0>(*y)) < 0;
@@ -1892,7 +1897,7 @@ MilliSortService::bigQueryQ3()
         timeTrace("step 4: sorted %u records in the join result",
                 numJoinedRecords);
 
-        // TODO: parallelize?
+        // Summed up bytes for each (lang, author); use all cores in parallel
         localGroupBy.reset(new LangAuthorBytesRecView[numJoinedRecords]);
         if (numJoinedRecords > 0) {
             std::atomic<size_t> nextStart(0);
@@ -1942,23 +1947,42 @@ MilliSortService::bigQueryQ3()
 
     // Step 5: shuffle the output table produced by join based on (lang, author)
     // in order to sum up the bytes.
-    ShuffleOp* shuffleOp2 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get());
-    std::vector<LangAuthorBytesRecView> topBytes;
-    {
-        SCOPED_TIMER(bigQueryStep5ElapsedTime)
-        for (size_t i = 0; i < numGroupBys.load(); i++) {
+    struct JoinResultPartitioner : public HashPartitioner {
+        LangAuthorBytesRecView* localGroupBy;
+
+        JoinResultPartitioner(size_t nrecords, size_t nodes,
+                std::vector<int>* coresAvail,
+                LangAuthorBytesRecView* localGroupBy)
+            : HashPartitioner(nrecords, nodes, coresAvail)
+            , localGroupBy(localGroupBy)
+        {}
+
+        virtual void
+        doWork(std::vector<Buffer>* outMsgs, size_t i) override
+        {
             StringView lang, author;
             uint64_t bytes;
             std::tie(lang, author, bytes) = localGroupBy[i];
-            size_t target = (lang.hash() ^ author.hash()) % world->size();
-            Buffer* buffer = &shuffleOp2->outgoingMessages[target];
+            size_t h = (lang.hash() ^ author.hash()) % outMsgs->size();
+            Buffer* buffer = &outMsgs->at(h);
             char nullChar = 0;
             buffer->appendCopy(lang.s, lang.len);
             buffer->appendCopy(&nullChar);
             buffer->appendCopy(author.s, author.len);
             buffer->appendCopy(&nullChar);
             buffer->appendCopy(&bytes);
+
         }
+    };
+
+    JoinResultPartitioner joinResultPartitioner(numGroupBys, world->size(),
+            &coresAvail, localGroupBy.get());
+
+    ShuffleOp* shuffleOp2 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get());
+    std::vector<LangAuthorBytesRecView> topBytes;
+    {
+        SCOPED_TIMER(bigQueryStep5ElapsedTime)
+        joinResultPartitioner.start(&shuffleOp2->outgoingMessages);
         timeTrace("step 5: hash-partitioned join result based on (lang, author)");
 
         globalShuffleOpTable[shuffleOp2->opId] = shuffleOp2;
@@ -2003,6 +2027,7 @@ MilliSortService::bigQueryQ3()
         timeTrace("step 5: sorted %u (lang, author, bytes) records",
                 groupBySum.size());
 
+        // TODO: parallelize?
         if (!groupBySum.empty()) {
             topBytes.push_back(*groupBySumPtrs.front());
             for (size_t i = 1; i < groupBySum.size(); i++) {
