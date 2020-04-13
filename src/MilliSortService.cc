@@ -31,7 +31,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 0
+#define TIME_TRACE 1
 
 #define TIME_TRACE_SP 0
 
@@ -1462,12 +1462,12 @@ MilliSortService::bigQueryQ3()
 
         bool operator==(const StringView& other) const
         {
-            return (len == other.len) && (strncmp(s, other.s, len) == 0);
+            return compare(other) == 0;
         }
 
         bool operator!=(const StringView& other) const
         {
-            return !((*this) == other);
+            return compare(other) != 0;
         }
     };
 
@@ -1589,7 +1589,6 @@ MilliSortService::bigQueryQ3()
     for (auto &tub : messages) {
         tub.construct(world->size());
     }
-    std::vector<Arachne::ThreadId> workers;
     std::atomic<size_t> nextStart(0);
     auto workerMain = [&nextStart] (CommitTable* tablet,
             std::vector<Buffer>* messages, uint16_t maxTargets) {
@@ -1614,21 +1613,51 @@ MilliSortService::bigQueryQ3()
         }
     };
 
+    std::atomic<size_t> nextMsg(0);
+    auto deserializer = [&nextMsg] (vector<vector<char>>* rxMessages,
+            vector<RepoAuthorRecView>* output) {
+        while (true) {
+            const static size_t B = 4;
+            size_t start = nextMsg.fetch_add(B);
+            size_t end = std::min(start + B, rxMessages->size());
+            if (start >= rxMessages->size()) {
+                break;
+            }
+
+            for (size_t i = start; i < end; i++) {
+                vector<char>& msg = rxMessages->at(i);
+                size_t offset = 0;
+                while (offset < msg.size()) {
+                    char* s1 = &msg[offset];
+                    while (msg[offset++]);
+                    uint32_t len1 = uint32_t(&msg[offset] - s1) - 1;
+                    char* s2 = &msg[offset];
+                    while (msg[offset++]);
+                    uint32_t len2 = uint32_t(&msg[offset] - s2) - 1;
+                    StringView repo(s1, len1);
+                    StringView author(s2, len2);
+                    output->emplace_back(repo, author);
+                }
+            }
+        }
+//        timeTrace("deserializer: copy out %u incoming commit records",
+//                output->size());
+    };
+
     // Step 1: shuffle commit records based on their repos; that is, all records
     // with the same repo shall end up on the same node.
-    std::vector<RepoAuthorRecView> incomingCommits;
+    vector<vector<RepoAuthorRecView>> incomingCommits(coresAvail.size());
+    size_t numIncomingCommits = 0;
     ShuffleOp* shuffleOp0 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_0, world.get());
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
-        int id = 0;
-        for (int coreId : coresAvail) {
-            workers.push_back(Arachne::createThreadOnCore(coreId, workerMain,
-                    &rawCommits, messages[id].get(), uint16_t(world->size())));
-            id++;
+        std::vector<Arachne::ThreadId> workers;
+        for (size_t id = 0; id < coresAvail.size(); id++) {
+            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                    workerMain, &rawCommits, messages[id].get(),
+                    uint16_t(world->size())));
         }
-        for (auto &tid : workers) {
-            Arachne::join(tid);
-        }
+        for (auto& tid : workers) Arachne::join(tid);
 
         for (size_t target = 0; target < world->size(); target++) {
             Buffer* outgoing = &shuffleOp0->outgoingMessages[target];
@@ -1646,22 +1675,21 @@ MilliSortService::bigQueryQ3()
         timeTrace("step 1: shuffled commit records, outgoing %u",
                 rawCommits.first.size());
 
-        for (std::vector<char>& msg : shuffleOp0->incomingMessages) {
-            size_t offset = 0;
-            while (offset < msg.size()) {
-                char* s1 = &msg[offset];
-                while (msg[offset++]);
-                uint32_t len1 = uint32_t(&msg[offset] - s1) - 1;
-                char* s2 = &msg[offset];
-                while (msg[offset++]);
-                uint32_t len2 = uint32_t(&msg[offset] - s2) - 1;
-                StringView repo(s1, len1);
-                StringView author(s2, len2);
-                incomingCommits.emplace_back(repo, author);
-            }
+        // Deserialize commit records from incoming shuffle messages; use all
+        // cores in parallel.
+        workers.clear();
+        for (size_t id = 0; id < coresAvail.size(); id++) {
+            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                    deserializer, &shuffleOp0->incomingMessages,
+                    &incomingCommits[id]));
+        }
+        for (auto& tid : workers) Arachne::join(tid);
+
+        for (auto& vec : incomingCommits) {
+            numIncomingCommits += vec.size();
         }
         timeTrace("step 1: deserialized %u incoming commit records",
-                incomingCommits.size());
+                numIncomingCommits);
     }
 
     // Step 2: remove duplicate incoming commit records; this is implemented by
@@ -1669,13 +1697,16 @@ MilliSortService::bigQueryQ3()
     // solution is to use a huge hash table, but this is likely going to be much
     // slower due to cache misses.
     std::vector<RepoAuthorRecView> leftJoinTable;
-    std::vector<decltype(incomingCommits)::value_type*> commitPtrs;
-    commitPtrs.reserve(incomingCommits.size());
+    std::vector<RepoAuthorRecView*> commitPtrs;
+    commitPtrs.reserve(numIncomingCommits);
     {
         SCOPED_TIMER(bigQueryStep2ElapsedTime)
-        for (auto& rec : incomingCommits) {
-            commitPtrs.push_back(&rec);
+        for (auto& vec : incomingCommits) {
+            for (auto& rec : vec) {
+                commitPtrs.push_back(&rec);
+            }
         }
+        timeTrace("step 2: initialized ptr array for indirect sort");
         ips4o::parallel::sort(commitPtrs.begin(), commitPtrs.end(),
                 [] (auto x, auto y) {
                     int r = x->first.compare(y->first);
@@ -1683,10 +1714,10 @@ MilliSortService::bigQueryQ3()
                 },
                 coresAvail.size());
 
-        timeTrace("step 2: sorted %u commit records", incomingCommits.size());
+        timeTrace("step 2: sorted %u commit records", numIncomingCommits);
 
         // TODO: parallelize?
-        if (!incomingCommits.empty()) {
+        if (numIncomingCommits > 0) {
             leftJoinTable.push_back(*commitPtrs.front());
             for (auto& commitPtr : commitPtrs) {
                 if (leftJoinTable.back() != *commitPtr) {
@@ -1747,9 +1778,63 @@ MilliSortService::bigQueryQ3()
 //    }
 
     // Step 4: join the commit table and the language table on repo
+    nextStart = 0;
+    vector<vector<LangAuthorBytesRecView>> joinResults(coresAvail.size());
+    auto joiner = [&nextStart, &leftJoinTable]
+            (std::vector<RepoLangBytesRecView*>* rightJoinPtrs,
+            std::vector<LangAuthorBytesRecView>* output) {
+        while (true) {
+            const static size_t B = 4096;
+            size_t start = nextStart.fetch_add(B);
+            size_t end = std::min(start + B, leftJoinTable.size());
+            if (start >= leftJoinTable.size()) {
+                break;
+            }
+
+            auto leftIt = leftJoinTable.begin() + start;
+            auto rightIt = std::lower_bound(rightJoinPtrs->begin(),
+                    rightJoinPtrs->end(), std::get<0>(*leftIt),
+                    [] (const RepoLangBytesRecView* v, const StringView& repo)
+                    { return std::get<0>(*v).compare(repo) < 0; }
+            );
+            auto leftItEnd = leftJoinTable.begin() + end;
+            while ((leftIt != leftItEnd) && (rightIt != rightJoinPtrs->end())) {
+                StringView& repo = std::get<0>(*leftIt);
+                int cmp = repo.compare(std::get<0>(**rightIt));
+                if (cmp < 0) {
+                    leftIt++;
+                    continue;
+                } else if (cmp > 0) {
+                    rightIt++;
+                    continue;
+                } else {
+                    auto leftIt0 = leftIt + 1;
+                    auto rightIt0 = rightIt + 1;
+                    while ((leftIt0 != leftItEnd) &&
+                           (repo == std::get<0>(*leftIt0))) {
+                        leftIt0++;
+                    }
+                    while ((rightIt0 != rightJoinPtrs->end()) &&
+                           (repo == std::get<0>(**rightIt0))) {
+                        rightIt0++;
+                    }
+                    for (auto l = leftIt; l != leftIt0; l++) {
+                        for (auto r = rightIt; r != rightIt0; r++) {
+                            output->emplace_back(std::get<1>(**r),
+                                    std::get<1>(*l), std::get<2>(**r));
+                        }
+                    }
+                    leftIt = leftIt0;
+                    rightIt = rightIt0;
+                }
+            }
+        }
+    };
+
     std::vector<decltype(incomingLangs)::value_type*> rightJoinPtrs;
     rightJoinPtrs.reserve(incomingLangs.size());
-    std::vector<LangAuthorBytesRecView> localGroupBy;
+    std::unique_ptr<LangAuthorBytesRecView[]> localGroupBy;
+    std::atomic<size_t> numGroupBys(0);
     {
         SCOPED_TIMER(bigQueryStep4ElapsedTime)
 
@@ -1767,52 +1852,37 @@ MilliSortService::bigQueryQ3()
                 rightJoinPtrs.size());
 
         // The following implements the mergesort-join algorithm.
-        // TODO: how to avoid dynamic vector relocation?
-        std::vector<LangAuthorBytesRecView> joinResult;
-        std::vector<LangAuthorBytesRecView*> joinResultPtrs;
-        size_t leftIdx = 0;
-        size_t rightIdx = 0;
-        while ((leftIdx < leftJoinTable.size()) &&
-                (rightIdx < rightJoinPtrs.size())) {
-            StringView& repo = std::get<0>(leftJoinTable[leftIdx]);
-            int r = repo.compare(std::get<0>(*rightJoinPtrs[rightIdx]));
-            if (r < 0) {
-                leftIdx++;
-                continue;
-            } else if (r > 0) {
-                rightIdx++;
-                continue;
-            } else {
-                size_t leftIdxEnd = leftIdx + 1;
-                size_t rightIdxEnd = rightIdx + 1;
-                while ((leftIdxEnd < leftJoinTable.size()) &&
-                        (repo == std::get<0>(leftJoinTable[leftIdxEnd]))) {
-                    leftIdxEnd++;
-                }
-                while ((rightIdxEnd < rightJoinPtrs.size()) &&
-                        (repo == std::get<0>(*rightJoinPtrs[rightIdxEnd]))) {
-                    rightIdxEnd++;
-                }
-                for (size_t i = leftIdx; i < leftIdxEnd; i++) {
-                    for (size_t j = rightIdx; j < rightIdxEnd; j++) {
-                        joinResult.emplace_back(
-                                std::get<1>(*rightJoinPtrs[j]),
-                                std::get<1>(leftJoinTable[i]),
-                                std::get<2>(*rightJoinPtrs[j]));
-                    }
-                }
-                leftIdx = leftIdxEnd;
-                rightIdx = rightIdxEnd;
-            }
+        std::vector<Arachne::ThreadId> workers;
+        for (size_t id = 0; id < coresAvail.size(); id++) {
+            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                    joiner, &rightJoinPtrs, &joinResults[id]));
+        }
+        for (auto& tid : workers) Arachne::join(tid);
+
+        size_t numJoinedRecords = 0;
+        for (auto& vec : joinResults) {
+            numJoinedRecords += vec.size();
         }
         timeTrace("step 4: joined the commit and language tables on repo");
 
         // Indirect-sort based on (lang, author)
-        joinResultPtrs.reserve(joinResult.size());
-        for (auto& rec : joinResult) {
-            joinResultPtrs.push_back(&rec);
+        workers.clear();
+        std::unique_ptr<LangAuthorBytesRecView*[]> joinResultPtrs(
+                new LangAuthorBytesRecView*[numJoinedRecords]);
+        size_t startIdx = 0;
+        for (size_t id = 0; id < coresAvail.size(); id++) {
+            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                    [&joinResultPtrs] (std::vector<LangAuthorBytesRecView>* in,
+                            size_t idx)
+                    { for (auto& r : *in) joinResultPtrs[idx++] = &r; },
+                    &joinResults[id], startIdx));
+            startIdx += joinResults[id].size();
         }
-        ips4o::parallel::sort(joinResultPtrs.begin(), joinResultPtrs.end(),
+        for (auto& tid : workers) Arachne::join(tid);
+        timeTrace("step 4: prepared ptr array for indirect sort");
+
+        ips4o::parallel::sort(joinResultPtrs.get(),
+                joinResultPtrs.get() + numJoinedRecords,
                 [] (const auto* x, const auto* y) {
                     int r = std::get<0>(*x).compare(std::get<0>(*y));
                     return (r != 0) ? (r < 0) :
@@ -1820,24 +1890,50 @@ MilliSortService::bigQueryQ3()
                 },
                 coresAvail.size());
         timeTrace("step 4: sorted %u records in the join result",
-                joinResult.size());
+                numJoinedRecords);
 
         // TODO: parallelize?
-        if (!joinResult.empty()) {
-            localGroupBy.push_back(*joinResultPtrs.front());
-            for (size_t i = 1; i < joinResult.size(); i++) {
-                auto& a = *joinResultPtrs[i];
-                auto& b = localGroupBy.back();
-                if ((std::get<0>(a) != std::get<0>(b)) ||
-                        (std::get<1>(a) != std::get<1>(b))) {
-                    localGroupBy.push_back(a);
-                } else {
-                    std::get<2>(b) += std::get<2>(a);
+        localGroupBy.reset(new LangAuthorBytesRecView[numJoinedRecords]);
+        if (numJoinedRecords > 0) {
+            std::atomic<size_t> nextStart(0);
+            auto sumBytes = [&joinResultPtrs, &numJoinedRecords,
+                      &localGroupBy, &numGroupBys, &nextStart]()
+            {
+                while (true) {
+                    const static size_t B = 4096;
+                    size_t start = nextStart.fetch_add(B);
+                    size_t end = std::min(start + B, numJoinedRecords);
+                    if (start >= numJoinedRecords) {
+                        break;
+                    }
+
+                    size_t lastIdx = start;
+                    for (size_t i = start + 1; i < end; i++) {
+                        auto& a = *joinResultPtrs[i];
+                        auto& b = *joinResultPtrs[lastIdx];
+                        if ((std::get<0>(a) != std::get<0>(b)) ||
+                                (std::get<1>(a) != std::get<1>(b))) {
+                            *joinResultPtrs[++lastIdx] = a;
+                        } else {
+                            std::get<2>(b) += std::get<2>(a);
+                        }
+                    }
+                    size_t more = lastIdx - start + 1;
+                    size_t k = numGroupBys.fetch_add(more);
+                    for (size_t i = start; i <= lastIdx; i++) {
+                        localGroupBy[k++] = *joinResultPtrs[i];
+                    }
                 }
+            };
+            workers.clear();
+            for (size_t id = 0; id < coresAvail.size(); id++) {
+                workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                        sumBytes));
             }
+            for (auto& tid : workers) Arachne::join(tid);
         }
         timeTrace("step 4: summed up bytes for %u (lang, author) combinations",
-                localGroupBy.size());
+                numGroupBys);
     }
 //    for (auto& tuple : localGroupBy) {
 //        LOG(NOTICE, "result (%s, %s, %lu)", std::get<0>(tuple).c_str(),
@@ -1850,10 +1946,10 @@ MilliSortService::bigQueryQ3()
     std::vector<LangAuthorBytesRecView> topBytes;
     {
         SCOPED_TIMER(bigQueryStep5ElapsedTime)
-        for (LangAuthorBytesRecView& tuple : localGroupBy) {
+        for (size_t i = 0; i < numGroupBys.load(); i++) {
             StringView lang, author;
             uint64_t bytes;
-            std::tie(lang, author, bytes) = tuple;
+            std::tie(lang, author, bytes) = localGroupBy[i];
             size_t target = (lang.hash() ^ author.hash()) % world->size();
             Buffer* buffer = &shuffleOp2->outgoingMessages[target];
             char nullChar = 0;
