@@ -147,6 +147,108 @@ struct Deserializer {
     }
 };
 
+/**
+ * Given a list of records sorted by their keys, produce a new sorted list of
+ * records with only distinct keys. The original list of records are scanned
+ * in parallel and the semantics to merge records with the same key is defined
+ * in the subclass.
+ */
+struct Combiner {
+    /// # records to scan
+    size_t numRecords;
+
+    /// # records already claimed by scan workers.
+    std::atomic<size_t> numClaimed;
+
+    /// # final records produced by combining records with the same key.
+    std::atomic<size_t> numFinalRecords;
+
+    std::vector<int> coresAvail;
+
+    std::vector<bool> scanDone;
+
+    Arachne::SpinLock mutex;
+
+    explicit Combiner(size_t nrecords, std::vector<int>* coresAvail)
+        : numRecords(nrecords)
+        , numClaimed(0)
+        , numFinalRecords(0)
+        , coresAvail(*coresAvail)
+        , scanDone(coresAvail->size())
+        , mutex()
+    {}
+
+    virtual bool equal(size_t idx0, size_t idx1) = 0;
+    virtual void doWork(size_t recordId, size_t& lastUniq) = 0;
+    virtual void copyRecord(size_t fromIdx, size_t toIdx) = 0;
+
+    void workerMain(int coreIdx)
+    {
+        size_t avgRecordsPerCore = (numRecords + coresAvail.size() - 1) /
+                coresAvail.size();
+        size_t start = avgRecordsPerCore * coreIdx;
+        size_t end = std::min(numRecords, start + avgRecordsPerCore);
+
+        // Advance `start` if the key of our first record is equal to that
+        // of the previous record.
+        if (start && equal(start - 1, start)) {
+            if (equal(start, end - 1)) {
+                // All records in range [start, end) are equal;
+                // there is nothing for us to do.
+                std::lock_guard<Arachne::SpinLock> _(mutex);
+                scanDone[coreIdx] = true;
+                return;
+            }
+
+            start++;
+            while (equal(start - 1, start)) {
+                start++;
+            }
+        }
+
+        // Advance `end` if the key of our last record is equal to that
+        // of the next record.
+        while ((end < numRecords) && (equal(end - 1, end))) {
+            end++;
+        }
+
+        // Scan all records in the range of [start, end).
+        size_t lastUniq = start;
+        for (size_t i = start; i < end; i++) {
+            doWork(i, lastUniq);
+        }
+
+        // Wait for the worker before us to finish scanning and claim the slots
+        // for writing final records; this is to make sure final records remain
+        // sorted.
+        size_t copyDst = 0;
+        while (true) {
+            std::lock_guard<Arachne::SpinLock> _(mutex);
+            if ((coreIdx == 0) || scanDone[coreIdx - 1]) {
+                scanDone[coreIdx] = true;
+                size_t more = lastUniq - start + 1;
+                copyDst = numFinalRecords.fetch_add(more);
+                break;
+            }
+        }
+
+        // Copy reduced records into their final destination.
+        for (size_t i = start; i <= lastUniq; i++) {
+            copyRecord(i, copyDst++);
+        }
+    }
+
+    void run()
+    {
+        std::vector<Arachne::ThreadId> workers;
+        for (size_t id = 0; id < coresAvail.size(); id++) {
+            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                    [this] (size_t id) { workerMain(id); }, id));
+        }
+        for (auto& tid : workers) Arachne::join(tid);
+    }
+};
+
 }
 
 #endif

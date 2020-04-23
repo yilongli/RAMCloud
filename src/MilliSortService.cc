@@ -1664,11 +1664,42 @@ MilliSortService::bigQueryQ3()
     // sorting and then scanning the commit records (in parallel). Note: another
     // solution is to use a huge hash table, but this is likely going to be much
     // slower due to cache misses.
-    std::vector<RepoAuthorRecView> leftJoinTable;
-    std::vector<RepoAuthorRecView*> commitPtrs;
-    commitPtrs.reserve(commitDeserializer.numRecords);
+    struct RepoAuthorCombiner : public Combiner {
+
+        std::vector<RepoAuthorRecView*>* commitPtrs;
+
+        std::unique_ptr<RepoAuthorRecView*[]> leftJoinTable;
+
+        explicit RepoAuthorCombiner(std::vector<RepoAuthorRecView*>* commitPtrs,
+                std::vector<int>* coresAvail)
+            : Combiner(commitPtrs->size(), coresAvail)
+            , commitPtrs(commitPtrs)
+            , leftJoinTable(new RepoAuthorRecView*[commitPtrs->size()])
+        {}
+
+        virtual bool equal(size_t idx0, size_t idx1)
+        {
+            return *(*commitPtrs)[idx0] == *(*commitPtrs)[idx1];
+        }
+
+        virtual void doWork(size_t recordId, size_t& lastUniq) override
+        {
+            if (!equal(recordId, lastUniq)) {
+                (*commitPtrs)[++lastUniq] = (*commitPtrs)[recordId];
+            }
+        }
+
+        virtual void copyRecord(size_t fromIdx, size_t toIdx) override
+        {
+            leftJoinTable[toIdx] = (*commitPtrs)[fromIdx];
+        }
+    };
+
+    Tub<RepoAuthorCombiner> repoAuthorCombiner;
     {
         SCOPED_TIMER(bigQueryStep2ElapsedTime)
+        std::vector<RepoAuthorRecView*> commitPtrs;
+        commitPtrs.reserve(commitDeserializer.numRecords);
         for (auto& vec : commitDeserializer.perCoreRecords) {
             for (auto& rec : vec) {
                 commitPtrs.push_back(&rec);
@@ -1684,17 +1715,10 @@ MilliSortService::bigQueryQ3()
 
         timeTrace("step 2: sorted %u commit records", commitPtrs.size());
 
-        // TODO: parallelize?
-        if (!commitPtrs.empty()) {
-            leftJoinTable.push_back(*commitPtrs.front());
-            for (auto& commitPtr : commitPtrs) {
-                if (leftJoinTable.back() != *commitPtr) {
-                    leftJoinTable.push_back(*commitPtr);
-                }
-            }
-        }
+        repoAuthorCombiner.construct(&commitPtrs, &coresAvail);
+        repoAuthorCombiner->run();
         timeTrace("step 2: found %u unique (repo, author) records",
-                leftJoinTable.size());
+                repoAuthorCombiner->numFinalRecords);
     }
 
     // Step 3: shuffle the language table based on repo as well (so each node
@@ -1775,26 +1799,31 @@ MilliSortService::bigQueryQ3()
     // Step 4: join the commit table and the language table on repo
     std::atomic<size_t> nextStart(0);
     vector<vector<LangAuthorBytesRecView>> joinResults(coresAvail.size());
-    auto joiner = [&nextStart, &leftJoinTable]
-            (std::vector<RepoLangBytesRecView*>* rightJoinPtrs,
+    auto joiner = [&nextStart, &repoAuthorCombiner]
+            (std::vector<RepoLangBytesRecView*>* rightJoinTable,
             std::vector<LangAuthorBytesRecView>* output) {
+        RepoAuthorRecView** leftJoinTable =
+                repoAuthorCombiner->leftJoinTable.get();
+        size_t numLeftJoinRecords = repoAuthorCombiner->numFinalRecords;
+
         while (true) {
             const static size_t B = 4096;
             size_t start = nextStart.fetch_add(B);
-            size_t end = std::min(start + B, leftJoinTable.size());
-            if (start >= leftJoinTable.size()) {
+            size_t end = std::min(start + B, numLeftJoinRecords);
+            if (start >= numLeftJoinRecords) {
                 break;
             }
 
-            auto leftIt = leftJoinTable.begin() + start;
-            auto rightIt = std::lower_bound(rightJoinPtrs->begin(),
-                    rightJoinPtrs->end(), std::get<0>(*leftIt),
+            auto leftIt = &leftJoinTable[start];
+            auto rightIt = std::lower_bound(rightJoinTable->begin(),
+                    rightJoinTable->end(), std::get<0>(**leftIt),
                     [] (const RepoLangBytesRecView* v, const StringView& repo)
                     { return std::get<0>(*v).compare(repo) < 0; }
             );
-            auto leftItEnd = leftJoinTable.begin() + end;
-            while ((leftIt != leftItEnd) && (rightIt != rightJoinPtrs->end())) {
-                StringView& repo = std::get<0>(*leftIt);
+            auto leftItEnd = &leftJoinTable[end];
+            auto rightItEnd = rightJoinTable->end();
+            while ((leftIt != leftItEnd) && (rightIt != rightItEnd)) {
+                StringView& repo = std::get<0>(**leftIt);
                 int cmp = repo.compare(std::get<0>(**rightIt));
                 if (cmp < 0) {
                     leftIt++;
@@ -1806,17 +1835,17 @@ MilliSortService::bigQueryQ3()
                     auto leftIt0 = leftIt + 1;
                     auto rightIt0 = rightIt + 1;
                     while ((leftIt0 != leftItEnd) &&
-                           (repo == std::get<0>(*leftIt0))) {
+                           (repo == std::get<0>(**leftIt0))) {
                         leftIt0++;
                     }
-                    while ((rightIt0 != rightJoinPtrs->end()) &&
+                    while ((rightIt0 != rightItEnd) &&
                            (repo == std::get<0>(**rightIt0))) {
                         rightIt0++;
                     }
                     for (auto l = leftIt; l != leftIt0; l++) {
                         for (auto r = rightIt; r != rightIt0; r++) {
                             output->emplace_back(std::get<1>(**r),
-                                    std::get<1>(*l), std::get<2>(**r));
+                                    std::get<1>(**l), std::get<2>(**r));
                         }
                     }
                     leftIt = leftIt0;
@@ -1826,10 +1855,50 @@ MilliSortService::bigQueryQ3()
         }
     };
 
-    std::vector<RepoLangBytesRecView*> rightJoinPtrs;
-    rightJoinPtrs.reserve(langDeserializer.numRecords);
-    std::unique_ptr<LangAuthorBytesRecView[]> localGroupBy;
-    std::atomic<size_t> numGroupBys(0);
+    struct SumBytes : public Combiner {
+
+        /// Array of pointers to input records.
+        LangAuthorBytesRecView** recordPtrs;
+
+        /// Array of final records.
+        std::unique_ptr<LangAuthorBytesRecView[]> finalRecords;
+
+        SumBytes(LangAuthorBytesRecView** recordPtrs, size_t nrecords,
+                std::vector<int>* coresAvail)
+            : Combiner(nrecords, coresAvail)
+            , recordPtrs(recordPtrs)
+            , finalRecords(new LangAuthorBytesRecView[nrecords])
+        {}
+
+        virtual bool equal(size_t idx0, size_t idx1)
+        {
+            auto& a = *recordPtrs[idx0];
+            auto& b = *recordPtrs[idx1];
+            return (std::get<0>(a) == std::get<0>(b)) &&
+                   (std::get<1>(a) == std::get<1>(b));
+        }
+
+        virtual void doWork(size_t recordId, size_t& lastUniq) override
+        {
+            auto& a = *recordPtrs[recordId];
+            auto& b = *recordPtrs[lastUniq];
+            if ((std::get<0>(a) != std::get<0>(b)) ||
+                    (std::get<1>(a) != std::get<1>(b))) {
+                *recordPtrs[++lastUniq] = a;
+            } else {
+                std::get<2>(b) += std::get<2>(a);
+            }
+        }
+
+        virtual void copyRecord(size_t fromIdx, size_t toIdx) override
+        {
+            finalRecords[toIdx] = *recordPtrs[fromIdx];
+        }
+    };
+
+    std::vector<RepoLangBytesRecView*> rightJoinTable;
+    rightJoinTable.reserve(langDeserializer.numRecords);
+    Tub<SumBytes> sumBytes;
     {
         SCOPED_TIMER(bigQueryStep4ElapsedTime)
 
@@ -1838,23 +1907,23 @@ MilliSortService::bigQueryQ3()
         // TODO: parallelize?
         for (auto& vec : langDeserializer.perCoreRecords) {
             for (auto& rec : vec) {
-                rightJoinPtrs.push_back(&rec);
+                rightJoinTable.push_back(&rec);
             }
         }
         timeTrace("step 4: prepared ptr array for indirect sort");
-        ips4o::parallel::sort(rightJoinPtrs.begin(), rightJoinPtrs.end(),
+        ips4o::parallel::sort(rightJoinTable.begin(), rightJoinTable.end(),
                 [] (const auto* x, const auto* y) {
                     return std::get<0>(*x).compare(std::get<0>(*y)) < 0;
                 },
                 coresAvail.size());
         timeTrace("step 4: sorted %u records in rightJoinTable based on repo",
-                rightJoinPtrs.size());
+                rightJoinTable.size());
 
         // The following implements the mergesort-join algorithm.
         std::vector<Arachne::ThreadId> workers;
         for (size_t id = 0; id < coresAvail.size(); id++) {
             workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
-                    joiner, &rightJoinPtrs, &joinResults[id]));
+                    joiner, &rightJoinTable, &joinResults[id]));
         }
         for (auto& tid : workers) Arachne::join(tid);
 
@@ -1892,47 +1961,12 @@ MilliSortService::bigQueryQ3()
                 numJoinedRecords);
 
         // Summed up bytes for each (lang, author); use all cores in parallel
-        localGroupBy.reset(new LangAuthorBytesRecView[numJoinedRecords]);
+        sumBytes.construct(joinResultPtrs.get(), numJoinedRecords, &coresAvail);
         if (numJoinedRecords > 0) {
-            std::atomic<size_t> nextStart(0);
-            auto sumBytes = [&joinResultPtrs, &numJoinedRecords,
-                      &localGroupBy, &numGroupBys, &nextStart]()
-            {
-                while (true) {
-                    const static size_t B = 4096;
-                    size_t start = nextStart.fetch_add(B);
-                    size_t end = std::min(start + B, numJoinedRecords);
-                    if (start >= numJoinedRecords) {
-                        break;
-                    }
-
-                    size_t lastIdx = start;
-                    for (size_t i = start + 1; i < end; i++) {
-                        auto& a = *joinResultPtrs[i];
-                        auto& b = *joinResultPtrs[lastIdx];
-                        if ((std::get<0>(a) != std::get<0>(b)) ||
-                                (std::get<1>(a) != std::get<1>(b))) {
-                            *joinResultPtrs[++lastIdx] = a;
-                        } else {
-                            std::get<2>(b) += std::get<2>(a);
-                        }
-                    }
-                    size_t more = lastIdx - start + 1;
-                    size_t k = numGroupBys.fetch_add(more);
-                    for (size_t i = start; i <= lastIdx; i++) {
-                        localGroupBy[k++] = *joinResultPtrs[i];
-                    }
-                }
-            };
-            workers.clear();
-            for (size_t id = 0; id < coresAvail.size(); id++) {
-                workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
-                        sumBytes));
-            }
-            for (auto& tid : workers) Arachne::join(tid);
+            sumBytes->run();
         }
         timeTrace("step 4: summed up bytes for %u (lang, author) combinations",
-                numGroupBys);
+                sumBytes->numFinalRecords);
     }
 //    for (auto& tuple : localGroupBy) {
 //        LOG(NOTICE, "result (%s, %s, %lu)", std::get<0>(tuple).c_str(),
@@ -1994,13 +2028,13 @@ MilliSortService::bigQueryQ3()
         }
     };
 
-
-    JoinResultPartitioner joinResultPartitioner(numGroupBys, world->size(),
-            &coresAvail, localGroupBy.get());
+    JoinResultPartitioner joinResultPartitioner(sumBytes->numFinalRecords,
+            world->size(), &coresAvail, sumBytes->finalRecords.get());
     ShuffleOp* shuffleOp2 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get());
     JoinResultDeserializer joinResultDeserializer(&coresAvail,
             &shuffleOp2->incomingMessages);
-    std::vector<LangAuthorBytesRecView> topBytes;
+    std::vector<LangAuthorBytesRecView> topBytes(LIMIT_K);
+    Tub<SumBytes> sumBytes2;
     {
         SCOPED_TIMER(bigQueryStep5ElapsedTime)
         joinResultPartitioner.start(&shuffleOp2->outgoingMessages);
@@ -2034,30 +2068,25 @@ MilliSortService::bigQueryQ3()
         timeTrace("step 5: sorted %u (lang, author, bytes) records",
                 groupBySumPtrs.size());
 
-        // TODO: parallelize?
+        // Summed up bytes for each (lang, author); use all cores in parallel
+        sumBytes2.construct(groupBySumPtrs.data(), groupBySumPtrs.size(),
+                &coresAvail);
         if (!groupBySumPtrs.empty()) {
-            topBytes.push_back(*groupBySumPtrs.front());
-            for (size_t i = 1; i < groupBySumPtrs.size(); i++) {
-                auto& a = topBytes.back();
-                auto& b = *groupBySumPtrs[i];
-                if ((std::get<0>(b) != std::get<0>(a)) ||
-                        (std::get<1>(b) != std::get<1>(a))) {
-                    topBytes.push_back(b);
-                } else {
-                    std::get<2>(a) += std::get<2>(b);
-                }
-            }
+            sumBytes2->run();
         }
-        timeTrace("step 5: merge duplicate records, %u left", topBytes.size());
+        size_t recordsLeft = sumBytes2->numFinalRecords;
+        timeTrace("step 5: merge duplicate records, %u left", recordsLeft);
 
         // Sort by bytes in descending order
-        size_t n = std::min(topBytes.size(), size_t(LIMIT_K));
-        std::partial_sort(topBytes.begin(), topBytes.begin() + n,
-                topBytes.end(), [] (const auto& lhs, const auto& rhs)
+        size_t n = std::min(recordsLeft, size_t(LIMIT_K));
+        std::partial_sort_copy(sumBytes2->finalRecords.get(),
+                sumBytes2->finalRecords.get() + recordsLeft,
+                topBytes.begin(), topBytes.end(),
+                [] (const auto& lhs, const auto& rhs)
                 { return std::get<2>(lhs) > std::get<2>(rhs); }
         );
         topBytes.resize(n);
-        timeTrace("step 5: partial-sorted top %u records", topBytes.size());
+        timeTrace("step 5: partial-sorted top %u records", n);
     }
 
     // Step 6: reduce to compute the top-K (lang, author, bytes)-tuples
