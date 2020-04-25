@@ -21,6 +21,7 @@
 #include "robin-hood/robin_hood.h"
 
 #include "Arachne/DefaultCorePolicy.h"
+#include "folly/AtomicUnorderedMap.h"
 #include "BigQuery.h"
 #include "ClockSynchronizer.h"
 #include "MilliSortService.h"
@@ -1855,50 +1856,115 @@ MilliSortService::bigQueryQ3()
         }
     };
 
-    struct SumBytes : public Combiner {
+    struct HashSumBytes : public HashCombiner {
+
+        struct KeyHash {
+            size_t operator()(LangAuthorBytesRecView* view) const {
+                return std::get<0>(*view).hash() ^ std::get<1>(*view).hash();
+            }
+        };
+
+        struct KeyEqual {
+            bool operator()(LangAuthorBytesRecView* x,
+                    LangAuthorBytesRecView* y) const {
+                return (std::get<0>(*x) == std::get<0>(*y)) &&
+                       (std::get<1>(*x) == std::get<1>(*y));
+            }
+        };
+
+        struct DummyAllocator {
+
+            HashSumBytes* owner;
+
+            void* allocate(size_t size) {
+                char* result = static_cast<char*>(owner->memOffset);
+                owner->memOffset = result + size;
+                return result;
+            }
+
+            void deallocate(void* p, size_t size) { }
+        };
+
+        DummyAllocator dummyAlloc;
+
+        /// Memory backing #finalRecords and #map.
+        void* backMemory;
+
+        /// First byte available in #backMemory.
+        void* memOffset;
+
+        /// # bytes in #backMemory.
+        size_t memBytes;
 
         /// Array of pointers to input records.
         LangAuthorBytesRecView** recordPtrs;
 
-        /// Array of final records.
-        std::unique_ptr<LangAuthorBytesRecView[]> finalRecords;
+        /// Array of final records located inside #backingMemory.
+        LangAuthorBytesRecView* finalRecords;
 
-        SumBytes(LangAuthorBytesRecView** recordPtrs, size_t nrecords,
-                std::vector<int>* coresAvail)
-            : Combiner(nrecords, coresAvail)
+        folly::AtomicUnorderedInsertMap<LangAuthorBytesRecView*,
+                folly::MutableAtom<size_t>, KeyHash, KeyEqual, true,
+                std::atomic, uint32_t, DummyAllocator> map;
+
+        std::atomic<size_t> numCopied;
+
+        using MapIter = decltype(map)::const_iterator;
+
+        HashSumBytes(LangAuthorBytesRecView** recordPtrs, size_t nrecords,
+                std::vector<int>* coresAvail, void* backMemory, size_t memBytes)
+            : HashCombiner(nrecords, coresAvail)
+            , dummyAlloc{this}
+            , backMemory(backMemory)
+            , memOffset(backMemory)
+            , memBytes(memBytes)
             , recordPtrs(recordPtrs)
-            , finalRecords(new LangAuthorBytesRecView[nrecords])
-        {}
-
-        virtual bool equal(size_t idx0, size_t idx1)
+            , finalRecords(NULL)
+            , map(nrecords, 0.8f, dummyAlloc)
+            , numCopied(0)
         {
-            auto& a = *recordPtrs[idx0];
-            auto& b = *recordPtrs[idx1];
-            return (std::get<0>(a) == std::get<0>(b)) &&
-                   (std::get<1>(a) == std::get<1>(b));
-        }
-
-        virtual void doWork(size_t recordId, size_t& lastUniq) override
-        {
-            auto& a = *recordPtrs[recordId];
-            auto& b = *recordPtrs[lastUniq];
-            if ((std::get<0>(a) != std::get<0>(b)) ||
-                    (std::get<1>(a) != std::get<1>(b))) {
-                *recordPtrs[++lastUniq] = a;
-            } else {
-                std::get<2>(b) += std::get<2>(a);
+            finalRecords = static_cast<LangAuthorBytesRecView*>(memOffset);
+            char* endOffset = (char*)(finalRecords + nrecords);
+            if (endOffset > (char*) backMemory + memBytes) {
+                DIE("Not enough memory for finalRecords, backMemory %p, "
+                    "memBytes %lu, endOffset %p", backMemory, memBytes,
+                    endOffset);
             }
         }
 
-        virtual void copyRecord(size_t fromIdx, size_t toIdx) override
+        virtual bool insert(size_t recordId) override
         {
-            finalRecords[toIdx] = *recordPtrs[fromIdx];
+            LangAuthorBytesRecView* rec = recordPtrs[recordId];
+            auto result = map.findOrConstruct(rec, [] (void* raw) {
+                new (raw) folly::MutableAtom<size_t>(0);
+            });
+            result.first->second.data.fetch_add(std::get<2>(*rec),
+                    std::memory_order_relaxed);
+            return result.second;
+        }
+
+        virtual void copyRecords(size_t shardId) override
+        {
+            auto range = map.shardRange(numMapShards, shardId);
+            size_t cnt = 0;
+            for (MapIter it(range.first); it != range.second; ++it) {
+                cnt++;
+            }
+
+            size_t copyDst = numCopied.fetch_add(cnt);
+            for (MapIter it(range.first); it != range.second; ++it) {
+                finalRecords[copyDst] = *it->first;
+                std::get<2>(finalRecords[copyDst]) =
+                        it->second.data.load(std::memory_order_relaxed);
+                copyDst++;
+            }
         }
     };
 
     std::vector<RepoLangBytesRecView*> rightJoinTable;
     rightJoinTable.reserve(langDeserializer.numRecords);
-    Tub<SumBytes> sumBytes;
+    static const size_t BACK_MEMORY_BYTES = 100 * 1000 * 1000;
+    static void* sumBytesBackMemory = new char[BACK_MEMORY_BYTES];
+    Tub<HashSumBytes> sumBytes;
     {
         SCOPED_TIMER(bigQueryStep4ElapsedTime)
 
@@ -1949,22 +2015,10 @@ MilliSortService::bigQueryQ3()
         for (auto& tid : workers) Arachne::join(tid);
         timeTrace("step 4: prepared ptr array for indirect sort");
 
-        ips4o::parallel::sort(joinResultPtrs.get(),
-                joinResultPtrs.get() + numJoinedRecords,
-                [] (const auto* x, const auto* y) {
-                    int r = std::get<0>(*x).compare(std::get<0>(*y));
-                    return (r != 0) ? (r < 0) :
-                            (std::get<1>(*x).compare(std::get<1>(*y)) < 0);
-                },
-                coresAvail.size());
-        timeTrace("step 4: sorted %u records in the join result",
-                numJoinedRecords);
-
-        // Summed up bytes for each (lang, author); use all cores in parallel
-        sumBytes.construct(joinResultPtrs.get(), numJoinedRecords, &coresAvail);
-        if (numJoinedRecords > 0) {
-            sumBytes->run();
-        }
+        sumBytes.construct(joinResultPtrs.get(), numJoinedRecords,
+                &coresAvail, sumBytesBackMemory, BACK_MEMORY_BYTES);
+        timeTrace("step 4: constructed sumBytes (folly::AtomicUnorderedMap)");
+        sumBytes->run();
         timeTrace("step 4: summed up bytes for %u (lang, author) combinations",
                 sumBytes->numFinalRecords);
     }
@@ -2029,12 +2083,13 @@ MilliSortService::bigQueryQ3()
     };
 
     JoinResultPartitioner joinResultPartitioner(sumBytes->numFinalRecords,
-            world->size(), &coresAvail, sumBytes->finalRecords.get());
+            world->size(), &coresAvail, sumBytes->finalRecords);
     ShuffleOp* shuffleOp2 = new ShuffleOp(ALLSHUFFLE_BIGQUERY_3, world.get());
     JoinResultDeserializer joinResultDeserializer(&coresAvail,
             &shuffleOp2->incomingMessages);
     std::vector<LangAuthorBytesRecView> topBytes(LIMIT_K);
-    Tub<SumBytes> sumBytes2;
+    static void* sumBytes2BackMemory = new char[BACK_MEMORY_BYTES];
+    Tub<HashSumBytes> sumBytes2;
     {
         SCOPED_TIMER(bigQueryStep5ElapsedTime)
         joinResultPartitioner.start(&shuffleOp2->outgoingMessages);
@@ -2058,29 +2113,23 @@ MilliSortService::bigQueryQ3()
                 groupBySumPtrs.push_back(&rec);
             }
         }
-        ips4o::parallel::sort(groupBySumPtrs.begin(), groupBySumPtrs.end(),
-                [] (const auto* x, const auto* y) {
-                    int r = std::get<0>(*x).compare(std::get<0>(*y));
-                    return (r != 0) ? (r < 0) :
-                            (std::get<1>(*x).compare(std::get<1>(*y)) < 0);
-                },
-                coresAvail.size());
-        timeTrace("step 5: sorted %u (lang, author, bytes) records",
-                groupBySumPtrs.size());
+        timeTrace("step 5: prepared groupBySumPtrs");
 
         // Summed up bytes for each (lang, author); use all cores in parallel
         sumBytes2.construct(groupBySumPtrs.data(), groupBySumPtrs.size(),
-                &coresAvail);
+                &coresAvail, sumBytes2BackMemory, BACK_MEMORY_BYTES);
+        timeTrace("step 5: constructed HashSumBytes");
         if (!groupBySumPtrs.empty()) {
             sumBytes2->run();
         }
         size_t recordsLeft = sumBytes2->numFinalRecords;
-        timeTrace("step 5: merge duplicate records, %u left", recordsLeft);
+        timeTrace("step 5: merge duplicate records, before %u, after %u",
+                sumBytes2->numRecords, recordsLeft);
 
         // Sort by bytes in descending order
         size_t n = std::min(recordsLeft, size_t(LIMIT_K));
-        std::partial_sort_copy(sumBytes2->finalRecords.get(),
-                sumBytes2->finalRecords.get() + recordsLeft,
+        std::partial_sort_copy(sumBytes2->finalRecords,
+                sumBytes2->finalRecords + recordsLeft,
                 topBytes.begin(), topBytes.end(),
                 [] (const auto& lhs, const auto& rhs)
                 { return std::get<2>(lhs) > std::get<2>(rhs); }

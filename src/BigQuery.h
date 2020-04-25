@@ -157,9 +157,6 @@ struct Combiner {
     /// # records to scan
     size_t numRecords;
 
-    /// # records already claimed by scan workers.
-    std::atomic<size_t> numClaimed;
-
     /// # final records produced by combining records with the same key.
     std::atomic<size_t> numFinalRecords;
 
@@ -171,7 +168,6 @@ struct Combiner {
 
     explicit Combiner(size_t nrecords, std::vector<int>* coresAvail)
         : numRecords(nrecords)
-        , numClaimed(0)
         , numFinalRecords(0)
         , coresAvail(*coresAvail)
         , scanDone(coresAvail->size())
@@ -235,6 +231,84 @@ struct Combiner {
         // Copy reduced records into their final destination.
         for (size_t i = start; i <= lastUniq; i++) {
             copyRecord(i, copyDst++);
+        }
+    }
+
+    void run()
+    {
+        std::vector<Arachne::ThreadId> workers;
+        for (size_t id = 0; id < coresAvail.size(); id++) {
+            workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
+                    [this] (size_t id) { workerMain(id); }, id));
+        }
+        for (auto& tid : workers) Arachne::join(tid);
+    }
+};
+
+struct HashCombiner {
+    /// # records to scan
+    size_t numRecords;
+
+    const size_t numMapShards;
+
+    /// # records already claimed by scan workers.
+    std::atomic<size_t> numClaimed;
+
+    /// # final records produced by combining records with the same key.
+    std::atomic<size_t> numFinalRecords;
+
+    /// # workers that have finished scanning.
+    std::atomic<size_t> scannersLeft;
+
+    std::vector<int> coresAvail;
+
+    std::atomic<size_t> nextShard;
+
+    explicit HashCombiner(size_t nrecords, std::vector<int>* coresAvail)
+        : numRecords(nrecords)
+        , numMapShards(coresAvail->size() * 20)
+        , numClaimed(0)
+        , numFinalRecords(0)
+        , scannersLeft(coresAvail->size())
+        , coresAvail(*coresAvail)
+        , nextShard(0)
+    {}
+
+    virtual bool insert(size_t recordId) = 0;
+    virtual void copyRecords(size_t shardId) = 0;
+
+    void workerMain(int coreIdx)
+    {
+        const static size_t BATCH_SIZE = 1024;
+        size_t cnt = 0;
+        while (true) {
+            size_t start = numClaimed.fetch_add(BATCH_SIZE);
+            size_t end = std::min(start + BATCH_SIZE, numRecords);
+            if (start >= numRecords) {
+                break;
+            }
+
+            for (size_t i = start; i < end; i++) {
+                if (insert(i)) {
+                    cnt++;
+                }
+            }
+        }
+        numFinalRecords.fetch_add(cnt);
+
+        scannersLeft--;
+        while (scannersLeft > 0) {
+            Arachne::yield();
+        }
+
+        // Copy reduced records into their final destination.
+        while (true) {
+            size_t shardId = nextShard.fetch_add(1);
+            if (shardId >= numMapShards) {
+                break;
+            }
+
+            copyRecords(shardId);
         }
     }
 

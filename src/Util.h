@@ -183,7 +183,7 @@ static FORCE_INLINE
 uint64_t
 wyhash64() {
     // State for wyhash64; can be seeded with any value.
-    static uint64_t wyhash64_x = generateRandom();
+    static thread_local uint64_t wyhash64_x = generateRandom();
 
     wyhash64_x += UINT64_C(0x60bee2bee120fc15);
     __uint128_t tmp;
@@ -192,6 +192,12 @@ wyhash64() {
     tmp = (__uint128_t)m1 * UINT64_C(0x1b03738712fad5c9);
     uint64_t m2 = (tmp >> 64) ^ tmp;
     return m2;
+}
+
+static FORCE_INLINE
+uint32_t
+wyhash32() {
+    return wyhash64();
 }
 
 } // end Util
