@@ -33,7 +33,7 @@ namespace RAMCloud {
 
 // Change 0 -> 1 in the following line to compile detailed time tracing in
 // this transport.
-#define TIME_TRACE 1
+#define TIME_TRACE 0
 
 #define TIME_TRACE_SP 0
 
@@ -984,6 +984,7 @@ MilliSortService::bigQueryQ1()
         int startRecId = sid * numDataTuples;
         int stopRecId = (sid + 1) * numDataTuples - 1;
         size_t totalRecords = 0;
+        size_t totalKeyBytes = 0;
         for (int tabletId = startRecId / recordsPerTablet;
                 tabletId <= stopRecId / recordsPerTablet; tabletId++) {
             int curRecId = tabletId * recordsPerTablet - 1;
@@ -1002,6 +1003,7 @@ MilliSortService::bigQueryQ1()
                     uint64_t views = std::stol(line.substr(comma + 1));
                     langCol.emplace_back(lang);
                     viewCol.emplace_back(views);
+                    totalKeyBytes += lang.size();
                 }
             } else {
                 LOG(ERROR, "File not found: %s", filename.c_str());
@@ -1010,6 +1012,8 @@ MilliSortService::bigQueryQ1()
                     langCol.size() - totalRecords, filename.c_str());
             totalRecords = langCol.size();
         }
+        LOG(NOTICE, "Average key length %.2f bytes",
+                double(totalKeyBytes) / double(totalRecords));
     }
     timeTrace("BigQuery Q1 started");
 
@@ -1183,9 +1187,10 @@ MilliSortService::bigQueryQ2() {
     }
     std::atomic<size_t> nextStart(0);
     auto partitioner = [&nextStart] (IPv4Col* tablet, PartitionByDest* parts,
-            uint16_t maxTargets) {
-        timeTrace("worker spawned on core %d", Arachne::core.id);
-        static const int BATCH_SIZE = 512;
+            uint16_t maxTargets, uint8_t numWorkers, uint8_t workerId) {
+        timeTrace("worker %u spawned on core %d", workerId, Arachne::core.id);
+        const size_t BATCH_SIZE = tablet->size() / (numWorkers * 20);
+
         size_t numRecords = 0;
         while (true) {
             size_t start = nextStart.fetch_add(BATCH_SIZE);
@@ -1207,10 +1212,11 @@ MilliSortService::bigQueryQ2() {
     {
         SCOPED_TIMER(bigQueryStep1ElapsedTime)
         std::vector<Arachne::ThreadId> workers;
-        int id = 0;
+        uint8_t id = 0;
         for (int coreId : coresAvail) {
             workers.push_back(Arachne::createThreadOnCore(coreId, partitioner,
-                    &tablet, msgsPerCore[id].get(), uint16_t(world->size())));
+                    &tablet, msgsPerCore[id].get(), uint16_t(world->size()),
+                    coresAvail.size(), id));
             id++;
         }
         for (auto &tid : workers) {
@@ -1225,8 +1231,8 @@ MilliSortService::bigQueryQ2() {
                 shuffleOp->outgoingMessages[target].appendExternal(
                         &msgsPerCore[c]->at(target));
             }
-            timeTrace("step 1: sending %u bytes to node %u",
-                    shuffleOp->outgoingMessages[target].size(), target);
+//            timeTrace("step 1: sending %u bytes to node %u",
+//                    shuffleOp->outgoingMessages[target].size(), target);
         }
     }
 

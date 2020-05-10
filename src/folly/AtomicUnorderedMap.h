@@ -361,6 +361,7 @@ struct AtomicUnorderedInsertMap {
     if (eslot > 0) {
         --eslot;
     }
+    eslot = std::min(eslot, bslot);
 
     while (bslot > 0 && slots_[bslot].state() != LINKED) {
       --bslot;

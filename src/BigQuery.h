@@ -277,7 +277,7 @@ struct HashCombiner {
     virtual bool insert(size_t recordId) = 0;
     virtual void copyRecords(size_t shardId) = 0;
 
-    void workerMain(int coreIdx)
+    void workerMain()
     {
         const static size_t BATCH_SIZE = 1024;
         size_t cnt = 0;
@@ -317,7 +317,7 @@ struct HashCombiner {
         std::vector<Arachne::ThreadId> workers;
         for (size_t id = 0; id < coresAvail.size(); id++) {
             workers.push_back(Arachne::createThreadOnCore(coresAvail[id],
-                    [this] (size_t id) { workerMain(id); }, id));
+                    [this] () { workerMain(); }));
         }
         for (auto& tid : workers) Arachne::join(tid);
     }
