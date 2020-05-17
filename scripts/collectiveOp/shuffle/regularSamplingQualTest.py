@@ -120,33 +120,70 @@ def compute_splitters(tagged_pivots, data_units_per_bucket):
         A list of splitters selected to divide the pivots evenly.
     '''
 
-    # Number of non-begin pivots we have passed so far.
-    num_nb_pivots_passed = 0
-    # Number of local nodes whose end pivots are yet to pass.
-    num_active_sources = 0
     splitters = []
-
     next_split_point = data_units_per_bucket
-    for pivot, tag in tagged_pivots:
-        if tag < 0:
-            # begin pivot
-            num_active_sources += 1
-        elif tag > 0:
-            # end pivot
-            num_active_sources -= 1
-            num_nb_pivots_passed += 1
-        else:
-            # normal pivot
-            num_nb_pivots_passed += 1
+    approx_cml_data = 0
 
-        approx_cml_data = num_nb_pivots_passed + (num_active_sources - 1) * 0.5
-        if approx_cml_data >= next_split_point:
-            splitters.append(pivot)
-            next_split_point += data_units_per_bucket
+    algo_choice = 0
+    if algo_choice == 0:
+        # John's simplified version of the algorithm
+        for pivot, tag in tagged_pivots:
+            if tag == 0:
+                # normal pivot
+                approx_cml_data += 1
+            else:
+                # begin or end pivot
+                approx_cml_data += .5
+            if approx_cml_data >= next_split_point:
+                splitters.append(pivot)
+                next_split_point += data_units_per_bucket
+    elif algo_choice == 1:
+        # Yilong's version of the algorithm, based on the weight matrix:
+        # +----------+-----+-----+-----+
+        # | prev\cur | b   | m   | e   |
+        # +----------+-----+-----+-----+
+        # | b        | 0.5 | 1   | 1   |
+        # +----------+-----+-----+-----+
+        # | m        | 0.5 | 1   | 1   |
+        # +----------+-----+-----+-----+
+        # | e        | 0   | 0.5 | 0.5 |
+        # +----------+-----+-----+-----+
+        _, prev = tagged_pivots[0]
+        for pivot, tag in tagged_pivots[1:]:
+            weight = 1
+            if prev > 0:
+                weight -= 0.5
+            if tag < 0:
+                weight -= 0.5
+            approx_cml_data += weight
+            if approx_cml_data >= next_split_point:
+                splitters.append(pivot)
+                next_split_point += data_units_per_bucket
 
-    if num_nb_pivots_passed + (num_active_sources - 1) * 0.5 < next_split_point:
-        last_pivot, _ = tagged_pivots[-1]
-        splitters.append(last_pivot)
+    # # Number of non-begin pivots we have passed so far.
+    # num_nb_pivots_passed = 0
+    # # Number of local nodes whose end pivots are yet to pass.
+    # num_active_sources = 0
+    # for pivot, tag in tagged_pivots:
+    #     if tag < 0:
+    #         # begin pivot
+    #         num_active_sources += 1
+    #     elif tag > 0:
+    #         # end pivot
+    #         num_active_sources -= 1
+    #         num_nb_pivots_passed += 1
+    #     else:
+    #         # normal pivot
+    #         num_nb_pivots_passed += 1
+    #
+    #     approx_cml_data = num_nb_pivots_passed + (num_active_sources - 1) * 0.5
+    #     if approx_cml_data >= next_split_point:
+    #         splitters.append(pivot)
+    #         next_split_point += data_units_per_bucket
+    #
+    # if num_nb_pivots_passed + (num_active_sources - 1) * 0.5 < next_split_point:
+    #     last_pivot, _ = tagged_pivots[-1]
+    #     splitters.append(last_pivot)
     return splitters
 
 
@@ -208,7 +245,7 @@ for simulation_id in range(num_sims):
             final_data_sizes[i] += bucket_sizes[i] / num_nodes
         buckets_at_node.append(bucket_sizes)
 
-    PRINT_SKEWNESS_ONLY = False
+    PRINT_SKEWNESS_ONLY = True
     if PRINT_SKEWNESS_ONLY:
         print(f"{max(final_data_sizes):.5f}", flush=True)
         continue
@@ -239,10 +276,6 @@ for simulation_id in range(num_sims):
             largest_msg_per_step[i] = max(largest_msg_per_step[i], msg_size)
             print(f", {msg_size:5.2f}", end="")
         print(f", {largest_msg_per_step[lock_step]:5.2f}")
-
-    # TODO: 2-level shuffle
-    group_size = math.ceil(math.sqrt(num_nodes))
-
 
     print("MaxShuffleMsg", end='')
     for largest_msg in largest_msg_per_step:

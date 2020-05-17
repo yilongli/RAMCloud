@@ -43,20 +43,35 @@ with open(client_log, 'r') as file:
 column_titles = f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} ' \
                 f'{"max":>12} {"p50":>12} {"p90":>12} {"records/ms":>12} ' \
                 f'{"runs":>12} {"runID(p50)":>12} '
+group_comm_steps = set()
 if query_no == 1:
     max_steps = 2
-    column_titles += f'{"localScan":>12} {"localScanImb":>12} {"gather":>12} {"gatherImb":>12}'
+    group_comm_steps = {1}
+    column_titles += f'{"localScan":>12} {"localScanImb":>12} {"gather":>12}'
 elif query_no == 2:
     max_steps = 4
+    group_comm_steps = {1, 3}
     column_titles += f'{"hashPart":>12} {"hashPartImb":>12} {"shuffle":>12} {"shuffleImb":>12} ' \
-                     f'{"countUniq":>12} {"countUniqImb":>12} {"gather":>12} {"gatherImb":>12}'
+                     f'{"countUniq":>12} {"countUniqImb":>12} {"gather":>12}'
+elif query_no == 3:
+    max_steps = 6
+    group_comm_steps = {1, 3, 5}
+    column_titles += f'{"shflCommit":>12} {"step1Imb":>12} {"foundUniq":>12} {"step2Imb":>12} ' \
+                     f'{"shflLang":>12} {"step3Imb":>12} {"join":>12} {"step4Imb":>12} ' \
+                     f'{"shflGroupBy":>12} {"step5Imb":>12} {"gather":>12}'
 else:
-    max_steps = 8
+    max_steps = 6
     column_titles += f'{"step1":>12} {"step1Imb":>12} {"step2":>12} ' \
                      f'{"step2Imb":>12} {"step3":>12} {"step3Imb":>12} ' \
                      f'{"step4":>12}  {"step4Imb":>12} {"step5":>12} ' \
                      f'{"step5Imb":>12} {"step6":>12} {"step6Imb":>12} ' \
                      f'{"step7":>12} {"step7Imb":>12} {"step8":>12} {"step8Imb":>12}'
+print('=========================== WARNING ==============================')
+print('1. The time breakdown of each step shown in this table is the\n'
+      '   so-called "collective" elapsed time.')
+print('2. The imbalance factor of each step is computed differently for\n'
+      '   local computation step and group communication step.')
+print('==================================================================')
 print(column_titles)
 
 for num_items_per_node in sorted(data_range_set):
@@ -80,26 +95,41 @@ for num_items_per_node in sorted(data_range_set):
 
         run_id = p50_run_id
 
-        # To compute the cluster-wise elapsed time of each phase, use the
-        # average from runs with total time that is less than 1% different
-        # from the p50 run.
-        run_ids = [run_id for t, run_id in total_times if abs(1 - t / p50_total_time) <= 0.01]
-
-        def compute_elapsed_time(str_phase):
-            return mean([max(record_table[(num_nodes, num_items_per_node, run_id, str_phase)]) for run_id in run_ids])
-
-        def compute_imbalance(str_phase):
-            key = (num_nodes, num_items_per_node, run_id, str_phase)
-            return max(record_table[key]) / min([x for x in record_table[key] if x > 0])
-
-        step_time = [.0] * max_steps
+        step_elapsed_time = [.0] * max_steps
         step_imbalance = [1] * max_steps
+        node_start_time = [.0] * num_nodes
         for step in range(max_steps):
-            try:
-                step_time[step] = compute_elapsed_time(f"Step {step + 1}")
-                step_imbalance[step] = compute_imbalance(f"Step {step + 1}")
-            except:
-                pass
+            step_str = f"Step {step + 1}"
+            key = (num_nodes, num_items_per_node, run_id, step_str)
+            node_elapsed_time = record_table[key]
+
+            node_finish_time = node_start_time.copy()
+            for i in range(num_nodes):
+                node_finish_time[i] += node_elapsed_time[i]
+
+            # Compute the collective start and finish time of this step.
+            # Here we chose the collective start/fin. time to be the latest
+            # individual start/fin. time. The overall elapsed time of this
+            # step is defined to be the gap between the collective finish and
+            # start times
+            latest_start_time = max(node_start_time)
+            latest_finish_time = max(node_finish_time)
+            step_elapsed_time[step] = latest_finish_time - latest_start_time
+
+            # Depending on the type of this step, compute/report the imbalance
+            # factor differently; the reason is that nodes can have different
+            # start times in group communication operations and that slow
+            # starters have negative impacts on the finish times of other nodes.
+            if step in group_comm_steps:
+                # For group comm. operations, the imbalance factor is computed
+                # using the same collective start time for all nodes.
+                step_imbalance[step] = step_elapsed_time[step] / \
+                        (min(node_finish_time) - latest_start_time)
+            else:
+                step_imbalance[step] = max(node_elapsed_time) / \
+                                       min(node_elapsed_time)
+
+            node_start_time = node_finish_time
 
         result = f'{num_nodes:12} {num_items_per_node:12} ' \
                  f'{num_nodes*num_items_per_node*1e-6:12.2f} ' \
@@ -107,6 +137,10 @@ for num_items_per_node in sorted(data_range_set):
                  f'{p50_total_time:12.2f} {p90_total_time:12.2f} ' \
                  f'{num_items_per_node/p50_total_time:12.1f} ' \
                  f'{len(total_times):12} {run_id:12} '
-        for step in range(max_steps):
-            result += f'{step_time[step]:12.2f} {step_imbalance[step]:12.2f} '
+        # Hack: we treat the last step (which is always a gather?) in BigQuery
+        # specially; as it's a many-to-one operation, there is no well-defined
+        # meaning for the imbalance factor.
+        for step in range(max_steps - 1):
+            result += f'{step_elapsed_time[step]:12.2f} {step_imbalance[step]:12.2f} '
+        result += f'{step_elapsed_time[-1]:12.2f}'
         print(result)
