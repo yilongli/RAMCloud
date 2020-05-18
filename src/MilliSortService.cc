@@ -1177,6 +1177,7 @@ MilliSortService::bigQueryQ2() {
             totalRecords = tablet.size();
         }
     }
+    ADD_COUNTER(millisortInitItems, tablet.size())
 
     // Step 1: scan the local tablet to build the shuffle messages; use all
     // worker cores to parallelize the work.
@@ -1299,6 +1300,7 @@ MilliSortService::bigQueryQ2() {
     };
 
     size_t numIPs = shuffleOp->totalRxBytes.load() / sizeof(Ipv4Address);
+    ADD_COUNTER(millisortFinalItems, numIPs)
     CountIpList topIPs;
     if (numIPs > 0) {
         SCOPED_TIMER(bigQueryStep3ElapsedTime);

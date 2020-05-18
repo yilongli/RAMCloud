@@ -34,6 +34,7 @@ with open(client_log, 'r') as file:
             data_range_set.add(num_items_per_node)
             continue
         if line.startswith("  Elapsed time (ms)") or \
+                line.startswith("  Imbalance") or \
                 line.startswith("  Step"):
             words = line.split()
             key = (num_nodes, num_items_per_node, run_id,
@@ -42,7 +43,7 @@ with open(client_log, 'r') as file:
 
 column_titles = f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} ' \
                 f'{"max":>12} {"p50":>12} {"p90":>12} {"records/ms":>12} ' \
-                f'{"runs":>12} {"runID(p50)":>12} '
+                f'{"dataImb":>12} {"runs":>12} {"runID(p50)":>12} '
 group_comm_steps = set()
 if query_no == 1:
     max_steps = 2
@@ -92,6 +93,8 @@ for num_items_per_node in sorted(data_range_set):
         p50_total_time, p50_run_id = total_times[int(len(total_times) * 0.50)]
         p90_total_time, p90_run_id = total_times[int(len(total_times) * 0.90)]
         # p95_total_time, p95_run_id = total_times[int(len(total_times) * 0.95)]
+        imbalance_ratio = max(record_table.get(
+            (num_nodes, num_items_per_node, 0, "Imbalance ratio"), [0.0]))
 
         run_id = p50_run_id
 
@@ -136,7 +139,7 @@ for num_items_per_node in sorted(data_range_set):
                  f'{min_total_time:12.2f} {max_total_time:12.2f} ' \
                  f'{p50_total_time:12.2f} {p90_total_time:12.2f} ' \
                  f'{num_items_per_node/p50_total_time:12.1f} ' \
-                 f'{len(total_times):12} {run_id:12} '
+                 f'{imbalance_ratio:12.2f} {len(total_times):12} {run_id:12} '
         # Hack: we treat the last step (which is always a gather?) in BigQuery
         # specially; as it's a many-to-one operation, there is no well-defined
         # meaning for the imbalance factor.

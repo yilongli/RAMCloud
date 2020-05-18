@@ -525,6 +525,13 @@ PerfStats::printClusterStats(Buffer* first, Buffer* second, int numServers)
         result.append(format("%-40s %s\n", "  Elapsed time (ms)",
                 formatMetricRatio(&diff, "bigQueryTime", "cyclesPerMillis",
                 " %8.3f").c_str()));
+        result.append(format("%-40s %s\n", "  Initial items",
+                formatMetric(&diff, "millisortInitItems", " %8.0f").c_str()));
+        result.append(format("%-40s %s\n", "  Final items",
+                formatMetric(&diff, "millisortFinalItems", " %8.0f").c_str()));
+        result.append(format("%-40s %s\n", "  Imbalance ratio",
+                formatMetricRatio(&diff, "millisortFinalItems",
+                "millisortInitItems", " %8.2f").c_str()));
 
         result.append("\n=== Time Breakdown (indiv. server) ===\n");
         result.append(format("%-40s %s\n", "  Step 1 (ms)",
