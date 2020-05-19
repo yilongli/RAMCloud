@@ -74,7 +74,7 @@
 #endif
 
 #ifndef IPS4O_LOG_BUCKETS
-#define IPS4O_LOG_BUCKETS 8
+#define IPS4O_LOG_BUCKETS 7
 #endif
 
 #ifndef IPS4O_MIN_PARALLEL_BLOCKS_PER_THREAD
