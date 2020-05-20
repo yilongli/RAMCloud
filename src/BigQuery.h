@@ -184,6 +184,9 @@ struct Combiner {
                 coresAvail.size();
         size_t start = avgRecordsPerCore * coreIdx;
         size_t end = std::min(numRecords, start + avgRecordsPerCore);
+        if (start >= end) {
+            return;
+        }
 
         // Advance `start` if the key of our first record is equal to that
         // of the previous record.
