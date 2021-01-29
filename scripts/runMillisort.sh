@@ -14,6 +14,9 @@ scripts/clusterperf.py -r 0 --disjunct --transport basic+infud --servers <num-se
 # --cpusPerServer fixed # cores per server; used on POD cluster to avoid interference between MilliSort nodes on the same phys. machine
 --disjunct --cpusPerServer 8
 
+# POD 1-cpu build machine sanity test
+scripts/clusterperf.py -r 0 --disjunct --transport basic+ofiud millisort --verbose --servers 2 --cpusPerServer 8 --count 10 --nodesPerPivotServer 10 --dataTuplesPerNode 10000
+
 # POD submit millisort job
 # echo_basic sanity test
 ./submit-clusterperf 3 1 clusterperf.py -r 0 --disjunct --transport basic+ofiud echo_basic --verbose --cpusPerServer 10

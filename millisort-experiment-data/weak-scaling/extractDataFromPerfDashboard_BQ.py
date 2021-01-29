@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import math
 import sys
 from statistics import mean
 
@@ -75,8 +76,8 @@ print('2. The imbalance factor of each step is computed differently for\n'
 print('==================================================================')
 print(column_titles)
 
-for num_items_per_node in sorted(data_range_set):
-    for num_nodes in sorted(node_range_set):
+for num_nodes in sorted(node_range_set):
+    for num_items_per_node in sorted(data_range_set):
         total_times = []
         max_run_id = 0
         for run_id in range(1000):
@@ -123,14 +124,17 @@ for num_items_per_node in sorted(data_range_set):
             # factor differently; the reason is that nodes can have different
             # start times in group communication operations and that slow
             # starters have negative impacts on the finish times of other nodes.
-            if step in group_comm_steps:
+            try:
                 # For group comm. operations, the imbalance factor is computed
                 # using the same collective start time for all nodes.
-                step_imbalance[step] = step_elapsed_time[step] / \
-                        (min(node_finish_time) - latest_start_time)
-            else:
-                step_imbalance[step] = max(node_elapsed_time) / \
-                                       min(node_elapsed_time)
+                if step in group_comm_steps:
+                    step_imbalance[step] = step_elapsed_time[step] / \
+                            (min(node_finish_time) - latest_start_time)
+                else:
+                    step_imbalance[step] = max(node_elapsed_time) / \
+                                           min(node_elapsed_time)
+            except ZeroDivisionError:
+                step_imbalance[step] = math.nan
 
             node_start_time = node_finish_time
 

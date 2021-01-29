@@ -109,9 +109,9 @@ void Sorter<Cfg>::parallelPrimary(const iterator begin, const iterator end,
             shared.small_tasks.push_back({start, stop, level});
         }
     };
-//    RAMCLOUD_LOG(RAMCloud::NOTICE, "minParallelBlocksPerThread %u, blockSize %u, "
-//            "max_seq_size %lu, big %lu, small %lu", Cfg::kMinParallelBlocksPerThread,
-//            Cfg::kBlockSize,
+//    RAMCLOUD_LOG(RAMCloud::NOTICE, "num_threads %d, minParallelBlocksPerThread %u, blockSize %u, "
+//            "max_seq_size %lu, big %lu, small %lu", num_threads,
+//            Cfg::kMinParallelBlocksPerThread, Cfg::kBlockSize,
 //            max_sequential_size, shared.big_tasks.size(), shared.small_tasks.size());
 
     do {

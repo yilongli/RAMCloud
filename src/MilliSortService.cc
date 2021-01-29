@@ -86,6 +86,14 @@ namespace {
 #define SUB_COUNTER(metric, delta) PerfStats::threadStats.metric -= delta;
 #define INC_COUNTER(metric) PerfStats::threadStats.metric++;
 
+// Get the "correct" number of cores to use for ips4o local sort; ips4o decides
+// whether to use sequential sorting by checking if #numRecords is smaller than
+// #cores * (1 << IPS4O_LOG_BUCKETS) * IPS4O_MIN_PARALLEL_BLOCKS_PER_THREAD.
+// Thus, we can force ips4o to use parallel sorting by reduce #cores we pass to
+// it, and this is what this macro is trying to do.
+#define GET_IPS4O_CORES(numRecords) \
+    std::min(int(coresAvail.size()), int(numRecords) / (128 * 2))
+
 // Change 0 -> 1 in the following line to use pseudo-random numbers to
 // initialize the local keys.
 #define USE_PSEUDO_RANDOM 1
@@ -1190,7 +1198,8 @@ MilliSortService::bigQueryQ2() {
     auto partitioner = [&nextStart] (IPv4Col* tablet, PartitionByDest* parts,
             uint16_t maxTargets, uint8_t numWorkers, uint8_t workerId) {
         timeTrace("worker %u spawned on core %d", workerId, Arachne::core.id);
-        const size_t BATCH_SIZE = tablet->size() / (numWorkers * 20);
+        const size_t BATCH_SIZE =
+                std::max(tablet->size() / (numWorkers * 20), 100lu);
 
         size_t numRecords = 0;
         while (true) {
@@ -1560,6 +1569,13 @@ MilliSortService::bigQueryQ3()
             std::string line;
             while (std::getline(*file.get(), line)) ++numRows;
 
+            if (numRows < numDataTuples * world->size()) {
+                LOG(ERROR, "Not enough records in the repo-languages table!");
+                return;
+            } else {
+                numRows = numDataTuples * world->size();
+            }
+
             // Read the portion of the records assigned to us.
             file.construct(repoLangFile.c_str());
             int ntuples = (numRows + world->size() - 1) / world->size();
@@ -1592,6 +1608,7 @@ MilliSortService::bigQueryQ3()
         LOG(NOTICE, "Initialized repo-lang tablet with %lu records from %s",
                 langCol.size(), repoLangFile.c_str());
     }
+    ADD_COUNTER(millisortInitItems, numDataTuples * 2);
 
     // Step 1: scan the local tablet to build up the shuffle messages; use all
     // worker cores to parallelize the work.
@@ -1727,7 +1744,7 @@ MilliSortService::bigQueryQ3()
         repoAuthorCombiner.construct(&commitPtrs, &coresAvail);
         repoAuthorCombiner->run();
         timeTrace("step 2: found %u unique (repo, author) records",
-                repoAuthorCombiner->numFinalRecords);
+                repoAuthorCombiner->numFinalRecords.load());
     }
 
     // Step 3: shuffle the language table based on repo as well (so each node
@@ -2006,6 +2023,7 @@ MilliSortService::bigQueryQ3()
             numJoinedRecords += vec.size();
         }
         timeTrace("step 4: joined the commit and language tables on repo");
+        ADD_COUNTER(millisortFinalItems, numJoinedRecords)
 
         // Indirect-sort based on (lang, author)
         workers.clear();
@@ -2028,7 +2046,7 @@ MilliSortService::bigQueryQ3()
         timeTrace("step 4: constructed sumBytes (folly::AtomicUnorderedMap)");
         sumBytes->run();
         timeTrace("step 4: summed up bytes for %u (lang, author) combinations",
-                sumBytes->numFinalRecords);
+                sumBytes->numFinalRecords.load());
     }
 //    for (auto& tuple : localGroupBy) {
 //        LOG(NOTICE, "result (%s, %s, %lu)", std::get<0>(tuple).c_str(),
@@ -2425,7 +2443,7 @@ MilliSortService::localSortAndPickPivots()
     auto localSort = [this] {
         ADD_COUNTER(localSortStartTime, Cycles::rdtsc() - startTime);
         SCOPED_TIMER(localSortElapsedTime);
-        int numWorkers = coresAvail.size();
+        int numWorkers = GET_IPS4O_CORES(numDataTuples);
         ADD_COUNTER(localSortWorkers, numWorkers);
         ips4o::parallel::sort(localKeys, localKeys + numDataTuples,
                 std::less<PivotKey>(), numWorkers);
@@ -2644,13 +2662,21 @@ MilliSortService::pivotBucketSort()
             numSmallerPivots = k;
         }
         pivotShuffleIsReady = true;
-        invokeShufflePush(allPivotServers.get(), ALLSHUFFLE_PIVOTS,
-                pivotShuffleMessages.get());
+        if (allPivotServers->size() == 1) {
+            // We must be doing single-level partitioning; bypass the pivot
+            // shuffle.
+            copyOutShufflePivots(0, pivotShuffleMessages->at(0).size(), 0,
+                    &pivotShuffleMessages->at(0));
+        } else {
+            invokeShufflePush(allPivotServers.get(), ALLSHUFFLE_PIVOTS,
+                    pivotShuffleMessages.get());
 
-        // Wait until we have received all pivots that belong to us.
-        while (pivotShuffleRxCount.load() < allPivotServers->size()) {
-            Arachne::yield();
+            // Wait until we have received all pivots that belong to us.
+            while (pivotShuffleRxCount.load() < allPivotServers->size()) {
+                Arachne::yield();
+            }
         }
+
 #if LOG_INTERMEDIATE_RESULT
         std::vector<PivotKey> tmp;
         for (auto p : sortedGatheredPivots) tmp.push_back(p.first);

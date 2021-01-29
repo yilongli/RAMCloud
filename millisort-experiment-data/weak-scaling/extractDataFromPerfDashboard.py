@@ -53,8 +53,8 @@ print(f'{"nodes":>12} {"records":>12} {"total(M)":>12} {"min":>12} {"max":>12} {
       f'{"shufPivImbal":>12} {"shufRecImbal":>12} {"rearrImbal":>12} '
       f'{"shuffleGbps":>12}')
 
-for num_items_per_node in sorted(data_range_set):
-    for num_nodes in sorted(node_range_set):
+for num_nodes in sorted(node_range_set):
+    for num_items_per_node in sorted(data_range_set):
         total_times = []
         max_run_id = 0
         for run_id in range(1000):
