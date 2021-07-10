@@ -790,7 +790,11 @@ MilliSortService::partition(PivotKey* keys, int numKeys, int numPartitions,
         } else {
             pivotIdx += s + 1;
         }
-        pivots->push_back(keys[pivotIdx]);
+        if (pivotIdx < 0) {
+            pivots->emplace_back(0, keys[0].serverId, keys[0].index);
+        } else {
+            pivots->push_back(keys[pivotIdx]);
+        }
     }
 }
 
